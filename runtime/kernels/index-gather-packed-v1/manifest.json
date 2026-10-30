@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "architecture": 121,
+  "threads": 128,
+  "grid": 192,
+  "query_rows": 6,
+  "lanes_per_key": 4,
+  "function": "ca_gather_index_k_packed4",
+  "source_sha256": "7b103a6522611d97f21795004aa9267e137a643d102ea9a9763d05bf6b57ba89",
+  "artifact_sha256": "6a846381dd20b1911242c8786e282f156dd311b882f1b3fde52534187f39a9e0",
+  "qualification_sha256": "2d9cbb25811c903f751fccd47663a6daec45dbf02a42769e794a4404cc899891",
+  "source_version": "s465",
+  "contract": "Bounded integer paged-key gather; same slots, payload/scales, six device query ends and128-key rounded bound. Four lanes copy one64-byte key; no model arithmetic or precision change."
+}

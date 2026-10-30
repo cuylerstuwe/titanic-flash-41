@@ -1,0 +1,246 @@
+{
+  "abi": 1,
+  "rows": 2048,
+  "tile_m": 64,
+  "max_active_clusters": null,
+  "experts": 384,
+  "hidden": 5120,
+  "intermediate": 576,
+  "topk": 6,
+  "deterministic": true,
+  "swiglu_limit": 10.0,
+  "scratch_bytes": 352523004,
+  "scratch_initializer": "zero",
+  "kernel_library_sha256": "4de5f4062e986b6a555130d09d7dc9b02ed9611dc71469a2ac5cbd35bd5489fb",
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+  "license": "Apache-2.0",
+  "nodes": [
+    {
+      "entry": 0,
+      "kernel_id": "integration.tp_moe.dynamic",
+      "pointers": {
+        "a_ptr": {
+          "role": "input",
+          "offset": 0
+        },
+        "topk_ids_ptr": {
+          "role": "ids",
+          "offset": 0
+        },
+        "topk_weights_ptr": {
+          "role": "routing_weights",
+          "offset": 0
+        },
+        "packed_a_ptr": {
+          "role": "scratch",
+          "offset": 152232960
+        },
+        "sfa_ptr": {
+          "role": "scratch",
+          "offset": 340648960
+        },
+        "packed_a_storage_ptr": {
+          "role": "scratch",
+          "offset": 152232960
+        },
+        "scale_storage_ptr": {
+          "role": "scratch",
+          "offset": 340648960
+        },
+        "intermediate_ptr": {
+          "role": "scratch",
+          "offset": 127943680
+        },
+        "barrier_count": {
+          "role": "scratch",
+          "offset": 1721856
+        },
+        "barrier_epoch": {
+          "role": "scratch",
+          "offset": 1771008
+        },
+        "pair_head": {
+          "role": "scratch",
+          "offset": 352451600
+        },
+        "producers_done_count": {
+          "role": "scratch",
+          "offset": 352451616
+        },
+        "all_work_published": {
+          "role": "scratch",
+          "offset": 352451632
+        },
+        "task_head": {
+          "role": "scratch",
+          "offset": 352451648
+        },
+        "task_tail": {
+          "role": "scratch",
+          "offset": 352451664
+        },
+        "task_ready_ptr": {
+          "role": "scratch",
+          "offset": 352451680
+        },
+        "task_expert_ptr": {
+          "role": "scratch",
+          "offset": 352463184
+        },
+        "task_m_tile_ptr": {
+          "role": "scratch",
+          "offset": 352474688
+        },
+        "task_slice_begin_ptr": {
+          "role": "scratch",
+          "offset": 352486192
+        },
+        "task_slice_count_ptr": {
+          "role": "scratch",
+          "offset": 352497696
+        },
+        "task_valid_rows_ptr": {
+          "role": "scratch",
+          "offset": 352509200
+        },
+        "tile_write_count_ptr": {
+          "role": "scratch",
+          "offset": 352520704
+        },
+        "b_w13": {
+          "role": "w13",
+          "offset": 0
+        },
+        "sfb_w13_ptr": {
+          "role": "s13",
+          "offset": 0
+        },
+        "b_down": {
+          "role": "w2",
+          "offset": 0
+        },
+        "sfb_down_ptr": {
+          "role": "s2",
+          "offset": 0
+        },
+        "sfb_w13_mx_ptr": {
+          "role": "s13",
+          "offset": 0
+        },
+        "sfb_down_mx_ptr": {
+          "role": "s2",
+          "offset": 0
+        },
+        "w13_residual_ptr": {
+          "role": "scratch",
+          "offset": 1720320
+        },
+        "down_residual_ptr": {
+          "role": "scratch",
+          "offset": 1720320
+        },
+        "w13_rp_ptr": {
+          "role": "w13",
+          "offset": 0
+        },
+        "w13_sfb_rp_ptr": {
+          "role": "s13",
+          "offset": 0
+        },
+        "down_rp_ptr": {
+          "role": "w2",
+          "offset": 0
+        },
+        "down_sfb_rp_ptr": {
+          "role": "s2",
+          "offset": 0
+        },
+        "row_counts": {
+          "role": "scratch",
+          "offset": 1720320
+        },
+        "expert_write_rows": {
+          "role": "scratch",
+          "offset": 352445440
+        },
+        "expert_tile_base": {
+          "role": "scratch",
+          "offset": 352446976
+        },
+        "input_global_scale": {
+          "role": "ones",
+          "offset": 0
+        },
+        "alpha": {
+          "role": "ones",
+          "offset": 0
+        },
+        "down_alpha": {
+          "role": "ones",
+          "offset": 0
+        },
+        "global_scale": {
+          "role": "ones",
+          "offset": 0
+        },
+        "scatter_ptr": {
+          "role": "scratch",
+          "offset": 2114560
+        },
+        "token_map_ptr": {
+          "role": "scratch",
+          "offset": 1820160
+        },
+        "token_weights_ptr": {
+          "role": "scratch",
+          "offset": 1967360
+        }
+      },
+      "scalars": {
+        "num_tokens": 2048,
+        "max_rows": 12288,
+        "scatter_rows": 12288,
+        "rows_padded": 36800,
+        "max_tasks": 2875,
+        "max_phys_tiles": 575,
+        "max_active_clusters": 48
+      }
+    },
+    {
+      "entry": 2,
+      "kernel_id": "moe.w4a16.topk_sum",
+      "pointers": {
+        "fc2_ptr": {
+          "role": "scratch",
+          "offset": 2114560
+        },
+        "output_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "topk_weights_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "route_expert_ids_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "expert_map_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "svh_ptr": {
+          "role": "output",
+          "offset": 0
+        }
+      },
+      "scalars": {
+        "weight_num_experts": 0,
+        "route_num_experts": 0,
+        "active_m": 2048
+      }
+    }
+  ]
+}

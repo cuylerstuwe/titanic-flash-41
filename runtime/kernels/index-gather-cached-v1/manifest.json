@@ -1,0 +1,16 @@
+{
+  "architecture": 121,
+  "physical_sms": 48,
+  "threads": 128,
+  "grid": 192,
+  "query_rows": 6,
+  "dirty_suffix_rows": 6,
+  "functions": [
+    "ca_gather_index_k_cached4",
+    "ca_index_gather_cache_advance"
+  ],
+  "source_sha256": "f8cc1492ada68c5cb2daab17090ef9d764a78b275bf73038988e5a1738852ba5",
+  "artifact_sha256": "4597cfeb6114e2a456ff0599506b8f4754252dbaa397ee403fe1214bae262608",
+  "qualification_sha256": "26dbefcac997593a4bcbe18d991447099b19b4ea53fe41751c381a0ff1fc3d38",
+  "contract": "Immutable injective slots; one ordered output owner. Reset/handoff/restore must invalidate. Refresh last6 real rows and rounded128 tile suffix. Separate stream-ordered validity publication."
+}

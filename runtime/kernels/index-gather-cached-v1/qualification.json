@@ -1,0 +1,336 @@
+{
+  "all_correct": true,
+  "index_gather_cached_screen": true,
+  "checks": [
+    {
+      "slot_order": "contiguous",
+      "case": "cold",
+      "live_end": 65535,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65529
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "append_six",
+      "live_end": 65541,
+      "copied_bound": 65664,
+      "all_bytes_exact": true,
+      "valid_prefix": 65535
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "reject_then_append",
+      "live_end": 65537,
+      "copied_bound": 65664,
+      "all_bytes_exact": true,
+      "valid_prefix": 65531
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "tile_boundary",
+      "live_end": 65666,
+      "copied_bound": 65792,
+      "all_bytes_exact": true,
+      "valid_prefix": 65660
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "zero_accept_rewrite",
+      "live_end": 65666,
+      "copied_bound": 65792,
+      "all_bytes_exact": true,
+      "valid_prefix": 65660
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "restore_other_prefix",
+      "live_end": 65535,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65529
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "fresh_size",
+      "live_end": 65536,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65530
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "fresh_size",
+      "live_end": 262144,
+      "copied_bound": 262144,
+      "all_bytes_exact": true,
+      "valid_prefix": 262138
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "fresh_size",
+      "live_end": 1048576,
+      "copied_bound": 1048576,
+      "all_bytes_exact": true,
+      "valid_prefix": 1048570
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "reset",
+      "live_end": 0,
+      "copied_bound": 0,
+      "all_bytes_exact": true,
+      "valid_prefix": 0
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "small_after_reset",
+      "live_end": 129,
+      "copied_bound": 256,
+      "all_bytes_exact": true,
+      "valid_prefix": 123
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "cold",
+      "live_end": 65535,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65529
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "append_six",
+      "live_end": 65541,
+      "copied_bound": 65664,
+      "all_bytes_exact": true,
+      "valid_prefix": 65535
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "reject_then_append",
+      "live_end": 65537,
+      "copied_bound": 65664,
+      "all_bytes_exact": true,
+      "valid_prefix": 65531
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "tile_boundary",
+      "live_end": 65666,
+      "copied_bound": 65792,
+      "all_bytes_exact": true,
+      "valid_prefix": 65660
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "zero_accept_rewrite",
+      "live_end": 65666,
+      "copied_bound": 65792,
+      "all_bytes_exact": true,
+      "valid_prefix": 65660
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "restore_other_prefix",
+      "live_end": 65535,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65529
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "fresh_size",
+      "live_end": 65536,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65530
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "fresh_size",
+      "live_end": 262144,
+      "copied_bound": 262144,
+      "all_bytes_exact": true,
+      "valid_prefix": 262138
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "fresh_size",
+      "live_end": 1048576,
+      "copied_bound": 1048576,
+      "all_bytes_exact": true,
+      "valid_prefix": 1048570
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "reset",
+      "live_end": 0,
+      "copied_bound": 0,
+      "all_bytes_exact": true,
+      "valid_prefix": 0
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "small_after_reset",
+      "live_end": 129,
+      "copied_bound": 256,
+      "all_bytes_exact": true,
+      "valid_prefix": 123
+    }
+  ],
+  "timing": [
+    {
+      "slot_order": "contiguous",
+      "live_end": 65536,
+      "median_us": [
+        7.929000072181225,
+        2.410000073723495
+      ],
+      "samples_us": [
+        [
+          8.084000088274479,
+          7.942000404000282,
+          7.865999825298786,
+          7.915999740362167
+        ],
+        [
+          2.420000033453107,
+          2.400000113993883,
+          2.3900000378489494,
+          2.463999902829528
+        ]
+      ],
+      "speed_ratio": 3.290041423082105
+    },
+    {
+      "slot_order": "contiguous",
+      "live_end": 262144,
+      "median_us": [
+        168.33899915218353,
+        2.449000021442771
+      ],
+      "samples_us": [
+        [
+          168.3640033006668,
+          168.31399500370026,
+          167.63600707054138,
+          168.8220053911209
+        ],
+        [
+          2.5059999898076057,
+          2.392000053077936,
+          2.5140000507235527,
+          2.386000007390976
+        ]
+      ],
+      "speed_ratio": 68.73785123652655
+    },
+    {
+      "slot_order": "contiguous",
+      "live_end": 1048576,
+      "median_us": [
+        720.7089960575104,
+        2.429000101983547
+      ],
+      "samples_us": [
+        [
+          734.0499758720398,
+          723.9699959754944,
+          717.4479961395264,
+          696.9839930534363
+        ],
+        [
+          2.4939998984336853,
+          2.383999992161989,
+          2.4580000899732113,
+          2.400000113993883
+        ]
+      ],
+      "speed_ratio": 296.71015471303264
+    },
+    {
+      "slot_order": "permuted_unique",
+      "live_end": 65536,
+      "median_us": [
+        15.315999742597342,
+        2.4059999268501997
+      ],
+      "samples_us": [
+        [
+          15.382000245153904,
+          15.321999788284302,
+          15.309999696910381,
+          15.293999575078487
+        ],
+        [
+          2.4059999268501997,
+          2.4059999268501997,
+          2.400000113993883,
+          2.41199997253716
+        ]
+      ],
+      "speed_ratio": 6.3657523725065905
+    },
+    {
+      "slot_order": "permuted_unique",
+      "live_end": 262144,
+      "median_us": [
+        212.98500150442123,
+        2.4500000290572643
+      ],
+      "samples_us": [
+        [
+          212.8800004720688,
+          213.80600333213806,
+          212.34799921512604,
+          213.09000253677368
+        ],
+        [
+          2.503999974578619,
+          2.3960000835359097,
+          2.5279999244958162,
+          2.394000068306923
+        ]
+      ],
+      "speed_ratio": 86.93265264424333
+    },
+    {
+      "slot_order": "permuted_unique",
+      "live_end": 1048576,
+      "median_us": [
+        850.9309887886047,
+        2.4239999474957585
+      ],
+      "samples_us": [
+        [
+          850.3119945526123,
+          849.9400019645691,
+          851.5499830245972,
+          901.6919732093811
+        ],
+        [
+          2.492000116035342,
+          2.369999885559082,
+          2.471999963745475,
+          2.3759999312460423
+        ]
+      ],
+      "speed_ratio": 351.04414489270266
+    }
+  ],
+  "source_sha256": "f8cc1492ada68c5cb2daab17090ef9d764a78b275bf73038988e5a1738852ba5",
+  "artifact_sha256": "4597cfeb6114e2a456ff0599506b8f4754252dbaa397ee403fe1214bae262608",
+  "compile_command": [
+    "nvcc",
+    "--cubin",
+    "-arch=sm_121",
+    "--std=c++17",
+    "-O3",
+    "/scratch/evidence/index-gather-cached-s475/component/gather.cu",
+    "-o",
+    "/scratch/evidence/index-gather-cached-s475/component/gather.cubin"
+  ],
+  "full_engine_acceptance": false,
+  "scope": "Contiguous and unique permuted slots; changed append/rejected suffixes, tile growth, restore invalidation, reset and tiny prefixes. Cached byte copy versus current packed4; no model arithmetic. Component ownership contract only; native reset/handoff/restore invalidation remains to implement and validate."
+}

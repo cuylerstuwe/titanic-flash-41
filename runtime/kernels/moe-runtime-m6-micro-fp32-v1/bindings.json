@@ -1,0 +1,101 @@
+{
+  "abi": 1,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+  "license": "Apache-2.0",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "gemm.mxfp8_quant_cute",
+      "pointers": [
+        "source_ptr",
+        "values_ptr",
+        "scale_rows_ptr",
+        "scale_mma_ptr"
+      ],
+      "i32_scalars": [
+        "m",
+        "source_k",
+        "grid_x"
+      ],
+      "header_sha256": "665e66a1d1127a3790113b69e5b9b07b882a5b81516cae364e1af51deb46d48a"
+    },
+    {
+      "index": 1,
+      "name": "kernel_001",
+      "kernel_id": "moe.w4a8.compact_micro",
+      "pointers": [
+        "packed_a_ptr",
+        "a_scales_ptr",
+        "w13_ptr",
+        "w13_scales_ptr",
+        "intermediate_ptr",
+        "projections_ptr",
+        "token_weights_ptr",
+        "topk_ids_ptr",
+        "alpha1_ptr",
+        "input_scale_ptr",
+        "w2_ptr",
+        "w2_scales_ptr",
+        "route_output_ptr",
+        "alpha2_ptr",
+        "down_scale_ptr"
+      ],
+      "i32_scalars": [
+        "num_pairs",
+        "max_active_clusters"
+      ],
+      "header_sha256": "61911774029867c47a8f5fe8ec55e3112b7c44c89277ac3d46681b6b454abe78"
+    },
+    {
+      "index": 2,
+      "name": "kernel_002",
+      "kernel_id": "moe.w4a8.compact_micro",
+      "pointers": [
+        "packed_a_ptr",
+        "a_scales_ptr",
+        "w13_ptr",
+        "w13_scales_ptr",
+        "intermediate_ptr",
+        "projections_ptr",
+        "token_weights_ptr",
+        "topk_ids_ptr",
+        "alpha1_ptr",
+        "input_scale_ptr",
+        "w2_ptr",
+        "w2_scales_ptr",
+        "route_output_ptr",
+        "alpha2_ptr",
+        "down_scale_ptr"
+      ],
+      "i32_scalars": [
+        "num_pairs",
+        "max_active_clusters"
+      ],
+      "header_sha256": "ef8fddff0a3fe0fd6ca8bfb7945b4105aa8fdb43418f0f808f23bac05286b94e"
+    },
+    {
+      "index": 3,
+      "name": "kernel_003",
+      "kernel_id": "moe.w4a16.topk_sum",
+      "pointers": [
+        "fc2_ptr",
+        "output_ptr",
+        "topk_weights_ptr",
+        "route_expert_ids_ptr",
+        "expert_map_ptr",
+        "svh_ptr"
+      ],
+      "i32_scalars": [
+        "weight_num_experts",
+        "route_num_experts",
+        "active_m"
+      ],
+      "header_sha256": "72be8ee23bf6e0406596a9df38fd8c5d404796f8c6275c685201f7c557c5e84e"
+    }
+  ],
+  "library_sha256": "03b36cae287f80b123c9ed8b82ac96d722ceee11b4010c036a58a836a408c374"
+}

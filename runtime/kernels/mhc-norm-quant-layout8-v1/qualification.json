@@ -1,0 +1,10 @@
+{
+  "all_exact": true,
+  "norm_quant_screen": true,
+  "checks": 15,
+  "component_report_sha256": "0dee67c79af68c933e48690ced2ea09ce0cf08ff763c9ab29a82d6436f102ff7",
+  "artifact_sha256": "1a6d3dc7648f09d1945dc085cc23372648d0f88e8c145a5348b6e114a02fb281",
+  "manifest_sha256": "4e84076b85df1737efbb3d56cf53a8fc0823a2ae119e1ee1495c6b23233dc997",
+  "source_sha256": "38991fb0e8cd9cb98bdf44720c3a842bee03039ed604e2a52439b1d930f815a2",
+  "full_engine_acceptance": false
+}

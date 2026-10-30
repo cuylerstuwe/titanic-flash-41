@@ -1,0 +1,38 @@
+{
+  "abi": 1,
+  "architecture": 121,
+  "physical_sms": 48,
+  "width": 512,
+  "page_tokens": [
+    32,
+    64,
+    128,
+    256
+  ],
+  "norm": false,
+  "input_dtype": "BF16",
+  "layout": "dsv4_fp8_448_bf16_rope64_e8m0_footer8",
+  "license": "Apache-2.0",
+  "source_commit": "f80c91a4b97e52e17fbcff088aa6b47b6270f6b9",
+  "source_sha256": "ccfbdc3617d99f1663abdf492c8c55b094d3eaf023704db272ef06e184dba157",
+  "adaptation": "Remove only normalization and latent output store; input is actual prefill-normalized BF16. Preserve exact RoPE/FP4 round trip/FP8 cache store.",
+  "adapter_sha256": "07e0504418b65af3a6e6f7492a10cdcdd3eb51404036224d27f200a02eccdf88",
+  "library_sha256": "6b93f2ada088c0a3c462ec3d9ac256842ea0512fc596571b1003aec5bb94d987",
+  "compiler_arguments": [
+    "nvcc",
+    "-shared",
+    "-Xcompiler=-fPIC",
+    "-std=c++20",
+    "--expt-relaxed-constexpr",
+    "-DSGL_CUDA_ARCH=1210",
+    "-O3",
+    "-gencode=arch=compute_121a,code=sm_121a",
+    "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include",
+    "-I/sgl-workspace/sglang/python/sglang/kernels/jit/include",
+    "-I/opt/sglang/lib/python3.12/site-packages/tvm_ffi/include",
+    "/scratch/primitive-exports/compression-prefill-v1/store.cu",
+    "-o",
+    "/scratch/primitive-exports/compression-prefill-v1/libcanada_prefill_store.so",
+    "-lcudart"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "installed FlashInfer 0.6.18 from pinned Canada image",
+  "source_sha256": "4290847ee462b73b850200997e957e9a5003c8f3c86e8f8c66ce453a2b264af5",
+  "license": "Apache-2.0 (rmsnorm.py file)",
+  "adaptation": "Sequential HC FP32 FMA; BF16 intermediate; native CuTe RMS reduction layout.",
+  "gpu_access_required_for_build": true,
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "mhc.combine_rms.h5120",
+      "width": 5120,
+      "stride": 20480,
+      "max_rows": 65536,
+      "header_sha256": "1d22c40f0613f7f6813ffbb12c1479e597a053af84ee8049b8d3ec9a5d724f57",
+      "object_sha256": "1fae128b11546608532b00f4bfef8b81788d164c654ed48a5125201b96348a62"
+    }
+  ]
+}

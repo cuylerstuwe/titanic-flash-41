@@ -1,0 +1,43 @@
+{
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "SG17 release archive 4922d0db9395fb8b537d7e216d509a5747867a45f20c18290e385786609dd05f",
+  "license": "Apache-2.0",
+  "architecture": 121,
+  "physical_sms": 48,
+  "source_sha256": "e796a354c363be8153b9112f5b46b6249c7762e0293c2e3d8541ba036bcf3802",
+  "adapter_sha256": "0f45e86b89b72b15dab5d4a7e49e80f216a5a8054038c75899f4604501974fb7",
+  "variant": "control",
+  "role": "Component-only SC/acq_rel staging experiment; explicit acquire retained at final staging RMW",
+  "layout": {
+    "world": 4,
+    "slots": 2,
+    "flag_stride": 128,
+    "slot_bytes": 67108864
+  },
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "canada.roce.notify_control.rank0",
+      "header_sha256": "f1608022c3edb656bd7565e4d5ceda8dd6d384e229b1873fd2edabd4b35dbffe",
+      "object_sha256": "0625306f5b3a117219d8d49047f27df2d3d71dcc3c2727ce9bb4e50091e3b152"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "canada.roce.notify_control.rank1",
+      "header_sha256": "d984b0c2e265d8a3db95d2f702c7533c14d1a3607d3019f0ee10e3473004178c",
+      "object_sha256": "d4dced68c11c4a23fa128ea5b9a8242b91526c4ad518df42fa750d91b6e3afd3"
+    },
+    {
+      "name": "kernel_002",
+      "kernel_id": "canada.roce.notify_control.rank2",
+      "header_sha256": "c815944425449bfb65211a4897459ea8f578b27e1d4c2289ac4c6e5bbe42fe2d",
+      "object_sha256": "4f8adaa58937eaf5177636d59dc1d4245c7163362c4766c7671262757ddbf062"
+    },
+    {
+      "name": "kernel_003",
+      "kernel_id": "canada.roce.notify_control.rank3",
+      "header_sha256": "2e22a39cc1c18d1942e4535ee5178a7cb6708820a8c0e312ccc60587d9eadea3",
+      "object_sha256": "dcd354c5bf7df74abb423f50074a93a46bd3d6311c82bdf1e88b60ca9f3a11ff"
+    }
+  ]
+}

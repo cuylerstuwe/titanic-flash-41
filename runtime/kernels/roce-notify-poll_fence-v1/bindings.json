@@ -1,0 +1,283 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "SG17 release archive 4922d0db9395fb8b537d7e216d509a5747867a45f20c18290e385786609dd05f",
+  "license": "Apache-2.0",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "canada.roce.notify_poll_fence.rank0",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "24e6b8014690e370da2ffcfeb5d1820b0c02fab69d06ca41b7fc216025f91b8a"
+    },
+    {
+      "index": 1,
+      "name": "kernel_001",
+      "kernel_id": "canada.roce.notify_poll_fence.rank1",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "2a1725ff60aaee341e909daef747366f6c351d88158c1bc3d35210da71a9e086"
+    },
+    {
+      "index": 2,
+      "name": "kernel_002",
+      "kernel_id": "canada.roce.notify_poll_fence.rank2",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "39324de6f6517a285072517ba56b5df6df0912f9eb60f806c974a2ef66452e12"
+    },
+    {
+      "index": 3,
+      "name": "kernel_003",
+      "kernel_id": "canada.roce.notify_poll_fence.rank3",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "df7a2df431e4d91b080e7e4ceb08b25d68fd93d0b04c7235731fbb44ff4c46c1"
+    }
+  ],
+  "library_sha256": "3e8807e027a6a4ed38c6dbdd27f6f3c321cd47797a5662809dc471bb6aa22a05"
+}

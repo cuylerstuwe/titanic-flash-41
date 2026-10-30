@@ -1,0 +1,24 @@
+{
+  "scope": "Finite resident CPU-control/GPU-state diagnostic; truncated outputs are not task-quality or natural-outcome performance qualification.",
+  "request_count": 8,
+  "max_new_tokens": 64,
+  "seed_base": 20261024,
+  "source_fixtures": [
+    "target-agentic-python-v1.json",
+    "target-agentic-rust-v1.json",
+    "target-agentic-repository-v1.json"
+  ],
+  "eos_teacher_forcing_source": "natural-r0 from native s247, canonical prompt plus complete generated output except final EOS",
+  "eos_source_sha256": "f9870135b5a9b269c6d1727804bb19c986f659f2958d37e048992c69fbbc0a27",
+  "fixture_sha256": "a25003e0dcd7833d9f65a5e138ec260ec1c892bfb38dc20f3ec1d2b5769239a7",
+  "expected_paths": [
+    "fresh/cancel",
+    "retained delta32",
+    "retained delta4096/cancel",
+    "fresh reset",
+    "retained delta1",
+    "fresh reset/cancel",
+    "equal committed prefix resets",
+    "fresh full completion prefix for EOS coverage"
+  ]
+}

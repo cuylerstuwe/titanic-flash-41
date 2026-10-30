@@ -1,0 +1,179 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "installed FlashInfer 0.6.18 from pinned Canada image",
+  "license": "BSD-3-Clause",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "norm.rms.h512.s512",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "M",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "e6b755b7fea39ecc1ee4c22583f29a9bfacf28639c5cbb06c4cf0dd6e701ecd8"
+    },
+    {
+      "index": 1,
+      "name": "kernel_001",
+      "kernel_id": "norm.rms.h1280.s1280",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "M",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "6c706191562c3f0fed13d4da63cbcea2d3636f37fd85746a8ec024877dd53223"
+    },
+    {
+      "index": 2,
+      "name": "kernel_002",
+      "kernel_id": "norm.rms.h5120.s5120",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "M",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "cbe74f760aca20bbeee49179069d22b653a8f3cc1eab4e94c60d143b384bc268"
+    },
+    {
+      "index": 3,
+      "name": "kernel_003",
+      "kernel_id": "norm.rms.h512.s768",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "M",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "1d02ea4cfa05742012e9ae82b70605ae411ad73e49280dcfb42a2cd738868e60"
+    },
+    {
+      "index": 4,
+      "name": "kernel_004",
+      "kernel_id": "norm.rms.h1280.s1536",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "M",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "c2d7f0723e27042d606443f1b6e5ab0269f5365f30822d7a53279b12fda293f3"
+    },
+    {
+      "index": 5,
+      "name": "kernel_005",
+      "kernel_id": "norm.rms.h5120.s5376",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "M",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "db96b9e961192dfe076b13b2549306d671d14298d07fb2935f093f599f855916"
+    }
+  ],
+  "library_sha256": "312f46c9fad8c38215bad577888e49152f69d70dd0fc2184088f6c2604580bb2"
+}

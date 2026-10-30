@@ -1,0 +1,27 @@
+{
+  "all_correct": true,
+  "private_int8": true,
+  "quantized_weights_and_scales_exact": true,
+  "canonical_unchanged": true,
+  "cases": [
+    {
+      "case": "normal",
+      "exact": true,
+      "finite": true
+    },
+    {
+      "case": "changed",
+      "exact": true,
+      "finite": true
+    },
+    {
+      "case": "zero",
+      "exact": true,
+      "finite": true
+    }
+  ],
+  "source_sha256": "42b172b6d80a609b34a9b5a02ee9bb2fdeb5cd8b099b3124ac63f487189e1ea8",
+  "manifest_sha256": "72654097390beb858c2778a1c64781c1500ed97d9bfdd88a77c9ffe7d345168c",
+  "component_sha256": "2d503f485d67d17c665fba218ae67feb090136f98dd0e275d9be19c0222231b3",
+  "scope": "Same tested component sources. Native driver quantizer and M5 GEMV ABI; exact CUDA comparison to JIT on canonical rank3 head, normal/changed/zero graph inputs. Target unchanged. Full actual-q integration and accepted-token rate not yet tested."
+}

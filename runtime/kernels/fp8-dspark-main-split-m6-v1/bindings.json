@@ -1,0 +1,115 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "Installed source in immutable Canada image82bb5857; exact SHA256 pins below",
+  "license": "BSD-3-Clause dense; Apache-2.0 quantizer",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "flashinfer.mxfp8.quant.pdl0",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "scales",
+          "kind": "pointer"
+        }
+      ],
+      "header_sha256": "8a757f220da45d1b502ba9edfe552281fed94396264b337c14418d126a356a91"
+    },
+    {
+      "index": 1,
+      "name": "kernel_001",
+      "kernel_id": "flashinfer.mxfp8.dense.pdl0",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "xs",
+          "kind": "pointer"
+        },
+        {
+          "name": "ws",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "alpha",
+          "kind": "pointer"
+        }
+      ],
+      "header_sha256": "ba3eca7c3ad6ef675204f23d83bf6535629ce9fda3e738bf4d04cb94ed1ec6ec"
+    },
+    {
+      "index": 2,
+      "name": "kernel_002",
+      "kernel_id": "flashinfer.mxfp8.quant.pdl1",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "scales",
+          "kind": "pointer"
+        }
+      ],
+      "header_sha256": "23ad08f05a55f3987907a9b74b8c8d397ca57b7a86f6b63d142ad3cbbdbc1c69"
+    },
+    {
+      "index": 3,
+      "name": "kernel_003",
+      "kernel_id": "flashinfer.mxfp8.dense.pdl1",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "xs",
+          "kind": "pointer"
+        },
+        {
+          "name": "ws",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "alpha",
+          "kind": "pointer"
+        }
+      ],
+      "header_sha256": "5046632f6b929371e7a81c9708910778014cfc9f1c7685904fa084743985d428"
+    }
+  ],
+  "library_sha256": "3cd353f95a82fe5ca02cb1ae3af62143cab546f6710a907a7ef243009216ea81"
+}

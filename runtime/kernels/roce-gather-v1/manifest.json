@@ -1,0 +1,42 @@
+{
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "SG17 release archive 4922d0db9395fb8b537d7e216d509a5747867a45f20c18290e385786609dd05f",
+  "license": "Apache-2.0",
+  "architecture": 121,
+  "physical_sms": 48,
+  "source_sha256": "e796a354c363be8153b9112f5b46b6249c7762e0293c2e3d8541ba036bcf3802",
+  "adapter_sha256": "74cbd5f5a7d18b9a9ea8b06bb2efd6d0cd52e3a5b3adff5c5fc90e05c35ebb3b",
+  "role": "Raw bit-preserving row-major all-gather; shares ordered proxy protocol with sum",
+  "layout": {
+    "world": 4,
+    "slots": 2,
+    "flag_stride": 128,
+    "slot_bytes": 67108864
+  },
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "canada.roce.row_gather.rank0",
+      "header_sha256": "aedfad5b0991fc31fe9972b2fb292e0e63cc3264a9f596e3438c99eb6bfdcdd2",
+      "object_sha256": "db0899ca0e320bd3f8bae0aa788fbc9cc1b82712ca6854d495ae99578cccb37c"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "canada.roce.row_gather.rank1",
+      "header_sha256": "18e359b0fcb29db7fdb63d9e6635a1f81f336e73c0a69766d55c4164fa519aec",
+      "object_sha256": "61c0c6323a64ba0587cf889e35ec0e0823f8a75c62315d606b95d33ae21109a1"
+    },
+    {
+      "name": "kernel_002",
+      "kernel_id": "canada.roce.row_gather.rank2",
+      "header_sha256": "7f0a38eb21d88bc1e3819546abfd310761d79846640507770f5c2f5d3b5f11e3",
+      "object_sha256": "0580c29bf53ef9f3d009c04511cb97b751fd8c28818da713379af84f93a6928b"
+    },
+    {
+      "name": "kernel_003",
+      "kernel_id": "canada.roce.row_gather.rank3",
+      "header_sha256": "f8b0ecb9565a47b1007d6eef8bc9dd553db1caa60993533f7dc5f8a722de437f",
+      "object_sha256": "e16530a2d9f06311234dbcf482407bc32e6a6ce7fadeb479790b761db2372b17"
+    }
+  ]
+}

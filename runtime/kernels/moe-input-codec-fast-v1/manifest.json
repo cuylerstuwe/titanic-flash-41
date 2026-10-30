@@ -1,0 +1,7 @@
+{
+  "format": "dual_quant_rows_v1",
+  "library_sha256": "ef5e336f5fb1a00f02e7910bb7800db724bda14bc2055804b5b7dba0aa5e837c",
+  "source_sha256": "f1d3561d91d87a95d458f84f142de040f7eabfdfbb704d2175cf0fe6f54e5178",
+  "source": "tools/moe-dual-quant-codec-fast.cu",
+  "numerics": "s510 exact eight-pattern routed/shared quantizer check"
+}

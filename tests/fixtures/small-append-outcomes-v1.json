@@ -1,0 +1,47 @@
+{
+  "cases": [
+    {
+      "task": "select-jobs",
+      "request_id": 2,
+      "delta": 1,
+      "seed": 1017738,
+      "prompt_tokens": 234,
+      "rendered_sha256": "e2761e218955155219334653aacaee50ba2e3839d7ff95a6b39087f76c84ec0c"
+    },
+    {
+      "task": "select-jobs",
+      "request_id": 4,
+      "delta": 6,
+      "seed": 1017739,
+      "prompt_tokens": 234,
+      "rendered_sha256": "e2761e218955155219334653aacaee50ba2e3839d7ff95a6b39087f76c84ec0c"
+    },
+    {
+      "task": "resolve-aliases",
+      "request_id": 6,
+      "delta": 1,
+      "seed": 1017738,
+      "prompt_tokens": 204,
+      "rendered_sha256": "af11529371738ccd2be5672e5932a256bb0db7ea9bd32dc534010707d62422e0"
+    },
+    {
+      "task": "resolve-aliases",
+      "request_id": 8,
+      "delta": 6,
+      "seed": 1017739,
+      "prompt_tokens": 204,
+      "rendered_sha256": "af11529371738ccd2be5672e5932a256bb0db7ea9bd32dc534010707d62422e0"
+    }
+  ],
+  "tasks": {
+    "select-jobs": "Implement select_jobs(jobs, budget) in Python. Each job is a tuple (id, cost, benefit). IDs are distinct nonnegative integers; costs are positive integers; benefits are nonnegative integers. budget is a nonnegative integer. There can be up to100 jobs and budget<=1000. Each job can be chosen at most once. Return a list of chosen IDs in increasing order that maximizes total benefit with total cost<=budget. Among equally beneficial subsets choose the one with the smallest total cost; if still tied choose the lexicographically smallest sorted ID list (usual Python list ordering, including the rule that a strict prefix is smaller). Do not mutate jobs. Use a polynomial-time dynamic program in the job count and budget; enumerating all subsets is not acceptable. Empty input or zero budget returns[]. Return only the complete function in one Python code block; no imports, top-level code, or examples. Built-in types/functions are available. You may assume all inputs satisfy the specification.",
+    "resolve-aliases": "Implement resolve_aliases(mapping) in Python. mapping maps distinct string keys to string values. Following a key means repeatedly looking up its current value while that value is itself a key in mapping. A value absent from mapping is a terminal. Return a new dictionary with exactly the original keys: map each to its terminal string, or None if its path reaches any cycle (including a self-loop). A key leading into a cycle must also map to None. Do not mutate mapping. The algorithm must handle chains of at least20000 keys without recursion and run in O(number of keys) expected time, sharing resolved paths rather than retracing each chain. Empty input returns{}. Return only the complete function in one Python code block; no imports, top-level code, or examples. Built-in types/functions are available. You may assume all inputs satisfy the specification."
+  },
+  "target_temperature": 1,
+  "target_top_p": 1,
+  "reasoning_effort": "high",
+  "maximum_new_tokens": 4096,
+  "tokenizer_sha256": "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b",
+  "encoder_binary_sha256": "903258d236e20c9b0493c4559a6b731fcb59a50487f03b6e7ea6f2976eabac72",
+  "scope": "Two new specified coding tasks, two seeds with1/6token retained suffixes. Complete-answer grading and time, small screening evidence only."
+}

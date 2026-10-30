@@ -1,0 +1,123 @@
+{
+  "source": "https://github.com/sgl-project/sglang",
+  "source_commit": "f80c91a4b97e52e17fbcff088aa6b47b6270f6b9",
+  "license": "Apache-2.0",
+  "adaptation": "Explicit BF16 combine boundary followed by FP32 row RMS reduction; four warps.",
+  "compiler": "3.7.1",
+  "gpu_access_required_for_build": false,
+  "entries": [
+    {
+      "name": "hc_combine_norm_bf16",
+      "symbol": "combine_norm",
+      "architecture": 121,
+      "physical_sms": 48,
+      "arguments": [
+        {
+          "name": "X",
+          "kind": "*bf16"
+        },
+        {
+          "name": "P",
+          "kind": "*fp32"
+        },
+        {
+          "name": "W",
+          "kind": "*bf16"
+        },
+        {
+          "name": "Y",
+          "kind": "*bf16"
+        }
+      ],
+      "constexprs": {
+        "B": 8192
+      },
+      "metadata": {
+        "allowed_dot_input_precisions": [
+          "tf32",
+          "tf32x3",
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "sm121",
+        "backend_name": "cuda",
+        "debug": false,
+        "default_dot_input_precision": "tf32",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b15"
+        ],
+        "enable_fp_fusion": true,
+        "enable_reflect_ftz": true,
+        "extern_libs": [
+          [
+            "libdevice",
+            "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+          ]
+        ],
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "9b4e70deae2b4669a0f253afaa2507c13c4a09e574a79b239064c34563affae6",
+        "instrumentation_mode": "",
+        "ir_override": null,
+        "launch_cooperative_grid": false,
+        "launch_pdl": false,
+        "max_num_imprecise_acc_default": 0,
+        "maxnreg": null,
+        "name": "combine_norm",
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 4,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "ptx_options": null,
+        "ptx_version": null,
+        "sanitize_overflow": true,
+        "shared": 16,
+        "supported_fp8_dtypes": [
+          "fp8e4b15",
+          "fp8e4nv",
+          "fp8e5"
+        ],
+        "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+        "tensordesc_meta": [],
+        "tmem_size": 0,
+        "triton_version": "3.7.1",
+        "warp_size": 32
+      },
+      "grid": {
+        "rows_div": 1,
+        "y": 1,
+        "z": 1
+      },
+      "ptx_parameters": [
+        [
+          "u64",
+          "combine_norm_param_0"
+        ],
+        [
+          "u64",
+          "combine_norm_param_1"
+        ],
+        [
+          "u64",
+          "combine_norm_param_2"
+        ],
+        [
+          "u64",
+          "combine_norm_param_3"
+        ],
+        [
+          "u64",
+          "combine_norm_param_4"
+        ],
+        [
+          "u64",
+          "combine_norm_param_5"
+        ]
+      ],
+      "source_sha256": "f0311fe5f56f974316f987ee6640f5551a880568d1ad416b966cf8db2cfe3162",
+      "artifact_sha256": "ba99f53c64a525c3e71ff5ca9df102bbe24716493100a0bce749f86510cb5a3e"
+    }
+  ]
+}

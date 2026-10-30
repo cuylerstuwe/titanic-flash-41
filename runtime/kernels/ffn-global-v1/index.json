@@ -1,0 +1,40 @@
+{
+  "rows": 6,
+  "world": 4,
+  "cases": [
+    {
+      "name": "initial",
+      "input_sha256": "1b7510a008f34892ce79997ae72e3e76bb4b6aa960570cc379f38dbae7d1db98",
+      "tokens_sha256": "789f36bb16a8151ac2b0d14a14c8066a534b0663bf30e1f7ada000d5cbc5723e",
+      "live": 6,
+      "output_sha256": "1d6a3c4c747d278a89c592c46fdab8d7a82224118be1749b1c993d7a2d7ea66c",
+      "values": 30720
+    },
+    {
+      "name": "changed",
+      "input_sha256": "ac98527fed3043f4003aa2cdb403c1c98ede836026e2115f9ad79fc0d6ed3619",
+      "tokens_sha256": "3a5793b7e5c99ec72a9e57181cad14d9668f9330fb1b14879479b617ca8bc5eb",
+      "live": 6,
+      "output_sha256": "44a869bb598af56a10b0327da1793063698bafe45ebba711e35803844df85f6b",
+      "values": 30720
+    },
+    {
+      "name": "zero",
+      "input_sha256": "0693f6bfa2117a9b14f9ceca13d3a5611de5dca226bf999f20a7f615fbd08dff",
+      "tokens_sha256": "3a5793b7e5c99ec72a9e57181cad14d9668f9330fb1b14879479b617ca8bc5eb",
+      "live": 6,
+      "output_sha256": "0693f6bfa2117a9b14f9ceca13d3a5611de5dca226bf999f20a7f615fbd08dff",
+      "values": 30720
+    },
+    {
+      "name": "padded",
+      "input_sha256": "1b7510a008f34892ce79997ae72e3e76bb4b6aa960570cc379f38dbae7d1db98",
+      "tokens_sha256": "3a5793b7e5c99ec72a9e57181cad14d9668f9330fb1b14879479b617ca8bc5eb",
+      "live": 4,
+      "output_sha256": "6554410b451f0ca4e3042ad301aa2f0363a79d1d777c27dd2bf9c2470a61337d",
+      "values": 30720
+    }
+  ],
+  "scope": "canonical TP4 FFN before mHC; not complete layer/model",
+  "reduction": "GPU FP32 sequential sum in fixed rank order 0,1,2,3; BF16 RN output, matching RoCEnante SG17"
+}

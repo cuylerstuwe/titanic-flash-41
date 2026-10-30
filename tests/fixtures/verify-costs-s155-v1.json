@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "source": "evidence/target-native-peer-r0-s155.json",
+  "workload": "Exact458token coding prompt,4physicalpeers,greedy,1024capacity,1warmup+3measured512outputturns",
+  "verified_rows": [
+    3,
+    4,
+    5,
+    6
+  ],
+  "observations": [
+    39,
+    141,
+    127,
+    184
+  ],
+  "complete_step_ms": [
+    40.583447974358975,
+    44.91271273049645,
+    47.71452620472441,
+    47.958153875
+  ],
+  "cost_includes": "Mean of draft+verification+commit+injection phase_ms, actual warmed request records. No1/2row estimate.",
+  "scope": "Scheduling experiment calibration only, not a guarantee of optimality or fullengine acceptance."
+}

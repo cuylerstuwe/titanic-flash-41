@@ -1,0 +1,6 @@
+{"case": "cold", "bitwise_equal": true, "different_values": 0, "max_abs_difference": 0.0, "hit": 0}
+{"case": "warm", "bitwise_equal": true, "different_values": 0, "max_abs_difference": 0.0, "hit": 1}
+{"case": "collision", "bitwise_equal": true, "different_values": 0, "max_abs_difference": 0.0, "hit": 0}
+{"case": "after_collision", "bitwise_equal": true, "different_values": 0, "max_abs_difference": 0.0, "hit": 0}
+{"case": "invalid_negative", "bitwise_equal": true, "different_values": 0, "max_abs_difference": 0.0, "hit": 0}
+{"case": "invalid_large", "bitwise_equal": true, "different_values": 0, "max_abs_difference": 0.0, "hit": 0}

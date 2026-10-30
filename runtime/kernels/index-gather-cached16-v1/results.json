@@ -1,0 +1,338 @@
+{
+  "all_correct": true,
+  "index_gather_cached16_screen": true,
+  "query_rows": 16,
+  "dirty_suffix_rows": 16,
+  "checks": [
+    {
+      "slot_order": "contiguous",
+      "case": "cold",
+      "live_end": 65535,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65519
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "append_sixteen",
+      "live_end": 65551,
+      "copied_bound": 65664,
+      "all_bytes_exact": true,
+      "valid_prefix": 65535
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "reject_then_append",
+      "live_end": 65537,
+      "copied_bound": 65664,
+      "all_bytes_exact": true,
+      "valid_prefix": 65521
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "tile_boundary",
+      "live_end": 65666,
+      "copied_bound": 65792,
+      "all_bytes_exact": true,
+      "valid_prefix": 65650
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "zero_accept_rewrite",
+      "live_end": 65666,
+      "copied_bound": 65792,
+      "all_bytes_exact": true,
+      "valid_prefix": 65650
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "restore_other_prefix",
+      "live_end": 65535,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65519
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "fresh_size",
+      "live_end": 65536,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65520
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "fresh_size",
+      "live_end": 262144,
+      "copied_bound": 262144,
+      "all_bytes_exact": true,
+      "valid_prefix": 262128
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "fresh_size",
+      "live_end": 1048576,
+      "copied_bound": 1048576,
+      "all_bytes_exact": true,
+      "valid_prefix": 1048560
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "reset",
+      "live_end": 0,
+      "copied_bound": 0,
+      "all_bytes_exact": true,
+      "valid_prefix": 0
+    },
+    {
+      "slot_order": "contiguous",
+      "case": "small_after_reset",
+      "live_end": 129,
+      "copied_bound": 256,
+      "all_bytes_exact": true,
+      "valid_prefix": 113
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "cold",
+      "live_end": 65535,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65519
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "append_sixteen",
+      "live_end": 65551,
+      "copied_bound": 65664,
+      "all_bytes_exact": true,
+      "valid_prefix": 65535
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "reject_then_append",
+      "live_end": 65537,
+      "copied_bound": 65664,
+      "all_bytes_exact": true,
+      "valid_prefix": 65521
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "tile_boundary",
+      "live_end": 65666,
+      "copied_bound": 65792,
+      "all_bytes_exact": true,
+      "valid_prefix": 65650
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "zero_accept_rewrite",
+      "live_end": 65666,
+      "copied_bound": 65792,
+      "all_bytes_exact": true,
+      "valid_prefix": 65650
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "restore_other_prefix",
+      "live_end": 65535,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65519
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "fresh_size",
+      "live_end": 65536,
+      "copied_bound": 65536,
+      "all_bytes_exact": true,
+      "valid_prefix": 65520
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "fresh_size",
+      "live_end": 262144,
+      "copied_bound": 262144,
+      "all_bytes_exact": true,
+      "valid_prefix": 262128
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "fresh_size",
+      "live_end": 1048576,
+      "copied_bound": 1048576,
+      "all_bytes_exact": true,
+      "valid_prefix": 1048560
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "reset",
+      "live_end": 0,
+      "copied_bound": 0,
+      "all_bytes_exact": true,
+      "valid_prefix": 0
+    },
+    {
+      "slot_order": "permuted_unique",
+      "case": "small_after_reset",
+      "live_end": 129,
+      "copied_bound": 256,
+      "all_bytes_exact": true,
+      "valid_prefix": 113
+    }
+  ],
+  "timing": [
+    {
+      "slot_order": "contiguous",
+      "live_end": 65536,
+      "median_us": [
+        7.991999853402376,
+        2.3799999617040157
+      ],
+      "samples_us": [
+        [
+          8.163999766111374,
+          8.005999960005283,
+          7.9100001603364944,
+          7.977999746799469
+        ],
+        [
+          2.377999946475029,
+          2.394000068306923,
+          2.3819999769330025,
+          2.3399998899549246
+        ]
+      ],
+      "speed_ratio": 3.357983185714138
+    },
+    {
+      "slot_order": "contiguous",
+      "live_end": 262144,
+      "median_us": [
+        167.66799986362457,
+        2.391000045463443
+      ],
+      "samples_us": [
+        [
+          167.9760068655014,
+          167.8059995174408,
+          167.52399504184723,
+          167.53000020980835
+        ],
+        [
+          2.463999902829528,
+          2.383999992161989,
+          2.3980000987648964,
+          2.3499999660998583
+        ]
+      ],
+      "speed_ratio": 70.12463265391776
+    },
+    {
+      "slot_order": "contiguous",
+      "live_end": 1048576,
+      "median_us": [
+        711.9400203227997,
+        2.457000082358718
+      ],
+      "samples_us": [
+        [
+          719.4380164146423,
+          734.3599796295166,
+          704.442024230957,
+          695.5739855766296
+        ],
+        [
+          2.460000105202198,
+          2.454000059515238,
+          2.5259999092668295,
+          2.3620000574737787
+        ]
+      ],
+      "speed_ratio": 289.7598683184975
+    },
+    {
+      "slot_order": "permuted_unique",
+      "live_end": 65536,
+      "median_us": [
+        15.438999980688095,
+        2.374999923631549
+      ],
+      "samples_us": [
+        [
+          15.518000349402428,
+          15.4600003734231,
+          15.398000366985798,
+          15.41799958795309
+        ],
+        [
+          2.3819999769330025,
+          2.377999946475029,
+          2.326000016182661,
+          2.3719999007880688
+        ]
+      ],
+      "speed_ratio": 6.500631779844747
+    },
+    {
+      "slot_order": "permuted_unique",
+      "live_end": 262144,
+      "median_us": [
+        214.3240049481392,
+        2.3919999366626143
+      ],
+      "samples_us": [
+        [
+          214.51200544834137,
+          214.136004447937,
+          214.136004447937,
+          214.63200449943542
+        ],
+        [
+          2.403999911621213,
+          2.3640000727027655,
+          2.420000033453107,
+          2.3799999617040157
+        ]
+      ],
+      "speed_ratio": 89.60033888929365
+    },
+    {
+      "slot_order": "permuted_unique",
+      "live_end": 1048576,
+      "median_us": [
+        869.3249821662903,
+        2.449000021442771
+      ],
+      "samples_us": [
+        [
+          850.6860136985779,
+          852.3939847946167,
+          893.7659859657288,
+          886.2559795379639
+        ],
+        [
+          2.5140000507235527,
+          2.3980000987648964,
+          2.4999999441206455,
+          2.3539999965578318
+        ]
+      ],
+      "speed_ratio": 354.9714065147896
+    }
+  ],
+  "source_sha256": "acbf9adba2c69a1fc2443afcdd55a322be27d984e744ff098283bec81dc1af7c",
+  "artifact_sha256": "dbbe4306d415a0f3a341bc635c016bacf3581545325a45aa2250cfd1cc9621af",
+  "compile_command": [
+    "nvcc",
+    "--cubin",
+    "-arch=sm_121",
+    "--std=c++17",
+    "-O3",
+    "/scratch/evidence/index-gather-cached16-s661/component/gather.cu",
+    "-o",
+    "/scratch/evidence/index-gather-cached16-s661/component/gather.cubin"
+  ],
+  "full_engine_acceptance": false,
+  "scope": "Sixteen query bounds including the maximum in the final query. Sixteen-row dirty suffix. Contiguous and unique permuted slots; changed append/rejected suffixes, tile growth, restore invalidation, reset and tiny prefixes. Cached byte copy versus current packed4; no model arithmetic. Component ownership contract only; native reset/handoff/restore invalidation remains to implement and validate."
+}

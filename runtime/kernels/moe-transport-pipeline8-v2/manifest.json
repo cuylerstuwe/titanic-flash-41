@@ -1,0 +1,25 @@
+{
+  "schema": "canada-moe-pipeline8-v2",
+  "source_commit": "8ba5a7c",
+  "screen": "s707",
+  "rows": 8192,
+  "local_rows": 2048,
+  "parts": 8,
+  "ranks": 4,
+  "layout": "dual_quant_rows_v1",
+  "gpu_arch": "sm_121",
+  "files": {
+    "bridge.so": "10c49a2b5b55849e6a97370d3ad6a8df4100ca5fad3732642c74f311ae463bdc",
+    "proxy.so": "d7a2206e70cd4847b921abd4144c78fbc7b530f9a675bf73049394de7a50733b",
+    "registered-codec.so": "fd7f93fabbf7f8b8ae5e4b0896a12279c7db6fe94416e0e7ec13df9c0d1f99c6",
+    "bridge.cu": "5ed059798c7c6e07ce41b6e3ce25722394d0f18e8583c0be338d39aa19ddc90a",
+    "roce_mapped_bridge.cu": "1e1804f5cd47066dcd95c51e0d166338b4d912928ab6e8d87d3bae5d04946ac6",
+    "roce_pipeline_inline.cuh": "a89868988f980273a81c43e156620b32c6ee4962ffd7f2a89a9d581da086a7ac",
+    "proxy.c": "81c9dc0a081855a1d2efedb6b48c170f2f68fa646b0ed48610a934321e40bb93",
+    "nccl_zero_cta_bridge.cu": "1890179bb6f7a2e99218000388eac5d2f11713f4978d4dea632c65b1b42d4406",
+    "moe-registered-pack.cu": "3b70d0d9623dd1519b6ed25e0aad8b3d07f6c064d7caa76ee1f123cc224cbd95",
+    "moe-dual-quant-codec-fast.cu": "f1d3561d91d87a95d458f84f142de040f7eabfdfbb704d2175cf0fe6f54e5178"
+  },
+  "contract": "Same quantization arithmetic, GPU-only model math. Runtime slot selection, per-part system release/peer completion, and full consumer/local-sender acknowledgment. Ordinary CUDA packed/output arrays; one shared registered communicator region per rank. Routing metadata gathers overlap activation RDMA between begin/finish. One ordered CUDA stream. Actual component proof, not whole-model acceptance.",
+  "license": "Original adapter and b12x Apache-2.0 components; see THIRD_PARTY_NOTICES.md."
+}

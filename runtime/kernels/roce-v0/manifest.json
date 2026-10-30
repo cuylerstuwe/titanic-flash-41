@@ -1,0 +1,53 @@
+{
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "SG17 release archive pinned by source_archive_sha256",
+  "source_archive_sha256": "4922d0db9395fb8b537d7e216d509a5747867a45f20c18290e385786609dd05f",
+  "source_manifest": "https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks/blob/64b02dea8681fb1d8e3a659ea432a8e9e9ba3995/runtime/sources.manifest",
+  "image": "sha256:82bb585723d16d25423646dd9b1300c51f5913f28c5e3900d5cc8eaf52f8aa4d",
+  "license": "Apache-2.0",
+  "role": "low-level communication dependency only; Rust owns lifecycle and ordering",
+  "architecture": 121,
+  "physical_sms": 48,
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "comm.roce.oneshot.rank0",
+      "header_sha256": "ed510c8eee2aaa5b0a93caef988d0a4db8a9c98a9cf4a6b61119777a25a21d4e",
+      "object_sha256": "d30e6146f915be8f5c2f650d6cb63344d1415abcb3f79a43a5f076d312a746cd"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "comm.roce.oneshot.rank1",
+      "header_sha256": "c2372884fc5c7ec7ffc2ed5daedecef8e81e28e1a2a58e80753ea5c851f66c16",
+      "object_sha256": "fac9ed5f2142a69162896ee7294bbea55661e4eb6486789bef25866ee1560435"
+    },
+    {
+      "name": "kernel_002",
+      "kernel_id": "comm.roce.oneshot.rank2",
+      "header_sha256": "9bf2791cf1d69b53d735efbfa3e47b61802088de778036811a89f9ad86eb3270",
+      "object_sha256": "36196976a8e23d93cf534dcbf0fb3f643b6503deaf0bcf8d8cfe31a9eb03e3c8"
+    },
+    {
+      "name": "kernel_003",
+      "kernel_id": "comm.roce.oneshot.rank3",
+      "header_sha256": "45adf81c7ebc2e23aaa96746c4cec1c8633647734b830467598ef4784957158a",
+      "object_sha256": "141f662a174e6ffd1125964c23d3a4f52bbf85372efb1b1854ed7dec28e7edaf"
+    }
+  ],
+  "layout": {
+    "world": 4,
+    "hcas": 2,
+    "threads": 256,
+    "slot_bytes": 67108864,
+    "recv_off": 0,
+    "flag_off": 536870912,
+    "send_off": 536872960,
+    "ctrl_off": 671090688,
+    "total_bytes": 671090816,
+    "flag_stride": 128,
+    "slots": 2
+  },
+  "proxy_abi": 3,
+  "proxy_source_sha256": "a35f54cf75d6abf2427c5d144300647685816060348883d2cbf51d153efc5c70",
+  "proxy_library_sha256": "5b879dc929ca829ef6b38581136b00576debff7bbcdc7a498f5266c52b6025ad"
+}

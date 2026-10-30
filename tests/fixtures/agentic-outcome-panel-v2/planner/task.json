@@ -1,0 +1,16 @@
+{
+  "id": "deterministic-build-plan-v1",
+  "instructions": "Fix client.py's plan(targets, dependencies, completed=()) and add focused pytest tests in test_client.py. Return a deterministic build order satisfying this exact contract:\n- Inputs are lists/tuples of string target names, a dictionary from string names to lists/tuples of prerequisite names, and a list/tuple of completed names. Inputs are valid; do not invent extra validation requirements. Missing dictionary entries are leaf tasks.\n- Include only unfinished tasks reachable from requested targets. Completed tasks already satisfy dependencies and prune traversal through themselves: their prerequisites need not be built. Omit all completed tasks and unrelated work. Deduplicate repeated targets and repeated prerequisites.\n- Repeatedly choose the lexicographically smallest currently ready unfinished task, emit it once, and release its dependents. This is a global ready-set rule, not merely sorting DFS inputs. Results must not depend on dictionary insertion order or prerequisite/target list order.\n- If the reachable unfinished graph contains a cycle, raise ValueError whose message contains cycle. Ignore cycles in unrelated or pruned completed branches.\n- Do not mutate any input, including nested dependency lists. Handle chains of 3000 tasks without changing Python's recursion limit.\nUse only the Python standard library in client.py. No network access is needed. Preserve the function API. Use the file and test tools and run tests on the final files before finishing.",
+  "system": "You are a coding agent. Complete the requested change using the supplied tools. Preserve behavior outside the requested change. Do not claim tests passed unless you ran them. Only the declared tools are available.",
+  "temperature": 1,
+  "top_p": 1,
+  "max_tokens": 262144,
+  "reasoning_effort": "high",
+  "max_calls": 16,
+  "max_case_seconds": 450,
+  "initial_files": [
+    "client.py",
+    "test_client.py"
+  ],
+  "held_out_grader_sha256": "a38b6266dea5bc5d67cad0228d093203eb9598289ab3772a4ecec61eda40fa46"
+}

@@ -1,0 +1,4 @@
+{
+  "purpose": "Synthetic public token IDs; fresh then odd/even retained appends, with one live row and padded suffixes. No private conversation content.",
+  "batches": [[1,127,300,1000,12,444],[777],[42,84],[600,900,1200],[100,200,300,400,500,600]]
+}

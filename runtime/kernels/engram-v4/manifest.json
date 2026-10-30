@@ -1,0 +1,285 @@
+{
+  "source": "https://github.com/sgl-project/sglang",
+  "source_commit": "f80c91a4b97e52e17fbcff088aa6b47b6270f6b9",
+  "license": "Apache-2.0",
+  "compiler": "3.7.1",
+  "ptxas": "CUDA 13.0.88, matching FlashInfer patch",
+  "model_contract": "Image token 129264 preserves its original HC residual after Engram",
+  "entries": [
+    {
+      "name": "engram_gate",
+      "symbol": "_engram_gate_kernel",
+      "architecture": 121,
+      "physical_sms": 48,
+      "arguments": [
+        {
+          "name": "X",
+          "kind": "*bf16"
+        },
+        {
+          "name": "KV",
+          "kind": "*bf16"
+        },
+        {
+          "name": "QW",
+          "kind": "*bf16"
+        },
+        {
+          "name": "KW",
+          "kind": "*bf16"
+        },
+        {
+          "name": "T",
+          "kind": "*i64"
+        },
+        {
+          "name": "O",
+          "kind": "*bf16"
+        }
+      ],
+      "signature": {
+        "X": "*bf16",
+        "KV": "*bf16",
+        "QW": "*bf16",
+        "KW": "*bf16",
+        "T": "*i64",
+        "O": "*bf16"
+      },
+      "constexprs": {
+        "D": 5120,
+        "HC": 4,
+        "EPS": 1e-20,
+        "CLAMP": 1e-06,
+        "B": 8192
+      },
+      "metadata": {
+        "allowed_dot_input_precisions": [
+          "tf32",
+          "tf32x3",
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "sm121",
+        "backend_name": "cuda",
+        "debug": false,
+        "default_dot_input_precision": "tf32",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b15"
+        ],
+        "enable_fp_fusion": false,
+        "enable_reflect_ftz": true,
+        "extern_libs": [
+          [
+            "libdevice",
+            "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+          ]
+        ],
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "758a8a429ee746194a57af93f8b7724387f17d79e6a6ef7c6d870ca9f6415b54",
+        "instrumentation_mode": "",
+        "ir_override": null,
+        "launch_cooperative_grid": false,
+        "launch_pdl": false,
+        "max_num_imprecise_acc_default": 0,
+        "maxnreg": null,
+        "name": "_engram_gate_kernel",
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 4,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "ptx_options": null,
+        "ptx_version": null,
+        "sanitize_overflow": true,
+        "shared": 16,
+        "supported_fp8_dtypes": [
+          "fp8e4b15",
+          "fp8e4nv",
+          "fp8e5"
+        ],
+        "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+        "tensordesc_meta": [],
+        "tmem_size": 0,
+        "triton_version": "3.7.1",
+        "warp_size": 32
+      },
+      "grid": {
+        "rows_div": 1,
+        "x_mul": 4,
+        "y": 1,
+        "z": 1
+      },
+      "ptx_parameters": [
+        [
+          "u64",
+          "_engram_gate_kernel_param_0"
+        ],
+        [
+          "u64",
+          "_engram_gate_kernel_param_1"
+        ],
+        [
+          "u64",
+          "_engram_gate_kernel_param_2"
+        ],
+        [
+          "u64",
+          "_engram_gate_kernel_param_3"
+        ],
+        [
+          "u64",
+          "_engram_gate_kernel_param_4"
+        ],
+        [
+          "u64",
+          "_engram_gate_kernel_param_5"
+        ],
+        [
+          "u64",
+          "_engram_gate_kernel_param_6"
+        ],
+        [
+          "u64",
+          "_engram_gate_kernel_param_7"
+        ]
+      ],
+      "source_sha256": "23bdc32c311b3a0fac143c3fdcee4b261cdf95934c5ee4cfaa0532fcf256c582",
+      "adapter_sha256": "25699160a77739e81cb466d8cbc16cda77b8b2fdbb46b46f55766adaf9433a6d",
+      "artifact_sha256": "856a04725d923717acda9ed45d8e094e8daf1522bba3a2cfb485de5e55b02ef0"
+    },
+    {
+      "name": "engram_packed",
+      "symbol": "_engram_gather_kernel",
+      "architecture": 121,
+      "physical_sms": 48,
+      "arguments": [
+        {
+          "name": "packed_ptr",
+          "kind": "*u8"
+        },
+        {
+          "name": "ids_ptr",
+          "kind": "*i64"
+        },
+        {
+          "name": "out_ptr",
+          "kind": "*bf16"
+        },
+        {
+          "name": "row_lo",
+          "kind": "i64"
+        },
+        {
+          "name": "row_hi",
+          "kind": "i64"
+        }
+      ],
+      "signature": {
+        "packed_ptr": "*u8",
+        "ids_ptr": "*i64",
+        "out_ptr": "*bf16",
+        "row_lo": "i64",
+        "row_hi": "i64"
+      },
+      "constexprs": {
+        "DIM": 256,
+        "BLK": 32,
+        "E8M0_ZERO": 5.877471754111438e-39
+      },
+      "metadata": {
+        "allowed_dot_input_precisions": [
+          "tf32",
+          "tf32x3",
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "sm121",
+        "backend_name": "cuda",
+        "debug": false,
+        "default_dot_input_precision": "tf32",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b15"
+        ],
+        "enable_fp_fusion": false,
+        "enable_reflect_ftz": true,
+        "extern_libs": [
+          [
+            "libdevice",
+            "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+          ]
+        ],
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "c46e92d3953e1e6512358ddf10e0a21dfde3f97983a03f3d917eab4887bb4912",
+        "instrumentation_mode": "",
+        "ir_override": null,
+        "launch_cooperative_grid": false,
+        "launch_pdl": false,
+        "max_num_imprecise_acc_default": 0,
+        "maxnreg": null,
+        "name": "_engram_gather_kernel",
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 4,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "ptx_options": null,
+        "ptx_version": null,
+        "sanitize_overflow": true,
+        "shared": 0,
+        "supported_fp8_dtypes": [
+          "fp8e4b15",
+          "fp8e4nv",
+          "fp8e5"
+        ],
+        "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+        "tensordesc_meta": [],
+        "tmem_size": 0,
+        "triton_version": "3.7.1",
+        "warp_size": 32
+      },
+      "grid": {
+        "rows_div": 1,
+        "x_mul": 24,
+        "y": 1,
+        "z": 1
+      },
+      "ptx_parameters": [
+        [
+          "u64",
+          "_engram_gather_kernel_param_0"
+        ],
+        [
+          "u64",
+          "_engram_gather_kernel_param_1"
+        ],
+        [
+          "u64",
+          "_engram_gather_kernel_param_2"
+        ],
+        [
+          "u64",
+          "_engram_gather_kernel_param_3"
+        ],
+        [
+          "u64",
+          "_engram_gather_kernel_param_4"
+        ],
+        [
+          "u64",
+          "_engram_gather_kernel_param_5"
+        ],
+        [
+          "u64",
+          "_engram_gather_kernel_param_6"
+        ]
+      ],
+      "source_sha256": "a3cc9bac72ba442aaf80206563410795758ea37bdddf495c35e3c18cbd636089",
+      "adapter_sha256": "87739b65499f9080f5f7efa69d0f9b03e67514cdd3da538fffd92f4fde251dbb",
+      "artifact_sha256": "9f9385ff7c2aa5b3281fd50e1442fdedda50c2344e9190d6619b81aa7a2a5bfb"
+    }
+  ]
+}

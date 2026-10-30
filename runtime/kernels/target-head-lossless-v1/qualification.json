@@ -1,0 +1,78 @@
+{
+  "all_four_weight_shards_exact": true,
+  "all_aot_logits_exact": true,
+  "corruption_rejected": true,
+  "rows": [
+    {
+      "rank": 0,
+      "all_weights_exact": true,
+      "escape_groups": 6722,
+      "records": [
+        {
+          "rows": 3,
+          "exact_logits": true,
+          "graph_rewrites_poison": true
+        },
+        {
+          "rows": 6,
+          "exact_logits": true,
+          "graph_rewrites_poison": true
+        }
+      ]
+    },
+    {
+      "rank": 1,
+      "all_weights_exact": true,
+      "escape_groups": 6696,
+      "records": [
+        {
+          "rows": 3,
+          "exact_logits": true,
+          "graph_rewrites_poison": true
+        },
+        {
+          "rows": 6,
+          "exact_logits": true,
+          "graph_rewrites_poison": true
+        }
+      ]
+    },
+    {
+      "rank": 2,
+      "all_weights_exact": true,
+      "escape_groups": 6614,
+      "records": [
+        {
+          "rows": 3,
+          "exact_logits": true,
+          "graph_rewrites_poison": true
+        },
+        {
+          "rows": 6,
+          "exact_logits": true,
+          "graph_rewrites_poison": true
+        }
+      ]
+    },
+    {
+      "rank": 3,
+      "all_weights_exact": true,
+      "escape_groups": 6711,
+      "records": [
+        {
+          "rows": 3,
+          "exact_logits": true,
+          "graph_rewrites_poison": true
+        },
+        {
+          "rows": 6,
+          "exact_logits": true,
+          "graph_rewrites_poison": true
+        }
+      ]
+    }
+  ],
+  "manifest_sha256": "202cb25339a2d37fc231d7f5c46adb36d62101e3792d2a6e9489722b477ae6d9",
+  "numerical_math_device": "CUDA",
+  "scope": "Four canonical vocabulary shards on one GB10, exact GPU bit validation and driver-launched M3/M6 graphs. Not a whole-model performance claim."
+}

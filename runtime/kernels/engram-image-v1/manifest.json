@@ -1,0 +1,108 @@
+{
+  "source": "Independent raw BF16 copy; image-token preservation contract from pinned SGLang model",
+  "source_sha256": "44e51c8278984380ebc4aca45aff32d907e0d0e43adbd850f83e06f3222b1634",
+  "entries": [
+    {
+      "name": "engram_select_image",
+      "symbol": "select_image",
+      "architecture": 121,
+      "physical_sms": 48,
+      "arguments": [
+        {
+          "name": "X",
+          "kind": "*bf16"
+        },
+        {
+          "name": "O",
+          "kind": "*bf16"
+        },
+        {
+          "name": "T",
+          "kind": "*i64"
+        }
+      ],
+      "metadata": {
+        "allowed_dot_input_precisions": [
+          "tf32",
+          "tf32x3",
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "sm121",
+        "backend_name": "cuda",
+        "debug": false,
+        "default_dot_input_precision": "tf32",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b15"
+        ],
+        "enable_fp_fusion": true,
+        "enable_reflect_ftz": true,
+        "extern_libs": [
+          [
+            "libdevice",
+            "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+          ]
+        ],
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "48b330fec319fd9256e74d0a30edacdd2e1798f198559d4ff1b4ff372b4e02ff",
+        "instrumentation_mode": "",
+        "ir_override": null,
+        "launch_cooperative_grid": false,
+        "launch_pdl": false,
+        "max_num_imprecise_acc_default": 0,
+        "maxnreg": null,
+        "name": "select_image",
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 4,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "ptx_options": null,
+        "ptx_version": null,
+        "sanitize_overflow": true,
+        "shared": 0,
+        "supported_fp8_dtypes": [
+          "fp8e4b15",
+          "fp8e4nv",
+          "fp8e5"
+        ],
+        "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+        "tensordesc_meta": [],
+        "tmem_size": 0,
+        "triton_version": "3.7.1",
+        "warp_size": 32
+      },
+      "grid": {
+        "rows_div": 1,
+        "x_mul": 20,
+        "y": 1,
+        "z": 1
+      },
+      "ptx_parameters": [
+        [
+          "u64",
+          "select_image_param_0"
+        ],
+        [
+          "u64",
+          "select_image_param_1"
+        ],
+        [
+          "u64",
+          "select_image_param_2"
+        ],
+        [
+          "u64",
+          "select_image_param_3"
+        ],
+        [
+          "u64",
+          "select_image_param_4"
+        ]
+      ],
+      "artifact_sha256": "ab14ff45826a86dfb7ab5c00d5223d7e6af3357064451be0a72187d83fa9de60"
+    }
+  ]
+}

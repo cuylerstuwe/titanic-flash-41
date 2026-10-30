@@ -1,0 +1,45 @@
+{
+  "all_correct": true,
+  "cases": [
+    {
+      "case": "cold",
+      "bitwise_equal": true,
+      "hit": 0,
+      "invalid_tags_unchanged": false
+    },
+    {
+      "case": "warm",
+      "bitwise_equal": true,
+      "hit": 1,
+      "invalid_tags_unchanged": false
+    },
+    {
+      "case": "collision",
+      "bitwise_equal": true,
+      "hit": 0,
+      "invalid_tags_unchanged": false
+    },
+    {
+      "case": "after_collision",
+      "bitwise_equal": true,
+      "hit": 0,
+      "invalid_tags_unchanged": false
+    },
+    {
+      "case": "invalid_negative",
+      "bitwise_equal": true,
+      "hit": 0,
+      "invalid_tags_unchanged": true
+    },
+    {
+      "case": "invalid_large",
+      "bitwise_equal": true,
+      "hit": 0,
+      "invalid_tags_unchanged": true
+    }
+  ],
+  "manifest_sha256": "f89998606ca6162a99f424891b5d6f1e8e83a33784c02152d6d67a2651579022",
+  "artifact_sha256": "cc8a2fdf4e83f6aef273a9c4257c95ca4d54c40afe1c67123c82343034ad2a46",
+  "source_sha256": "a404ca375d2319d1648f09345e8916b10394af3eb76db868dd3419a0df34c7cc",
+  "scope": "Native pointer/scalar ABI and graph replay with canonical rank3 operands; cold/hit/collision/changed-base/invalid-token checks against the current fused FP32 head. Not native generation or performance."
+}

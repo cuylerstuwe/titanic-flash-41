@@ -1,0 +1,102 @@
+{
+  "schema": "source-prior-exploration-v1",
+  "thinking_mode": "thinking",
+  "reasoning_effort": "high",
+  "temperature": 1,
+  "top_p": 1,
+  "scope": "Fresh public authored reasoning prompts. Oracle code/prose labels test value of a starting prior before building a classifier. Short capped diagnostics, not workload distribution or outcome quality.",
+  "cases": [
+    {
+      "id": "rust-interval-normalizer",
+      "category": "code",
+      "family": "intervals-rust",
+      "request": {
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Implement a Rust function that normalizes a vector of half-open integer intervals. Each interval has start, end and a source label. Reject reversed endpoints, ignore empty intervals, and return disjoint sorted segments whose value is the sorted set of labels covering the entire segment. Merge adjacent segments when their label sets are equal. Repeated intervals carrying the same label must not duplicate that label or cause it to disappear too early when only one repeated interval ends. Endpoints can reach the full i64 range, so do not subtract endpoints or compute an end plus one. Use only the standard library. Explain the sweep invariant and specify deterministic ordering of output labels, then give a complete implementation and focused tests for overlaps, adjacency, duplicates, negative endpoints and extreme endpoints. Discuss the cost in terms of event count and the total size of the output label sets rather than promising an impossible bound independent of output size."
+          }
+        ],
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 202680200,
+        "max_tokens": 384,
+        "stream": false,
+        "chat_template_kwargs": {
+          "thinking": true
+        },
+        "reasoning_effort": "high"
+      }
+    },
+    {
+      "id": "python-transactional-patches",
+      "category": "code",
+      "family": "transactions-python",
+      "request": {
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Implement apply_edits(text, edits) in Python, where every edit is a tuple (start, end, replacement) using offsets into the original text. The operation is transactional: validate every edit before producing a result, and never mutate the edit list. Reject out-of-range or reversed offsets and overlapping nonempty ranges. Multiple insertions at the same offset are allowed and preserve their input order. An insertion at the start of a replacement occurs immediately before that replacement; one at the end occurs immediately after it. Reject an insertion strictly inside a replaced range. Adjacent replacements are allowed. Define the ordering unambiguously when several endpoints and insertions share a position, and make that ordering independent of sorting stability assumptions. Supply the implementation using only built-in types, an explanation of the validation and construction invariants, and concise tests for the difficult boundary cases. Avoid repeatedly copying the full text for each edit."
+          }
+        ],
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 202680201,
+        "max_tokens": 384,
+        "stream": false,
+        "chat_template_kwargs": {
+          "thinking": true
+        },
+        "reasoning_effort": "high"
+      }
+    },
+    {
+      "id": "repair-cafe-pilot",
+      "category": "prose",
+      "family": "community-ideation",
+      "request": {
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": "A neighborhood group wants to run a monthly repair cafe with eight volunteers, three worktables and a donated room. People may bring clothes, bicycles or small household items, but volunteers have different skills and the group cannot promise to fix everything. Design three meaningfully different ways to organize the first two events, compare their practical failure modes, and recommend a pilot with a clear decision after the first event. Focus on useful completed repairs and an enjoyable experience for beginners rather than maximizing attendance. Include a triage process, handling a queue that grows too long, how to avoid one experienced volunteer becoming the bottleneck, and a way to collect evidence without burdening visitors. Specify a simple rule for declining work beyond the group's competence without inventing local legal requirements. Give examples of what you would change if most visitors bring clothing versus bicycles, and how the plan changes if two volunteers fail to arrive."
+          }
+        ],
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 202680202,
+        "max_tokens": 384,
+        "stream": false,
+        "chat_template_kwargs": {
+          "thinking": true
+        },
+        "reasoning_effort": "high"
+      }
+    },
+    {
+      "id": "documentation-migration",
+      "category": "prose",
+      "family": "organizational-planning",
+      "request": {
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": "A small software team has accumulated useful documentation in a wiki, issue comments and personal notes. Search is poor, important instructions contradict each other, and a planned migration to a new documentation tool risks losing tacit knowledge. The team has two afternoons a week for six weeks and cannot stop normal support work. Propose three different migration strategies and choose a reversible first phase. Distinguish information worth preserving from information worth updating and information that should be clearly marked uncertain. Explain how to resolve ownership when nobody considers a page theirs, how to avoid copying every stale page, and how to keep old links usable during the transition. Include a concrete weekly plan, a small measure of whether people find correct answers faster, and criteria for stopping or changing course. Do not assume a particular commercial product or claim that new software alone solves the problem. Identify the early facts that would most change your recommendation."
+          }
+        ],
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 202680203,
+        "max_tokens": 384,
+        "stream": false,
+        "chat_template_kwargs": {
+          "thinking": true
+        },
+        "reasoning_effort": "high"
+      }
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "installed FlashInfer 0.6.18 from pinned Canada image",
+  "license": "BSD-3-Clause",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "norm.rms.h5120.s20480",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "M",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "c42eefc2c2770dae2229e3e0e5523a50208ddd3374516cd6668b84036c8fcbf0"
+    }
+  ],
+  "library_sha256": "7f3aba2ce82cb9da6dc53b4602aba1ada526aade09759838b933d8013f25b4ed"
+}

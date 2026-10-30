@@ -1,0 +1,1 @@
+Derived from FlashInfer RMSNormKernel and MXFP8 quantization helpers. Copyright (c) 2025 by FlashInfer team. Apache License 2.0. Source repository: https://github.com/flashinfer-ai/flashinfer . Original source hashes and derivation in query_rms_quant_patch.py; original notices retained in patched_rms.py.

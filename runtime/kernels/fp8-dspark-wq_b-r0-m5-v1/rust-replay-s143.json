@@ -1,0 +1,14 @@
+{
+  "device_bytes": 42378756,
+  "graph_ms": 0.014513280242681503,
+  "nodes": 2,
+  "outputs": [
+    {
+      "bitwise_equal": true,
+      "bytes": 81920,
+      "different_bytes": 0,
+      "name": "output"
+    }
+  ],
+  "replays": 50
+}

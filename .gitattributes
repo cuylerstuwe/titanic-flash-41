@@ -1,0 +1,3 @@
+# Preserve hash-checked artifacts exactly, including generated text formatting.
+* whitespace=-blank-at-eof
+runtime/** -text -whitespace

@@ -1,0 +1,283 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "SG17 release archive pinned by source_archive_sha256",
+  "license": "Apache-2.0",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "comm.roce.oneshot.rank0",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "ed510c8eee2aaa5b0a93caef988d0a4db8a9c98a9cf4a6b61119777a25a21d4e"
+    },
+    {
+      "index": 1,
+      "name": "kernel_001",
+      "kernel_id": "comm.roce.oneshot.rank1",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "c2372884fc5c7ec7ffc2ed5daedecef8e81e28e1a2a58e80753ea5c851f66c16"
+    },
+    {
+      "index": 2,
+      "name": "kernel_002",
+      "kernel_id": "comm.roce.oneshot.rank2",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "9bf2791cf1d69b53d735efbfa3e47b61802088de778036811a89f9ad86eb3270"
+    },
+    {
+      "index": 3,
+      "name": "kernel_003",
+      "kernel_id": "comm.roce.oneshot.rank3",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "45adf81c7ebc2e23aaa96746c4cec1c8633647734b830467598ef4784957158a"
+    }
+  ],
+  "library_sha256": "f5244cca059972c4a1b439133b6a741a482d3f8e66769a0c6b3127fedbb6364d"
+}

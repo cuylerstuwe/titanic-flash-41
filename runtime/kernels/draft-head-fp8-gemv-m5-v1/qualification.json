@@ -1,0 +1,21 @@
+{
+  "all_correct": true,
+  "private_fp8": true,
+  "cases": [
+    {
+      "case": "initial",
+      "finite": true,
+      "bitwise_equal": true
+    },
+    {
+      "case": "changed",
+      "finite": true,
+      "bitwise_equal": true
+    }
+  ],
+  "artifact_sha256": "d22e30b7b3ad5dcf8e86902c645b2e1cf844a37c5f581c81e15005ab10707319",
+  "manifest_sha256": "3fb49354d55985556da11afc614f198789477ecd30faffd5350395a6a66a8bf8",
+  "source_sha256": "ce7405ced9698a52c4c3af9ae90e63fb2fee8266da4ea2d65f6af3a9d326cc1a",
+  "quantizer_manifest_sha256": "c29c51ee205a1da873213cccc4d880332c5f83ef1d7943a570d65d3f98577278",
+  "scope": "Two GPU inputs, canonical rank3 checkpoint prepared by the unchanged qualified native private-FP8 quantizer. Native CUDA-driver four-pointer/two-scratch ABI, captured replay and bitwise Triton GPU comparison. No target or full-model claim."
+}

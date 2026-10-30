@@ -1,0 +1,58 @@
+{
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+  "license": "Apache-2.0",
+  "architecture": 121,
+  "physical_sms": 48,
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "integration.tp_moe.dynamic",
+      "header_sha256": "f6e3b97b32250496f7dbfb1515ff1e23d74b5c525023ac1069e0a44b65fc9cb5",
+      "object_sha256": "56d4703d0e3c3b788fbee54a4dddb2c21a851b3cd11965985d4976eaec5a86e8"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "integration.tp_moe.dynamic",
+      "header_sha256": "285900166d9e920212207773c77e9357127f58902cc4d50f1f85be0c5c139c1c",
+      "object_sha256": "d501d72cc88c784d1fb87471119568fb6dca28f0b909673fd529bcac9766172a"
+    },
+    {
+      "name": "kernel_002",
+      "kernel_id": "moe.w4a16.topk_sum",
+      "header_sha256": "57ac33d2a63d0ff3db944eda15b423f6cf145d3115919718c1f36595e8f8ab88",
+      "object_sha256": "a0a69915ba6b2b5bfcf12a9be856118dfb9c5081f2bba885d4981134cc5fb522"
+    }
+  ],
+  "geometry": {
+    "experts": 384,
+    "hidden": 5120,
+    "intermediate": 576,
+    "topk": 6,
+    "rows": 6
+  },
+  "precision": "Canonical MXFP4 E8M0 K32;W4A8;FP32 FC1 through SwiGLU;BF16 activation boundary and output;deterministic topk sum",
+  "fc1_input_address_overlay": {
+    "base_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+    "license": "Apache-2.0",
+    "source": "https://github.com/local-inference-lab/b12x",
+    "stages": [
+      2,
+      2
+    ],
+    "reuse_fc1_weight_scales": false,
+    "output_major_tasks": false,
+    "hoisted_input": true,
+    "files": {
+      "w4a8_phase1.py": {
+        "original_sha256": "fc9f78557b85fd415ebf0103e8bd6f345fbd1d166e033a38aaff5c4cfc343948",
+        "patched_sha256": "5192ef5daa86b0f8c70c596d2f9be176f6a3496c32046a60685fd8b304b61509"
+      },
+      "w4a8_phase2.py": {
+        "original_sha256": "0c9fce39b243676e6754ea1fe111f765b5a993b6d6946ac410301a4663d1c5c3",
+        "patched_sha256": "0c9fce39b243676e6754ea1fe111f765b5a993b6d6946ac410301a4663d1c5c3"
+      }
+    }
+  },
+  "checkpoint_index_sha256": "74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8"
+}

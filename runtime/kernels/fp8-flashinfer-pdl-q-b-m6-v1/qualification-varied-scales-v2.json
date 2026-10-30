@@ -1,0 +1,236 @@
+{
+  "geometry": {
+    "rows": 6,
+    "in_features": 1280,
+    "out_features": 8192,
+    "scale_a_bytes": 5120,
+    "scale_b_bytes": 327680,
+    "mma_tiler_mn": [
+      16,
+      128
+    ],
+    "swap_ab": false,
+    "tile_k": 128,
+    "split_k_slices": 1,
+    "split_k_atomic_bf16": false,
+    "max_active_clusters": 48,
+    "use_prefetch": false,
+    "quantizer_2t": false,
+    "quantizer_grid": 22
+  },
+  "weight_scale_pattern": "GPU random block32x32 scales",
+  "cases": [
+    {
+      "case": "random",
+      "pdl_off_on_bytes_exact": true,
+      "guards_exact": true,
+      "reference": [
+        {
+          "pdl": false,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        },
+        {
+          "pdl": true,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "case": "changed",
+      "pdl_off_on_bytes_exact": true,
+      "guards_exact": true,
+      "reference": [
+        {
+          "pdl": false,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        },
+        {
+          "pdl": true,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "case": "zero",
+      "pdl_off_on_bytes_exact": true,
+      "guards_exact": true,
+      "reference": [
+        {
+          "pdl": false,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        },
+        {
+          "pdl": true,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        }
+      ]
+    }
+  ],
+  "graph_latency": [
+    {
+      "pdl": false,
+      "repetitions_per_graph": 100,
+      "samples_ms_in_order": [
+        0.012609920501708984,
+        0.012607359886169433,
+        0.012605760097503662,
+        0.012600640058517456,
+        0.012607680559158325,
+        0.012609599828720093,
+        0.01259935975074768,
+        0.012607680559158325,
+        0.012611199617385865,
+        0.012629120349884034,
+        0.012607359886169433,
+        0.012722239494323731,
+        0.012599680423736572,
+        0.012605119943618775,
+        0.012594239711761475,
+        0.012612160444259644,
+        0.012603199481964112,
+        0.012602239847183228,
+        0.012611839771270752,
+        0.012600959539413452,
+        0.012612479925155639,
+        0.012601280212402343,
+        0.012612160444259644,
+        0.012602239847183228,
+        0.012603520154953004,
+        0.01260864019393921,
+        0.012609920501708984,
+        0.013214720487594605,
+        0.012624640464782715,
+        0.012607040405273438
+      ],
+      "median_ms": 0.01260752022266388,
+      "p95_ms": 0.012722239494323731,
+      "p99_ms": 0.013214720487594605
+    },
+    {
+      "pdl": true,
+      "repetitions_per_graph": 100,
+      "samples_ms_in_order": [
+        0.011891839504241943,
+        0.01189120054244995,
+        0.0118777596950531,
+        0.011906880140304565,
+        0.011890560388565063,
+        0.011910079717636109,
+        0.011885440349578858,
+        0.01189728021621704,
+        0.011895359754562377,
+        0.01189120054244995,
+        0.013400000333786011,
+        0.012578879594802856,
+        0.011898560523986816,
+        0.011894400119781495,
+        0.011892479658126832,
+        0.011891520023345948,
+        0.011892479658126832,
+        0.011890879869461059,
+        0.011885759830474853,
+        0.011875200271606445,
+        0.011896959543228149,
+        0.011924480199813842,
+        0.011884800195693969,
+        0.011884479522705079,
+        0.01192288041114807,
+        0.011900160312652588,
+        0.013019520044326782,
+        0.012519359588623047,
+        0.011887040138244629,
+        0.011877119541168213
+      ],
+      "median_ms": 0.011892479658126832,
+      "p95_ms": 0.013019520044326782,
+      "p99_ms": 0.013400000333786011
+    }
+  ],
+  "full_engine_acceptance": false,
+  "median_speedup": 1.060125439361035,
+  "scope": "Standalone static-shape projection, synthetic GPU inputs, identical tactic/math off/on. AOT C ABI plus CUDA graph, alternating measurement order, warm repeatedly reused weights. Does not represent full-model cache residency, single-stream generation, PP consistency, quality or engine acceptance."
+}

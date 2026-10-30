@@ -1,0 +1,267 @@
+{
+  "abi": 1,
+  "rows": 16384,
+  "tile_m": 64,
+  "max_active_clusters": null,
+  "experts": 384,
+  "hidden": 5120,
+  "intermediate": 576,
+  "topk": 6,
+  "deterministic": true,
+  "swiglu_limit": 10.0,
+  "scratch_bytes": 1771609596,
+  "scratch_initializer": "zero",
+  "kernel_library_sha256": "d9450a096168c6f6a6d7824e3d5d86c9554cc1fc9476d3af3821cbb9fbfbeb5b",
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+  "license": "Apache-2.0",
+  "nodes": [
+    {
+      "entry": 0,
+      "kernel_id": "integration.tp_moe.dynamic",
+      "pointers": {
+        "a_ptr": {
+          "role": "input",
+          "offset": 0
+        },
+        "topk_ids_ptr": {
+          "role": "ids",
+          "offset": 0
+        },
+        "topk_weights_ptr": {
+          "role": "routing_weights",
+          "offset": 0
+        },
+        "packed_a_ptr": {
+          "role": "scratch",
+          "offset": 1103225856
+        },
+        "sfa_ptr": {
+          "role": "scratch",
+          "offset": 1732043776
+        },
+        "packed_a_storage_ptr": {
+          "role": "scratch",
+          "offset": 1103225856
+        },
+        "scale_storage_ptr": {
+          "role": "scratch",
+          "offset": 1732043776
+        },
+        "intermediate_ptr": {
+          "role": "scratch",
+          "offset": 1022166016
+        },
+        "barrier_count": {
+          "role": "scratch",
+          "offset": 13764096
+        },
+        "barrier_epoch": {
+          "role": "scratch",
+          "offset": 14157312
+        },
+        "pair_head": {
+          "role": "scratch",
+          "offset": 1771371536
+        },
+        "producers_done_count": {
+          "role": "scratch",
+          "offset": 1771371552
+        },
+        "all_work_published": {
+          "role": "scratch",
+          "offset": 1771371568
+        },
+        "task_head": {
+          "role": "scratch",
+          "offset": 1771371584
+        },
+        "task_tail": {
+          "role": "scratch",
+          "offset": 1771371600
+        },
+        "task_ready_ptr": {
+          "role": "scratch",
+          "offset": 1771371616
+        },
+        "task_expert_ptr": {
+          "role": "scratch",
+          "offset": 1771410000
+        },
+        "task_m_tile_ptr": {
+          "role": "scratch",
+          "offset": 1771448384
+        },
+        "task_slice_begin_ptr": {
+          "role": "scratch",
+          "offset": 1771486768
+        },
+        "task_slice_count_ptr": {
+          "role": "scratch",
+          "offset": 1771525152
+        },
+        "task_valid_rows_ptr": {
+          "role": "scratch",
+          "offset": 1771563536
+        },
+        "tile_write_count_ptr": {
+          "role": "scratch",
+          "offset": 1771601920
+        },
+        "b_w13": {
+          "role": "w13",
+          "offset": 0
+        },
+        "sfb_w13_ptr": {
+          "role": "s13",
+          "offset": 0
+        },
+        "b_down": {
+          "role": "w2",
+          "offset": 0
+        },
+        "sfb_down_ptr": {
+          "role": "s2",
+          "offset": 0
+        },
+        "sfb_w13_mx_ptr": {
+          "role": "s13",
+          "offset": 0
+        },
+        "sfb_down_mx_ptr": {
+          "role": "s2",
+          "offset": 0
+        },
+        "w13_residual_ptr": {
+          "role": "scratch",
+          "offset": 13762560
+        },
+        "down_residual_ptr": {
+          "role": "scratch",
+          "offset": 13762560
+        },
+        "w13_rp_ptr": {
+          "role": "w13",
+          "offset": 0
+        },
+        "w13_sfb_rp_ptr": {
+          "role": "s13",
+          "offset": 0
+        },
+        "down_rp_ptr": {
+          "role": "w2",
+          "offset": 0
+        },
+        "down_sfb_rp_ptr": {
+          "role": "s2",
+          "offset": 0
+        },
+        "row_counts": {
+          "role": "scratch",
+          "offset": 13762560
+        },
+        "expert_write_rows": {
+          "role": "scratch",
+          "offset": 1771365376
+        },
+        "expert_tile_base": {
+          "role": "scratch",
+          "offset": 1771366912
+        },
+        "input_global_scale": {
+          "role": "ones",
+          "offset": 0
+        },
+        "alpha": {
+          "role": "ones",
+          "offset": 0
+        },
+        "down_alpha": {
+          "role": "ones",
+          "offset": 0
+        },
+        "global_scale": {
+          "role": "ones",
+          "offset": 0
+        },
+        "scatter_ptr": {
+          "role": "scratch",
+          "offset": 15533056
+        },
+        "token_map_ptr": {
+          "role": "scratch",
+          "offset": 14550528
+        },
+        "token_weights_ptr": {
+          "role": "scratch",
+          "offset": 15041792
+        }
+      },
+      "scalars": {
+        "num_tokens": 16384,
+        "max_rows": 98304,
+        "scatter_rows": 98304,
+        "rows_padded": 122816,
+        "max_tasks": 9595,
+        "max_phys_tiles": 1919,
+        "max_active_clusters": 48
+      }
+    },
+    {
+      "entry": 4,
+      "kernel_id": "moe.w4a16.topk_sum",
+      "pointers": {
+        "fc2_ptr": {
+          "role": "scratch",
+          "offset": 15533056
+        },
+        "output_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "topk_weights_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "route_expert_ids_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "expert_map_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "svh_ptr": {
+          "role": "output",
+          "offset": 0
+        }
+      },
+      "scalars": {
+        "weight_num_experts": 0,
+        "route_num_experts": 0,
+        "active_m": 16384
+      }
+    }
+  ],
+  "input_format": "dual_quant_rows_v1",
+  "input_bytes": 96993280,
+  "routed_quantizer_entry": 2,
+  "prequantized_input_overlay": {
+    "base_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+    "license": "Apache-2.0",
+    "source": "https://github.com/local-inference-lab/b12x",
+    "packed_input_layout": "dual_quant_rows_v1: each row has K E4M3 bytes, K/32 UE8M0 bytes, K/8 correction-mask bytes",
+    "files": {
+      "b12x_next/moe/_shared/kernels/dynamic.py": {
+        "original_sha256": "2002c3f3fd01783d7214b0df95004692fcc89b78558554b9f857efe23de6455c",
+        "patched_sha256": "4001a6789c18bd9588f0e7e4a4012e13fe067e7d8770bcab3ed9b77a8aa50de1"
+      },
+      "b12x_next/moe/fused_moe/_impl.py": {
+        "original_sha256": "69b31e9d9ef898b04f1411da1e7ed0d5acd545d0f54976c718540a3fe546925c",
+        "patched_sha256": "2f474f669d3af802d65d697bf54a11713afcd347d017ae16c6e75be5d94ed86d"
+      }
+    }
+  },
+  "codec_library_sha256": "2525383543b80033b06d86febd0ab78f7e155f6bbdc007b35676dc26cbf8b6bd",
+  "codec_source_sha256": "699184729085b406cf51f50966dac93c02575e5c3397a7903ddde0e4a9dc0f6c"
+}

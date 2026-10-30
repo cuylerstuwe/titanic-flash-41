@@ -1,0 +1,99 @@
+{
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "Installed source in immutable Canada image82bb5857; exact SHA256 pins below",
+  "license": "BSD-3-Clause dense; Apache-2.0 quantizer",
+  "role": "Selected low-level GPU primitives only; no engine runtime",
+  "source_pins": {
+    "dense": {
+      "file": "/opt/sglang/lib/python3.12/site-packages/flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py",
+      "sha256": "eee668e5c143f1c31690ad8a7b44f65050fee3232df1e1c484a3789c2ef0d960"
+    },
+    "quant": {
+      "file": "/opt/sglang/lib/python3.12/site-packages/flashinfer/quantization/kernels/mxfp8_quantize.py",
+      "sha256": "271ec175cf3d0f71e7c9962d47c219c82f838cdb1b8704b135a980ced4020e21"
+    }
+  },
+  "geometry": {
+    "rows": 16,
+    "in_features": 5120,
+    "out_features": 448,
+    "block_size": 32,
+    "quantizer": null,
+    "output_layout": "row_major_bf16",
+    "quantized_c": false,
+    "dense_policy": {
+      "split_k_slices": 1,
+      "split_k_atomic_bf16": false,
+      "output_clear": false
+    },
+    "flashinfer": {
+      "scale_a_bytes": 20480,
+      "scale_b_bytes": 81920,
+      "mma_tiler_mn": [
+        16,
+        64
+      ],
+      "swap_ab": false,
+      "tile_k": 128,
+      "max_active_clusters": 48,
+      "use_prefetch": false,
+      "quantizer_2t": false,
+      "quantizer_grid": 128
+    }
+  },
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "flashinfer.mxfp8.quant.pdl0",
+      "enable_pdl": false,
+      "header_sha256": "637ef5704aab9d7766e009d5eb8583f6ac293e4e0c72b1a0d3fa59b19dcd4615",
+      "object_sha256": "cf860ad26b838bc65d14c100135e90857229b82ea265fd16865dc3c655485e8c"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "flashinfer.mxfp8.dense.pdl0",
+      "enable_pdl": false,
+      "header_sha256": "d4e851c32543261ae216ea09a45a6a758f5d7abcae8ed7d6d34a8751d9b80eed",
+      "object_sha256": "2f40987c7e63fdfdf27491b97dd63cab7cfe6d7e2ca6a5d2793b8671eef05ded"
+    },
+    {
+      "name": "kernel_002",
+      "kernel_id": "flashinfer.mxfp8.quant.pdl1",
+      "enable_pdl": true,
+      "header_sha256": "e39d52b2ed8eae72e7ffc0982c0df9f9b1552fc671d28b58709926d876a0b205",
+      "object_sha256": "27d94adbf8359a16bcb22ce3254e67a52551bbda663387ae8a62c06781f610e4"
+    },
+    {
+      "name": "kernel_003",
+      "kernel_id": "flashinfer.mxfp8.dense.pdl1",
+      "enable_pdl": true,
+      "header_sha256": "4538c866b45bc08a4e8054e6810d99265f43e097c93df51801eba07760ab26c4",
+      "object_sha256": "3ad510952da5ac42f7d0bf3a0020e2b780f6f4754e275790510e3d7186352a98"
+    }
+  ],
+  "backend": {
+    "kind": "flashinfer_static_words_v1",
+    "enable_pdl": true
+  },
+  "upstream_bundle": {
+    "path": "build-output",
+    "hashes": {
+      "manifest.json": "a2cbadcbfea45a0083f5d5d353f014d72fb7e931812a99e7e4ceaec852469a1a",
+      "bindings.json": "b2bdbf8210b117ed2f71cbc5cebee0be0712e7a48c5c22988eb58319e017a94c",
+      "libcanada_primitives.so": "90045adf602e3eba69460c369a2fff8a87dc1a59ecc305a3a33f850c83ed6521"
+    },
+    "qualification_sha256": "8f908010ae821e88101f61b241948535be1cfa209d2164d8d3bbc76b787373bf",
+    "adaptation": "Metadata only; unchanged AOT/CABI. Rust owns canonical weights, buffers, stream and graphs."
+  },
+  "source_modifications": {
+    "original_sha256": "eee668e5c143f1c31690ad8a7b44f65050fee3232df1e1c484a3789c2ef0d960",
+    "derived_sha256": "daefb1d751c683210b71aa4f663a8d315f4f864fb17be1353afac0d077f9a638",
+    "patch_sha256": "2af1dc27e200f75fcdfbcab8a1205acb9909e4e784d739e50250a65c4385b4a1",
+    "change": "generic shared read fence and warp join before elected TMA consumer release",
+    "numerical_contract": "unchanged quantization, tiling, MMA arithmetic, PDL and output precision",
+    "parent_manifest_sha256": "bb899c1a331196e434d7426b05f587a83a0f355ee5b7638ecfc12c79f23985f5",
+    "control_all_objects_exact": true
+  }
+}

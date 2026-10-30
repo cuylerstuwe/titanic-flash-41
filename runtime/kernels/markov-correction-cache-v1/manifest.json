@@ -1,0 +1,162 @@
+{
+  "source_sha256": "a404ca375d2319d1648f09345e8916b10394af3eb76db868dd3419a0df34c7cc",
+  "contract": "Canonical BF16 Markov weights/embeddings, FP32 dot/correction. Exact per-token memoization,256direct-mapped slots and per64-column tags. One ordered stream and fixed weight owner. Invalid token IDs never index or update a slot. GPU counters are diagnostics, not retained model state.",
+  "entries": [
+    {
+      "name": "markov_cache_m1",
+      "symbol": "markov_head_cached",
+      "architecture": 121,
+      "physical_sms": 48,
+      "arguments": [
+        {
+          "name": "X",
+          "kind": "*bf16"
+        },
+        {
+          "name": "W",
+          "kind": "*bf16"
+        },
+        {
+          "name": "Base",
+          "kind": "*fp32"
+        },
+        {
+          "name": "Token",
+          "kind": "*i32"
+        },
+        {
+          "name": "Cache",
+          "kind": "*fp32"
+        },
+        {
+          "name": "Tags",
+          "kind": "*i32"
+        },
+        {
+          "name": "Y",
+          "kind": "*fp32"
+        },
+        {
+          "name": "Hit",
+          "kind": "*i32"
+        },
+        {
+          "name": "Counters",
+          "kind": "*u64"
+        }
+      ],
+      "constexprs": {
+        "N": 32320,
+        "SLOTS": 256,
+        "BN": 64
+      },
+      "metadata": {
+        "allowed_dot_input_precisions": [
+          "tf32",
+          "tf32x3",
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "sm121",
+        "backend_name": "cuda",
+        "debug": false,
+        "default_dot_input_precision": "tf32",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b15"
+        ],
+        "enable_fp_fusion": true,
+        "enable_reflect_ftz": true,
+        "extern_libs": [
+          [
+            "libdevice",
+            "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+          ]
+        ],
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "89009584ce362c58416e09bf8287d7af5e1a8950cd968354ac9d9f76fc6de725",
+        "instrumentation_mode": "",
+        "ir_override": null,
+        "launch_cooperative_grid": false,
+        "launch_pdl": false,
+        "max_num_imprecise_acc_default": 0,
+        "maxnreg": null,
+        "name": "markov_head_cached",
+        "num_ctas": 1,
+        "num_stages": 1,
+        "num_warps": 4,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "ptx_options": null,
+        "ptx_version": null,
+        "sanitize_overflow": true,
+        "shared": 512,
+        "supported_fp8_dtypes": [
+          "fp8e4b15",
+          "fp8e4nv",
+          "fp8e5"
+        ],
+        "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+        "tensordesc_meta": [],
+        "tmem_size": 0,
+        "triton_version": "3.7.1",
+        "warp_size": 32
+      },
+      "grid": {
+        "rows_div": 64,
+        "x_mul": 1,
+        "x_add": 0,
+        "y": 1,
+        "z": 1
+      },
+      "ptx_parameters": [
+        [
+          "u64",
+          "markov_head_cached_param_0"
+        ],
+        [
+          "u64",
+          "markov_head_cached_param_1"
+        ],
+        [
+          "u64",
+          "markov_head_cached_param_2"
+        ],
+        [
+          "u64",
+          "markov_head_cached_param_3"
+        ],
+        [
+          "u64",
+          "markov_head_cached_param_4"
+        ],
+        [
+          "u64",
+          "markov_head_cached_param_5"
+        ],
+        [
+          "u64",
+          "markov_head_cached_param_6"
+        ],
+        [
+          "u64",
+          "markov_head_cached_param_7"
+        ],
+        [
+          "u64",
+          "markov_head_cached_param_8"
+        ],
+        [
+          "u64",
+          "markov_head_cached_param_9"
+        ],
+        [
+          "u64",
+          "markov_head_cached_param_10"
+        ]
+      ],
+      "artifact_sha256": "cc8a2fdf4e83f6aef273a9c4257c95ca4d54c40afe1c67123c82343034ad2a46"
+    }
+  ]
+}

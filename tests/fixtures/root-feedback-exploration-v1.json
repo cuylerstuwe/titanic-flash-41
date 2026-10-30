@@ -1,0 +1,43 @@
+{
+  "schema": "root-feedback-exploration-v1",
+  "thinking_mode": "thinking",
+  "reasoning_effort": "high",
+  "temperature": 1,
+  "top_p": 1,
+  "scope": "Fresh public authored families for a small next-round root-temperature feedback intervention. Capped reasoning diagnostics, not completed outcomes or representative traffic.",
+  "cases": [
+    {
+      "id": "go-coalescing-cancellation",
+      "family": "concurrency-go",
+      "workload": "concurrency-go",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Design and implement a small Go request coalescer for an expensive lookup. Callers with the same key should share an in-flight lookup; callers with different keys must proceed independently. Each caller has its own context. Canceling one caller must not cancel the shared lookup while another caller is still waiting. Once the last waiter cancels, cancel the shared lookup and allow the next request for that key to start a fresh lookup immediately. A lookup may complete concurrently with cancellation and may ignore cancellation briefly. Its late result must never overwrite a newer lookup or satisfy that newer lookup's waiters. Cache neither values nor errors after the waiters have received them. Never hold the global mutex while executing the lookup or waiting for a result. Return a concrete API and implementation using only the standard library, then focused tests with controlled channels rather than time-based sleeps. Explain the ownership and completion invariants, especially the last-waiter cancellation versus new-request race. Choose explicit semantics for a caller whose cancellation races with a completed result and apply them consistently."
+        }
+      ]
+    },
+    {
+      "id": "javascript-incremental-ndjson",
+      "family": "streaming-javascript",
+      "workload": "streaming-javascript",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Implement a JavaScript async generator that parses newline-delimited JSON from an AsyncIterable of Uint8Array chunks. It must handle UTF-8 code points split across chunks, CRLF split between chunks, a final record without a newline, and empty chunks. Blank lines are ignored. A JSON string may contain an escaped newline, which is not a record boundary. Enforce a configurable maximum UTF-8 byte length per nonblank record before decoding it into an unbounded string; exclude the line terminator and allow a single trailing CR only when followed by LF. Invalid UTF-8, malformed JSON, and overlong records must raise distinct typed errors containing the one-based physical line number. When the consumer stops early, ensure upstream iterator cleanup runs; do not read ahead by another chunk after yielding the final record available in the current chunk unless the consumer asks for more. Avoid quadratic copying and accumulating the complete stream. Supply the implementation, tests that control chunk boundaries, and a short explanation of byte-counting and cleanup. Explicitly state any constraint you impose on the source chunks."
+        }
+      ]
+    },
+    {
+      "id": "library-workshop-tradeoffs",
+      "family": "ideation-planning",
+      "workload": "ideation-planning",
+      "messages": [
+        {
+          "role": "user",
+          "content": "A public library has one room, six volunteer mentors, a small equipment budget, and eight weekly two-hour sessions to help thirty adults learn to build useful personal software tools. Participants vary widely in technical experience and some rely on loaner laptops with unreliable internet. Propose three meaningfully different workshop formats, compare their likely failure modes, and recommend a practical pilot that can be changed after week two. The objective is participants completing useful projects, not maximizing lecture coverage or selling a particular tool. Include how to handle accessibility needs, uneven attendance, privacy concerns about uploading personal data, and mentors becoming bottlenecks. Give concrete sample projects at two difficulty levels, a lightweight way to measure progress without grading people, and fallback plans for a network outage and two mentors being absent. Explain which assumptions most affect your choice and what early evidence would make you switch formats. Avoid inventing costs or local policies; mark decisions that require input from library staff. Produce an actionable plan with tradeoffs rather than a promotional pitch."
+        }
+      ]
+    }
+  ]
+}

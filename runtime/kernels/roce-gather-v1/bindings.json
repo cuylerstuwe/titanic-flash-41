@@ -1,0 +1,299 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "SG17 release archive 4922d0db9395fb8b537d7e216d509a5747867a45f20c18290e385786609dd05f",
+  "license": "Apache-2.0",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "canada.roce.row_gather.rank0",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "row_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "aedfad5b0991fc31fe9972b2fb292e0e63cc3264a9f596e3438c99eb6bfdcdd2"
+    },
+    {
+      "index": 1,
+      "name": "kernel_001",
+      "kernel_id": "canada.roce.row_gather.rank1",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "row_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "18e359b0fcb29db7fdb63d9e6635a1f81f336e73c0a69766d55c4164fa519aec"
+    },
+    {
+      "index": 2,
+      "name": "kernel_002",
+      "kernel_id": "canada.roce.row_gather.rank2",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "row_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "7f0a38eb21d88bc1e3819546abfd310761d79846640507770f5c2f5d3b5f11e3"
+    },
+    {
+      "index": 3,
+      "name": "kernel_003",
+      "kernel_id": "canada.roce.row_gather.rank3",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "row_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "f8b0ecb9565a47b1007d6eef8bc9dd553db1caa60993533f7dc5f8a722de437f"
+    }
+  ],
+  "library_sha256": "6b6aaba10cba2c3fccd820c80a7044f34863d8af5d615f5f3e839458429288c7"
+}

@@ -1,0 +1,41 @@
+{
+  "abi": 1,
+  "architecture": 121,
+  "physical_sms": 48,
+  "rope_heads": 16,
+  "rope_head_width": 512,
+  "rope_width": 64,
+  "norm_widths": [
+    512,
+    1280,
+    5120
+  ],
+  "epsilon": 1e-20,
+  "library_sha256": "ff72a18eed431496f4d025e46d8744a34d49a08009a5d3241c6e29d7309c81da",
+  "source": "SGLang low-level RoPE and FlashInfer low-level RMSNorm",
+  "sglang_commit": "f80c91a4b97e52e17fbcff088aa6b47b6270f6b9",
+  "sglang_license": "Apache-2.0",
+  "rope_source_sha256": "c599b6d5bce1f3e7cfd0422707cd1a1ad33ea676493c9fe36d73810834e88103",
+  "flashinfer_version": "0.6.18",
+  "flashinfer_license": "BSD-3-Clause",
+  "norm_source_sha256": "88264c1294d609ad294954a923d0b02db3568c32f13c9211f13b9d5786605a28",
+  "adapter_sha256": "65235e7b772407d680d4cf1ba86655388e38e5be2c08ca6fd35e04bbbbf4f3e3",
+  "compiler_arguments": [
+    "nvcc",
+    "-shared",
+    "-Xcompiler=-fPIC",
+    "-std=c++20",
+    "--expt-relaxed-constexpr",
+    "-DSGL_CUDA_ARCH=1210",
+    "-O3",
+    "--use_fast_math",
+    "-gencode=arch=compute_121a,code=sm_121a",
+    "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include",
+    "-I/kernel-reference/kernels/jit/include",
+    "-I/opt/sglang/lib/python3.12/site-packages/tvm_ffi/include",
+    "/scratch/primitive-exports/prelude-v0/prelude.cu",
+    "-o",
+    "/scratch/primitive-exports/prelude-v0/libcanada_prelude.so",
+    "-lcudart"
+  ]
+}

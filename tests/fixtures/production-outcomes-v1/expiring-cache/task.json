@@ -1,0 +1,16 @@
+{
+  "id": "expiring-cache-v1",
+  "instructions": "Implement ExpiringLRU(capacity) in client.py and add tests. capacity is a positive integer. Methods are put(key, value, ttl, now), get(key, now, default=None), and keys(now). Times are finite integer or float values supplied by callers, monotonically nondecreasing over the whole instance. No clock reads. TTL is a nonnegative number. Expire entries whose expiry <= now before every operation. put overwrites a key and makes it most recently used; its expiry is now+ttl. ttl=0 removes an existing key and stores nothing. get returns a live value and marks that key most recently used; a miss returns default and changes no surviving key's recency. keys returns a new list of live keys from least to most recently used without changing order. After put, evict least recently used keys until size<=capacity. None is an ordinary stored value and must be distinguishable from a miss using a supplied default. Keys are strings and values are arbitrary Python objects; preserve value identity. Use only the standard library and run tests on final files.",
+  "system": "You are a coding agent. Complete the requested change using the supplied tools. Do not claim tests passed unless you ran them. Only the declared tools are available.",
+  "temperature": 1,
+  "top_p": 1,
+  "max_tokens": 262144,
+  "reasoning_effort": "high",
+  "max_calls": 16,
+  "max_case_seconds": 900,
+  "initial_files": [
+    "client.py",
+    "test_client.py"
+  ],
+  "held_out_grader_sha256": "2aeefe022cf9258c8c06e08ff054cc4600abbcfccca058b660a784fac26a5509"
+}

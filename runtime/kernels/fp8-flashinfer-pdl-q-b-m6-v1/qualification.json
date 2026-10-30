@@ -1,0 +1,235 @@
+{
+  "geometry": {
+    "rows": 6,
+    "in_features": 1280,
+    "out_features": 8192,
+    "scale_a_bytes": 5120,
+    "scale_b_bytes": 327680,
+    "mma_tiler_mn": [
+      16,
+      128
+    ],
+    "swap_ab": false,
+    "tile_k": 128,
+    "split_k_slices": 1,
+    "split_k_atomic_bf16": false,
+    "max_active_clusters": 48,
+    "use_prefetch": false,
+    "quantizer_2t": false,
+    "quantizer_grid": 22
+  },
+  "cases": [
+    {
+      "case": "random",
+      "pdl_off_on_bytes_exact": true,
+      "guards_exact": true,
+      "reference": [
+        {
+          "pdl": false,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        },
+        {
+          "pdl": true,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "case": "changed",
+      "pdl_off_on_bytes_exact": true,
+      "guards_exact": true,
+      "reference": [
+        {
+          "pdl": false,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        },
+        {
+          "pdl": true,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        }
+      ]
+    },
+    {
+      "case": "zero",
+      "pdl_off_on_bytes_exact": true,
+      "guards_exact": true,
+      "reference": [
+        {
+          "pdl": false,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        },
+        {
+          "pdl": true,
+          "quantized_input": {
+            "different_values": 0,
+            "values": 7680,
+            "max_abs": 0.0
+          },
+          "scales": {
+            "different_values": 0,
+            "values": 5120,
+            "max_abs": 0.0
+          },
+          "output": {
+            "different_values": 0,
+            "values": 49152,
+            "max_abs": 0.0
+          }
+        }
+      ]
+    }
+  ],
+  "graph_latency": [
+    {
+      "pdl": false,
+      "repetitions_per_graph": 100,
+      "samples_ms_in_order": [
+        0.012445440292358398,
+        0.01242624044418335,
+        0.012428480386734008,
+        0.012448960542678833,
+        0.012422399520874023,
+        0.013174400329589844,
+        0.01254688024520874,
+        0.012419840097427368,
+        0.012426559925079345,
+        0.012420159578323365,
+        0.012428159713745118,
+        0.012485120296478271,
+        0.012510720491409302,
+        0.013235520124435424,
+        0.012696959972381593,
+        0.01252992033958435,
+        0.012549120187759399,
+        0.012519359588623047,
+        0.01254080057144165,
+        0.012550079822540283,
+        0.012545919418334961,
+        0.013295999765396117,
+        0.012699520587921143,
+        0.012550719976425172,
+        0.012521920204162597,
+        0.012527999877929687,
+        0.01251871943473816,
+        0.012543679475784301,
+        0.012552640438079833,
+        0.0125382399559021
+      ],
+      "median_ms": 0.01252896010875702,
+      "p95_ms": 0.013235520124435424,
+      "p99_ms": 0.013295999765396117
+    },
+    {
+      "pdl": true,
+      "repetitions_per_graph": 100,
+      "samples_ms_in_order": [
+        0.011754560470581054,
+        0.011746560335159301,
+        0.011750400066375732,
+        0.011749759912490845,
+        0.012089279890060424,
+        0.0131113600730896,
+        0.011741759777069092,
+        0.011740479469299316,
+        0.011727999448776245,
+        0.011728320121765137,
+        0.011761599779129028,
+        0.01180448055267334,
+        0.011807999610900878,
+        0.013270399570465087,
+        0.011809279918670654,
+        0.011807999610900878,
+        0.011810239553451538,
+        0.011800639629364014,
+        0.01182271957397461,
+        0.01179360032081604,
+        0.011808960437774659,
+        0.013276159763336182,
+        0.011802879571914672,
+        0.011811519861221314,
+        0.011809600591659546,
+        0.011809279918670654,
+        0.011804159879684448,
+        0.011811840534210204,
+        0.011808960437774659,
+        0.01181056022644043
+      ],
+      "median_ms": 0.011807999610900878,
+      "p95_ms": 0.013270399570465087,
+      "p99_ms": 0.013276159763336182
+    }
+  ],
+  "full_engine_acceptance": false,
+  "median_speedup": 1.061056954743678,
+  "scope": "Standalone static-shape projection, synthetic GPU inputs, identical tactic/math off/on. AOT C ABI plus CUDA graph, alternating measurement order, warm repeatedly reused weights. Does not represent full-model cache residency, single-stream generation, PP consistency, quality or engine acceptance."
+}

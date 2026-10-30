@@ -1,0 +1,17 @@
+{
+  "all_exact": true,
+  "cases": [
+    {
+      "pattern": "random",
+      "all_exact": true
+    },
+    {
+      "pattern": "shared-subnormal",
+      "all_exact": true
+    }
+  ],
+  "input_format": "dual_quant_rows_v1",
+  "canonical_layer": 0,
+  "rank": 3,
+  "runtime_python_required": false
+}

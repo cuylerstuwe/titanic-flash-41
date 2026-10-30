@@ -1,0 +1,143 @@
+{
+  "entries": [
+    {
+      "name": "hc_norm_quant_p4",
+      "symbol": "hc_combine_norm_quant",
+      "architecture": 121,
+      "physical_sms": 48,
+      "arguments": [
+        {
+          "name": "X",
+          "kind": "*bf16"
+        },
+        {
+          "name": "P",
+          "kind": "*fp32"
+        },
+        {
+          "name": "W",
+          "kind": "*bf16"
+        },
+        {
+          "name": "Y",
+          "kind": "*bf16"
+        },
+        {
+          "name": "Q",
+          "kind": "*fp8e4nv"
+        },
+        {
+          "name": "SR",
+          "kind": "*u8"
+        },
+        {
+          "name": "SM",
+          "kind": "*u8"
+        }
+      ],
+      "metadata": {
+        "allowed_dot_input_precisions": [
+          "tf32",
+          "tf32x3",
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "sm121",
+        "backend_name": "cuda",
+        "debug": false,
+        "default_dot_input_precision": "tf32",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b15"
+        ],
+        "enable_fp_fusion": true,
+        "enable_reflect_ftz": true,
+        "extern_libs": [
+          [
+            "libdevice",
+            "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+          ]
+        ],
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "141569ef7f0982102d6ecfa59b7167bdde9f9c7efcaa7c7cf68d46822cad8ee2",
+        "instrumentation_mode": "",
+        "ir_override": null,
+        "launch_cooperative_grid": false,
+        "launch_pdl": false,
+        "max_num_imprecise_acc_default": 0,
+        "maxnreg": null,
+        "name": "hc_combine_norm_quant",
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 8,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "ptx_options": null,
+        "ptx_version": null,
+        "sanitize_overflow": true,
+        "shared": 8192,
+        "supported_fp8_dtypes": [
+          "fp8e4b15",
+          "fp8e4nv",
+          "fp8e5"
+        ],
+        "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+        "tensordesc_meta": [],
+        "tmem_size": 0,
+        "triton_version": "3.7.1",
+        "warp_size": 32
+      },
+      "grid": {
+        "rows_div": 1,
+        "y": 4,
+        "z": 1
+      },
+      "ptx_parameters": [
+        [
+          "u64",
+          "hc_combine_norm_quant_param_0"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_1"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_2"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_3"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_4"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_5"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_6"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_7"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_8"
+        ]
+      ],
+      "artifact_sha256": "96fd9671bfabce85666c2adb38430981ca1afb9a04518d1ace79786c2020d62d",
+      "source_sha256": "cb0394c5aa2a6bc47aaaf3e7d391a09981985489848ef4e901df0b0ebb14d2d5",
+      "constexprs": {
+        "PARTS": 4
+      }
+    }
+  ],
+  "attribution": "SGLang f80c91a4b97e52e17fbcff088aa6b47b6270f6b9 _hc_combine_norm; b12x a7d7d29b2ef8869086e0ceaa787321f17544e3c9 quant/mxfp8_rows.py and intrinsics.py; Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0",
+  "contract": "HC4 H5120 small rows; BF16 combine and normalized boundaries, four ordered FP32 FMAs, native minimum amax1e-4 and UE8M0 exponent ceiling; preserves BF16 output and exact FP8/scale bytes."
+}

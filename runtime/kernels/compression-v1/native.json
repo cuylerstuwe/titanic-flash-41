@@ -1,0 +1,46 @@
+{
+  "abi": 1,
+  "architecture": 121,
+  "physical_sms": 48,
+  "head_dim": 512,
+  "rope_dim": 64,
+  "position_dtype": "i32",
+  "location_dtype": "i64",
+  "request_dtype": "i64",
+  "page_tokens": [
+    32,
+    64,
+    128,
+    256
+  ],
+  "layout": "dsv4_fp8_448_bf16_rope64_e8m0_footer8",
+  "pdl": false,
+  "eps": 1e-20,
+  "source": "https://github.com/sgl-project/sglang",
+  "source_commit": "f80c91a4b97e52e17fbcff088aa6b47b6270f6b9",
+  "license": "Apache-2.0",
+  "source_sha256": {
+    "c1.cuh": "ccfbdc3617d99f1663abdf492c8c55b094d3eaf023704db272ef06e184dba157",
+    "c2.cuh": "fafc9851ef4b143a8c4768b0b0d0161a60f64f21990bc8c578f3ba36386e8dee"
+  },
+  "adapter_sha256": "84daceeb9af596b3d7f6af3dbf7d71407c772e9094ae904b5334a8604a894a7a",
+  "library_sha256": "c53e0f6511ab203bac528f7e67a4db05e454d6bb72f896160d8c411f822aa2ab",
+  "compiler_arguments": [
+    "nvcc",
+    "-shared",
+    "-Xcompiler=-fPIC",
+    "-std=c++20",
+    "--expt-relaxed-constexpr",
+    "-DSGL_CUDA_ARCH=1210",
+    "-O3",
+    "--use_fast_math",
+    "-gencode=arch=compute_121a,code=sm_121a",
+    "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include",
+    "-I/sgl-workspace/sglang/python/sglang/kernels/jit/include",
+    "-I/opt/sglang/lib/python3.12/site-packages/tvm_ffi/include",
+    "/scratch/primitive-exports/compression-v1/compression.cu",
+    "-o",
+    "/scratch/primitive-exports/compression-v1/libcanada_compression.so",
+    "-lcudart"
+  ]
+}

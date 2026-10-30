@@ -1,0 +1,31 @@
+{
+  "architecture": 121,
+  "physical_sms": 48,
+  "threads": 128,
+  "function": "ca_shared_swiglu_quant128",
+  "rows": 6,
+  "input_columns": 1152,
+  "activation_columns": 576,
+  "padded_columns": 640,
+  "minimum_amax": 0.0001,
+  "activation_dtype": "bf16",
+  "quant_dtype": "e4m3",
+  "scale_format": "ue8m0_ceil",
+  "source_sha256": "11852b0f56e224e032e3dcad404a41fc60f726a9e555ae3568961ae14ddd382c",
+  "artifact_sha256": "eda8fb6995f7e595c804b9523037ecb58f936f5b1f2a8826a03ae44a59a8d143",
+  "qualification_sha256": "715c3bf6bad566b68cbe6a8560116c1ab1b60d540d2bd33d6e765f1c2457a3ec",
+  "sources": [
+    {
+      "url": "https://github.com/sgl-project/sglang",
+      "revision": "f80c91a4b97e52e17fbcff088aa6b47b6270f6b9",
+      "license": "Apache-2.0",
+      "role": "clipped BF16 SwiGLU numerical contract"
+    },
+    {
+      "url": "https://github.com/local-inference-lab/b12x",
+      "revision": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+      "license": "Apache-2.0",
+      "role": "MXFP8 group quantization and MMA scale layout"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "architecture": 121,
+  "threads": 128,
+  "grid": 192,
+  "query_rows": 16,
+  "dirty_suffix_rows": 16,
+  "lanes_per_key": 4,
+  "source_sha256": "acbf9adba2c69a1fc2443afcdd55a322be27d984e744ff098283bec81dc1af7c",
+  "artifact_sha256": "dbbe4306d415a0f3a341bc635c016bacf3581545325a45aa2250cfd1cc9621af",
+  "proof_version": "s661"
+}

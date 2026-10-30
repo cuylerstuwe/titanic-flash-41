@@ -1,0 +1,227 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "Pinned Canada image82bb5857, source hashes in query_rms_quant_patch.py",
+  "license": "Apache-2.0",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "query.rms_quant.s1280.r4.async1",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "kind": "pointer"
+        },
+        {
+          "name": "s",
+          "kind": "pointer"
+        },
+        {
+          "name": "rows",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "d3cb1a13a777079adade982bdf95505213699a6bff6f3535521451867a6a47d0"
+    },
+    {
+      "index": 1,
+      "name": "kernel_001",
+      "kernel_id": "query.rms_quant.s1280.r4.async0",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "kind": "pointer"
+        },
+        {
+          "name": "s",
+          "kind": "pointer"
+        },
+        {
+          "name": "rows",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "56b7bd4ac72d396a0dbb846b1274efd3f65f26fdcc6113940eb8ce3ed8129681"
+    },
+    {
+      "index": 2,
+      "name": "kernel_002",
+      "kernel_id": "query.rms_quant.s1280.r1.async0",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "kind": "pointer"
+        },
+        {
+          "name": "s",
+          "kind": "pointer"
+        },
+        {
+          "name": "rows",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "f3a06eb21d5b43588dc65123e8531c9c267f24c727c69712d00b0d600d8f3656"
+    },
+    {
+      "index": 3,
+      "name": "kernel_003",
+      "kernel_id": "query.rms_quant.s1792.r4.async1",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "kind": "pointer"
+        },
+        {
+          "name": "s",
+          "kind": "pointer"
+        },
+        {
+          "name": "rows",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "3df0fad8b92c8dfb7eeb2e7885686f4f52f14f197cfd5fca4141979d8416fe40"
+    },
+    {
+      "index": 4,
+      "name": "kernel_004",
+      "kernel_id": "query.rms_quant.s1792.r4.async0",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "kind": "pointer"
+        },
+        {
+          "name": "s",
+          "kind": "pointer"
+        },
+        {
+          "name": "rows",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "564c78fd392876bbdce77b68dadc66288688591b55e9066442c3112d6b200a9d"
+    },
+    {
+      "index": 5,
+      "name": "kernel_005",
+      "kernel_id": "query.rms_quant.s1792.r1.async0",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "kind": "pointer"
+        },
+        {
+          "name": "s",
+          "kind": "pointer"
+        },
+        {
+          "name": "rows",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "e26b744a6b5dbecf30ea3c2506ef54d44b8898d27676970a2e0e0a54e215ee0f"
+    }
+  ],
+  "library_sha256": "b711fd33f831c01138f2c517f04897e32e56b1f8ff58205c22c589ce1caa1999"
+}

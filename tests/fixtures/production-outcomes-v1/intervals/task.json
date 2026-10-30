@@ -1,0 +1,16 @@
+{
+  "id": "intervals-v1",
+  "instructions": "Implement subtract_intervals(base, blocked) in client.py and add tests in test_client.py. Inputs are lists of (start, end) integer pairs denoting half-open intervals. Ignore empty pairs where start == end; raise ValueError for start > end in either input, including a blocked pair when base is empty. Return a new sorted list of nonempty (start, end) tuples describing the union of base minus the union of blocked. Merge touching surviving intervals. Accept unsorted, duplicate, nested and overlapping pairs, negative coordinates and arbitrarily large integers. Do not enumerate individual coordinates, convert coordinates to float, or mutate either input. Use only the standard library. Run tests on the final files before finishing.",
+  "system": "You are a coding agent. Complete the requested change using the supplied tools. Do not claim tests passed unless you ran them. Only the declared tools are available.",
+  "temperature": 1,
+  "top_p": 1,
+  "max_tokens": 262144,
+  "reasoning_effort": "high",
+  "max_calls": 16,
+  "max_case_seconds": 900,
+  "initial_files": [
+    "client.py",
+    "test_client.py"
+  ],
+  "held_out_grader_sha256": "566dbe6e7de2744dc332523023a21b07455f2b431bdee2fd1e45e751f53fd589"
+}

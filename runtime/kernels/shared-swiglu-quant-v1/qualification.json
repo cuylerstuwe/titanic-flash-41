@@ -1,0 +1,430 @@
+{
+  "all_exact": true,
+  "shared_swiglu_quant_screen": true,
+  "checks": [
+    {
+      "rows": 1,
+      "case": "normal",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 1,
+      "case": "clamped",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 1,
+      "case": "zero",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 1,
+      "case": "tiny",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 1,
+      "case": "changed",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 3,
+      "case": "normal",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 3,
+      "case": "clamped",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 3,
+      "case": "zero",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 3,
+      "case": "tiny",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 3,
+      "case": "changed",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 6,
+      "case": "normal",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 6,
+      "case": "clamped",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 6,
+      "case": "zero",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 6,
+      "case": "tiny",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    },
+    {
+      "rows": 6,
+      "case": "changed",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "all_exact": true
+    }
+  ],
+  "timing": [
+    {
+      "rows": 1,
+      "median_us": [
+        1.7074999632313848,
+        0.9397499961778522,
+        0.9457500127609819
+      ],
+      "samples_us": [
+        [
+          1.752499956637621,
+          1.7059999518096447,
+          1.705499948002398,
+          1.7185000469908118,
+          1.7074999632313848,
+          1.7074999632313848
+        ],
+        [
+          0.9655000176280737,
+          0.9405000018887222,
+          0.9389999904669821,
+          0.9560000034980476,
+          0.9330000029876828,
+          0.9355000220239162
+        ],
+        [
+          0.9430000209249556,
+          0.9495000122115016,
+          0.9485000045970082,
+          0.9379999828524888,
+          0.950500019825995,
+          0.9374999790452421
+        ]
+      ],
+      "speed_ratios": [
+        1.0,
+        1.8169725673595345,
+        1.8054453504542736
+      ]
+    },
+    {
+      "rows": 3,
+      "median_us": [
+        1.7082499689422548,
+        0.9420000133104622,
+        0.9399999980814755
+      ],
+      "samples_us": [
+        [
+          1.7269999952986836,
+          1.7040000529959798,
+          1.7079999670386314,
+          1.7170000355690718,
+          1.7025000415742397,
+          1.7084999708458781
+        ],
+        [
+          0.9474999969825149,
+          0.9384999866597354,
+          0.9544999920763075,
+          0.9420000133104622,
+          0.9420000133104622,
+          0.9415000095032156
+        ],
+        [
+          0.9384999866597354,
+          0.9379999828524888,
+          0.9490000084042549,
+          0.950500019825995,
+          0.9415000095032156,
+          0.9364999714307487
+        ]
+      ],
+      "speed_ratios": [
+        1.0,
+        1.8134288161408483,
+        1.8172872047114519
+      ]
+    },
+    {
+      "rows": 6,
+      "median_us": [
+        1.7177500412799418,
+        0.9425000171177089,
+        0.9379999828524888
+      ],
+      "samples_us": [
+        [
+          1.7300000181421638,
+          1.713500008918345,
+          1.715000020340085,
+          1.7190000507980585,
+          1.716500031761825,
+          1.7384999664500356
+        ],
+        [
+          0.9490000084042549,
+          0.944000028539449,
+          0.9495000122115016,
+          0.9405000018887222,
+          0.9374999790452421,
+          0.9410000056959689
+        ],
+        [
+          0.9360000258311629,
+          0.9394999942742288,
+          0.9474999969825149,
+          0.9335000067949295,
+          0.9374999790452421,
+          0.9384999866597354
+        ]
+      ],
+      "speed_ratios": [
+        1.0,
+        1.8225464297953555,
+        1.8312900561641883
+      ]
+    }
+  ],
+  "names": [
+    "native_swiglu_then_native_quant",
+    "fused_128_threads",
+    "fused_64_threads"
+  ],
+  "source_sha256": "11852b0f56e224e032e3dcad404a41fc60f726a9e555ae3568961ae14ddd382c",
+  "artifact_sha256": "eda8fb6995f7e595c804b9523037ecb58f936f5b1f2a8826a03ae44a59a8d143",
+  "compile_command": [
+    "nvcc",
+    "--cubin",
+    "-arch=sm_121",
+    "--std=c++17",
+    "-O3",
+    "--use_fast_math",
+    "/scratch/evidence/shared-swiglu-quant-s473/component/shared.cu",
+    "-o",
+    "/scratch/evidence/shared-swiglu-quant-s473/component/shared.cubin"
+  ],
+  "full_engine_acceptance": false,
+  "scope": "15 changed-input cases at M1/M3/M6, normal/clamped/zero/tiny values, repeated graphs and guards. Compare BF16 activation and every raw FP8/row-scale/MMA-scale byte against existing immutable SGLang/b12x native libraries. Six order-rotated timing groups. No arithmetic precision, clipping, BF16 rounding or scale rule change; component only."
+}

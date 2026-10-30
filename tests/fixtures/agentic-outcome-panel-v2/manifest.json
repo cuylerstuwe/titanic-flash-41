@@ -1,0 +1,33 @@
+{
+  "schema": "agentic-outcome-panel-v2",
+  "cases": [
+    "events",
+    "planner"
+  ],
+  "controller_sha256": "95475671bfbcbf5a3309fdec5c87bf9e4e072287fe56278cf85d6e563a4fd199",
+  "files": {
+    "events/evaluate.py": "b1c3d5562154ee0ca6833febf460f58469cccdf9ade78b58f064123f0458a7ea",
+    "events/initial_client.py": "bffbd1e3a9fdd0fb2ae54c2131403ee76b36731590f6e6a7faee0ee5d3d1a85a",
+    "events/initial_test_client.py": "2af14e01788da5b9655093da9a09823045fef76f2c0d96a74923e127f4f6fb3a",
+    "events/manifest.json": "6e45f2240ff2781879064bee85df6573ebbb61c6bbdd41ba160e5eb6500973da",
+    "events/run.py": "95475671bfbcbf5a3309fdec5c87bf9e4e072287fe56278cf85d6e563a4fd199",
+    "events/selfcheck_client.py": "b16edcd7a2baecf9b50c53b45519418c76f0956579e24b47d8ffb048a8df4ae3",
+    "events/task.json": "4f4ce4a69fa75c5ce01ddd1ad6bcee81a0be924ee8dc722d53b3475c4b6f9634",
+    "planner/evaluate.py": "a38b6266dea5bc5d67cad0228d093203eb9598289ab3772a4ecec61eda40fa46",
+    "planner/initial_client.py": "80636dce0fb0ae5921cd19f34e05f49e73d9ce694a82672973be7fb46d054652",
+    "planner/initial_test_client.py": "edae353e2726af827724ef5307cd7a579e7c0538616d3e2a99ceb2e94e276f0c",
+    "planner/manifest.json": "f5ef6d16b918af8af15d5e701048d3ac0e4ba74545fa0c2c7d5800d022f128f7",
+    "planner/run.py": "95475671bfbcbf5a3309fdec5c87bf9e4e072287fe56278cf85d6e563a4fd199",
+    "planner/selfcheck_client.py": "63e97a5208bf28d01082fca7d51fd3e843d692eab965445db94760418208d441",
+    "planner/task.json": "4a3a8673f40bdc6f812be0131c955bb8a21fcfe99b21bd6e8bd89c02c854f1cc"
+  },
+  "task_count": 2,
+  "seeds_per_task": 1,
+  "max_total_case_seconds": 900,
+  "prepared_only": true,
+  "scope": "Two independent coding tasks supplement the retry pilot; parser repair begins with real repository context over64K. One sample/task remains a small screen, not production quality qualification.",
+  "long_case": "events",
+  "long_case_prompt_tokens": 70888,
+  "long_case_rendered_sha256": "1f884528bf2ef52815f09f4476c49749bc7cb979b08c2b247fa2347014abbd19",
+  "controller_base_sha256": "5e097bceee9034f4c9624161f49762e73abaf2a3f2a62d86e9085f87d2180c9e"
+}

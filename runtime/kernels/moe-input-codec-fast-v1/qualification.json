@@ -1,0 +1,219 @@
+{
+  "version": "s510",
+  "source_commit": "449ec1ea92d7935a98764b053d8142ce44cf01c0",
+  "all_exact": true,
+  "cases": [
+    {
+      "pattern": "random",
+      "different_bytes": {
+        "fast_payload": 0,
+        "fused_payload": 0,
+        "fast_shared_values": 0,
+        "fast_shared_row_scales": 0,
+        "fast_shared_mma_scales": 0,
+        "routed_values": 0,
+        "routed_scales": 0,
+        "shared_values": 0,
+        "shared_row_scales": 0,
+        "shared_mma_scales": 0
+      },
+      "correction_bits": 0,
+      "values": 41943040,
+      "guards": true,
+      "all_exact": true
+    },
+    {
+      "pattern": "zero",
+      "different_bytes": {
+        "fast_payload": 0,
+        "fused_payload": 0,
+        "fast_shared_values": 0,
+        "fast_shared_row_scales": 0,
+        "fast_shared_mma_scales": 0,
+        "routed_values": 0,
+        "routed_scales": 0,
+        "shared_values": 0,
+        "shared_row_scales": 0,
+        "shared_mma_scales": 0
+      },
+      "correction_bits": 0,
+      "values": 41943040,
+      "guards": true,
+      "all_exact": true
+    },
+    {
+      "pattern": "tiny",
+      "different_bytes": {
+        "fast_payload": 0,
+        "fused_payload": 0,
+        "fast_shared_values": 0,
+        "fast_shared_row_scales": 0,
+        "fast_shared_mma_scales": 0,
+        "routed_values": 0,
+        "routed_scales": 0,
+        "shared_values": 0,
+        "shared_row_scales": 0,
+        "shared_mma_scales": 0
+      },
+      "correction_bits": 0,
+      "values": 41943040,
+      "guards": true,
+      "all_exact": true
+    },
+    {
+      "pattern": "shared-subnormal",
+      "different_bytes": {
+        "fast_payload": 0,
+        "fused_payload": 0,
+        "fast_shared_values": 0,
+        "fast_shared_row_scales": 0,
+        "fast_shared_mma_scales": 0,
+        "routed_values": 0,
+        "routed_scales": 0,
+        "shared_values": 0,
+        "shared_row_scales": 0,
+        "shared_mma_scales": 0
+      },
+      "correction_bits": 4864318,
+      "values": 41943040,
+      "guards": true,
+      "all_exact": true
+    },
+    {
+      "pattern": "shared-ties",
+      "different_bytes": {
+        "fast_payload": 0,
+        "fused_payload": 0,
+        "fast_shared_values": 0,
+        "fast_shared_row_scales": 0,
+        "fast_shared_mma_scales": 0,
+        "routed_values": 0,
+        "routed_scales": 0,
+        "shared_values": 0,
+        "shared_row_scales": 0,
+        "shared_mma_scales": 0
+      },
+      "correction_bits": 3997696,
+      "values": 41943040,
+      "guards": true,
+      "all_exact": true
+    },
+    {
+      "pattern": "mixed-scales",
+      "different_bytes": {
+        "fast_payload": 0,
+        "fused_payload": 0,
+        "fast_shared_values": 0,
+        "fast_shared_row_scales": 0,
+        "fast_shared_mma_scales": 0,
+        "routed_values": 0,
+        "routed_scales": 0,
+        "shared_values": 0,
+        "shared_row_scales": 0,
+        "shared_mma_scales": 0
+      },
+      "correction_bits": 163735,
+      "values": 41943040,
+      "guards": true,
+      "all_exact": true
+    },
+    {
+      "pattern": "large-scales",
+      "different_bytes": {
+        "fast_payload": 0,
+        "fused_payload": 0,
+        "fast_shared_values": 0,
+        "fast_shared_row_scales": 0,
+        "fast_shared_mma_scales": 0,
+        "routed_values": 0,
+        "routed_scales": 0,
+        "shared_values": 0,
+        "shared_row_scales": 0,
+        "shared_mma_scales": 0
+      },
+      "correction_bits": 0,
+      "values": 41943040,
+      "guards": true,
+      "all_exact": true
+    },
+    {
+      "pattern": "scale-boundaries",
+      "different_bytes": {
+        "fast_payload": 0,
+        "fused_payload": 0,
+        "fast_shared_values": 0,
+        "fast_shared_row_scales": 0,
+        "fast_shared_mma_scales": 0,
+        "routed_values": 0,
+        "routed_scales": 0,
+        "shared_values": 0,
+        "shared_row_scales": 0,
+        "shared_mma_scales": 0
+      },
+      "correction_bits": 57341,
+      "values": 41943040,
+      "guards": true,
+      "all_exact": true
+    }
+  ],
+  "timing": [
+    {
+      "name": "baseline-local-prepare",
+      "median_ms": 0.4430519938468933,
+      "samples_ms": [
+        0.4964680075645447,
+        0.4439519941806793,
+        0.44079598784446716,
+        0.4421519935131073
+      ]
+    },
+    {
+      "name": "fast-local-prepare",
+      "median_ms": 0.4177840054035187,
+      "samples_ms": [
+        0.4580079913139343,
+        0.41650399565696716,
+        0.4188680052757263,
+        0.41670000553131104
+      ]
+    },
+    {
+      "name": "fused-local-prepare",
+      "median_ms": 0.1705000028014183,
+      "samples_ms": [
+        0.17665599286556244,
+        0.1698320060968399,
+        0.17054800689220428,
+        0.17045199871063232
+      ]
+    },
+    {
+      "name": "baseline-shared-unpack",
+      "median_ms": 0.6318440139293671,
+      "samples_ms": [
+        0.631820023059845,
+        0.6743999719619751,
+        0.6314799785614014,
+        0.6318680047988892
+      ]
+    },
+    {
+      "name": "fast-shared-unpack",
+      "median_ms": 0.5766699910163879,
+      "samples_ms": [
+        0.5772839784622192,
+        0.6336159706115723,
+        0.5760560035705566,
+        0.5758960247039795
+      ]
+    }
+  ],
+  "rows": 8192,
+  "columns": 5120,
+  "bytes_per_row": 5920,
+  "transport_byte_ratio": 0.578125,
+  "library_sha256": "105a4192837408db24b70193fa60c2c2e729d669c1cb6c8d06bdea3850afc399",
+  "fast_library_sha256": "ef5e336f5fb1a00f02e7910bb7800db724bda14bc2055804b5b7dba0aa5e837c",
+  "full_engine_acceptance": false,
+  "scope": "Eight exact GPU pattern checks for original versus fast codec and fused BF16-to-packed producer. Same row format and both native quantizers. Compare preparation/unpack overhead only; no network or model speed claim."
+}

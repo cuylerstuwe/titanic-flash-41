@@ -1,0 +1,64 @@
+{
+  "architecture": 121,
+  "physical_sms": 48,
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "query.rms_quant.s1280.r4.async1",
+      "width": 1280,
+      "stride": 1280,
+      "max_rows": 6,
+      "header_sha256": "d3cb1a13a777079adade982bdf95505213699a6bff6f3535521451867a6a47d0",
+      "object_sha256": "7f300486c059c0dea5e15a401f2f28b23eacb15c4c46ad1fb1096680600bfdbe"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "query.rms_quant.s1280.r4.async0",
+      "width": 1280,
+      "stride": 1280,
+      "max_rows": 6,
+      "header_sha256": "56b7bd4ac72d396a0dbb846b1274efd3f65f26fdcc6113940eb8ce3ed8129681",
+      "object_sha256": "cc20144aeb6497078df45f3701709de2da6b8bc5ff700b5bdf74e50e1398f646"
+    },
+    {
+      "name": "kernel_002",
+      "kernel_id": "query.rms_quant.s1280.r1.async0",
+      "width": 1280,
+      "stride": 1280,
+      "max_rows": 6,
+      "header_sha256": "f3a06eb21d5b43588dc65123e8531c9c267f24c727c69712d00b0d600d8f3656",
+      "object_sha256": "a0885975225e8043d9958b74bde909421affd5eb49cd771b066dc55995941f51"
+    },
+    {
+      "name": "kernel_003",
+      "kernel_id": "query.rms_quant.s1792.r4.async1",
+      "width": 1280,
+      "stride": 1792,
+      "max_rows": 6,
+      "header_sha256": "3df0fad8b92c8dfb7eeb2e7885686f4f52f14f197cfd5fca4141979d8416fe40",
+      "object_sha256": "efb4058a423b4b2b1728eabc7bb9cc864da29c5be10a66a1af6d3c6ce9334337"
+    },
+    {
+      "name": "kernel_004",
+      "kernel_id": "query.rms_quant.s1792.r4.async0",
+      "width": 1280,
+      "stride": 1792,
+      "max_rows": 6,
+      "header_sha256": "564c78fd392876bbdce77b68dadc66288688591b55e9066442c3112d6b200a9d",
+      "object_sha256": "3005413cb954637961ff8e7fe23bcd135991ad021537527336d82b47acef4fa8"
+    },
+    {
+      "name": "kernel_005",
+      "kernel_id": "query.rms_quant.s1792.r1.async0",
+      "width": 1280,
+      "stride": 1792,
+      "max_rows": 6,
+      "header_sha256": "e26b744a6b5dbecf30ea3c2506ef54d44b8898d27676970a2e0e0a54e215ee0f",
+      "object_sha256": "983d2115ad4a6f0ed302fa6a58388bd2d5f8f041e2e35d6fd5c5bda33d70378b"
+    }
+  ],
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "Pinned Canada image82bb5857, source hashes in query_rms_quant_patch.py",
+  "license": "Apache-2.0",
+  "source_sha256": "be6fd976e6344acbf49a23334718033fa800dbe3170f0ff1ab88c25d12264888"
+}

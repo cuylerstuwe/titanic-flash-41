@@ -1,0 +1,163 @@
+{
+  "date": "2026-10-30",
+  "single_stream": true,
+  "client": "head GB10, loopback HTTP directly to server",
+  "model_parallelism": "TP4",
+  "hardware": "3 ASUS GX10 + 1 NVIDIA DGX Spark, dual 100 Gb/s switched RoCE",
+  "compiler_source_sha256": "2f58184d0d610c78c9f61cffb3e419af226fffaab7c3cf1bb6da29d2fe7c3e1b",
+  "source_url": "https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa",
+  "source_revision": "7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2",
+  "settings": {
+    "temperature": 0,
+    "top_p": 1,
+    "thinking": false,
+    "max_tokens": 512,
+    "repetitions": 3
+  },
+  "rows": [
+    {
+      "context": "clean",
+      "workload": "code",
+      "titanic_decode_tps": {
+        "median": 115.52188989739545,
+        "min": 114.74769681547936,
+        "max": 115.60668802545504,
+        "stdev": 0.38649874937624934,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.15513616986572742,
+        "min": 0.15262419707141817,
+        "max": 0.1626079110428691,
+        "stdev": 0.004240171225595188,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 71.57781042288849,
+        "sglang-tuned": 103.0501327003324,
+        "tensorfold": 110.8839365430241
+      }
+    },
+    {
+      "context": "clean",
+      "workload": "prose",
+      "titanic_decode_tps": {
+        "median": 59.92090899935372,
+        "min": 58.82823365994308,
+        "max": 59.95619704663518,
+        "stdev": 0.5236077884739272,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.14789457083679736,
+        "min": 0.1404583021067083,
+        "max": 0.14876497304067016,
+        "stdev": 0.003727621741476193,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 32.92104872709232,
+        "sglang-tuned": 46.315845996857675,
+        "tensorfold": 57.67837667994458
+      }
+    },
+    {
+      "context": "clean",
+      "workload": "prose2",
+      "titanic_decode_tps": {
+        "median": 54.800900868735134,
+        "min": 54.08141572098515,
+        "max": 54.864974411229014,
+        "stdev": 0.3552352143669841,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.12668794207274914,
+        "min": 0.12371485005132854,
+        "max": 0.13493744586594403,
+        "stdev": 0.004747399824231234,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 26.7517911172939,
+        "sglang-tuned": 43.72182796367915,
+        "tensorfold": 56.30457268437747
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "code",
+      "titanic_decode_tps": {
+        "median": 113.88717638423863,
+        "min": 111.48733937716743,
+        "max": 113.90562041128138,
+        "stdev": 1.1356662754425124,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.2484615941066295,
+        "min": 0.24740445706993341,
+        "max": 0.26810697512701154,
+        "stdev": 0.009519878547626233,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 57.358793189004516,
+        "sglang-tuned": 85.98516855760624,
+        "tensorfold": 94.67134822472953
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "prose",
+      "titanic_decode_tps": {
+        "median": 60.09518290757425,
+        "min": 58.58072235861402,
+        "max": 60.186801381861834,
+        "stdev": 0.7364686406618156,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.2545008680317551,
+        "min": 0.23075676104053855,
+        "max": 0.26263958611525595,
+        "stdev": 0.01352584309796978,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 31.99416760975024,
+        "sglang-tuned": 45.76539923068635,
+        "tensorfold": 57.66456969748044
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "prose2",
+      "titanic_decode_tps": {
+        "median": 58.83932150104866,
+        "min": 57.94146486836886,
+        "max": 59.01405350224894,
+        "stdev": 0.4698846409988186,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.22373353294096887,
+        "min": 0.22232364397495985,
+        "max": 0.24505627807229757,
+        "stdev": 0.010399892626772203,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 28.12880041612874,
+        "sglang-tuned": 44.12675113346383,
+        "tensorfold": 53.74595055288519
+      }
+    }
+  ],
+  "cold_131k_first_token_seconds": {
+    "titanic": 21.05005984287709,
+    "sglang_tuned": 32.44752314499965,
+    "tensorfold": 56.01667726300366
+  },
+  "scope": "Short capped throughput diagnostics. Competitor values are previously published measurements on a different four-Spark system. No task-quality or recommended-sampler claim."
+}

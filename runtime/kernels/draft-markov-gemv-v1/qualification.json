@@ -1,0 +1,20 @@
+{
+  "all_correct": true,
+  "markov": true,
+  "cases": [
+    {
+      "case": "initial",
+      "finite": true,
+      "bitwise_equal": true
+    },
+    {
+      "case": "changed",
+      "finite": true,
+      "bitwise_equal": true
+    }
+  ],
+  "artifact_sha256": "303f6716a283121de7f5c60ed71949517b252ef72e57c4732c4068acdf894976",
+  "manifest_sha256": "3548509eb8a83babd0c6fb635df9e205fd651243f8436ded942192fc10d5ae74",
+  "source_sha256": "14cd9134c4c285c698dd8354cdb45284cd2c41ce0eedf13092729ce59e721ff7",
+  "scope": "Two GPU-generated inputs, native CUDA-driver pointer/scalar ABI with two null scratch arguments, graph replay and exact comparison against the Triton GPU kernel. Canonical rank3 BF16 head shard, FP32 output; Markov mode adds FP32 base logits. No full-model claim."
+}

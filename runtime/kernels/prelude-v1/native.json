@@ -1,0 +1,41 @@
+{
+  "abi": 1,
+  "architecture": 121,
+  "physical_sms": 48,
+  "rope_heads": 16,
+  "rope_head_width": 512,
+  "rope_width": 64,
+  "norm_widths": [
+    512,
+    1280,
+    5120
+  ],
+  "epsilon": 1e-20,
+  "library_sha256": "632a18e2fc453d7a3a89c61231da4509f40d57f06d7ba84c41cda0fa03673cfb",
+  "source": "SGLang low-level RoPE; effective FlashInfer CuTe RMSNorm in the separate rms bundle",
+  "sglang_commit": "f80c91a4b97e52e17fbcff088aa6b47b6270f6b9",
+  "sglang_license": "Apache-2.0",
+  "rope_source_sha256": "c599b6d5bce1f3e7cfd0422707cd1a1ad33ea676493c9fe36d73810834e88103",
+  "flashinfer_version": "0.6.18",
+  "flashinfer_license": "BSD-3-Clause",
+  "norm_source_sha256": "b273fe5444aaf86a1600c196817b7a733b18f6f82030a16e1ef2731c784d48f0",
+  "adapter_sha256": "87f0664f805c2afe0745a40ec18fbd92832315c506f6e57e4cb3565abee05628",
+  "compiler_arguments": [
+    "nvcc",
+    "-shared",
+    "-Xcompiler=-fPIC",
+    "-std=c++20",
+    "--expt-relaxed-constexpr",
+    "-DSGL_CUDA_ARCH=1210",
+    "-O3",
+    "--use_fast_math",
+    "-gencode=arch=compute_121a,code=sm_121a",
+    "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include",
+    "-I/kernel-reference/kernels/jit/include",
+    "-I/opt/sglang/lib/python3.12/site-packages/tvm_ffi/include",
+    "/scratch/primitive-exports/prelude-v1/prelude.cu",
+    "-o",
+    "/scratch/primitive-exports/prelude-v1/libcanada_prelude.so",
+    "-lcudart"
+  ]
+}

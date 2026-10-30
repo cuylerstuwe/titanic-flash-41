@@ -1,0 +1,190 @@
+{
+  "all_correct": true,
+  "all_weights_bit_exact": true,
+  "canonical_unchanged": true,
+  "cases": [
+    {
+      "case": "normal",
+      "exact_to_canonical": true,
+      "checks": {
+        "canonical": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 8.013701021706643e-08
+        },
+        "lossless": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 8.013701021706643e-08
+        },
+        "fp8": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 0.026398533040940867
+        },
+        "int8": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 0.006723199800648206
+        }
+      },
+      "timing": {
+        "canonical": {
+          "samples_us": [
+            1479.3920516967773,
+            1415.93599319458,
+            1421.0879802703857,
+            1420.0960397720337
+          ],
+          "median_us": 1420.5920100212097
+        },
+        "lossless": {
+          "samples_us": [
+            1157.8880548477173,
+            1146.623969078064,
+            1153.7920236587524,
+            1148.7040519714355
+          ],
+          "median_us": 1151.248037815094
+        },
+        "fp8": {
+          "samples_us": [
+            810.9760284423828,
+            787.1999740600586,
+            792.415976524353,
+            795.4559922218323
+          ],
+          "median_us": 793.9359843730927
+        },
+        "int8": {
+          "samples_us": [
+            812.7359747886658,
+            801.5360236167908,
+            793.5680150985718,
+            796.3839769363403
+          ],
+          "median_us": 798.9600002765656
+        }
+      }
+    },
+    {
+      "case": "changed",
+      "exact_to_canonical": true,
+      "checks": {
+        "canonical": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 8.010526653812301e-08
+        },
+        "lossless": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 8.010526653812301e-08
+        },
+        "fp8": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 0.026676353698869056
+        },
+        "int8": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 0.006814987934230869
+        }
+      },
+      "timing": {
+        "canonical": {
+          "samples_us": [
+            1428.544044494629,
+            1440.2879476547241,
+            1476.3519763946533,
+            1591.6160345077515
+          ],
+          "median_us": 1458.3199620246887
+        },
+        "lossless": {
+          "samples_us": [
+            1147.6479768753052,
+            1256.3199996948242,
+            1148.7040519714355,
+            1204.9599885940552
+          ],
+          "median_us": 1176.8320202827454
+        },
+        "fp8": {
+          "samples_us": [
+            835.4880213737488,
+            802.7520179748535,
+            790.2719974517822,
+            789.2159819602966
+          ],
+          "median_us": 796.5120077133179
+        },
+        "int8": {
+          "samples_us": [
+            957.1520090103149,
+            797.5680232048035,
+            797.6319789886475,
+            793.4719920158386
+          ],
+          "median_us": 797.6000010967255
+        }
+      }
+    },
+    {
+      "case": "zero",
+      "exact_to_canonical": true,
+      "checks": {
+        "canonical": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 0.0
+        },
+        "lossless": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 0.0
+        },
+        "fp8": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 0.0
+        },
+        "int8": {
+          "finite": true,
+          "guard_unchanged": true,
+          "relative_rms_to_canonical_fp64": 0.0
+        }
+      },
+      "timing": {
+        "canonical": {
+          "samples_us": [],
+          "median_us": null
+        },
+        "lossless": {
+          "samples_us": [],
+          "median_us": null
+        },
+        "fp8": {
+          "samples_us": [],
+          "median_us": null
+        },
+        "int8": {
+          "samples_us": [],
+          "median_us": null
+        }
+      }
+    }
+  ],
+  "exponent_escape_groups": 6711,
+  "encoded_bytes": 253388800,
+  "source_sha256": "14508b51f641c0c987c9c313e57731cc630c830e24a28c87fe4a71abc408363b",
+  "manifest_sha256": "11318ad0d9ac049fb416f4a738a034f3a24b56b1b3bfb379af55fcc187c553d0",
+  "control_manifests": {
+    "lossless": "11318ad0d9ac049fb416f4a738a034f3a24b56b1b3bfb379af55fcc187c553d0",
+    "canonical": "68a05744dcc65c20ea742beb76e940581ed9b94c8e8b932b72b7dfd250a19751",
+    "fp8": "c29c51ee205a1da873213cccc4d880332c5f83ef1d7943a570d65d3f98577278",
+    "int8": "72654097390beb858c2778a1c64781c1500ed97d9bfdd88a77c9ffe7d345168c"
+  },
+  "scope": "M5 specialization of existing lossless target-head source. Native driver ABI and exact canonical-bit reconstruction, captured normal/changed/zero inputs, output guards, GPU FP64 reference. Four reversed cache-evicted timing pairs per nonzero synthetic input. Canonical rank3 shard; all-rank bit checks required on native loading. No target change or acceptance claim."
+}

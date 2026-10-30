@@ -1,0 +1,22 @@
+{
+  "schema": 2,
+  "thinking_mode": "thinking",
+  "reasoning_effort": "high",
+  "scope": "Explicit transport exception contract. Original v1 observations and frozen34-check grader remain unchanged; this is a new task variant, not a reinterpretation of its answers.",
+  "cases": [
+    {
+      "id": "python-http-retry-explicit-errors",
+      "workload": "Coding retry patch with an explicit transport exception contract",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a coding agent working in a repository. Inspect the supplied code and tool results, explain the root cause, and provide a concrete patch with meaningful tests. Preserve existing behavior outside the requested change."
+        },
+        {
+          "role": "user",
+          "content": "Fix this async HTTP retry helper. Retry only transport failures, HTTP408/429 and5xx. For this transport, only OSError and its subclasses (including ConnectionError and TimeoutError) are transport failures. ValueError, AssertionError and other non-OSError exceptions from transport.get are programming errors and must propagate immediately without retry or sleep. Respect bounded Retry-After, propagate cancellation, support injectable sleep/jitter for deterministic tests, and never sleep after the final attempt. Keep successful-response behavior. Return the complete implementation and focused pytest tests.\n\nclient.py:\n```python\nimport asyncio\nimport random\nfrom dataclasses import dataclass\n\n@dataclass\nclass Reply:\n    status: int\n    body: bytes\n    retry_after: float | None = None\n\nclass Client:\n    def __init__(self, transport, *, attempts=4, base_delay=0.1, max_delay=5.0):\n        self.transport = transport\n        self.attempts = attempts\n        self.base_delay = base_delay\n        self.max_delay = max_delay\n\n    async def fetch(self, url):\n        last = None\n        for attempt in range(self.attempts):\n            try:\n                reply = await self.transport.get(url)\n                if reply.status >= 400:\n                    raise RuntimeError(f'HTTP {reply.status}')\n                return reply.body\n            except Exception as exc:\n                last = exc\n                delay = min(self.max_delay, self.base_delay * 2 ** attempt)\n                await asyncio.sleep(delay + random.random() * delay)\n        raise last\n```\n\nLatest test run:\nFAILED test_does_not_retry_http_404: expected 1 transport call, got 4\nFAILED test_does_not_sleep_after_last_failure: expected 3 sleeps, got 4\nFAILED test_retry_after_is_bounded: expected delay <= 5.0\nPASSED test_eventual_success\nPASSED test_cancellation_propagates\n"
+        }
+      ]
+    }
+  ]
+}

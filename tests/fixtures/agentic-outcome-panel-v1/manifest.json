@@ -1,0 +1,14 @@
+{
+  "files": {
+    "evaluate.py": "504a31f3cfadc3dc7599e32fa45be6d62f166134215affd24198a8b4342a3901",
+    "initial_client.py": "c4e8f377aaaa6b2ce83711354727993b33c4df6ca0f3c5739799e04c02b015fc",
+    "initial_test_client.py": "75a9fc34742158832e76e680da7e100e37f865819c1c791ecc490f38403dcdd6",
+    "run.py": "5e097bceee9034f4c9624161f49762e73abaf2a3f2a62d86e9085f87d2180c9e",
+    "selfcheck.py": "b1f70f5fd58c76daa8159b774bea5b1d5ff7ceedc3dcd67587fb50b30914cc6d",
+    "selfcheck_client.py": "2b984dbb6e3a34f798524c0ad977d327c5225f6fd7bb8209e4054ed00807e279",
+    "selfcheck_test_client.py": "333ea78b6d7c15feec23222476f860d1abd7ddfa937914357b6d2a5c906ccf0d",
+    "task.json": "e199872bd8448d38004a61d272e2e01966061d65eba23ed3383bfc34a214e920"
+  },
+  "prepared_only": true,
+  "executed": false
+}

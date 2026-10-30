@@ -1,0 +1,16 @@
+{
+  "id": "atomic-batch-v1",
+  "instructions": "Implement apply_batch(state, operations) in client.py and add tests. state is a dict of string keys to integer values. Each operation is a tuple: (\"set\", key, value), (\"add\", key, integer_delta), (\"delete\", key), or (\"check\", key, expected_value). Evaluate operations in order on a private working copy. add and delete require the key to exist or raise KeyError; check requires both an existing key and an equal value or raises ValueError. Unknown operations or wrong tuple lengths raise ValueError. Inputs otherwise use the types stated. On any failure leave state exactly unchanged and propagate the specified exception. On success update the ORIGINAL state dict in place with the final working contents and return a new snapshot dict equal to it; return value must not alias state. Operations may be a one-shot generator: consume it only once. Propagate iterator exceptions without committing. An empty batch succeeds. Do not mutate the operations or any operation tuple. Use only the standard library and run tests on the final files.",
+  "system": "You are a coding agent. Complete the requested change using the supplied tools. Do not claim tests passed unless you ran them. Only the declared tools are available.",
+  "temperature": 1,
+  "top_p": 1,
+  "max_tokens": 262144,
+  "reasoning_effort": "high",
+  "max_calls": 16,
+  "max_case_seconds": 900,
+  "initial_files": [
+    "client.py",
+    "test_client.py"
+  ],
+  "held_out_grader_sha256": "beb18d2ffb03d7c4e3841a02f5aae7c50d3e303d516b8b17ebbd8d44cbdf568c"
+}

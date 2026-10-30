@@ -1,0 +1,44 @@
+{
+  "all_live_exact": true,
+  "cases": [
+    {
+      "live_rows": 1,
+      "exact": true,
+      "sha256": "e8a9d56ebf8fcfe9e5791d9c3d353e7669b4a047c35bae7f819ce7fd46cec314"
+    },
+    {
+      "live_rows": 2,
+      "exact": true,
+      "sha256": "f6899833119297025b61cf65bb18d5a3ea21f29dddef1dc15a0b29e85d6a6b0a"
+    },
+    {
+      "live_rows": 3,
+      "exact": true,
+      "sha256": "04855b6b8d34d6b23b907e02e3b87cbcb9bde609ea7e21617f5a7e256fafc253"
+    },
+    {
+      "live_rows": 4,
+      "exact": true,
+      "sha256": "29e9462c8d4b0ab71d68c3fee20a3404d488889e222c8899987a79ac09c6b796"
+    },
+    {
+      "live_rows": 6,
+      "exact": true,
+      "sha256": "6108d9df9a2e2bae53b59928845deb3da99f7e1e99600962fe9fa3c53373bf26"
+    },
+    {
+      "live_rows": 0,
+      "exact": true,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "nodes": [
+    "gemm.mxfp8_quant_cute",
+    "moe.w4a8.compact_micro",
+    "moe.w4a16.topk_sum"
+  ],
+  "canonical_layer": 0,
+  "tensor_parallel_rank": 3,
+  "scratch_bytes": 5603344,
+  "runtime_python_required": false
+}

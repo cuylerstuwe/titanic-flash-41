@@ -1,0 +1,67 @@
+{
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "Installed source in immutable Canada image82bb5857; exact SHA256 pins below",
+  "license": "BSD-3-Clause dense; Apache-2.0 quantizer",
+  "role": "Selected low-level GPU primitives only; no engine runtime",
+  "source_pins": {
+    "dense": {
+      "file": "/opt/sglang/lib/python3.12/site-packages/flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py",
+      "sha256": "eee668e5c143f1c31690ad8a7b44f65050fee3232df1e1c484a3789c2ef0d960"
+    },
+    "quant": {
+      "file": "/opt/sglang/lib/python3.12/site-packages/flashinfer/quantization/kernels/mxfp8_quantize.py",
+      "sha256": "271ec175cf3d0f71e7c9962d47c219c82f838cdb1b8704b135a980ced4020e21"
+    }
+  },
+  "geometry": {
+    "rows": 6,
+    "in_features": 5120,
+    "out_features": 1280,
+    "scale_a_bytes": 20480,
+    "scale_b_bytes": 204800,
+    "mma_tiler_mn": [
+      64,
+      64
+    ],
+    "swap_ab": false,
+    "tile_k": 128,
+    "split_k_slices": 1,
+    "split_k_atomic_bf16": false,
+    "max_active_clusters": 48,
+    "use_prefetch": false,
+    "quantizer_2t": false,
+    "quantizer_grid": 128
+  },
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "flashinfer.mxfp8.quant.pdl0",
+      "enable_pdl": false,
+      "header_sha256": "d307677cb23a3ee1cdf7657edffecf0d255ffce2986b1387ce8d82ffa3e6d48d",
+      "object_sha256": "1ce3f698cadf1ec5fad0242f7af9677cf1f160c91819553320816261303b67cf"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "flashinfer.mxfp8.dense.pdl0",
+      "enable_pdl": false,
+      "header_sha256": "c2a5b2f26931355b13147e6ce97b8da2bbfdc31bf30a9dbc85a7995c242d0930",
+      "object_sha256": "4ee2e08fcae8907bde1e9a13343ae1199c97d7279f7d08a591444ca30fe23243"
+    },
+    {
+      "name": "kernel_002",
+      "kernel_id": "flashinfer.mxfp8.quant.pdl1",
+      "enable_pdl": true,
+      "header_sha256": "74f5ca8c9eb065d0cec74127eee2a6302871a14cc703f5daa2921211797ed13b",
+      "object_sha256": "a29ef49aab541f038989ff07989915665b491182cbc87098b157b21f06caccb7"
+    },
+    {
+      "name": "kernel_003",
+      "kernel_id": "flashinfer.mxfp8.dense.pdl1",
+      "enable_pdl": true,
+      "header_sha256": "5aa64ba77f90d6931275cde6ba9db16392d6963299eb08aeb983e67c9bc39ce4",
+      "object_sha256": "7576a90b02dd2abdf353f1f84fd0e0ddb1962104b875ff96634a6b5b78f418bc"
+    }
+  ]
+}

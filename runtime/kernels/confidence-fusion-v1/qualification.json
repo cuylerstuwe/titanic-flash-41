@@ -1,0 +1,27 @@
+{
+  "all_correct": true,
+  "confidence_fusion": true,
+  "cases": [
+    {
+      "state": "normal",
+      "features_and_latent_exact": true,
+      "finite": true,
+      "errors_clear": true,
+      "max_abs_error_to_fp64": 3.5762786865234375e-07,
+      "captured_graph_replay": true
+    },
+    {
+      "state": "changed",
+      "features_and_latent_exact": true,
+      "finite": true,
+      "errors_clear": true,
+      "max_abs_error_to_fp64": 9.275390766561031e-08,
+      "captured_graph_replay": true
+    }
+  ],
+  "artifact_sha256": "ec40be03482ba514ef0f13ccc9f85d05c2b1f8edad3609215876d8578d95caf6",
+  "manifest_sha256": "a4c22d6e657ccec5b505f70eb8db0921e3d91b1cc3eb32f12ddb17cd2e19d5ae",
+  "source_sha256": "e0ca00d3f23847495a8d5a9d34c672dcd57ce35ad4c0d4426ae6c89968c8d0e9",
+  "full_engine_acceptance": false,
+  "scope": "CUDA-driver four-pointer preparatory kernel and nine-pointer/int causal kernel ABI, two changed-input graph cases, canonical checkpoint weights, exact feature/latent and FP64 GPU dot diagnosis."
+}

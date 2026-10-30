@@ -1,0 +1,143 @@
+{
+  "libraries": [
+    {
+      "id": "primitive",
+      "root": "/scratch/primitive-exports/fp8-canonical-wo_b-r0-m6-v0",
+      "library": "libcanada_primitives.so",
+      "bindings": "bindings.json"
+    }
+  ],
+  "buffers": [
+    {
+      "name": "buffer_000",
+      "bytes": 24576,
+      "file": "buffer_000.bin"
+    },
+    {
+      "name": "buffer_001",
+      "bytes": 21504,
+      "file": "buffer_001.bin"
+    },
+    {
+      "name": "buffer_002",
+      "bytes": 10485760,
+      "file": "buffer_002.bin"
+    },
+    {
+      "name": "buffer_003",
+      "bytes": 327680,
+      "file": "buffer_003.bin"
+    },
+    {
+      "name": "buffer_004",
+      "bytes": 61440,
+      "file": "buffer_004.bin"
+    },
+    {
+      "name": "buffer_005",
+      "bytes": 4,
+      "file": "buffer_005.bin"
+    }
+  ],
+  "nodes": [
+    {
+      "library": "primitive",
+      "entry": 0,
+      "arguments": [
+        {
+          "kind": "pointer",
+          "buffer": "buffer_000",
+          "offset": 0
+        },
+        {
+          "kind": "pointer",
+          "buffer": "buffer_001",
+          "offset": 0
+        },
+        {
+          "kind": "pointer",
+          "buffer": "buffer_001",
+          "offset": 12288
+        },
+        {
+          "kind": "pointer",
+          "buffer": "buffer_001",
+          "offset": 13312
+        },
+        {
+          "kind": "word",
+          "value": 6
+        },
+        {
+          "kind": "word",
+          "value": 2048
+        },
+        {
+          "kind": "word",
+          "value": 24
+        }
+      ]
+    },
+    {
+      "library": "primitive",
+      "entry": 1,
+      "arguments": [
+        {
+          "kind": "pointer",
+          "buffer": "buffer_001",
+          "offset": 0
+        },
+        {
+          "kind": "pointer",
+          "buffer": "buffer_002",
+          "offset": 0
+        },
+        {
+          "kind": "pointer",
+          "buffer": "buffer_001",
+          "offset": 13312
+        },
+        {
+          "kind": "pointer",
+          "buffer": "buffer_003",
+          "offset": 0
+        },
+        {
+          "kind": "pointer",
+          "buffer": "buffer_004",
+          "offset": 0
+        },
+        {
+          "kind": "word",
+          "value": 16
+        },
+        {
+          "kind": "word",
+          "value": 16
+        },
+        {
+          "kind": "word",
+          "value": 16
+        },
+        {
+          "kind": "pointer",
+          "buffer": "buffer_005",
+          "offset": 0
+        },
+        {
+          "kind": "word",
+          "value": 6
+        }
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "output",
+      "buffer": "buffer_004",
+      "offset": 0,
+      "bytes": 61440,
+      "expected": "output-expected.bin"
+    }
+  ]
+}

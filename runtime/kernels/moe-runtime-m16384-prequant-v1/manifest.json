@@ -1,0 +1,66 @@
+{
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+  "license": "Apache-2.0",
+  "architecture": 121,
+  "physical_sms": 48,
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "integration.tp_moe.dynamic",
+      "header_sha256": "f6e3b97b32250496f7dbfb1515ff1e23d74b5c525023ac1069e0a44b65fc9cb5",
+      "object_sha256": "07bc2ee19f0b1514cd9dd8e7096a0a45a83047453b561cf23cf8db875afe4b5d"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "integration.tp_moe.dynamic",
+      "header_sha256": "285900166d9e920212207773c77e9357127f58902cc4d50f1f85be0c5c139c1c",
+      "object_sha256": "373edbced13f36ca3aa315ded307abee56d99c7c75726524c3a876db0b55d27c"
+    },
+    {
+      "name": "kernel_002",
+      "kernel_id": "gemm.mxfp8_quant_cute",
+      "header_sha256": "e4d2d52c98398b53acf2d4fc7a3ce5de84ae71192940fb72cecf046cf04883ab",
+      "object_sha256": "cfde12292874512e4ddb7df38aa5ccb12c24d816644a6b3e2b246b4eddaa713e"
+    },
+    {
+      "name": "kernel_003",
+      "kernel_id": "gemm.mxfp8_quant_cute",
+      "header_sha256": "5e1db79e7c792ec56fa5e17bcabcf7da02a4d3ac223aa3c86fc06b0b04414c7a",
+      "object_sha256": "5eb19c14b7d9f6e51b6cf055144a3eff444baac309bfcda213fa75403984d567"
+    },
+    {
+      "name": "kernel_004",
+      "kernel_id": "moe.w4a16.topk_sum",
+      "header_sha256": "3c629576c9519b469a32cb1f33accb9f54d16f8ebb86ffe31d0c8b709811c626",
+      "object_sha256": "d38ab847d1264788f8f94e3d1b0e9f583546b3a6f8ea278b7c04c7d99cec49fc"
+    }
+  ],
+  "geometry": {
+    "experts": 384,
+    "hidden": 5120,
+    "intermediate": 576,
+    "topk": 6,
+    "rows": 16384
+  },
+  "prequantized_input_overlay": {
+    "base_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+    "license": "Apache-2.0",
+    "source": "https://github.com/local-inference-lab/b12x",
+    "packed_input_layout": "dual_quant_rows_v1: each row has K E4M3 bytes, K/32 UE8M0 bytes, K/8 correction-mask bytes",
+    "files": {
+      "b12x_next/moe/_shared/kernels/dynamic.py": {
+        "original_sha256": "2002c3f3fd01783d7214b0df95004692fcc89b78558554b9f857efe23de6455c",
+        "patched_sha256": "4001a6789c18bd9588f0e7e4a4012e13fe067e7d8770bcab3ed9b77a8aa50de1"
+      },
+      "b12x_next/moe/fused_moe/_impl.py": {
+        "original_sha256": "69b31e9d9ef898b04f1411da1e7ed0d5acd545d0f54976c718540a3fe546925c",
+        "patched_sha256": "2f474f669d3af802d65d697bf54a11713afcd347d017ae16c6e75be5d94ed86d"
+      }
+    }
+  },
+  "input_format": "dual_quant_rows_v1",
+  "input_bytes": 96993280,
+  "codec_source_sha256": "699184729085b406cf51f50966dac93c02575e5c3397a7903ddde0e4a9dc0f6c",
+  "codec_library_sha256": "2525383543b80033b06d86febd0ab78f7e155f6bbdc007b35676dc26cbf8b6bd"
+}

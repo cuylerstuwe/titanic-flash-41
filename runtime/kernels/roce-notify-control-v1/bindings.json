@@ -1,0 +1,283 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "SG17 release archive 4922d0db9395fb8b537d7e216d509a5747867a45f20c18290e385786609dd05f",
+  "license": "Apache-2.0",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "canada.roce.notify_control.rank0",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "f1608022c3edb656bd7565e4d5ceda8dd6d384e229b1873fd2edabd4b35dbffe"
+    },
+    {
+      "index": 1,
+      "name": "kernel_001",
+      "kernel_id": "canada.roce.notify_control.rank1",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "d984b0c2e265d8a3db95d2f702c7533c14d1a3607d3019f0ee10e3473004178c"
+    },
+    {
+      "index": 2,
+      "name": "kernel_002",
+      "kernel_id": "canada.roce.notify_control.rank2",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "c815944425449bfb65211a4897459ea8f578b27e1d4c2289ac4c6e5bbe42fe2d"
+    },
+    {
+      "index": 3,
+      "name": "kernel_003",
+      "kernel_id": "canada.roce.notify_control.rank3",
+      "arguments": [
+        {
+          "name": "input_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "output_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "size_packs",
+          "kind": "i32"
+        },
+        {
+          "name": "nbytes",
+          "kind": "i32"
+        },
+        {
+          "name": "recv_base",
+          "kind": "i64"
+        },
+        {
+          "name": "flag_base",
+          "kind": "i64"
+        },
+        {
+          "name": "send_base",
+          "kind": "i64"
+        },
+        {
+          "name": "ctrl_base",
+          "kind": "i64"
+        },
+        {
+          "name": "slot_bytes",
+          "kind": "i64"
+        },
+        {
+          "name": "epoch_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "stage_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "tail_counter_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "poison_ptr",
+          "kind": "i64"
+        },
+        {
+          "name": "spin_limit",
+          "kind": "u32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "2e22a39cc1c18d1942e4535ee5178a7cb6708820a8c0e312ccc60587d9eadea3"
+    }
+  ],
+  "library_sha256": "3bf8f6a73ea006fe4876acbd1d3e0552ceb75b1720269bd6413aedbd7c7b9660"
+}

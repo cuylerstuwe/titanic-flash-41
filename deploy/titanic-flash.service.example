@@ -1,0 +1,22 @@
+[Unit]
+Description=Titanic Flash 4.1 four-rank inference cohort
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+StartLimitIntervalSec=1800
+StartLimitBurst=2
+
+[Service]
+Type=simple
+# Replace this with the unprivileged deployment account on the head.
+User=REPLACE_WITH_DEPLOYMENT_USER
+WorkingDirectory=/srv/titanic-flash-41/source
+ExecStart=/usr/bin/python3 /srv/titanic-flash-41/source/deploy/fleet.py serve /srv/titanic-flash-41/state/fleet.json
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=150
+KillSignal=SIGTERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

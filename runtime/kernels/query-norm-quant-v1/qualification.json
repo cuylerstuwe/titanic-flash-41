@@ -1,0 +1,11 @@
+{
+  "all_exact": true,
+  "query_norm_quant_screen": true,
+  "checks": 14,
+  "component_report_sha256": "3a265789c59b7f7b003c3e67b8ca2f63c96e8307f2d8f3e2d87e0ee40385dbd5",
+  "artifact_sha256": "b711fd33f831c01138f2c517f04897e32e56b1f8ff58205c22c589ce1caa1999",
+  "manifest_sha256": "03f238299afc63992e9ebd4c3dc551089c713f04bdb5f1d897357204c39a6116",
+  "source_sha256": "be6fd976e6344acbf49a23334718033fa800dbe3170f0ff1ab88c25d12264888",
+  "full_engine_acceptance": false,
+  "scope": "M6 physical rows, two input strides, seven patterns each; exact BF16 RMS, FlashInfer FP8 and UE8M0 scales. Target Q-B only; full-model evaluation follows."
+}

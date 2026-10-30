@@ -1,0 +1,16 @@
+{
+  "id": "layered-config-v1",
+  "instructions": "Implement merge_layers(layers) in client.py and add tests. Each layer is a dict with string keys and JSON-compatible values. Combine left-to-right. A None value at a mapping key deletes that key if present; this rule applies recursively to mappings. A mapping value recursively overlays the existing mapping at that key, or an empty mapping if the old value is not a mapping. All other values, including lists, replace the old value wholesale; None INSIDE a list is ordinary data and never a delete command. Empty overlay mappings preserve an existing mapping; an empty mapping replacing a scalar creates {}. The output must share no mutable objects (dicts or lists, even those nested inside lists) with any input. Do not mutate inputs. layers may be a one-shot iterator. An empty iterator returns {}. Use only the standard library and run tests on the final files.",
+  "system": "You are a coding agent. Complete the requested change using the supplied tools. Do not claim tests passed unless you ran them. Only the declared tools are available.",
+  "temperature": 1,
+  "top_p": 1,
+  "max_tokens": 262144,
+  "reasoning_effort": "high",
+  "max_calls": 16,
+  "max_case_seconds": 900,
+  "initial_files": [
+    "client.py",
+    "test_client.py"
+  ],
+  "held_out_grader_sha256": "2d49232cb0a3d1db98e222125f4c6673e3614190d7643c6cf695c389e37dd7f4"
+}

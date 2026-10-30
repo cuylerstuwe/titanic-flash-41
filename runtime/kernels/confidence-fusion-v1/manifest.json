@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "architecture": 121,
+  "block_threads": 256,
+  "artifact_sha256": "ec40be03482ba514ef0f13ccc9f85d05c2b1f8edad3609215876d8578d95caf6",
+  "source_sha256": "e0ca00d3f23847495a8d5a9d34c672dcd57ce35ad4c0d4426ae6c89968c8d0e9",
+  "compile_command": [
+    "nvcc",
+    "--cubin",
+    "-arch=sm_121",
+    "--std=c++17",
+    "-O3",
+    "--fmad=false",
+    "/scratch/primitive-exports/confidence-fusion-v1/confidence.cu",
+    "-o",
+    "/scratch/primitive-exports/confidence-fusion-v1/confidence.cubin"
+  ],
+  "functions": [
+    {
+      "name": "ca_confidence_hidden_terms",
+      "pointer_arguments": 4,
+      "int_arguments": 0
+    },
+    {
+      "name": "ca_confidence_fused_latent",
+      "pointer_arguments": 9,
+      "int_arguments": 1
+    }
+  ],
+  "contract": "Original Canada split confidence projection. Canonical BF16 embedding/hidden values widened to FP32, FP32 accumulation and sigmoid. Causal work scheduling only; actual proposal q and target unchanged."
+}

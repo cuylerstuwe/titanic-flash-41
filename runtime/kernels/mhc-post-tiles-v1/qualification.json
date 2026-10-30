@@ -1,0 +1,10 @@
+{
+  "all_exact": true,
+  "mhc_post_tiles_screen": true,
+  "checks": 14,
+  "artifact_sha256": "ceb600b836faddb1f815a7590a3c136f37fcb63841028c57ef775905933c37bb",
+  "source_sha256": "070e231216e95ed8ddfecb73d25597ea2e677513cf0cf9bc8673ff4645f9695c",
+  "component_report_sha256": "5fd50f68d069ecb23ac4cf75bedd078821d38b1ffc44401cc0794176441f10ae",
+  "manifest_sha256": "b6e6dc4d603745c26fec10ee61037e2342c1d5206c0dcfd6609976260a212d1e",
+  "full_engine_acceptance": false
+}

@@ -1,0 +1,52 @@
+{
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+  "license": "Apache-2.0",
+  "role": "selected low-level GPU primitives only; no model engine",
+  "architecture": 121,
+  "physical_sms": 48,
+  "geometry": {
+    "rows": 4096,
+    "in_features": 6144,
+    "out_features": 6400,
+    "block_size": 32,
+    "checkpoint_prefix": "layers.1.engram.wkv",
+    "rank": 0,
+    "dense_policy": {
+      "split_k_slices": 1,
+      "split_k_atomic_bf16": false,
+      "output_clear": false
+    },
+    "quantizer": {
+      "subgroup_width": 4,
+      "threads": 256,
+      "grid_ctas_per_sm": 4
+    },
+    "output_layout": "row_major_bf16",
+    "quantized_c": false
+  },
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "gemm.mxfp8_quant_cute",
+      "header_sha256": "665e66a1d1127a3790113b69e5b9b07b882a5b81516cae364e1af51deb46d48a",
+      "object_sha256": "bb0fbdc5406308649d20ccfda5884c678737f8d258e956dda716e3bfacbab667"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "gemm.dense",
+      "header_sha256": "e0c076fc07cbf22ca3e68c301a059bf0e11d6bfdbf178a13092a5d928564e560",
+      "object_sha256": "eeeee274d9b26b509d7c54cceae0a81d7b6620b568a33d6523284021e343e61f"
+    }
+  ],
+  "source_modifications": {
+    "base_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+    "original_sha256": "3d6beb905def96efd4eec8c121a7866065467c046fcdd76f1240b00dad004375",
+    "derived_sha256": "fa94b2e382a417fbf4360ac8553d711f04a7b39fba885f367865b0eb7a276ff0",
+    "patch_sha256": "d084eb391cbe70f3d782d5eaaa3e7030ac957798393b86323eea25002e40a8e2",
+    "parent_manifest_sha256": "cac5b8ae03e494f635f9de668e226af5a40aba5d1398a5f984d33b7766c6ab47",
+    "control_dense_object_exact": true,
+    "change": "generic shared read fence and warp join before elected TMA consumer release",
+    "numerical_contract": "unchanged quantizer, dense ABI, lowering policy, MMA arithmetic and output precision"
+  }
+}

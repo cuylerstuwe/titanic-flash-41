@@ -1,0 +1,28 @@
+{
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "installed FlashInfer 0.6.18 from pinned Canada image",
+  "source_sha256": "b273fe5444aaf86a1600c196817b7a733b18f6f82030a16e1ef2731c784d48f0",
+  "license": "BSD-3-Clause",
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "norm.rms.h1280.s1280",
+      "width": 1280,
+      "stride": 1280,
+      "max_rows": 65536,
+      "header_sha256": "4c1406ffc9c6bf835c7c3695b42ad11d092b21857744ddc212d96c96f71ec398",
+      "object_sha256": "4720598c57aa34cbb9e95afdbc54047467dd9fd2a2b1f1c494377f21f94936eb"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "norm.rms.h1280.s1792",
+      "width": 1280,
+      "stride": 1792,
+      "max_rows": 65536,
+      "header_sha256": "a57ab59dcdab41037acaa51a8be026826112ec28e29da20c664a1363f1638a8f",
+      "object_sha256": "b799e3e2b45fb44ec73fc2084660ad9058f41671aa59515a5e7c736b748d64ec"
+    }
+  ]
+}

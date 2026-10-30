@@ -1,0 +1,43 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "installed FlashInfer 0.6.18 from pinned Canada image",
+  "license": "Apache-2.0 (rmsnorm.py file)",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "mhc.combine_rms.h5120",
+      "arguments": [
+        {
+          "name": "x",
+          "kind": "pointer"
+        },
+        {
+          "name": "p",
+          "kind": "pointer"
+        },
+        {
+          "name": "w",
+          "kind": "pointer"
+        },
+        {
+          "name": "y",
+          "kind": "pointer"
+        },
+        {
+          "name": "rows",
+          "kind": "i64"
+        },
+        {
+          "name": "eps",
+          "kind": "f32"
+        }
+      ],
+      "header_sha256": "1d22c40f0613f7f6813ffbb12c1479e597a053af84ee8049b8d3ec9a5d724f57"
+    }
+  ],
+  "library_sha256": "f24091ad1bd8ec5afaedfe85369f211616bb9e5d31894a213ed71784c5c6a75c"
+}

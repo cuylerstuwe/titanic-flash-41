@@ -1,0 +1,90 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "heads": 16,
+  "width": 512,
+  "main_topk": 128,
+  "extra_page_tokens": 2,
+  "helper_sha256": "153b497637fe2ad1292bc7b27ef76c3be1f0f9a61fd5785ebd77d05adee72426",
+  "source_sha256": "f7cb21078f1f6d997a3f96f1513eaa8b923ca57b4d17156952ec476e56d60cad",
+  "header_sha256": "5f005980cff1606fc1a239faeb93d1d697710c92014d549e4425e9db04f675e0",
+  "adapted_header_sha256": "551bfacaea043845d21ef418fc27ed38258bcaccb2974d9d3b94994587bddbb5",
+  "adapter_sha256": "20b7916277fb5934c381c1df12849a1b8c5df25aaada7c6f6982055470be8663",
+  "libraries": {
+    "2": {
+      "file": "libdirect2.so",
+      "sha256": "9ec2f1221c2be0f1f7ddd19e147a06cada0092757ec79136903575c88ac78524",
+      "compiler_arguments": [
+        "nvcc",
+        "-shared",
+        "-Xcompiler=-fPIC",
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "-gencode=arch=compute_121a,code=sm_121a",
+        "-DNDEBUG",
+        "-DCANADA_BF16_KEY_SPLITS=2",
+        "-I/scratch/primitive-exports/attention-direct-split-s780/include",
+        "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include",
+        "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/attention/sparse_mla_sm120",
+        "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/cutlass/include",
+        "/scratch/primitive-exports/attention-direct-split-s780/direct.cu",
+        "/scratch/primitive-exports/attention-direct-split-s780/split-bf16-attention.cu",
+        "-o",
+        "/scratch/primitive-exports/attention-direct-split-s780/libdirect2.so",
+        "-lcudart"
+      ]
+    },
+    "4": {
+      "file": "libdirect4.so",
+      "sha256": "25cd90c88ded2802348b8e686e95b0c73efd9bf041510d18c9c3e274d189a8a0",
+      "compiler_arguments": [
+        "nvcc",
+        "-shared",
+        "-Xcompiler=-fPIC",
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "-gencode=arch=compute_121a,code=sm_121a",
+        "-DNDEBUG",
+        "-DCANADA_BF16_KEY_SPLITS=4",
+        "-I/scratch/primitive-exports/attention-direct-split-s780/include",
+        "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include",
+        "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/attention/sparse_mla_sm120",
+        "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/cutlass/include",
+        "/scratch/primitive-exports/attention-direct-split-s780/direct.cu",
+        "/scratch/primitive-exports/attention-direct-split-s780/split-bf16-attention.cu",
+        "-o",
+        "/scratch/primitive-exports/attention-direct-split-s780/libdirect4.so",
+        "-lcudart"
+      ]
+    },
+    "8": {
+      "file": "libdirect8.so",
+      "sha256": "ea39f9b940e485ee6116c06264a1dfb38cb7b1a54917367ae478a60c1737db31",
+      "compiler_arguments": [
+        "nvcc",
+        "-shared",
+        "-Xcompiler=-fPIC",
+        "-std=c++17",
+        "-O3",
+        "--use_fast_math",
+        "-gencode=arch=compute_121a,code=sm_121a",
+        "-DNDEBUG",
+        "-DCANADA_BF16_KEY_SPLITS=8",
+        "-I/scratch/primitive-exports/attention-direct-split-s780/include",
+        "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include",
+        "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include/flashinfer/attention/sparse_mla_sm120",
+        "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/cutlass/include",
+        "/scratch/primitive-exports/attention-direct-split-s780/direct.cu",
+        "/scratch/primitive-exports/attention-direct-split-s780/split-bf16-attention.cu",
+        "-o",
+        "/scratch/primitive-exports/attention-direct-split-s780/libdirect8.so",
+        "-lcudart"
+      ]
+    }
+  },
+  "license": "BSD-3-Clause",
+  "source": "Pinned FlashInfer raw CUDA kernel, no engine",
+  "numerical_contract": "BF16 QK, existing FP8 XV, BF16 partial outputs, sink mass divided across parts; GPU FP32 LSE merge. Disjoint64-keytiles; original KV layout/bytes."
+}

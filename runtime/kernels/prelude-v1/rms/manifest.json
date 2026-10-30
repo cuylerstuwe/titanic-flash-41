@@ -1,0 +1,64 @@
+{
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "installed FlashInfer 0.6.18 from pinned Canada image",
+  "source_sha256": "b273fe5444aaf86a1600c196817b7a733b18f6f82030a16e1ef2731c784d48f0",
+  "license": "BSD-3-Clause",
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "norm.rms.h512.s512",
+      "width": 512,
+      "stride": 512,
+      "max_rows": 65536,
+      "header_sha256": "e6b755b7fea39ecc1ee4c22583f29a9bfacf28639c5cbb06c4cf0dd6e701ecd8",
+      "object_sha256": "69e9e1083afadb7350be7d6eb58c2f0ade823237ee754c3e90d93f1356b43391"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "norm.rms.h1280.s1280",
+      "width": 1280,
+      "stride": 1280,
+      "max_rows": 65536,
+      "header_sha256": "6c706191562c3f0fed13d4da63cbcea2d3636f37fd85746a8ec024877dd53223",
+      "object_sha256": "559716e48e97c3b41f9320a3f08624268afc1bb02eef594959041e5a1da0cf60"
+    },
+    {
+      "name": "kernel_002",
+      "kernel_id": "norm.rms.h5120.s5120",
+      "width": 5120,
+      "stride": 5120,
+      "max_rows": 65536,
+      "header_sha256": "cbe74f760aca20bbeee49179069d22b653a8f3cc1eab4e94c60d143b384bc268",
+      "object_sha256": "326db31f29909f669ed208cf9c01698f2136c5a22b5980d1ccdb773987e2b7df"
+    },
+    {
+      "name": "kernel_003",
+      "kernel_id": "norm.rms.h512.s768",
+      "width": 512,
+      "stride": 768,
+      "max_rows": 65536,
+      "header_sha256": "1d02ea4cfa05742012e9ae82b70605ae411ad73e49280dcfb42a2cd738868e60",
+      "object_sha256": "ae2426dd924984a10af6875db800c604767fa5acbe197a1c6a5e302500533ad8"
+    },
+    {
+      "name": "kernel_004",
+      "kernel_id": "norm.rms.h1280.s1536",
+      "width": 1280,
+      "stride": 1536,
+      "max_rows": 65536,
+      "header_sha256": "c2d7f0723e27042d606443f1b6e5ab0269f5365f30822d7a53279b12fda293f3",
+      "object_sha256": "73b6eec4d929638b47dc86717a2b9766a4b541beba6001ab26bbedc4879d0388"
+    },
+    {
+      "name": "kernel_005",
+      "kernel_id": "norm.rms.h5120.s5376",
+      "width": 5120,
+      "stride": 5376,
+      "max_rows": 65536,
+      "header_sha256": "db96b9e961192dfe076b13b2549306d671d14298d07fb2935f093f599f855916",
+      "object_sha256": "b676d2639c1f699e42c99e783146c5f6ec1c6f92f218f3b8f5d2ca17daa1aada"
+    }
+  ]
+}

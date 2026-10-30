@@ -1,0 +1,15 @@
+{
+  "source_commit": "162d95339419a7641e42dd76e58a0b2c378d3d30",
+  "source_component": "s699",
+  "architecture": 121,
+  "layout": "dual_quant_rows_v1",
+  "columns": 5120,
+  "numerical_contract": "Same native routed/shared quantizers and 5920-byte row format; coalesced IO only.",
+  "canonical_reference_sha256": "ef5e336f5fb1a00f02e7910bb7800db724bda14bc2055804b5b7dba0aa5e837c",
+  "files": {
+    "libcanada_moe_input_codec.so": "079b3970a6c444cd06df3a48896ef2e4a2c558bdfcd3a88b0197da4e6f8875e9",
+    "moe-registered-pack.cu": "557592264ab38b36744ef88234b5d092639fe6a6787187517c0f0e6589a6a573",
+    "moe-dual-quant-codec-fast.cu": "f1d3561d91d87a95d458f84f142de040f7eabfdfbb704d2175cf0fe6f54e5178"
+  },
+  "license": "Apache-2.0 upstream formulas attributed in included source; new row IO organization is original."
+}

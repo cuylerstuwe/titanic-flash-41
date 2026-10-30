@@ -1,0 +1,16 @@
+{
+  "id": "retry-agent-loop-v1",
+  "instructions": "Fix this async HTTP retry helper. Retry only transport failures, HTTP408/429 and5xx. For this transport, only OSError and its subclasses (including ConnectionError and TimeoutError) are transport failures. ValueError, AssertionError and other non-OSError exceptions from transport.get are programming errors and must propagate immediately without retry or sleep. Respect bounded Retry-After, propagate cancellation, support injectable sleep/jitter for deterministic tests, and never sleep after the final attempt. Keep successful-response behavior. Use the provided file and test tools to fix client.py and add focused pytest coverage in test_client.py. Run the tests before finishing. All files are local to this disposable task; no external services are needed.",
+  "system": "You are a coding agent. Complete the requested change using the supplied tools. Preserve behavior outside the requested change. Do not claim tests passed unless you ran them. Only the declared tools are available.",
+  "temperature": 1,
+  "top_p": 1,
+  "max_tokens": 262144,
+  "reasoning_effort": "high",
+  "max_calls": 24,
+  "max_case_seconds": 900,
+  "initial_files": [
+    "client.py",
+    "test_client.py"
+  ],
+  "held_out_grader_sha256": "504a31f3cfadc3dc7599e32fa45be6d62f166134215affd24198a8b4342a3901"
+}

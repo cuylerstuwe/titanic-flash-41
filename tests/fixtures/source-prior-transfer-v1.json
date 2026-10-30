@@ -1,0 +1,102 @@
+{
+  "schema": "source-prior-transfer-v1",
+  "thinking_mode": "thinking",
+  "reasoning_effort": "high",
+  "temperature": 1,
+  "top_p": 1,
+  "scope": "Four fresh authored task families reserved for the first transfer check of the unchanged s803 whole-step feedback rule. One seed and384-token cap per task, fixed versus feedback only. Not completed outcome quality or a workload distribution.",
+  "cases": [
+    {
+      "id": "rust-incremental-frames",
+      "category": "code",
+      "family": "incremental-protocol",
+      "request": {
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Design and implement a streaming frame decoder in Rust using only the standard library. Each frame begins with an unsigned decimal byte length followed by a colon, then exactly that many arbitrary payload bytes, followed by a comma. Chunks may end anywhere, including inside the length field or between the final payload byte and its comma. Empty payloads are allowed. Reject a missing length, nondecimal length characters, lengths beyond a caller supplied maximum, and a wrong terminator. Define a poisoned state after an error so that another feed cannot silently recover partway through a malformed frame. Avoid parsing a decimal length into a wider integer and only checking overflow afterward. The feed method may produce several complete owned payloads while retaining an incomplete frame. Include a finish method that distinguishes a clean end of stream from truncation. Explain the memory bound, specify whether leading zeroes are accepted, and test every split point of several concatenated frames, malformed boundaries and a zero-length frame. Do not assume that payloads are UTF-8."
+          }
+        ],
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 202680800,
+        "max_tokens": 384,
+        "stream": false,
+        "chat_template_kwargs": {
+          "thinking": true
+        },
+        "reasoning_effort": "high"
+      }
+    },
+    {
+      "id": "typescript-singleflight-cache",
+      "category": "code",
+      "family": "asynchronous-cache",
+      "request": {
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Implement a TypeScript asynchronous memoization cache with a maximum completed-entry count, an expiration time measured from successful completion, and one in-flight loader call per key. A rejected load must not be cached. Concurrent callers for the same key should receive the same in-flight result. Explicit invalidation must allow a replacement load to start immediately, and the earlier load must not overwrite or delete that replacement when it eventually settles. Completed entries use least-recently-used eviction; in-flight work does not consume the completed-entry budget. Define what happens when a load finishes after every caller has stopped awaiting it, without pretending JavaScript promises can be forcibly cancelled. Inject a monotonic clock so that expiration tests need no sleeps. Give the implementation, state invariants, and deterministic tests using manually resolved promises for invalidation races, rejection, expiration, eviction and concurrent access. State how a zero capacity cache behaves and avoid depending on network libraries or a particular test framework."
+          }
+        ],
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 202680801,
+        "max_tokens": 384,
+        "stream": false,
+        "chat_template_kwargs": {
+          "thinking": true
+        },
+        "reasoning_effort": "high"
+      }
+    },
+    {
+      "id": "museum-audio-prototype",
+      "category": "prose",
+      "family": "creative-accessibility",
+      "request": {
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": "A small local museum wants to prototype a self-guided audio experience for a six-room exhibition. Its volunteers can record speech but cannot build a complex mobile application. Visitors include adults with little time, families, and people who prefer to read rather than listen. Propose three distinct narrative structures, then choose a practical prototype that can be tested during one weekend. Explain how visitors start, skip or rejoin the experience without hearing every room in order. Include a sample opening, a fallback for visitors without headphones or reliable mobile reception, and an approach to transcripts that does not make reading feel secondary. The curator worries that an entertaining story will flatten uncertainty in the historical evidence. Show how the structure can communicate uncertainty clearly while remaining engaging. Define a short observation plan that measures whether visitors understand and remember the exhibition rather than merely whether they activate a QR code. Identify which decisions should stay reversible until the prototype is evaluated."
+          }
+        ],
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 202680802,
+        "max_tokens": 384,
+        "stream": false,
+        "chat_template_kwargs": {
+          "thinking": true
+        },
+        "reasoning_effort": "high"
+      }
+    },
+    {
+      "id": "build-queue-investigation",
+      "category": "prose",
+      "family": "operations-investigation",
+      "request": {
+        "model": "DeepSeek-V4.1-Flash-1017",
+        "messages": [
+          {
+            "role": "user",
+            "content": "A software team's build queue has become slower, but total CPU utilization is usually below fifty percent. Some jobs wait for scarce test devices, some share a dependency download service, and some retry after a flaky test. The team has only partial logs: enqueue time, start time, finish time, final status, worker name and repository. It can add a small amount of instrumentation next week but cannot replace the build system now. Propose a practical investigation that separates queueing, useful execution, resource waiting and wasted retries. List competing explanations for the low utilization and say which observations would discriminate between them. Recommend two reversible scheduling or caching experiments, including what must stay fixed to compare them fairly. Explain how to avoid making a quick repository look better by delaying a slower repository's work. Give a concise plan for the first three days, the minimum additional fields to log, and a decision rule for keeping or rolling back each experiment. Do not infer a bottleneck solely from aggregate utilization."
+          }
+        ],
+        "temperature": 1,
+        "top_p": 1,
+        "seed": 202680803,
+        "max_tokens": 384,
+        "stream": false,
+        "chat_template_kwargs": {
+          "thinking": true
+        },
+        "reasoning_effort": "high"
+      }
+    }
+  ]
+}

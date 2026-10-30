@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "architecture": 121,
+  "threads": 128,
+  "grid": 192,
+  "query_rows": 6,
+  "lanes_per_key": 4,
+  "function": "ca_sparse6_gather_keys_packed4",
+  "source_sha256": "3e15bcdbb8428d2d4f052b278e91e6bd207aa70d7d72a5a54eec27070d6e8cd6",
+  "artifact_sha256": "dc78579e7b22ccc9dd0f7538e50908002df1ee5cace166b8ef32913fd04b7c41",
+  "qualification_sha256": "8931210decfc93114142faecb9af8b6801657bc3c7428d6af8b5e51a9e750644",
+  "source_version": "s467",
+  "contract": "Exact raw-byte sparse paged-key copies; same compact block IDs, slots, rounded padding, bounds and invalid-live-slot error. Four lanes copy one64-byte key; no model arithmetic or precision change."
+}

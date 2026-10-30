@@ -1,0 +1,131 @@
+{
+  "schema": "agentic-exploration-v1",
+  "thinking_mode": "thinking",
+  "reasoning_effort": "high",
+  "temperature": 1,
+  "top_p": 1,
+  "scope": "Public authored prompt pool for rotating small screens. Mostly coding plus ideation and operations. Not a representative user-traffic sample or a completed quality evaluation.",
+  "selection": {
+    "rotation": "Choose different families from recent screens; do not always take first entries.",
+    "transfer": "Reserve transfer tasks for checking promising policies after selection on exploration tasks. Do not tune on their results and continue calling them held out.",
+    "phases": "Collect reasoning, answer and tool-call frontiers explicitly; preserve phase labels and real emitted prefixes.",
+    "contexts": "Use varied relevant repository/tool/history material for long contexts, including beyond128K when useful. Do not multiply each screen by every context or pad only with repeated filler.",
+    "workload_policy_screen_start": "Often start with two different task families when the hypothesis depends on workload. This is an example, not a mandatory per-experiment count; pure kernel screens need no added prompt panel."
+  },
+  "validation": {
+    "mechanism": "Use small component and state checks first; policies depend more strongly on workload than removal of unused computation.",
+    "caps": "Capped generation is performance evidence, not a completed outcome. Separate TTFT, decode, total time and outcome quality.",
+    "precision": "Canonical target settings and weights; actual-q rejection for proposal changes.",
+    "background": "Default foreground only unless a specific regression mechanism or final whole-stack qualification warrants background."
+  },
+  "cases": [
+    {
+      "id": "python-pagination-streaming",
+      "workload": "debugging-python",
+      "family": "debugging-python",
+      "split": "exploration",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Fix this small streaming API client. Return the revised function and focused pytest tests. Explain the failure briefly.\n\nAPI contract: fetch(cursor) returns {'items': iterable, 'next_cursor': cursor_or_None}. Only None means end of pagination; 0 and the empty string are valid cursors. The first fetch uses None. Pages can be empty. The function must stay lazy: do not request the next page until the current page is exhausted by the consumer. If a non-None cursor repeats, raise ValueError before fetching that cursor again. Propagate fetch exceptions unchanged. Do not retry or buffer all pages.\n\nCurrent implementation:\n    def records(fetch):\n        cursor = None\n        while True:\n            page = fetch(cursor)\n            yield from page['items']\n            cursor = page.get('next_cursor')\n            if not cursor:\n                return\n\nA user reports that cursor 0 ends iteration early. Another reports an infinite loop on an empty page with a repeated next cursor. Include tests for these reports, early consumer termination, a one-shot items iterator, and exception propagation."
+        }
+      ],
+      "quality_checks": [
+        "Preserves valid falsy cursors and empty pages",
+        "Detects repeat before duplicate fetch",
+        "No eager next-page request or materialization",
+        "One-shot iterator and exception tests pass"
+      ]
+    },
+    {
+      "id": "rust-config-parser",
+      "workload": "feature-rust",
+      "family": "feature-rust",
+      "split": "exploration",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Implement a small Rust configuration parser with no external crates. Provide complete code and unit tests.\n\nSignature: pub fn parse_limits(text: &str) -> Result<Limits, ParseError>. Limits has jobs: u16 and timeout_ms: Option<u32>. Defaults are jobs=4 and timeout_ms=None. An empty or whitespace-only string uses defaults. Otherwise parse comma-separated key=value fields; whitespace around fields, keys and values is allowed. The only keys are jobs and timeout_ms. Reject duplicate keys, unknown keys, missing '=' or values, extra '=', empty fields (including trailing commas), signs, non-ASCII digits, and overflow. jobs must be 1..=64. timeout_ms may be the exact lowercase word 'none' or an integer 1..=3600000. ParseError should identify the one-based field number and a useful reason; an error must never leave a partially returned configuration. Do not silently clamp or ignore input. Explain how your tests cover boundary and malformed inputs."
+        }
+      ],
+      "quality_checks": [
+        "Defaults and boundaries correct",
+        "Malformed input and duplicates rejected",
+        "Field errors identify correct index",
+        "No external dependency or silent correction"
+      ]
+    },
+    {
+      "id": "typescript-abort-race",
+      "workload": "debugging-typescript",
+      "family": "debugging-typescript",
+      "split": "transfer",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Review and replace this timeout wrapper. Supply TypeScript code and tests with fake timers or an explicit deterministic test clock.\n\nRequired API: withTimeout<T>(work: (signal: AbortSignal) => Promise<T>, ms: number, outer?: AbortSignal): Promise<T>.\nRequirements: reject negative/nonfinite ms before starting work; an already-aborted outer signal prevents work from starting; otherwise work starts once with a fresh signal. Resolve/reject with work's result if it wins. Timeout or outer abort must abort the supplied signal and reject the wrapper with an Error carrying the corresponding reason. All terminal paths remove listeners and cancel timers. Later work settlement must not produce an unhandled rejection. Handle work throwing synchronously. Define simultaneous settlement ordering through the actual event order rather than polling. Do not assume cancellation stops the underlying operation.\n\nCurrent sketch:\n    export function withTimeout<T>(work: () => Promise<T>, ms: number) {\n      return Promise.race([\n        work(),\n        new Promise<T>((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),\n      ]);\n    }\n\nThe bug report says completed work leaves timers alive and an outer cancellation is ignored. Keep the replacement small enough to review."
+        }
+      ],
+      "quality_checks": [
+        "Single start and already-aborted handling",
+        "Timer/listener cleanup on every terminal path",
+        "Sync throw and losing rejection handled",
+        "Cancellation distinguished from guaranteed operation termination"
+      ]
+    },
+    {
+      "id": "sqlite-migration-plan",
+      "workload": "migration-sql",
+      "family": "migration-sql",
+      "split": "exploration",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Design a safe SQLite migration and its verification queries. Explain any assumptions explicitly.\n\nExisting tables:\n    CREATE TABLE projects(id INTEGER PRIMARY KEY, name TEXT NOT NULL);\n    CREATE TABLE notes(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id), slug TEXT NOT NULL, body TEXT NOT NULL);\n\nThe application now requires uniqueness of (project_id, slug), matching slug bytes exactly. Existing data may contain duplicates. Do not discard or merge notes automatically, alter note IDs, or change body/slug text. The migration should report duplicate groups and refuse to install the new constraint when any exist. When none exist, install the uniqueness rule atomically. Existing inserts may run concurrently, so a separate preflight query is insufficient protection. The caller owns the connection and enables foreign-key enforcement. Give a concrete execution sequence, transaction/error handling pseudocode, SQL, rollback behavior, and compact test cases including duplicates across different projects and a write racing the preflight. Avoid an unnecessary full table rebuild."
+        }
+      ],
+      "quality_checks": [
+        "No data loss or silent deduplication",
+        "Atomic uniqueness installation despite preflight race",
+        "Correct project-scoped byte-sensitive uniqueness",
+        "Rollback and concurrent writer behavior described"
+      ]
+    },
+    {
+      "id": "offline-product-ideation",
+      "workload": "ideation-planning",
+      "family": "ideation-planning",
+      "split": "exploration",
+      "messages": [
+        {
+          "role": "user",
+          "content": "We have one developer for four weeks to build a useful offline-first household equipment and maintenance app. It must work without an account or reliable Wi-Fi, import an existing CSV of equipment, and let a family recover or export its data. Most users will not keep entering detailed logs. We can test with five households. We cannot assume an AI subscription, sell their data, or integrate with manufacturers in the first version.\n\nPropose three meaningfully different product directions. For each, identify the user habit it depends on, its smallest useful workflow, its main failure mode, and a cheap way to disprove its value. Choose one and give a four-week implementation/test plan, an explicit list of things to leave out, and observable success/stop criteria. Address offline conflicts and data recovery proportionally to an MVP. Keep the answer concrete; do not invent market research or promise reliability that the design cannot provide."
+        }
+      ],
+      "quality_checks": [
+        "Three distinct useful workflows",
+        "Fits stated resources and offline constraints",
+        "Testable success and stop criteria",
+        "Recovery/conflict tradeoffs and uncertainty explicit"
+      ]
+    },
+    {
+      "id": "incident-triage-evidence",
+      "workload": "agentic-operations",
+      "family": "agentic-operations",
+      "split": "transfer",
+      "messages": [
+        {
+          "role": "user",
+          "content": "You are helping investigate a document-indexing service. Produce a prioritized read-only investigation plan and a concise update for the user. Do not execute changes or assert a root cause before the evidence supports one.\n\nEvidence supplied by separate tools:\n1. Client p95 request latency rose from 0.8s to 8s at 10:05; median stayed near 0.4s.\n2. A worker dashboard shows throughput increased from 90 to 110 documents/s after a 10:00 deploy. It counts retries as processed documents.\n3. Queue depth grew from 200 to 4500. About 70% of queued documents share tenant T17.\n4. CPU is 55-65%, memory stable, disk free space 38%. No OOM messages.\n5. A storage trace sampled only worker B: read p99 is 180ms versus 12ms yesterday. Worker A was not sampled.\n6. Logs show intermittent 'stale revision' retries for T17. The deploy changed deduplication keys; configuration also changed the worker count from 4 to 6.\n7. A health check using a small cached document succeeds in 70ms. A single larger uncached document took 11s.\n\nAvailable read-only tools: query_logs(filter, start, end), queue_stats(group_by), trace_request(request_id), compare_config(revisions), and sample_storage(host, duration_seconds). Give the first three calls with specific arguments and explain how different results would change the next step. Distinguish user outcome speed from the dashboard rate, identify confounders, and include a stop condition for handing this back for a reversible change proposal. Treat T17 as an opaque identifier; no private contents are available."
+        }
+      ],
+      "quality_checks": [
+        "No unsupported root-cause assertion",
+        "Useful discriminating tool sequence",
+        "Retries and latency tail distinguished from aggregate throughput",
+        "Confounders and evidence limits explicit"
+      ]
+    }
+  ]
+}
