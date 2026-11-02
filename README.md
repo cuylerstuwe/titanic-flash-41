@@ -1,3 +1,5 @@
+<img width="500" height="500" alt="Image" src="https://github.com/user-attachments/assets/81e32ce1-67aa-485b-8434-e47d80770f16" />
+
 # Titanic Flash 4.1
 
 A native Rust inference engine and OpenAI-compatible server for **DeepSeek-V4.1-Flash-1017**, running tensor parallel inference across **four NVIDIA GB10 systems**. The intended deployment is four DGX Sparks with dual 100 Gb/s RoCE connections and local NVMe storage.
