@@ -6,34 +6,34 @@ A native Rust inference engine and OpenAI-compatible server for **DeepSeek-V4.1-
 
 The engine includes GPU model execution, speculative decoding, SSD-backed Engram lookup, prompt reuse, streaming tool calls, image input, and native foreground/background scheduling. It admits two requests, each with the full context capacity, and queues additional requests. Rust owns model execution and request scheduling; CUDA and compiled GPU operators perform model arithmetic. Python utilities handle installation and fleet lifecycle.
 
-This checkout carries the **November 1 engine update (s1173)**. Its portable deployment passed focused four-device startup, serving, caching, image-input and timing checks, followed by the fresh single-stream benchmark below. See [validation scope](docs/VALIDATION.md), including the remaining empty-fleet provisioning limitation.
+This checkout carries the **November 1 engine update (s1173)**. Its portable deployment passed focused four-device startup, serving, caching, image-input and timing checks. The benchmark below remeasures the installed native s1173 build after a four-device reboot. See [validation scope](docs/VALIDATION.md), including the remaining empty-fleet provisioning limitation.
 
 ## Performance
 
-Single-stream measurements from **November 1, 2026 (s1173)**, using the published comparison's prompts, context file, request settings and timing function. The benchmark client ran **on the head GB10 against loopback HTTP**, bypassing any external router. All 24 requests completed successfully. Only Titanic was measured again; competitor results below are the author's existing published numbers.
+Single-stream measurements from **November 1, 2026, after a four-device reboot (s1173)**, using the published comparison's prompts, context file, request settings and timing function. The benchmark ran **on the head GB10 against its local HTTP endpoint**, verified to route through `lo`, bypassing any external router or physical network hop. All 24 requests completed in one pass on the first model load of that boot. Only Titanic was measured again; competitor results below are the author's existing published numbers.
 
 Median generation speed in **tokens/second**, three repetitions with a 512-token output budget:
 
 | Starting context | Workload | SGLang stock, published | SGLang tuned, published | TensorFold, published | Titanic s1173 |
 |---|---|---:|---:|---:|---:|
-| Clean | Code | 71.6 | 103.1 | 110.9 | 113.2 |
-| Clean | Prose | 32.9 | 46.3 | 57.7 | 61.9 |
-| Clean | Prose 2 | 26.8 | 43.7 | 56.3 | 57.7 |
-| ~131K tokens | Code | 57.4 | 86.0 | 94.7 | 101.9 |
-| ~131K tokens | Prose | 32.0 | 45.8 | 57.7 | 57.9 |
-| ~131K tokens | Prose 2 | 28.1 | 44.1 | 53.7 | 54.1 |
+| Clean | Code | 71.6 | 103.1 | 110.9 | 117.3 |
+| Clean | Prose | 32.9 | 46.3 | 57.7 | 63.4 |
+| Clean | Prose 2 | 26.8 | 43.7 | 56.3 | 60.4 |
+| ~131K tokens | Code | 57.4 | 86.0 | 94.7 | 108.7 |
+| ~131K tokens | Prose | 32.0 | 45.8 | 57.7 | 60.6 |
+| ~131K tokens | Prose 2 | 28.1 | 44.1 | 53.7 | 56.8 |
 
 | Uncached ~131K prompt, time to first generated content | SGLang tuned, published | TensorFold, published | Titanic s1173 |
 |---|---:|---:|---:|
-| First long-context request | 32.45 s | 56.02 s | 21.22 s |
+| First long-context request | 32.45 s | 56.02 s | 21.19 s |
 
-The comparison uses **temperature 0, top-p 1, thinking disabled**. These are benchmark settings, not the server's recommended-use defaults. “Prose 2” is the published fishing-village story workload, not the separate sampled-chat workload. Cold timing means no reusable prompt state; it does not mean a reboot or empty operating-system file cache. Generation trials follow warmups and can reuse prompt state.
+The comparison uses **temperature 0, top-p 1, thinking disabled**. These are benchmark settings, not the server's recommended-use defaults. “Prose 2” is the published fishing-village story workload, not the separate sampled-chat workload. Uncached timing means no reusable prompt state; it does not mean an empty operating-system file cache. Generation trials follow warmups and can reuse prompt state.
 
-These are **cross-system comparisons**: Titanic ran on three ASUS GX10s and one DGX Spark, with two switched 100 Gb/s fabrics. The published runs used four DGX Sparks and a different network arrangement. The two long-context prose rows are near ties with TensorFold at this sample size. These short throughput measurements do not establish completed-task quality or which system solves arbitrary agentic tasks fastest. Multi-stream results are deliberately omitted.
+These are **cross-system comparisons**: Titanic ran on three ASUS GX10s and one DGX Spark, with two switched 100 Gb/s fabrics. The published runs used four DGX Sparks and a different network arrangement. These short throughput measurements do not establish completed-task quality or which system solves arbitrary agentic tasks fastest. Multi-stream results are deliberately omitted.
 
-Titanic used the approved 2350 MHz cap. Boot and allocation history can affect GB10 memory bandwidth; those conditions were not normalized against the published runs or the older Titanic measurements. The table reports observed results, not an isolated measure of engine efficiency. [The previous s986 measurements](benchmarks/results-2026-10-30.json) remain available separately; the new long-context generation medians were lower than those historical observations.
+Titanic used the approved 2350 MHz cap. All six generation medians in this complete pass were 2.3–6.7% higher than the [earlier s1173 portable-build pass](benchmarks/results-2026-11-01.json); first-long-prompt TTFT was essentially unchanged (21.19 versus 21.22 s). The earlier pass followed repeated model launches. Build hashes, continuations and allocation history differ, so the improvement cannot be attributed solely to reboot or memory bandwidth. [The previous s986 measurements](benchmarks/results-2026-10-30.json) also remain available; long-context code and prose 2 are still below those historical observations. See the [complete comparison and limits](docs/BENCHMARKS.md).
 
-Source: [published comparison and benchmark client](https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa), pinned revision `7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2`. [Full results](benchmarks/results-2026-11-01.json) include ranges, timing details, hardware and source identity; [individual samples](benchmarks/samples-2026-11-01.json) omit generated text. [Reproduction instructions](docs/BENCHMARKS.md) use the original external timing function.
+Source: [published comparison and benchmark client](https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa), pinned revision `7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2`. [Full results](benchmarks/results-2026-11-01-clean-boot.json) include ranges, timing details, hardware and measured-build identity; [individual samples](benchmarks/samples-2026-11-01-clean-boot.json) omit generated text. [Reproduction instructions](docs/BENCHMARKS.md) use the original external timing function.
 
 ## Model and quality
 

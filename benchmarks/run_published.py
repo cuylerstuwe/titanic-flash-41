@@ -7,8 +7,10 @@ Run on an idle head node. Cold timing requires a freshly started model server.
 import argparse
 import hashlib
 import importlib.util
+import ipaddress
 import json
 import os
+import subprocess
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -17,6 +19,22 @@ REVISION = '7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2'
 CLIENT_SHA = '76a078842a0dd50b8345a6feb4455b890517eac51513f030701cd4a65d0a23ee'
 CONTEXT_SHA = '6b4b21a0ed3ae0eefe2b0aab0b9555eb1332334347c8bda80a83a2eaee168457'
 
+def require_head_local(base_url):
+    """Allow loopback or a Linux interface address whose route stays on lo."""
+    url = urllib.parse.urlsplit(base_url)
+    assert url.scheme == 'http' and url.hostname, 'use a head-local HTTP endpoint'
+    if url.hostname == 'localhost':
+        return
+    address = ipaddress.ip_address(url.hostname)  # no remote DNS names
+    if address.is_loopback:
+        return
+    command = ['ip'] + (['-6'] if address.version == 6 else [])
+    result = subprocess.run(command + ['-j', 'route', 'get', str(address)],
+                            capture_output=True, text=True, check=True, timeout=5)
+    routes = json.loads(result.stdout)
+    assert len(routes) == 1 and routes[0].get('type') == 'local' and routes[0].get('dev') == 'lo', \
+        'endpoint must route locally through lo; run this benchmark on the head node'
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--base-url', default='http://127.0.0.1:8000')
@@ -24,8 +42,7 @@ def main():
     ap.add_argument('--model', default='DeepSeek-V4.1-Flash-1017')
     ap.add_argument('--output', type=Path, required=True)
     a = ap.parse_args()
-    url = urllib.parse.urlsplit(a.base_url)
-    assert url.scheme == 'http' and url.hostname in ['127.0.0.1', 'localhost', '::1']
+    require_head_local(a.base_url)
     a.output.mkdir(parents=True, exist_ok=False)
     client = a.output/'external-client.py'
     source = f'https://gist.githubusercontent.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa/raw/{REVISION}/tf_bench.py'

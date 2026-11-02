@@ -64,6 +64,13 @@ router. Fresh s1173 summaries and text-free sample records are under
 remeasured. This greedy/no-thinking diagnostic is separate from the recommended
 sampling profile used in the serving checks.
 
+A later head-local pass completed all **24 requests** on the installed native
+s1173 build, on the first model load after rebooting all four devices. The README
+now reports that complete pass; summaries and text-free samples are in
+`benchmarks/*2026-11-01-clean-boot.json`. This is a separate native-build
+measurement and does not extend the portable qualification above. See
+[benchmark conditions and comparisons](BENCHMARKS.md).
+
 The main build uses CUDA 13.0.88. Selected bundled mHC statistics kernels were
 assembled with PTXAS 13.1.80, as recorded in their manifests; do not describe the
 entire operator bundle as having a single compiler version. These prebuilt
