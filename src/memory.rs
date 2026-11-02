@@ -5,6 +5,19 @@ use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 static HOST_WORKSPACE_RESERVED: AtomicUsize = AtomicUsize::new(0);
+#[path = "memory_image_storage.rs"]
+mod image_storage;
+pub(crate) use image_storage::{ImageStorageCharge, allocate_image_storage};
+
+/// Release only allocator-free host pages. Live token histories, model state,
+/// immutable caches and CUDA allocations retain their storage and addresses.
+/// Used by an explicit pressure experiment, never by per-token execution.
+pub(crate) fn trim_free_host_pages() -> bool {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    { unsafe { libc::malloc_trim(0) != 0 } }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    { false }
+}
 
 /// Back every page of a new zeroed host buffer before admitting later work.
 /// A calloc-backed Vec can otherwise defer nearly its entire physical charge
@@ -43,6 +56,20 @@ impl std::fmt::Display for InputCapacityError {
 impl std::error::Error for InputCapacityError {}
 pub(crate) struct HostWorkspaceReservation(usize);
 pub(crate) fn reserve_host_workspace(bytes: usize) -> Result<HostWorkspaceReservation> {
+    reserve_host_workspace_with_floor(bytes, 8usize << 30)
+}
+/// Raw inputs waiting for a lifetime slot cannot consume the unallocated
+/// part of the admitted owners' state capacity. Existing cache/image bytes
+/// already consume physical memory and must not be charged a second time.
+pub(crate) fn reserve_waiting_host_workspace(bytes: usize, image_budget: usize) -> Result<HostWorkspaceReservation> {
+    if image_budget == 0 { return reserve_host_workspace(bytes); }
+    image_storage::with_unallocated_capacity(image_budget, |growth| {
+        reserve_host_workspace_with_floor(bytes, (8usize << 30) + growth)
+    })
+}
+fn reserve_host_workspace_with_floor(bytes: usize, floor: usize) -> Result<HostWorkspaceReservation> {
+    #[cfg(not(target_os="linux"))]
+    let _ = floor;
     ensure!(bytes > 0, "empty host workspace reservation");
     HOST_WORKSPACE_RESERVED.fetch_update(Ordering::AcqRel, Ordering::Acquire,
         |current| current.checked_add(bytes).filter(|&total|total <= 4usize << 30))
@@ -50,10 +77,10 @@ pub(crate) fn reserve_host_workspace(bytes: usize) -> Result<HostWorkspaceReserv
     #[cfg(target_os="linux")]
     {
         let admitted = Available::gb10(usize::MAX, usize::MAX)
-            .map(|m|m.admitted_available >= 8usize << 30);
+            .map(|m|m.admitted_available >= floor);
         if !matches!(admitted, Ok(true)) {
             HOST_WORKSPACE_RESERVED.fetch_sub(bytes, Ordering::AcqRel);
-            ensure!(admitted?, InputCapacityError("host input workspace cannot retain the UMA reserve", (8usize << 30) + bytes));
+            ensure!(admitted?, InputCapacityError("host input workspace cannot retain required UMA headroom", floor + bytes));
         }
     }
     Ok(HostWorkspaceReservation(bytes))

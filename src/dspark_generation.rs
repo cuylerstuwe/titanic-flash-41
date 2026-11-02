@@ -15,6 +15,22 @@ use crate::{
 use anyhow::{Result, ensure};
 use std::{path::Path, rc::Rc, time::Instant};
 
+/// Validated before loading and applied when preparing each serving owner.
+/// The explicit control preserves the established0.20recipe. Both admitted
+/// cutoffs use the same causal stopping rule and exact rejection sampler.
+pub(crate) fn serving_causal_three_threshold() -> Result<f32> {
+    match std::env::var("CANADA_SCRATCH_CAUSAL_THREE_THRESHOLD").as_deref() {
+        Ok("0.2" | "0.20") | Err(std::env::VarError::NotPresent) => Ok(0.20),
+        Ok("0.25") => Ok(0.25),
+        _ => anyhow::bail!("serving causal-three threshold must be0.20or0.25"),
+    }
+}
+
+#[path = "dspark_pair_probe.rs"]
+mod pair_probe;
+#[path = "matched_path_session.rs"]
+mod matched_path_session;
+
 /// A short block of n rows contains the anchor and proposals1..n-1.
 /// Confidence n precedes proposal n and uses only that included prefix.
 /// Later confidences and excluded proposal identities cannot affect stopping.
@@ -113,13 +129,60 @@ pub(crate) struct GreedySession {
 pub(crate) struct LongHistoryBuffers {
     features: Features,
     chunk: crate::cuda::Buffer<half::bf16>,
+    wide: Option<crate::cuda::Buffer<half::bf16>>,
+    wide_enabled: bool,
+    rows: usize,
+    minimum_match: usize,
 }
 impl LongHistoryBuffers {
     pub(crate) fn new(cuda:&Cuda,core:&[u8])->Result<Self> {
+        Self::with_rows(cuda,core,16)
+    }
+    pub(crate) fn wide_conditioning_requested()->Result<bool> {
+        Ok(match std::env::var("CANADA_SCRATCH_COPY_WIDE_CONDITIONING") {
+            Ok(v)if v=="1"=>true,Ok(v)if v=="0"=>false,
+            Err(std::env::VarError::NotPresent)=>false,
+            _=>anyhow::bail!("copy wide conditioning must be0or1"),
+        })
+    }
+    pub(crate) fn minimum_match_requested(rows:usize)->Result<usize> {
+        let name=match rows {
+            16=>"CANADA_SCRATCH_HISTORY16_MINIMUM_MATCH",
+            32=>"CANADA_SCRATCH_HISTORY32_MINIMUM_MATCH",
+            _=>anyhow::bail!("long history minimum requires16or32rows"),
+        };
+        let minimum=match std::env::var(name) {
+            Ok(v)=>match v.as_str(){"32"=>32,"48"=>48,"64"=>64,
+                _=>anyhow::bail!("invalid long history minimum: {name}")},
+            Err(std::env::VarError::NotPresent)=>64,
+            Err(error)=>return Err(error.into()),
+        };
+        // Narrow16/24 and32-row/32-key experiments stay finite-probe-only.
+        ensure!((rows==16&&[32,64].contains(&minimum))||(rows==32&&[48,64].contains(&minimum)),
+            "unqualified long history minimum for {rows}rows");
+        Ok(minimum)
+    }
+    pub(crate) fn with_rows(cuda:&Cuda,core:&[u8],rows:usize)->Result<Self> {
+        let wide=Self::wide_conditioning_requested()?&&rows==32;
         ensure!(std::env::var("CANADA_SCRATCH_LONG_HISTORY_GENERATION").as_deref()==Ok("1")
-            && cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+22*15360*2,
+            && (rows==16 || (rows==32 && crate::config::history32_enabled()))
+            // Include both the external padded input and the conditioner's
+            // captured-input allocation in the startup construction forecast.
+            && cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+(rows+6+if wide{256}else{0})*15360*2,
             "long history scratch admission");
-        Ok(Self{features:Features::new(cuda,core,16)?,chunk:cuda.allocate(6*15360)?})
+        Ok(Self{features:Features::new(cuda,core,rows)?,chunk:cuda.allocate(6*15360)?,
+            wide:if wide{Some(cuda.allocate(128*15360)?)}else{None},wide_enabled:wide,rows,
+            minimum_match:Self::minimum_match_requested(rows)?})
+    }
+    pub(crate) fn set_wide_for_probe(&mut self,enabled:bool)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_COPY_CONDITIONING_GENERATION_SCREEN").as_deref()==Ok("1")
+            &&self.rows==32&&self.wide.is_some(),"copy conditioning switch needs isolated owned storage");
+        self.wide_enabled=enabled;Ok(())
+    }
+    pub(crate) fn set_minimum_for_probe(&mut self,minimum:usize)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_HISTORY_MATCH_GENERATION_SCREEN").as_deref()==Ok("1")
+            &&[16,24,32,48,64].contains(&minimum),"history minimum switch requires the finite screen");
+        self.minimum_match=minimum;Ok(())
     }
 }
 /// Discrete token metadata only; model probabilities remain on the GPU.
@@ -170,6 +233,7 @@ pub(crate) fn new_history_lookup(cuda:&Cuda,context:usize,prefix:&[u32])->Result
 /// Small proposal-policy metadata accompanies encoder-only prompt images.
 /// Tensor conditioning is reconstructed; warmup and proposal choices retain
 /// the same snapshot semantics as complete session images.
+#[derive(Clone)]
 pub(crate) struct ProposalPolicyImage {
     owner:Rc<()>,target_seed:Option<u64>,stop_token:Option<u32>,draft_warmed:bool,
     causal_three_threshold:Option<f32>,causal_full_threshold:Option<f32>,causal_short_rows:usize,
@@ -187,6 +251,19 @@ impl ProposalPolicyImage {
 }
 pub(crate) struct PreparedSession(GreedySession);
 impl PreparedSession {
+    pub(crate) fn independent_for_probe(&self,target:&Target,core:&[u8],stream:&Stream,kernels:&Path)->Result<Self> {
+        Self::new(&self.0.cuda,core,self.0.draft.independent_for_probe(target,core,stream,kernels)?)?
+            .with_serving_policy(stream)
+    }
+    pub(crate) fn prepare_copy_conditioning(&mut self,buffers:&LongHistoryBuffers,comm:&Roce,stream:&Stream)->Result<bool> {
+        let Some(input)=&buffers.wide else{return Ok(false)};
+        ensure!(buffers.rows==32&&buffers.wide_enabled,"wide copy preparation storage");
+        unsafe{self.0.cuda.zero_device(input.ptr(),input.bytes(),stream)?;}
+        self.0.draft.prepare_copy_wide(input,comm,stream)?;Ok(true)
+    }
+    pub(crate) fn release_copy_conditioning(&mut self,stream:&Stream)->Result<()> {
+        self.0.draft.release_prepared_copy_wide(stream)
+    }
     /// The s280/s283 paired screens admit this conservative stopping policy
     /// for serving. Diagnostic constructors retain their explicit controls.
     /// Only confidences conditioned on included proposals affect the choice;
@@ -202,7 +279,7 @@ impl PreparedSession {
         };
         ensure!(self.0.rejection.is_some() && !self.0.stochastic_prefix_schedule,
             "serving causal policy requires the admitted categorical sampler");
-        self.0.causal_three_threshold = enabled.then_some(0.20);
+        self.0.causal_three_threshold = enabled.then_some(serving_causal_three_threshold()?);
         self.0.causal_short_rows = 3;
         self.0.block_verification=match std::env::var("CANADA_SCRATCH_BLOCK_VERIFY") {
             Ok(v)=>{ensure!(v=="0"||v=="1","invalid block verification policy");v=="1"},
@@ -287,6 +364,7 @@ pub(crate) struct StateImage {
     acceptance_temperature_frontiers: usize,
 }
 impl StateImage {
+    pub(crate) fn exchangeable(&self)->bool {self.target.exchangeable()}
     pub(crate) fn device_bytes(&self)->usize {self.target.bytes()+self.draft.bytes()}
     pub(crate) fn manifest(&self) -> serde_json::Value {
         serde_json::json!({"position":self.target.position(),"target":self.target.manifest(),
@@ -305,6 +383,10 @@ impl StateImage {
             "acceptance_temperature_frontiers":self.acceptance_temperature_frontiers,
             "lookup":self.history_lookup.as_ref().map(HistoryLookup::state_digest)}))
     }
+}
+pub(crate) struct ExchangePrepared {
+    target:crate::state_image::exchange::Prepared,
+    draft:crate::dspark_kv::StateImage,
 }
 #[derive(serde::Serialize)]
 pub(crate) struct Step {
@@ -560,7 +642,11 @@ impl GreedySession {
     }
     pub(crate) fn history_lookup_digest_for_probe(&self)->Result<Option<String>> {
         ensure!(!self.poisoned&&(std::env::var("CANADA_SCRATCH_ENCODER_CACHE_SCREEN").as_deref()==Ok("1")
-            ||std::env::var("CANADA_SCRATCH_ACTIVE_ENCODER_CHECKPOINT_SCREEN").as_deref()==Ok("1")),
+            ||std::env::var("CANADA_SCRATCH_ACTIVE_ENCODER_CHECKPOINT_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_INDEX_SCORE_MODEL_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_PEER_PREFILL_SCREEN").as_deref()==Ok("1")
+            ||(crate::config::history32_probe_enabled()
+                &&std::env::var("CANADA_SCRATCH_HISTORY32_GENERATION_SCREEN").as_deref()==Ok("1"))),
             "history digest requires finite encoder cache screen");
         Ok(self.history_lookup.as_ref().map(HistoryLookup::state_digest))
     }
@@ -573,6 +659,18 @@ impl GreedySession {
             || std::env::var("CANADA_SCRATCH_LONG_HISTORY_GENERATION").as_deref()==Ok("1")),
             "conditioning state digest requires isolated comparison");
         self.draft.save_state_image(4*1024*1024,comm,stream)?.digest()
+    }
+    pub(crate) fn probe_copy_conditioning(&self,core:&[u8],kernels:&Path,comm:&Roce,stream:&Stream)
+        ->Result<serde_json::Value>{
+        let(features,live)=self.prefill_features.values()?;
+        ensure!(!self.poisoned&&live>=64,"copy conditioning requires a full accepted prefill tail");
+        self.draft.probe_copy_conditioning(core,kernels,features,comm,stream)
+    }
+    pub(crate) fn probe_copy_batched_kv(&mut self,comm:&Roce,stream:&Stream,
+        control:&mut crate::control_channel::ControlChannel)->Result<serde_json::Value> {
+        let(features,live)=self.prefill_features.values()?;
+        ensure!(!self.poisoned&&live>=64,"copy KV batching requires accepted prefill features");
+        self.draft.probe_copy_batched_kv(features,comm,stream,control)
     }
     /// Read-only branch-opportunity fixture. Each branch uses the existing
     /// serial verifier and rolls back completely; this is not a tree engine.
@@ -844,6 +942,10 @@ impl GreedySession {
             .ok_or_else(||anyhow::anyhow!("session image byte overflow"))?,
             self.history_lookup.as_ref().map_or(0,HistoryLookup::reserved_workspace_bytes)))
     }
+    pub(crate) fn exchange_state_image_bytes(&self,target:&Target)->Result<(usize,usize)> {
+        let(_,host)=self.compact_state_image_bytes(target)?;
+        Ok((target.exchange_state_image_bytes()?+self.draft.state_image_bytes()?,host))
+    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_prefill(
         target: &Target,
@@ -956,6 +1058,12 @@ impl GreedySession {
     }
     pub(crate) fn save_state_image(&mut self, target: &Target, anchor: u32, budget: usize,
         comm: &Roce, stream: &Stream) -> Result<StateImage> {
+        self.save_image(target,anchor,budget,false,comm,stream)
+    }
+    pub(crate) fn save_exchange_state_image(&mut self,target:&Target,anchor:u32,budget:usize,
+        comm:&Roce,stream:&Stream)->Result<StateImage>{self.save_image(target,anchor,budget,true,comm,stream)}
+    fn save_image(&mut self,target:&Target,anchor:u32,budget:usize,exchange:bool,
+        comm:&Roce,stream:&Stream)->Result<StateImage>{
         ensure!(!self.poisoned && target.profile_is_current() && anchor < 129280
             && (1..=2 * 1024usize.pow(3)).contains(&budget)
             && target.position() == self.draft.position()?
@@ -966,7 +1074,8 @@ impl GreedySession {
             crate::state_image::CapacityRefused);
         // Snapshot ownership includes the entire session, so altered seeds,
         // lookup-table collision history and warmup policy are restored too.
-        let saved_target = target.save_state_image(budget, comm, stream)?;
+        let saved_target = if exchange{target.save_exchange_state_image(budget,comm,stream)?}
+            else{target.save_state_image(budget, comm, stream)?};
         let remaining = budget.checked_sub(saved_target.bytes())
             .ok_or_else(|| anyhow::anyhow!("session image budget overflow"))?;
         self.poisoned = true;
@@ -991,6 +1100,51 @@ impl GreedySession {
             acceptance_temperature_frontiers:self.acceptance_temperature_frontiers };
         self.poisoned = false;
         Ok(saved)
+    }
+    /// Additional peak bytes and final inactive-device charge. History lookup
+    /// ownership is moved, never cloned, during the exchange itself.
+    pub(crate) fn exchange_growth(&self,target:&Target,saved:&StateImage,budget:usize)->Result<(usize,usize)>{
+        ensure!(!self.poisoned&&Rc::ptr_eq(&self.image_owner,&saved.owner)
+            &&target.profile_is_current()&&target.position()==self.draft.position()?,"session exchange frontier");
+        let draft=self.draft.state_image_bytes()?;
+        let(extra,capacity)=target.exchange_growth(&saved.target,budget.checked_sub(draft).ok_or(crate::state_image::CapacityRefused)?)?;
+        Ok((extra+draft,capacity+draft))
+    }
+    pub(crate) fn prepare_exchange(&mut self,target:&Target,saved:&StateImage,budget:usize,comm:&Roce,stream:&Stream)
+        ->Result<Option<ExchangePrepared>> {
+        let(extra,_)=self.exchange_growth(target,saved,budget)?;
+        if self.cuda.admission_memory()?.admitted_available<8*1024usize.pow(3)+extra{return Ok(None);}
+        let draft_bytes=self.draft.state_image_bytes()?;
+        let Some(target)=target.prepare_exchange(&saved.target,budget-draft_bytes,comm,stream)?else{return Ok(None);};
+        let draft=match self.draft.save_state_image(draft_bytes,comm,stream){
+            Ok(image)=>image,Err(e)if e.downcast_ref::<crate::state_image::CapacityRefused>().is_some()=>return Ok(None),Err(e)=>return Err(e),
+        };
+        Ok(Some(ExchangePrepared{target,draft}))
+    }
+    pub(crate) fn exchange_state_image(&mut self,target:&mut Target,saved:&mut StateImage,prepared:ExchangePrepared,
+        anchor:u32,lineage:u64,comm:&Roce,stream:&Stream)->Result<u32>{
+        ensure!(!self.poisoned&&Rc::ptr_eq(&self.image_owner,&saved.owner)&&anchor<129280
+            &&target.profile_is_current()&&target.position()==self.draft.position()?,"session exchange owner");
+        self.poisoned=true;
+        target.exchange_state_image(&mut saved.target,prepared.target,lineage,comm,stream)?;
+        self.draft.restore_state_image(&saved.draft,comm,stream)?;saved.draft=prepared.draft;
+        let temperature=self.draft.draft_temperature();let conditioning=self.draft.conditioning_split();
+        self.draft.set_draft_temperature(saved.draft_temperature,stream)?;
+        self.draft.set_conditioning_split(saved.conditioning_split,stream)?;
+        saved.draft_temperature=temperature;saved.conditioning_split=conditioning;
+        std::mem::swap(&mut self.target_seed,&mut saved.target_seed);
+        std::mem::swap(&mut self.stop_token,&mut saved.stop_token);
+        std::mem::swap(&mut self.history_lookup,&mut saved.history_lookup);
+        std::mem::swap(&mut self.draft_warmed,&mut saved.draft_warmed);
+        std::mem::swap(&mut self.causal_three_threshold,&mut saved.causal_three_threshold);
+        std::mem::swap(&mut self.causal_full_threshold,&mut saved.causal_full_threshold);
+        std::mem::swap(&mut self.causal_short_rows,&mut saved.causal_short_rows);
+        std::mem::swap(&mut self.block_verification,&mut saved.block_verification);
+        std::mem::swap(&mut self.acceptance_temperature_frontiers,&mut saved.acceptance_temperature_frontiers);
+        let restored=saved.anchor;saved.anchor=anchor;
+        ensure!(target.position()==self.draft.position()?
+            &&self.history_lookup.as_ref().is_none_or(|h|h.position()==target.position()),"exchanged session frontiers disagree");
+        self.poisoned=false;Ok(restored)
     }
     pub(crate) fn restore_state_image(&mut self, target: &mut Target, saved: &StateImage,
         lineage: u64, comm: &Roce, stream: &Stream) -> Result<u32> {
@@ -1063,6 +1217,10 @@ impl GreedySession {
         self.history_lookup.as_mut().ok_or_else(||anyhow::anyhow!("history lookup absent"))?
             .resize_strong_backup_for_probe(enabled)
     }
+    pub(crate) fn configure_full_commit_metadata_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(!self.poisoned,"full-commit metadata needs a healthy session");
+        self.draft.set_full_commit_metadata_for_probe(enabled,stream)
+    }
     pub(crate) fn configure_history_maximum_for_probe(&mut self,maximum:usize)->Result<usize> {
         ensure!(!self.poisoned && self.block_verification && self.target_seed.is_some()
             && std::env::var("CANADA_SCRATCH_HISTORY_MATCH_SCREEN").as_deref()==Ok("1"),
@@ -1072,51 +1230,112 @@ impl GreedySession {
         let lookup=self.history_lookup.as_mut().ok_or_else(||anyhow::anyhow!("history index absent"))?;
         lookup.resize_maximum_for_probe(maximum)?;Ok(lookup.workspace_bytes())
     }
+    /// Diagnostic only: price five teacher-forced probabilities before an
+    /// otherwise eligible copy. No candidate selection depends on the separate
+    /// stochastic query used to validate the conditioned probabilities.
+    pub(crate) fn observe_long_history_for_probe(&mut self,target:&Target,anchor:u32,
+        limit:usize,comm:&Roce,stream:&Stream)->Result<Option<serde_json::Value>> {
+        ensure!(std::env::var("CANADA_SCRATCH_HISTORY_CONFIDENCE_SCREEN").as_deref()==Ok("1")
+            && !self.poisoned && target.profile_is_current()
+            && target.position()==self.draft.position()? && self.block_verification,
+            "history confidence observation requires the isolated causal screen");
+        if limit<16 || self.target_seed.is_none()
+            || !(self.draft_warmed || self.draft.sampled_graphs_ready()) {return Ok(None)}
+        let Some((source,copy))=self.history_lookup.as_ref()
+            .map(|h|h.propose_long(target.position(),anchor)).transpose()?.flatten()
+            else{return Ok(None)};
+        let began=Instant::now();
+        self.draft.run(anchor,comm,stream)?;
+        let query_ms=began.elapsed().as_secs_f64()*1000.;
+        let known:[u32;5]=copy[..5].try_into().unwrap();
+        let(probabilities,confidence,first_capture)=self.draft.score_history_for_probe(&known,comm,stream)?;
+        let observation_ms=began.elapsed().as_secs_f64()*1000.;
+        // Outside the priced path: normal sampled Markov rows are an
+        // independent conditioning check wherever predecessor identities match.
+        let seed=crate::categorical::block_round_seed(self.target_seed.unwrap(),target.position());
+        let neural=self.draft.stochastic_proposals(seed,comm,stream)?;
+        let q=self.draft.proposal_probabilities_prefix(5)?;
+        let mut checked=0;
+        for i in 0..5{
+            if i!=0&&neural[i-1]!=copy[i-1]{continue}
+            let raw=unsafe{self.cuda.read_device(q.ptr()+((i*129280+copy[i]as usize)*8)as u64,8)}?;
+            ensure!(f64::from_le_bytes(raw.try_into().unwrap())==probabilities[i],
+                "teacher-forced probability disagrees with the same normal Markov conditioning");checked+=1;
+        }
+        ensure!(target.position()==self.draft.position()?,"observation advanced accepted state");
+        Ok(Some(serde_json::json!({"position":target.position(),"copy_root":copy[0],
+            "q_copy_root":probabilities[0],"q_copy_prefix":probabilities,"copy_prefix":known,
+            "root_confidence":confidence[0],"copy_confidences":confidence,
+            "neural_root":neural[0],"match_tokens":source.matched,
+            "source_end":source.source_end,"query_ms":query_ms,"first_capture":first_capture,
+            "normal_conditioning_checks":checked,"observation_ms":observation_ms,
+            "diagnostic_total_ms":began.elapsed().as_secs_f64()*1000.})))
+    }
     /// Select the long profile using only committed-history match metadata.
     /// A point-mass proposal accepts matching independent target draws; the
     /// first mismatch/bonus is a fresh target token. No approximate acceptance.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_long_history_step(&mut self,target:&mut Target,longer:&mut Target,
         buffers:&mut LongHistoryBuffers,anchor:u32,limit:usize,comm:&Roce,stream:&Stream)->Result<Option<Step>> {
+        match longer.physical_rows() {
+            16=>self.try_history_block::<16>(target,longer,buffers,anchor,limit,comm,stream),
+            32 if crate::config::history32_enabled()=>
+                self.try_history_block::<32>(target,longer,buffers,anchor,limit,comm,stream),
+            _=>anyhow::bail!("long history target geometry is not enabled"),
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn try_history_block<const ROWS:usize>(&mut self,target:&mut Target,longer:&mut Target,
+        buffers:&mut LongHistoryBuffers,anchor:u32,limit:usize,comm:&Roce,stream:&Stream)->Result<Option<Step>> {
         ensure!(std::env::var("CANADA_SCRATCH_LONG_HISTORY_GENERATION").as_deref()==Ok("1")
-            && !self.poisoned && target.physical_rows()==6 && longer.physical_rows()==16
+            && !self.poisoned && target.physical_rows()==6 && longer.physical_rows()==ROWS && buffers.rows==ROWS
             && target.profile_is_current() && target.position()==self.draft.position()?,
             "long history session frontier/profile");
-        if limit<16 || self.target_seed.is_none()
+        if limit<ROWS || self.target_seed.is_none()
             || !(self.draft_warmed || self.draft.sampled_graphs_ready()) {return Ok(None)}
         let begin=Instant::now();let start=target.position();
-        let Some((source,proposals))=self.history_lookup.as_ref()
-            .map(|h|h.propose_long(start,anchor)).transpose()?.flatten() else{return Ok(None)};
+        let Some((source,inputs))=self.history_lookup.as_ref()
+            .map(|h|h.propose_block_minimum::<ROWS>(start,anchor,buffers.minimum_match)).transpose()?.flatten() else{return Ok(None)};
+        let proposals=&inputs[1..];
         self.poisoned=true;
         let result=(|| {
-            let mut inputs=[anchor;16];inputs[1..].copy_from_slice(&proposals);
             longer.handoff_from(target)?;let drafted=Instant::now();
             longer.begin_verification(&inputs,comm,stream)?;
-            let predictions=longer.verification_sample(self.target_seed.unwrap(),stream)?;
+            let predictions=longer.verification_history_sample(self.target_seed.unwrap(),comm,stream)?;
             let verify_host_ms=longer.verification_host_ms()?;let verified=Instant::now();
-            ensure!(predictions.len()==16,"long history target draws");
+            ensure!(predictions.len()==ROWS,"long history target draws");
             let mut matched=0;
-            while matched<15 && proposals[matched]==predictions[matched] {matched+=1;}
+            while matched<ROWS-1 && proposals[matched]==predictions[matched] {matched+=1;}
             let accepted=stop_frontier(&predictions,1+matched,self.stop_token);
             buffers.features.run(longer,stream)?;
             longer.finish_verification(accepted,comm,stream)?;let committed=Instant::now();
-            let (features,live)=buffers.features.values()?;ensure!(live==16,"long feature capture extent");
-            // Conditioning is row-independent. Reuse its existing M6 kernels;
-            // only accepted rows enter the draft KV, in their causal order.
-            for offset in (0..accepted).step_by(6) {
-                let rows=(accepted-offset).min(6);
+            let (features,live)=buffers.features.values()?;ensure!(live==ROWS,"long feature capture extent");
+            // Four or more M6 chunks repaid the replicated wide projection in
+            // the finite component screen. Rejected features are never copied
+            // into its input or committed to draft KV. Short copies keep M6.
+            if buffers.wide_enabled&&accepted>=19 {
+                let padded=buffers.wide.as_ref().ok_or_else(||anyhow::anyhow!("wide copy workspace absent"))?;
                 unsafe {
-                    self.cuda.zero_device(buffers.chunk.ptr(),buffers.chunk.bytes(),stream)?;
-                    self.cuda.copy_device(buffers.chunk.ptr(),features.ptr()+(offset*15360*2)as u64,rows*15360*2,stream)?;
+                    self.cuda.zero_device(padded.ptr(),padded.bytes(),stream)?;
+                    self.cuda.copy_device(padded.ptr(),features.ptr(),accepted*15360*2,stream)?;
                 }
-                self.draft.inject_distributed(&buffers.chunk,rows,rows,start+offset as u64,comm,stream)?;
+                self.draft.inject_copy_wide(padded,accepted,start,comm,stream)?;
+            }else{
+                for offset in (0..accepted).step_by(6) {
+                    let rows=(accepted-offset).min(6);
+                    unsafe {
+                        self.cuda.zero_device(buffers.chunk.ptr(),buffers.chunk.bytes(),stream)?;
+                        self.cuda.copy_device(buffers.chunk.ptr(),features.ptr()+(offset*15360*2)as u64,rows*15360*2,stream)?;
+                    }
+                    self.draft.inject_distributed(&buffers.chunk,rows,rows,start+offset as u64,comm,stream)?;
+                }
             }
             self.history_lookup.as_mut().unwrap().commit(start,&inputs[..accepted])?;
             target.handoff_from(longer)?;
             ensure!(target.position()==start+accepted as u64 && self.draft.position()?==target.position()
                 && self.history_lookup.as_ref().unwrap().position()==target.position(),"long history publication frontiers");
             Ok(Step{tokens:inputs[..accepted].to_vec(),next_anchor:predictions[accepted-1],
-                draft_tokens:proposals.to_vec(),matching_proposals:accepted-1,verified_rows:16,draft_confidence:None,
+                draft_tokens:proposals.to_vec(),matching_proposals:accepted-1,verified_rows:ROWS,draft_confidence:None,
                 proposal_source:"long_history_point_mass",lookup_match_tokens:Some(source.matched),lookup_source_end:Some(source.source_end),
                 profiled_verify:false,profile_append_metrics:None,position:target.position(),verify_host_ms,
                 acceptance_expected_lengths:None,acceptance_temperature_probe:None,
@@ -1157,6 +1376,11 @@ impl GreedySession {
             "DSpark session frontier/visibility"
         );
         let start = target.position();
+        // The fixed five-row bidirectional drafter cannot query past the
+        // advertised context. Finish the last four positions with ordinary
+        // target draws instead; no draft probabilities are used at this edge.
+        let context_tail = target.context_capacity().saturating_sub(start as usize)
+            < crate::dspark_kv::QUERY_ROWS;
         self.poisoned = true;
         let result = (|| {
             let begin = Instant::now();
@@ -1169,12 +1393,14 @@ impl GreedySession {
             // be reused without an otherwise unnecessary neural draft.
             let fallback_warm=self.draft_warmed
                 || (self.target_seed.is_some() && self.draft.sampled_graphs_ready());
-            let lookup = if fallback_warm {
+            let lookup = if fallback_warm && !context_tail {
                 self.history_lookup.as_ref()
                     .map(|history| history.propose(start, anchor)).transpose()?.flatten()
             } else { None };
             let mut acceptance_temperature_probe=None;
-            let (draft_tokens, draft_confidence, scheduled_rows, produced_proposals) = if let Some(proposal) = &lookup {
+            let (draft_tokens, draft_confidence, scheduled_rows, produced_proposals) = if context_tail {
+                ([anchor; 5], None, 1, 0)
+            } else if let Some(proposal) = &lookup {
                 // History-only deterministic proposals have point-mass q.
                 // No draft result or stale confidence is consumed on this path.
                 (proposal.tokens, None, 6, 5)
@@ -1209,7 +1435,9 @@ impl GreedySession {
             // Cumulative products cannot recover after crossing the threshold;
             // inclusion of proposal j is thus decided before observing it.
             // At that stopping boundary, the bonus is a fresh target draw.
-            let live = if lookup.is_some() {
+            let live = if context_tail {
+                1
+            } else if lookup.is_some() {
                 limit
             } else if let Some(threshold) = self.causal_full_threshold {
                 let confidence = draft_confidence
@@ -1256,7 +1484,7 @@ impl GreedySession {
                         // Greedy p is a point mass: accept exactly the matching
                         // target-argmax prefix, with its first mismatch as bonus.
                         target.verification_greedy(stream)
-                    } else if lookup.is_some() {
+                    } else if lookup.is_some() || context_tail {
                         // An independent categorical target draw either equals
                         // the point-mass proposal or is its conditional residual.
                         // Taking the matching prefix and first mismatch/bonus
@@ -1382,7 +1610,8 @@ impl GreedySession {
                 matching_proposals: matched,
                 verified_rows: live,
                 draft_confidence,
-                proposal_source: if lookup.is_some() { "history_point_mass" } else { "dspark" },
+                proposal_source: if context_tail { "context_tail_target" }
+                    else if lookup.is_some() { "history_point_mass" } else { "dspark" },
                 lookup_match_tokens: lookup.as_ref().map(|p| p.matched),
                 lookup_source_end: lookup.as_ref().map(|p| p.source_end),
                 profiled_verify: profile_now,
@@ -1418,13 +1647,19 @@ impl GreedySession {
         self.poisoned=true;
         self.prefill_features.run(target,stream)?;
         let (values,live)=self.prefill_features.values()?;
-        ensure!(live==added.min(128),"DSpark retained EXTEND feature rows");
-        if added<128 {
+        // An ordinary short EXTEND evaluates only its new decoder rows.
+        // A resumed ragged wide chunk instead replays the complete128-row
+        // decoder tail, including old rows under the original request floor.
+        // In that case those recomputed features replace the entire drafter
+        // window even when this interruption added fewer than128 tokens.
+        ensure!(live==128 || (added<128 && live==added),
+            "DSpark retained EXTEND feature rows");
+        if live<128 {
             // Old accepted features still occupy the draft's bounded window.
             // Only this request's new rows were evaluated by the decoder.
             self.draft.inject(values,live,live,previous,stream)?;
         } else {
-            // The entire128-token draft window is replaced by the new tail.
+            // The entire128-token draft window is replaced by the target tail.
             self.draft.reset(stream)?;
             self.draft.inject_prefill_tail(values,live,target.position(),stream)?;
         }

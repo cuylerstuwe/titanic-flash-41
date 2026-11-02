@@ -108,8 +108,12 @@ pub struct Branch {
     gather: KeyGather,
     keys: Rc<KeyMatrix>,
     scorer: Scorer,
-    grouped16: Option<crate::grouped_sparse_index::Grouped>,
-    grouped16_active: Cell<bool>,
+    key_sharded: Option<crate::key_sharded_index::KeySharded>,
+    key_sharded_active: Cell<bool>,
+    key_sharded_auto: Cell<bool>,
+    key_sharded_min_position: u64,
+    compact_verifier: Option<crate::grouped_sparse_index::Grouped>,
+    compact_verifier_active: Cell<bool>,
     selection: Selection,
     // Beyond 16384 positions: source20 publishes kept blocks, 24..36 consume them.
     publisher: Option<crate::candidates::Publisher>,
@@ -121,8 +125,30 @@ pub struct Branch {
     key_splits: u32,
 }
 impl Branch {
+    pub(crate) fn has_key_sharded(&self)->bool {self.key_sharded.is_some()}
+    pub(crate) fn has_key_sharded_publisher(&self)->bool {self.key_sharded.as_ref().is_some_and(|p|p.block_ids().is_some())}
+    pub(crate) fn key_sharded_active(&self)->bool {self.key_sharded_active.get()}
+    pub(crate) fn set_key_sharded_auto(&self,enabled:bool) {
+        self.key_sharded_auto.set(enabled&&self.key_sharded.is_some());
+    }
+    pub(crate) fn key_sharded_eligible_at(&self,position:u64)->bool {
+        position>=self.key_sharded_min_position
+    }
+    pub(crate) fn key_sharded_transition(&self,position:u64)->Option<bool> {
+        let desired=self.key_sharded_eligible_at(position);
+        (self.key_sharded_auto.get()&&desired!=self.key_sharded_active.get()).then_some(desired)
+    }
+    pub(crate) fn set_key_sharded_for_probe(&self,enabled:bool) {
+        if let Some(shard)=&self.key_sharded {
+            self.key_sharded_active.set(enabled);shard.invalidate();self.gather.invalidate_cache();
+        }
+    }
     pub(crate) fn grouped16_replay_taps(&self)->Vec<(&'static str,u64,usize)> {
-        let Some(grouped)=self.grouped16.as_ref().filter(|_|self.grouped16_active.get()) else{return Vec::new();};
+        let grouped=match &self.scorer {
+            Scorer::Grouped(grouped) if self.query.output().rows()==16=>Some(grouped),
+            _=>self.compact_verifier.as_ref().filter(|_|self.compact_verifier_active.get()),
+        };
+        let Some(grouped)=grouped else{return Vec::new();};
         let mut taps=grouped.replay_taps();
         taps.extend([
             ("query-projection",self.q.output().ptr(),self.q.output().bytes()),
@@ -133,18 +159,34 @@ impl Branch {
             ("selected",self.selection.indices().ptr(),self.selection.indices().bytes())]);
         taps
     }
-    pub(crate) fn has_grouped16(&self)->bool {self.grouped16.is_some()}
-    pub(crate) fn grouped16_enabled(&self)->bool {self.grouped16_active.get()}
+    pub(crate) fn has_grouped16(&self)->bool {self.query.output().rows()==16&&self.compact_verifier.is_some()}
+    pub(crate) fn grouped16_enabled(&self)->bool {self.query.output().rows()==16
+        &&(self.compact_verifier_active.get()||matches!(self.scorer,Scorer::Grouped(_)))}
+    pub(crate) fn has_compact32(&self)->bool {self.query.output().rows()==32&&self.compact_verifier.is_some()}
+    pub(crate) fn compact32_active(&self)->bool {self.has_compact32()&&self.compact_verifier_active.get()}
+    pub(crate) fn compact_index_enabled(&self)->bool {
+        self.compact_verifier_active.get()||matches!(self.scorer,Scorer::Grouped(_))
+    }
+    pub(crate) fn set_compact32_for_probe(&self,enabled:bool)->Result<()> {
+        self.gather.set_packed32_for_probe(enabled)?;
+        if self.has_compact32() {self.compact_verifier_active.set(enabled);}
+        Ok(())
+    }
     pub(crate) fn set_grouped16_for_probe(&self,enabled:bool) {
-        if self.grouped16.is_some() {
-            self.grouped16_active.set(enabled);
+        if self.compact_verifier.is_some() {
+            self.compact_verifier_active.set(enabled);
             self.gather.invalidate_cache();
         }
     }
     pub(crate) fn packed_gather_enabled(&self)->bool {self.bounded_gather && self.gather.packed_enabled()}
     pub(crate) fn cached_gather_enabled(&self)->bool {self.bounded_gather && self.gather.cached_enabled()}
-    pub(crate) fn invalidate_gather_cache(&self) {self.gather.invalidate_cache();}
-    pub(crate) fn prepare_gather_cache(&self,stream:&Stream)->Result<()> {self.gather.prepare_cache(stream)}
+    pub(crate) fn invalidate_gather_cache(&self) {
+        self.gather.invalidate_cache();if let Some(shard)=&self.key_sharded {shard.invalidate();}
+    }
+    pub(crate) fn prepare_gather_cache(&self,stream:&Stream)->Result<()> {
+        self.gather.prepare_cache(stream)?;
+        if let Some(shard)=&self.key_sharded {shard.prepare(stream)?;}Ok(())
+    }
     pub(crate) fn set_cached16_for_probe(&self,enabled:bool)->Result<()> {self.gather.set_cached16_for_probe(enabled)}
     pub(crate) fn packed_sparse_gather_enabled(&self)->bool {
         match &self.scorer {
@@ -223,7 +265,7 @@ impl Branch {
         columns: usize,
     ) -> Result<Self> {
         Self::new_rows(
-            cuda, stream, weights, blas, layer, kernels, frequency, core, key_rows, columns, 6,
+            cuda, stream, weights, blas, layer, kernels, frequency, core, key_rows, columns, 6, None,
         )
     }
     pub fn new_rows(
@@ -238,6 +280,7 @@ impl Branch {
         key_rows: usize,
         columns: usize,
         rows: usize,
+        key_owner: Option<&Self>,
     ) -> Result<Self> {
         ensure!(
             crate::config::target_rows(rows),
@@ -269,6 +312,23 @@ impl Branch {
             && columns > crate::candidates::WINDOW
             && std::env::var("CANADA_SCRATCH_SPARSE_INDEX").as_deref() == Ok("1");
         let adaptive6=sparse6 && std::env::var("CANADA_SCRATCH_SPARSE_INDEX_ADAPTIVE").as_deref()==Ok("1");
+        let serving_grouped32=match std::env::var("CANADA_SCRATCH_GROUPED_SPARSE32") {
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid compact M32 policy");value=="1"},
+            Err(std::env::VarError::NotPresent)=>false,
+            Err(error)=>return Err(error.into()),
+        };
+        let serving_grouped16=match std::env::var("CANADA_SCRATCH_GROUPED_SPARSE16") {
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid compact M16 policy");value=="1"},
+            Err(std::env::VarError::NotPresent)=>false,
+            Err(error)=>return Err(error.into()),
+        };
+        let selected_grouped16_storage=match std::env::var("CANADA_SCRATCH_SELECTED_GROUPED16_STORAGE_SCREEN") {
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid selected M16 storage policy");value=="1"},
+            Err(std::env::VarError::NotPresent)=>false,
+            Err(error)=>return Err(error.into()),
+        } && serving_grouped16
+            &&std::env::var("CANADA_SCRATCH_GROUPED_SPARSE16_SCREEN").as_deref()!=Ok("1");
+        let compact32_screen=std::env::var("CANADA_SCRATCH_COMPACT32_INDEX_SCREEN").as_deref()==Ok("1");
         let grouped_requested = match std::env::var("CANADA_SCRATCH_GROUPED_SPARSE128") {
             Ok(value) => {ensure!(value == "0" || value == "1", "invalid grouped sparse policy"); value == "1"},
             // s357: four-device retained-prefix/logit/state screen passed.
@@ -276,8 +336,13 @@ impl Branch {
             Err(std::env::VarError::NotPresent) => true,
             Err(error) => return Err(error.into()),
         };
-        let grouped = grouped_requested && rows == 128 && columns == 1048576
-            && [24, 28, 32, 36].contains(&layer);
+        // The selected-only M16 experiment removes an unused dense key matrix,
+        // retaining the identical compact scorer. Explicit A/B probes still own
+        // both alternatives, so they can switch without replacing graph inputs.
+        let grouped = ((grouped_requested&&rows==128)
+            ||(rows==16&&selected_grouped16_storage)
+            ||(rows==32&&serving_grouped32&&!compact32_screen))
+            &&columns==1048576&&[24,28,32,36].contains(&layer);
         let shard_requested = match std::env::var("CANADA_SCRATCH_ROW_SHARDED_INDEX") {
             Ok(value) => {ensure!(value == "0" || value == "1", "invalid index row-shard policy"); value == "1"},
             // s361: exact four-rank logits/state against saved s353 controls.
@@ -297,12 +362,54 @@ impl Branch {
             ((shard_requested && columns == 524288 && [2, 8, 14].contains(&layer))
                 || (shard_publisher && columns == 1048576 && layer == 20));
         ensure!(!(sparse6 || grouped) || key_rows == columns, "sparse index requires zero-based full key storage");
-        let keys = Rc::new(KeyMatrix::new(cuda,
-            if grouped { crate::grouped_sparse_index::key_capacity(columns) }
-            else if sparse6 && !adaptive6 { crate::sparse_index::key_capacity(columns) } else { key_rows })?);
+        let key_capacity=if grouped&&rows==16 {crate::grouped_sparse_index::key_capacity16(columns)}
+            else if grouped {crate::grouped_sparse_index::key_capacity(columns)}
+            else if sparse6&&!adaptive6 {crate::sparse_index::key_capacity(columns)} else{key_rows};
+        let keys=if let Some(owner)=key_owner {
+            // The source constructor has already checked this exact causal
+            // cache/weight owner. Wide and M128 gathers rebuild all reachable
+            // keys on the same ordered stream; no decode gather cache is lent.
+            ensure!(std::env::var("CANADA_SCRATCH_WIDE_INDEX_KEYS_SCREEN").as_deref()==Ok("1")
+                &&crate::config::wide_rows(rows)&&[2,8,14,20].contains(&layer)
+                &&!grouped&&!sparse6&&!owner.gather.cached_enabled()
+                &&owner.keys.rows()==key_capacity&&cuda.owns_buffer(&owner.keys.payload),
+                "sequential wide gathered-key loan geometry/owner");
+            owner.keys.clone()
+        }else{Rc::new(KeyMatrix::new(cuda,key_capacity)?)};
         let native = mqa::Native::open(cuda, &kernels.join("mqa-v1"))?;
         let schedule=native.clone();
         let topk_native = topk::Native::open(cuda, &kernels.join("topk-v2"))?;
+        let key_sharded_requested=match std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX") {
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid key-shard policy");value=="1"},
+            Err(std::env::VarError::NotPresent)=>false,
+            Err(error)=>return Err(error.into()),
+        };
+        let publisher_screen=std::env::var("CANADA_SCRATCH_KEY_SHARDED_PUBLISHER_SCREEN").as_deref()==Ok("1");
+        ensure!(!publisher_screen||std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX_SCREEN").as_deref()==Ok("1"),"publisher partition is an isolated index screen");
+        let publisher_requested=match std::env::var("CANADA_SCRATCH_KEY_SHARDED_PUBLISHER") {
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid key publisher policy");value=="1"},
+            Err(std::env::VarError::NotPresent)=>false,
+            Err(error)=>return Err(error.into()),
+        };
+        let shard_geometry=(columns==524288&&[2,8,14].contains(&layer))
+            ||((publisher_screen||publisher_requested)&&columns==1048576&&layer==20);
+        let branch_requested=if layer==20{publisher_requested}else{key_sharded_requested};
+        let sixteen_requested=match std::env::var("CANADA_SCRATCH_KEY_SHARDED16") {
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid sixteen-row key partition policy");value=="1"},
+            Err(std::env::VarError::NotPresent)=>false,
+            Err(error)=>return Err(error.into()),
+        };
+        let key_sharded=if (rows==6||(rows==16&&sixteen_requested))&&key_rows==columns&&shard_geometry
+            &&(branch_requested||std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX_SCREEN").as_deref()==Ok("1")) {
+            Some(crate::key_sharded_index::KeySharded::new(cuda,core,native.clone(),topk_native.clone(),query.output(),columns)?)
+        }else{None};
+        let key_sharded_auto=Cell::new(key_sharded.is_some()&&branch_requested
+            &&std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX_SCREEN").as_deref()!=Ok("1"));
+        let key_sharded_active=Cell::new(key_sharded.is_some()&&branch_requested&&!key_sharded_auto.get());
+        // The smaller publisher crossover is retained only as a diagnostic:
+        // its component gain did not establish a full-model gain at393K.
+        let key_sharded_min_position=if layer==20&&publisher_screen
+            &&std::env::var("CANADA_SCRATCH_KEY_SHARD_MIDPOINT_SCREEN").as_deref()==Ok("1") {393216}else{524288};
         let dense_bytes = rows.div_ceil(4) * 4 * columns.div_ceil(128) * 128 * 4;
         let mut scorer = if grouped {
             Scorer::Grouped(crate::grouped_sparse_index::Grouped::new(cuda, core, native,
@@ -342,11 +449,12 @@ impl Branch {
         };
         match &mut scorer {
             Scorer::Sparse6(s)|Scorer::Adaptive6{sparse:s,..}=>s.configure_packed_gather(kernels)?,
+            Scorer::Grouped(g) if [16,32].contains(&rows)=>g.configure_packed_gather(kernels)?,
             _=>{},
         }
         let key_splits=schedule.key_splits(match &scorer {
             Scorer::Chunked(c)=>c.rows(0)?.len(),
-            Scorer::Grouped(_)=>32,
+            Scorer::Grouped(_)=>rows.min(32),
             _=>rows,
         });
         if shard_index_rows {
@@ -386,24 +494,25 @@ impl Branch {
         let consumer = (wide && [24, 28, 32, 36].contains(&layer))
             .then(|| crate::candidates::Consumer::new(cuda, core, rows, columns))
             .transpose()?;
-        let serving_grouped16=match std::env::var("CANADA_SCRATCH_GROUPED_SPARSE16") {
-            Ok(value)=>{ensure!(value=="0"||value=="1","invalid compact M16 policy");value=="1"},
-            Err(std::env::VarError::NotPresent)=>false,
-            Err(error)=>return Err(error.into()),
-        };
-        ensure!(!serving_grouped16 || !crate::mhc::attention16_overlap_enabled()?,
-            "compact M16 currently requires the qualified serial attention schedule");
-        let grouped16=if rows==16 && columns==1048576 && consumer.is_some()
-            && (serving_grouped16 || std::env::var("CANADA_SCRATCH_GROUPED_SPARSE16_SCREEN").as_deref()==Ok("1")) {
-            ensure!(matches!(scorer,Scorer::Dense(_)) && !shard_index_rows && key_rows==columns
-                && key_splits==12,"M16 compact comparison requires the native dense12-way schedule");
+        ensure!(!serving_grouped16 || !crate::mhc::attention16_overlap_enabled()?
+            || crate::mhc::compact16_overlap_enabled()?,
+            "compact M16 requires serial attention or the pipeline-fenced overlap opt-in");
+        let compact_requested=(rows==16&&!selected_grouped16_storage&&(serving_grouped16
+            ||std::env::var("CANADA_SCRATCH_GROUPED_SPARSE16_SCREEN").as_deref()==Ok("1")))
+            ||(rows==32&&compact32_screen);
+        let compact_verifier=if compact_requested && columns==1048576 && consumer.is_some() {
+            ensure!(((rows==16&&matches!(scorer,Scorer::Dense(_)))
+                ||(rows==32&&matches!(scorer,Scorer::Chunked(_))))
+                && !shard_index_rows && key_rows==columns && key_splits==12,
+                "compact verifier comparison requires the native16-row12-way dense schedule");
             let mut grouped=crate::grouped_sparse_index::Grouped::new(cuda,core,schedule,
                 topk_native,query.output(),Rc::new(KeyMatrix::new(cuda,
-                    crate::grouped_sparse_index::key_capacity16(columns))?),columns,SCORE_BUDGET)?;
-            grouped.configure_packed_gather16(kernels)?;
+                    if rows==16 {crate::grouped_sparse_index::key_capacity16(columns)}
+                    else {crate::grouped_sparse_index::key_capacity(columns)})?),columns,SCORE_BUDGET)?;
+            grouped.configure_packed_gather(kernels)?;
             Some(grouped)
         }else{None};
-        let grouped16_active=Cell::new(serving_grouped16 && grouped16.is_some());
+        let compact_verifier_active=Cell::new(((rows==16&&serving_grouped16)||(rows==32&&serving_grouped32))&&compact_verifier.is_some());
         let mut branch=Self {
             q,
             heads,
@@ -411,7 +520,8 @@ impl Branch {
             gather: KeyGather::new(cuda, core, kernels, rows)?,
             keys,
             scorer,
-            grouped16,grouped16_active,
+            key_sharded,key_sharded_active,key_sharded_auto,key_sharded_min_position,
+            compact_verifier,compact_verifier_active,
             selection,
             publisher,
             consumer,
@@ -470,8 +580,29 @@ impl Branch {
     pub(crate) fn candidate_mask(&self) -> Option<&Buffer<u8>> {
         self.publisher.as_ref().map(|p| p.mask())
     }
+    /// Publisher-owned block scores survive later consumer index operations;
+    /// the shared full-token score workspace does not.
+    pub(crate) fn published_block_taps(&self)->Vec<(&'static str,u64,usize)> {
+        self.publisher.as_ref().map_or_else(Vec::new,|p|p.selector_taps())
+    }
     pub(crate) fn candidate_mask_is_compact(&self) -> bool {
         self.publisher.as_ref().is_some_and(|p| p.compact_mask())
+    }
+    /// One active index scorer at a time on the target's ordered stream.
+    /// Sparse6 scatter output stays separate: it can read its compact scores
+    /// while writing the expanded matrix. Masks/keys/selected IDs also remain
+    /// private and retain their original lifetime.
+    pub(crate) fn share_score_scratch(&mut self, storage: Rc<Buffer<f32>>) -> Result<usize> {
+        let mut released=match &mut self.scorer {
+            Scorer::Dense(s)=>s.share_score_scratch(storage.clone())?,
+            Scorer::Chunked(s)=>s.share_score_scratch(storage.clone())?,
+            Scorer::Grouped(s)=>s.share_score_scratch(storage.clone())?,
+            Scorer::Sparse6(s)=>s.share_score_scratch(storage.clone())?,
+            Scorer::Adaptive6{dense,sparse,..}=>dense.share_score_scratch(storage.clone())?
+                +sparse.share_score_scratch(storage.clone())?,
+        };
+        if let Some(s)=&mut self.compact_verifier {released+=s.share_score_scratch(storage)?;}
+        Ok(released)
     }
     pub(crate) fn share_candidate_scratch_from(&mut self, prior: &Self) -> Result<()> {
         match (&mut self.publisher, &prior.publisher) {
@@ -516,8 +647,9 @@ impl Branch {
         self.heads.run(hidden, stream)?;
         self.query
             .run(self.q.output(), self.heads.output(), &meta.query, stream)?;
-        let grouped16_active=self.grouped16_active.get();
-        if !grouped16_active && !self.sparse6_active() && !matches!(self.scorer, Scorer::Grouped(_)) {
+        let compact_verifier_active=self.compact_verifier_active.get();
+        let key_sharded_active=self.key_sharded_active.get();
+        if !key_sharded_active && !compact_verifier_active && !self.sparse6_active() && !matches!(self.scorer, Scorer::Grouped(_)) {
             self.gather.run_with_bound(cache, &meta.slots, &self.keys,
                 self.bounded_gather.then_some(meta.ranges.key_ends()), stream)?;
         }
@@ -532,10 +664,15 @@ impl Branch {
             }
             Ok(())
         };
-        if grouped16_active {
-            ensure!(meta.zero_based,"M16 compact requires zero-based ranges");
-            self.grouped16.as_mut().expect("prepared M16 compact scorer").run(cache,&meta.slots,&meta.windows,
-                mask.ok_or_else(||anyhow::anyhow!("M16 compact source mask missing"))?,&self.selection,stream)?;
+        if key_sharded_active {
+            ensure!(meta.zero_based&&self.consumer.is_none()
+                &&self.publisher.is_some()==self.has_key_sharded_publisher(),"key-shard zero-based source index");
+            self.key_sharded.as_mut().expect("prepared key sharding").run(cache,&meta.slots,meta.ranges.key_ends(),
+                &meta.windows,&self.selection,comm.ok_or_else(||anyhow::anyhow!("key-shard collective owner missing"))?,stream)?;
+        }else if compact_verifier_active {
+            ensure!(meta.zero_based,"compact verifier requires zero-based ranges");
+            self.compact_verifier.as_mut().expect("prepared compact verifier scorer").run(cache,&meta.slots,&meta.windows,
+                mask.ok_or_else(||anyhow::anyhow!("compact verifier source mask missing"))?,&self.selection,stream)?;
         }else{match &mut self.scorer {
             Scorer::Dense(dense) | Scorer::Adaptive6{dense,active:false,..} => {
                 dense.run(&meta.ranges, stream)?;
@@ -581,8 +718,10 @@ impl Branch {
             // while a member causal row is shorter. Skipping its sort leaves
             // native selection order variable. The short-row guarantee must
             // cover the actual producer before we rely on ordered IDs/padding.
-            let mut lengths = if grouped16_active {
-                self.grouped16.as_ref().unwrap().selection_lengths()
+            let mut lengths = if key_sharded_active {
+                self.key_sharded.as_ref().unwrap().selection_lengths()
+            }else if compact_verifier_active {
+                self.compact_verifier.as_ref().unwrap().selection_lengths()
             }else{match &self.scorer {
                 Scorer::Grouped(grouped)=>grouped.selection_lengths(),
                 Scorer::Sparse6(s)|Scorer::Adaptive6{sparse:s,active:true,..}=>
@@ -605,11 +744,14 @@ impl Branch {
         if let Scorer::Grouped(grouped) = &self.scorer {
             grouped.poison_selection_on_error(self.selection.indices(), stream)?;
         }
-        if grouped16_active {
-            self.grouped16.as_ref().unwrap().poison_selection_on_error(self.selection.indices(),stream)?;
+        if compact_verifier_active {
+            self.compact_verifier.as_ref().unwrap().poison_selection_on_error(self.selection.indices(),stream)?;
         }
         if let Some(p) = &mut self.publisher {
-            if let Some(rows)=owned_rows {
+            if key_sharded_active {
+                p.publish_selected(self.key_sharded.as_ref().and_then(|s|s.block_ids())
+                    .ok_or_else(||anyhow::anyhow!("key partition missing candidate blocks"))?,&meta.windows,stream)?;
+            }else if let Some(rows)=owned_rows {
                 p.publish_sharded(&meta.windows,rows,comm.expect("checked publisher communicator"),live,stream)?;
             }else{p.publish(&meta.windows, stream)?;}
         }
@@ -632,6 +774,7 @@ impl Branch {
     }
     /// Diagnostic only: the complete matrix for Dense, the last row chunk otherwise.
     pub fn scores(&self) -> Result<&Buffer<f32>> {
+        ensure!(!self.key_sharded_active.get(),"key-shard path does not materialize the replicated diagnostic scores");
         ensure!(!self.compact_sparse6() || !self.sparse6_active(), "compact selection does not materialize the diagnostic full score matrix");
         Ok(match &self.scorer {
             Scorer::Dense(d) | Scorer::Adaptive6{dense:d,active:false,..} => d.output(),

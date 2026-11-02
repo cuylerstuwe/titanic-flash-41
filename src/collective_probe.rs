@@ -42,6 +42,9 @@ fn check(cuda: &Cuda, module: &Module, output: &Buffer<u16>, raw: &Buffer<f32>,
 }
 
 pub fn run(rank: usize, endpoint: &str, nonce: &[u8], root: &Path, core: &Path) -> Result<Value> {
+    if std::env::var("CANADA_SCRATCH_TWO_OWNER_TRANSPORT_SCREEN").as_deref()==Ok("1") {
+        return run_two_owner_pool(rank,endpoint,nonce,root,core);
+    }
     if std::env::var("CANADA_SCRATCH_PREFILL_COLUMN_GATHER_SCREEN").as_deref()==Ok("1") {
         return run_column_gather(rank,endpoint,nonce,root,core);
     }
@@ -119,6 +122,91 @@ pub fn run(rank: usize, endpoint: &str, nonce: &[u8], root: &Path, core: &Path) 
         "nccl_graph_stream_ordering":std::env::var("NCCL_GRAPH_STREAM_ORDERING").ok(),
         "results":results,"all_gpu_checks_pass":true,"serving_policy_changed":false,
         "scope":"BF16 sources; native FP32 sum versus exact promotion, NCCL FP32 sum, one BF16 output rounding. GPU-generated fixtures and FP64 oracle. Timing includes both conversion kernels; six balanced pairs, 256 reductions per interval. Component screen only."}))
+}
+
+/// Price the existing communication kernels before introducing a batched
+/// model/state owner. Compare two contiguous row slices with one combined
+/// payload; no arithmetic order, target precision or serving path changes.
+fn run_two_owner_pool(rank:usize,endpoint:&str,nonce:&[u8],root:&Path,core:&Path)->Result<Value> {
+    let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;let stream=cuda.stream()?;
+    let module=cuda.module(&std::fs::read(core)?)?;
+    let mut comm=Roce::local(&cuda,&root.join("roce-v0"),rank)?;
+    comm.attach_gather(&root.join("roce-gather-v1"))?;
+    let blobs=crate::rendezvous::exchange_blob(rank,endpoint.parse()?,nonce,&comm.blob()?)?;
+    comm.connect(&blobs)?;let mut records=Vec::new();
+    for rows in [3usize,6,16] {
+        for (kind,columns,gather) in [("residual_sum",5120,false),("qkv_gather",448,true),
+            ("engram_gather",6400,true),("logit_raw_gather",64640,true)] {
+            // FP32 logit gathers use the same raw16-byte-pack primitive;
+            //64640u16 words are32320FP32 words per rank and row.
+            let n=2*rows*columns;let out_n=n*if gather{4}else{1};
+            let mut input=cuda.allocate::<u16>(n)?;
+            let mut storage=(0..2).map(|_|cuda.allocate::<u16>(out_n+128)).collect::<Result<Vec<_>>>()?;
+            for x in &mut storage{x.upload(&vec![0xa55a;out_n+128])?;}
+            let mut outputs=storage.iter().map(|x|unsafe{x.view(64,out_n)}).collect::<Result<Vec<_>>>()?;
+            let raw=cuda.allocate::<f32>(out_n)?;
+            fixture(&module,&mut input,rank,0,&stream)?;stream.join_default()?;
+            let mut graphs=Vec::new();
+            for variant in 0..2 {
+                let out=&mut outputs[variant];
+                let enqueue=||->Result<()>{
+                    let parts=if variant==0{2}else{1};
+                    for part in 0..parts {
+                        let x=unsafe{input.view(part*n/parts,n/parts)}?;
+                        let mut y=unsafe{out.view(part*out_n/parts,out_n/parts)}?;
+                        if gather {unsafe{comm.gather_bf16(&x,&mut y,columns,&stream)}?;}
+                        else {unsafe{comm.sum_bf16(&x,&mut y,&stream)}?;}
+                    }Ok(())
+                };
+                enqueue()?;stream.synchronize()?;
+                graphs.push(stream.capture(||{for _ in 0..8{enqueue()?;}Ok(())})?);
+            }
+            let mut checks=Vec::new();let mut pairs=Vec::new();
+            for pattern in [0,2] {
+                fixture(&module,&mut input,rank,pattern,&stream)?;
+                for graph in &graphs{unsafe{graph.launch(&stream)}?;}
+                stream.synchronize()?;
+                let before=storage.iter().map(Buffer::download).collect::<Result<Vec<_>>>()?;
+                ensure!(before[0]==before[1],"pooled transport changed {kind} rows{rows} pattern{pattern}");
+                ensure!(before.iter().all(|x|x[..64].iter().chain(&x[out_n+64..]).all(|&v|v==0xa55a)),"pooled transport guard overwritten");
+                let oracle=if gather {
+                    let rank_major=cuda.allocate::<u16>(out_n)?;
+                    let expected=cuda.allocate::<u16>(out_n)?;
+                    for peer in 0..4 {
+                        let mut peer_input=unsafe{rank_major.view(peer*n,n)}?;
+                        fixture(&module,&mut peer_input,peer,pattern,&stream)?;
+                    }
+                    let (mut src,mut dst,mut r,mut c)=(rank_major.ptr(),expected.ptr(),(2*rows)as i32,(columns/8)as i32);
+                    let mut args=[(&mut src as *mut u64).cast(),(&mut dst as *mut u64).cast(),
+                        (&mut r as *mut i32).cast(),(&mut c as *mut i32).cast()];
+                    unsafe {module.function("ca_transpose_rank_columns")?.launch(
+                        [(out_n/8).div_ceil(256)as u32,1,1],[256,1,1],0,&stream,&mut args)}?;
+                    stream.synchronize()?;
+                    ensure!(expected.download()?==before[0][64..out_n+64],"pooled gather differs from GPU-generated expected peers");
+                    json!({"gpu_peer_fixture_and_transpose_exact":true})
+                }else{check(&cuda,&module,&outputs[1],&raw,pattern,0,&stream)?};
+                checks.push(json!({"pattern":pattern,"exact":true,"guards":true,"gpu_oracle":oracle,
+                    "sha256":format!("{:x}",Sha256::digest(before[0][64..out_n+64].iter().flat_map(|x|x.to_le_bytes()).collect::<Vec<_>>()))}));
+                for repeat in 0..6 {
+                    let mut times=[0f32;2];
+                    for variant in [repeat%2,1-repeat%2] {
+                        for _ in 0..4 {unsafe{graphs[variant].launch(&stream)}?;}
+                        stream.synchronize()?;
+                        let a=cuda.event()?;let b=cuda.event()?;a.record(&stream)?;
+                        for _ in 0..16 {unsafe{graphs[variant].launch(&stream)}?;}
+                        b.record(&stream)?;times[variant]=b.elapsed_since(&a)?/128.;comm.health()?;
+                    }
+                    pairs.push(json!({"pattern":pattern,"repeat":repeat,"first_variant":repeat%2,"milliseconds_per_pair":times}));
+                }
+                for (i,x) in storage.iter().enumerate(){ensure!(x.download()?==before[i],"pooled transport replay changed bytes");}
+            }
+            records.push(json!({"kind":kind,"rows_per_owner":rows,"pooled_rows":2*rows,"local_columns_u16":columns,
+                "input_bytes_per_owner":n,"checks":checks,"pairs":pairs}));
+        }
+    }
+    stream.synchronize()?;comm.health()?;
+    Ok(json!({"rank":rank,"all_exact":true,"records":records,
+        "scope":"Two existing native collectives versus one combined row payload on four devices. Twelve shapes, two changed GPU fixtures, output guards, six reversed-order timing pairs per fixture; native sums retain FP32 accumulation and BF16 output. Warm captured-graph transport only, no row-pack cost, competing model traffic or whole-model/serving claim."}))
 }
 
 fn run_column_gather(rank:usize,endpoint:&str,nonce:&[u8],root:&Path,core:&Path)->Result<Value>{

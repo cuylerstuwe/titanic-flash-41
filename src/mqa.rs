@@ -276,6 +276,8 @@ pub struct Dense {
     columns: usize,
     stride: usize,
     output: Buffer<f32>,
+    // A view must be dropped before the optional same-owner scratch backing.
+    score_owner: Option<Rc<Buffer<f32>>>,
     stream: Cell<usize>,
 }
 impl Dense {
@@ -331,6 +333,7 @@ impl Dense {
             columns,
             stride,
             output,
+            score_owner: None,
             stream: Cell::new(0),
         })
     }
@@ -372,6 +375,17 @@ impl Dense {
         ensure!(status == 0, "MQA launch: {status}");
         Ok(())
     }
+    /// Construction-only scratch reuse. Q/K descriptors do not contain the
+    /// score pointer; launch binds the view after its producer writes it.
+    pub(crate) fn share_score_scratch(&mut self, storage: Rc<Buffer<f32>>) -> Result<usize> {
+        ensure!(self.stream.get()==0 && self.score_owner.is_none()
+            && self.cuda.owns_buffer(&storage) && storage.len()>=self.output.len(),
+            "score scratch requires unexecuted same-context sufficient storage");
+        let released=self.output.bytes();
+        self.output=unsafe{storage.view(0,self.output.len())}?;
+        self.score_owner=Some(storage);
+        Ok(released)
+    }
     pub fn output(&self) -> &Buffer<f32> {
         &self.output
     }
@@ -408,6 +422,8 @@ pub struct Chunked {
     columns: usize,
     stride: usize,
     output: Buffer<f32>,
+    // A view must be dropped before the optional same-owner scratch backing.
+    score_owner: Option<Rc<Buffer<f32>>>,
     stream: Cell<usize>,
 }
 impl Chunked {
@@ -463,6 +479,7 @@ impl Chunked {
             columns,
             stride,
             output,
+            score_owner: None,
             stream: Cell::new(0),
         })
     }
@@ -524,6 +541,17 @@ impl Chunked {
             c.start
         );
         Ok(())
+    }
+    /// Construction-only scratch reuse. Q/K descriptors do not contain the
+    /// score pointer; launch binds the view after its producer writes it.
+    pub(crate) fn share_score_scratch(&mut self, storage: Rc<Buffer<f32>>) -> Result<usize> {
+        ensure!(self.stream.get()==0 && self.score_owner.is_none()
+            && self.cuda.owns_buffer(&storage) && storage.len()>=self.output.len(),
+            "score scratch requires unexecuted same-context sufficient storage");
+        let released=self.output.bytes();
+        self.output=unsafe{storage.view(0,self.output.len())}?;
+        self.score_owner=Some(storage);
+        Ok(released)
     }
     pub fn output(&self) -> &Buffer<f32> {
         &self.output

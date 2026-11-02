@@ -32,6 +32,9 @@ fn main() -> Result<()> {
         Some("resident-token-peer") if args.len() == 3 => {
             canada_engine::resident_worker::run_file(Path::new(&args[2]))?;
         }
+        Some("worker-config-validate") if args.len()==4 && ["http","file"].contains(&args[3].as_str()) => {
+            println!("{}",canada_engine::resident_worker::validate_configuration(Path::new(&args[2]),args[3]=="http")?);
+        }
         Some("gpu-primitive-lifetime") if args.len() == 4 => {
             let report=canada_engine::primitives::probe_lifetime(Path::new(&args[2]))?;
             serde_json::to_writer_pretty(File::create(&args[3])?,&report)?;
@@ -72,6 +75,14 @@ fn main() -> Result<()> {
         Some("gpu-staged-metadata-probe") if args.len() == 3 => {
             let report = canada_engine::cuda::probe_staged_metadata()?;
             serde_json::to_writer_pretty(File::create(&args[2])?, &report)?;
+        }
+        Some("gpu-core-module-reuse-probe") if args.len() == 4 => {
+            let report=canada_engine::cuda::probe_core_module_reuse(Path::new(&args[2]))?;
+            serde_json::to_writer_pretty(File::create(&args[3])?,&report)?;
+        }
+        Some("gpu-blas-workspace-probe") if args.len() == 3 => {
+            let report=canada_engine::blas::probe_shared_workspace()?;
+            serde_json::to_writer_pretty(File::create(&args[2])?,&report)?;
         }
         Some("gpu-ordering-probe") if args.len() == 4 => {
             let report = canada_engine::cuda::probe_default_order(Path::new(&args[2]))?;
@@ -159,6 +170,10 @@ fn main() -> Result<()> {
             let cuda = canada_engine::cuda::Cuda::open(0)?;
             let report = serde_json::json!({"memory":cuda.admission_memory()?,"integrated_attribute":cuda.attribute(18)?});
             serde_json::to_writer_pretty(File::create(&args[2])?, &report)?;
+        }
+        Some("gpu-mqa-score-pool") if args.len() == 5 => {
+            let report=canada_engine::mqa_probe::run_score_pool(Path::new(&args[2]),Path::new(&args[3]))?;
+            serde_json::to_writer_pretty(File::create(&args[4])?,&report)?;
         }
         Some("gpu-mqa-chunked") if args.len() == 4 => {
             let report = canada_engine::mqa_probe::run_chunked(Path::new(&args[2]))?;
@@ -608,6 +623,25 @@ fn main() -> Result<()> {
             )?;
             serde_json::to_writer_pretty(File::create(&args[7])?, &result)?;
         }
+        Some("gpu-sharded-categorical-probe") if args.len() == 8 => {
+            let result = canada_engine::sharded_categorical_probe::run(
+                args[2].parse()?, &args[3], &std::fs::read(&args[4])?,
+                Path::new(&args[5]), Path::new(&args[6]),
+            )?;
+            serde_json::to_writer_pretty(File::create(&args[7])?, &result)?;
+        }
+        Some("gpu-paired-shared-up-probe") if args.len()==8 => {
+            let result=canada_engine::fp8_linear::paired_shared_up_probe(
+                Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4]),
+                Path::new(&args[5]),Path::new(&args[6]))?;
+            serde_json::to_writer_pretty(File::create(&args[7])?,&result)?;
+        }
+        Some("gpu-paired-qkv-probe") if args.len()==8 => {
+            let result=canada_engine::fp8_linear::paired_qkv_probe(
+                Path::new(&args[2]),Path::new(&args[3]),Path::new(&args[4]),
+                Path::new(&args[5]),Path::new(&args[6]))?;
+            serde_json::to_writer_pretty(File::create(&args[7])?,&result)?;
+        }
         Some("gpu-sum-grid-probe") if args.len() == 8 => {
             let result = canada_engine::sum_grid_probe::run(
                 args[2].parse()?, &args[3], &std::fs::read(&args[4])?, Path::new(&args[5]),
@@ -620,6 +654,10 @@ fn main() -> Result<()> {
                 Path::new(&args[5]), Path::new(&args[6]),
             )?;
             serde_json::to_writer_pretty(File::create(&args[7])?, &result)?;
+        }
+        Some("gpu-vision-placement-probe") if args.len() == 3 => {
+            let report=canada_engine::worker_media::placement_probe(Path::new(&args[2]))?;
+            println!("{}",serde_json::json!({"rank":report["rank"],"placement_exact":report["placement_exact"]}));
         }
         Some("gpu-transport-probe") if args.len() == 8 => {
             let result = canada_engine::collective_probe::run(

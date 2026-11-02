@@ -31,7 +31,13 @@ pub(crate) struct WideBuild {
     sp_rank: Option<usize>,
     arenas: [Rc<crate::cuda::RowArena>; 2],
     shared_arenas: bool,
+    shared_moe: bool,
     moe: Rc<Workspace>,
+    // Embedding and full-row gather storage survive individual layer scopes,
+    // but not a completed prefill chunk. Keep them separate from layer parity
+    // storage and lend them only to sequential wide profiles.
+    input_arena: Option<Rc<crate::cuda::RowArena>>,
+    gather_arena: Option<Rc<crate::cuda::RowArena>>,
 }
 /// Engram layers 1/14 and the embedding-fed layer0 keep full rows; every
 /// other encoder layer may run its mHC boundaries sequence-parallel.
@@ -39,6 +45,11 @@ pub(crate) fn sequence_parallel_layer(layer: usize) -> bool {
     (2..=20).contains(&layer) && layer != 14
 }
 impl WideBuild {
+    pub(crate) fn transient_arena_for_probe(&self,slot:usize)->Result<Rc<crate::cuda::RowArena>> {
+        ensure!(std::env::var("CANADA_SCRATCH_NARROW_ARENA_LOAN_SCREEN").as_deref()==Ok("1")
+            &&self.rows==8192&&self.sp_rank.is_some()&&slot<2,"finite prefill arena loan");
+        Ok(self.arenas[slot].clone())
+    }
     pub(crate) fn new(
         cuda: &Cuda,
         kernels: &Path,
@@ -55,24 +66,60 @@ impl WideBuild {
             ensure!(prior.rows >= rows && prior.sp_rank == sp_rank
                 && prior.arenas.iter().all(|a| a.bytes() >= arena_bytes),
                 "shared wide arenas require the same layout and sufficient capacity");
-            // These are explicitly transient layer-parity arenas. Model state,
-            // padded-K operands and MoE route scratch remain separately owned.
-            // The caller admits only sequential profiles of one revision owner.
+            // These are explicitly transient layer-parity arenas. Model state
+            // and padded-K operands remain separately owned. Same-width peer
+            // MoE scratch has its own finite admission below.
+            // The caller admits only sequential profiles on one ordered
+            // stream; independent request owners may lend these transients
+            // only through the separately gated peer-bank construction.
             prior.arenas.clone()
         } else {
             [cuda.row_arena(arena_bytes)?, cuda.row_arena(arena_bytes)?]
         };
-        let mut moe = Workspace::new(cuda, &kernels.join(format!("moe-runtime-m{rows}-v0")))?;
-        if [8192,16384].contains(&rows) && sp_rank.is_some() && crate::moe::packed_gather_requested()? {
-            moe.enable_packed(&kernels.join(format!("moe-runtime-m{rows}-prequant-v1")))?;
-        }
+        let peer_moe=std::env::var("CANADA_SCRATCH_PEER_WIDE_MOE_SHARE_SCREEN").as_deref()==Ok("1")
+            &&share.is_some_and(|p|p.rows==rows);
+        let moe=if peer_moe {
+            ensure!(crate::config::shared_owner_profiles_requested(),
+                "finite peer MoE workspace admission");
+            share.unwrap().moe.clone()
+        }else{
+            let root=kernels.join(format!("moe-runtime-m{rows}-v0"));
+            let mut moe=if std::env::var("CANADA_SCRATCH_WIDE_MOE_ARENA_SCREEN").as_deref()==Ok("1") {
+                ensure!(crate::config::shared_owner_profiles_requested()&&sp_rank.is_some(),
+                    "wide MoE arena loan requires sequential owner profiles");
+                Workspace::new_sequential(cuda,&root,share.map(|s|s.moe.as_ref()))?
+            }else{Workspace::new(cuda,&root)?};
+            if [8192,16384].contains(&rows) && sp_rank.is_some() && crate::moe::packed_gather_requested()? {
+                moe.enable_packed(&kernels.join(format!("moe-runtime-m{rows}-prequant-v1")))?;
+            }
+            Rc::new(moe)
+        };
+        let io_pool=std::env::var("CANADA_SCRATCH_WIDE_IO_ARENAS_SCREEN").as_deref()==Ok("1");
+        ensure!(!io_pool || (sp_rank.is_some()
+            &&crate::config::shared_owner_profiles_requested()),
+            "wide IO arena loan requires the finite sequential full-profile screen");
+        let (input_arena,gather_arena)=if io_pool {
+            if let Some(prior)=share {
+                (Some(prior.input_arena.as_ref().ok_or_else(||anyhow::anyhow!("missing wide input arena donor"))?.clone()),
+                 Some(prior.gather_arena.as_ref().ok_or_else(||anyhow::anyhow!("missing wide gather arena donor"))?.clone()))
+            }else{
+                (Some(cuda.row_arena(rows*30720*2)?),Some(cuda.row_arena(rows*(20480*2+4*4))?))
+            }
+        }else{(None,None)};
         Ok(Self {
             rows,
             sp_rank,
             arenas,
             shared_arenas: share.is_some(),
-            moe: Rc::new(moe),
+            shared_moe: peer_moe,
+            moe,
+            input_arena,gather_arena,
         })
+    }
+    pub(crate) fn input_arena(&self)->Option<&Rc<crate::cuda::RowArena>> {self.input_arena.as_ref()}
+    pub(crate) fn gather_arena(&self)->Option<&Rc<crate::cuda::RowArena>> {self.gather_arena.as_ref()}
+    pub(crate) fn prepare_moe_scratch(&self,stream:&Stream)->Result<()> {
+        self.moe.prepare_sequential_scratch(stream)
     }
     /// Build one layer's transient storage in its parity arena.
     pub(crate) fn layer<R>(
@@ -87,9 +134,13 @@ impl WideBuild {
     }
     pub(crate) fn report(&self) -> serde_json::Value {
         serde_json::json!({"rows":self.rows,"sequence_parallel_mhc":self.sp_rank.is_some(),"arena_bytes":self.arenas[0].bytes(),
-            "shared_row_arenas":self.shared_arenas,
+            "shared_row_arenas":self.shared_arenas,"shared_moe_workspace":self.shared_moe,
+            "sequential_moe_backing_bytes":self.moe.sequential_scratch_bytes(),
             "owned_arena_bytes":if self.shared_arenas {0}else{self.arenas[0].bytes()+self.arenas[1].bytes()},
-            "arena_high_water":[self.arenas[0].high_water(),self.arenas[1].high_water()]})
+            "arena_high_water":[self.arenas[0].high_water(),self.arenas[1].high_water()],
+            "shared_wide_IO":self.input_arena.is_some(),
+            "wide_IO_backing_bytes":self.input_arena.as_ref().map_or(0,|a|a.bytes())
+                +self.gather_arena.as_ref().map_or(0,|a|a.bytes())})
     }
 }
 /// Sequence-parallel sublayer I/O: this rank owns rows [rank*M/4, (rank+1)*M/4)
@@ -117,7 +168,15 @@ pub struct SwaLayer {
     ffn_reduced: Buffer<bf16>,
     sink: Buffer<f32>,
     next_input_prefetch: Option<crate::l2_prefetch::Window>,
+    pair_deferred_ffn: bool,
+    pair_attention: PairAttention,
 }
+/// Enqueue/capture-only state. A pooled projection must consume exactly the
+/// private normalization prepared from this predecessor, on the same stream.
+#[derive(Clone,Copy,PartialEq,Eq)]
+struct PairAttentionInput { residual:u64, pre:u64, stream:usize }
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum PairAttention { Ordinary, Defer, Prepared(PairAttentionInput), Projected(PairAttentionInput) }
 impl SwaLayer {
     pub(crate) fn set_verify16_schedule_for_probe(&mut self, mask: u8, stream: &Stream) -> Result<()> {
         ensure!(mask<=3,"M16 FFN overlap component mask");
@@ -137,7 +196,7 @@ impl SwaLayer {
     /// cannot overwrite an earlier residual or DSpark feature tap.
     pub(crate) fn share_narrow_workspace(&mut self,cuda:&Cuda,workspace:Rc<Workspace>,rows:usize)->Result<()> {
         let old=&*self.moe_workspace;
-        ensure!([6,16,128].contains(&rows) && self.sp.is_none()
+        ensure!([6,16,32,128].contains(&rows) && self.sp.is_none()
             && old.output().len()==rows*5120 && workspace.output().len()==rows*5120
             && cuda.owns_buffer(old.output()) && cuda.owns_buffer(workspace.output())
             && old.live_bounds()==workspace.live_bounds()
@@ -229,7 +288,17 @@ impl SwaLayer {
             None,
         )
     }
-    /// `shared_moe` is the wide profile's single routed-expert workspace.
+    pub(crate) fn narrow_workspace_sharing_enabled(rows:usize)->bool {
+        match rows {
+            32=>crate::config::history32_enabled(),
+            16=>std::env::var("CANADA_SCRATCH_VERIFY16_SHARED_MOE").as_deref()==Ok("1"),
+            6|128=>std::env::var("CANADA_SCRATCH_NARROW_SHARED_MOE").as_deref()==Ok("1"),
+            _=>false,
+        }
+    }
+    /// `shared_moe` belongs to this execution profile. Wide profiles require it;
+    /// qualified narrow profiles may bind their scratch during construction,
+    /// avoiding allocation of forty workspaces before the usual consolidation.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_rows_in(
         cuda: &Cuda,
@@ -251,8 +320,11 @@ impl SwaLayer {
             "decoder execution profile not implemented for this layer"
         );
         ensure!(
-            crate::config::wide_rows(rows) == shared_moe.is_some(),
-            "wide encoder layers share one routed-expert workspace"
+            if crate::config::wide_rows(rows) {shared_moe.is_some()} else {
+                shared_moe.is_none() || (Self::narrow_workspace_sharing_enabled(rows)
+                    && std::env::var("CANADA_SCRATCH_NARROW_MOE_CONSTRUCTION").as_deref()==Ok("1"))
+            },
+            "shared routed-expert workspace requires its admitted profile policy"
         );
         // Ratio2 groups through19 are implemented; later ratio1 sources need
         // a separate graph. Qualification is recorded per immutable runtime.
@@ -349,6 +421,15 @@ impl SwaLayer {
         ensure!(!(micro_moe && live_moe),"exclusive MoE experiment modes");
         ensure!(!micro_moe || std::env::var("CANADA_SCRATCH_MOE_MICRO_AB").as_deref()==Ok("1"),
             "micro MoE requires the isolated model comparison");
+        if !crate::config::wide_rows(rows) && let Some(workspace)=&shared_moe {
+            let live=live_moe || (rows==16
+                && std::env::var("CANADA_SCRATCH_VERIFY16_LIVE_MOE").as_deref()==Ok("1"));
+            ensure!(sp_rank.is_none() && !micro_moe && workspace.output().len()==rows*5120
+                && cuda.owns_buffer(workspace.output()) && workspace.live_bounds()==live
+                && !workspace.micro_fp32() && !workspace.task_order()
+                && !workspace.task_order_m3() && !workspace.scale_reuse(),
+                "construction-time narrow scratch must preserve the ordinary workspace contract");
+        }
         let moe_workspace = match shared_moe {
             Some(w) => w,
             None if live_moe => Rc::new(Workspace::new_live(cuda,kernels)?),
@@ -405,6 +486,8 @@ impl SwaLayer {
             ffn_boundary,
             sink,
             next_input_prefetch: None,
+            pair_deferred_ffn: false,
+            pair_attention: PairAttention::Ordinary,
             attn_reduced: cuda.allocate_rows(local_rows * 5120)?,
             ffn_reduced: cuda.allocate_rows(local_rows * 5120)?,
         })
@@ -503,18 +586,9 @@ impl SwaLayer {
             Some(self.attn_boundary.pre()),
             stream,
         )?;
+        if self.pair_deferred_ffn {return Ok(());}
         self.run_ffn(tokens, comm, stream)?;
-        self.ffn.prefetch_join(stream)?;
-        if let Some(hint) = &self.next_input_prefetch {
-            hint.begin(stream)?;
-        }
-        unsafe { Self::reduce(self.sp.is_some(), comm, self.ffn.output(), &mut self.ffn_reduced, stream) }?;
-        self.ffn_boundary
-            .finish(&self.ffn_reduced, self.attn_boundary.output(), stream)?;
-        if let Some(hint) = &self.next_input_prefetch {
-            hint.join(stream)?;
-        }
-        Ok(())
+        self.finish_ffn(comm,stream)
     }
     pub fn output(&self) -> &Buffer<bf16> {
         self.ffn_boundary.output()
@@ -577,6 +651,59 @@ impl SwaLayer {
             unsafe { comm.sum_bf16(partial, reduced, stream) }
         }
     }
+    pub(crate) fn defer_pair_attention(&mut self)->Result<()> {
+        ensure!(self.pair_deferred_ffn&&self.sp.is_none()&&self.engram.is_none()
+            &&(2..40).contains(&self.layer)&&self.layer!=14
+            &&self.pair_attention==PairAttention::Ordinary,
+            "paired QKV stage requires an idle admitted non-Engram layer");
+        self.attention.paired_input_projection()?;
+        self.pair_attention=PairAttention::Defer;Ok(())
+    }
+    pub(crate) fn clear_pair_attention(&mut self) {self.pair_attention=PairAttention::Ordinary;}
+    /// None ends the first stage; Some(true) resumes after pooled projection.
+    /// The ordinary path enqueues exactly its existing boundary preparation.
+    fn prepare_attention_input(&mut self,residual:&Buffer<bf16>,pre:&Buffer<f32>,stream:&Stream)
+        ->Result<Option<bool>> {
+        let identity=PairAttentionInput{residual:residual.ptr(),pre:pre.ptr(),stream:stream.raw()as usize};
+        match self.pair_attention {
+            PairAttention::Ordinary=>{
+                self.attn_boundary.prepare(residual,Some(pre),stream)?;Ok(Some(false))
+            },
+            PairAttention::Defer=>{
+                self.attn_boundary.prepare(residual,Some(pre),stream)?;
+                self.pair_attention=PairAttention::Prepared(identity);Ok(None)
+            },
+            PairAttention::Projected(expected)=>{
+                ensure!(expected==identity,"paired attention predecessor or stream changed");
+                self.pair_attention=PairAttention::Ordinary;Ok(Some(true))
+            },
+            PairAttention::Prepared(_)=>anyhow::bail!("paired attention resumed before projection"),
+        }
+    }
+    pub(crate) fn project_pair_attention(&mut self,other:&mut Self,pool:&crate::fp8_linear::PairedQkv,
+        live:usize,other_live:usize,stream:&Stream)->Result<()> {
+        let(PairAttention::Prepared(a),PairAttention::Prepared(b))=(self.pair_attention,other.pair_attention)
+            else{anyhow::bail!("both paired normalizations must be ready");};
+        ensure!(self.layer==other.layer&&a.stream==b.stream&&a.stream==stream.raw()as usize
+            &&self.attn_boundary.input().ptr()!=other.attn_boundary.input().ptr(),
+            "paired attention private input/layer/stream ownership");
+        pool.run(self.attention.paired_input_projection()?,self.attn_boundary.input(),
+            self.attn_boundary.quantized_input(),live,other.attention.paired_input_projection()?,
+            other.attn_boundary.input(),other.attn_boundary.quantized_input(),other_live,stream)?;
+        self.pair_attention=PairAttention::Projected(a);other.pair_attention=PairAttention::Projected(b);Ok(())
+    }
+    fn project_attention_input(&mut self,precomputed:bool,positions:&Positions,locations:&RowLocations,
+        cache:&mut PagedKv,comm:&Roce,stream:&Stream)->Result<()> {
+        if precomputed {
+            ensure!(self.sp.is_none(),"pooled attention cannot consume a sequence shard");
+            self.attention.project_precomputed(self.attn_boundary.input(),positions,locations,cache,comm,stream)
+        }else{
+            Self::gather_input(&mut self.sp,&self.attn_boundary,comm,stream)?;
+            self.attention.project_distributed_quantized(
+                match &self.sp{Some(sp)=>&sp.gathered,None=>self.attn_boundary.input()},
+                self.attn_boundary.quantized_input(),positions,locations,cache,Some(comm),stream)
+        }
+    }
     pub fn run_indexed_from_previous(
         &mut self,
         residual: &Buffer<bf16>,
@@ -597,18 +724,8 @@ impl SwaLayer {
                 && self.engram.is_none(),
             "ratio2 source-layer graph contract"
         );
-        self.attn_boundary
-            .prepare(residual, Some(previous_pre), stream)?;
-        Self::gather_input(&mut self.sp, &self.attn_boundary, comm, stream)?;
-        self.attention.project_distributed_quantized(
-            match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
-            self.attn_boundary.quantized_input(),
-            positions,
-            locations,
-            cache,
-            Some(comm),
-            stream,
-        )?;
+        let Some(precomputed)=self.prepare_attention_input(residual,previous_pre,stream)? else{return Ok(());};
+        self.project_attention_input(precomputed,positions,locations,cache,comm,stream)?;
         if self.attention.query_overlap_enabled() {
             // Q-B's quantized workspace is still in flight on its side stream.
             // The index's own canonical quantizer consumes the ready BF16
@@ -656,18 +773,12 @@ impl SwaLayer {
                 && self.engram.is_none(),
             "shared compressed-source graph contract"
         );
-        self.attn_boundary
-            .prepare(residual, Some(previous_pre), stream)?;
-        if let Some(sp) = self.sp.as_mut().filter(|sp| sp.use_quantized) {
+        let Some(precomputed)=self.prepare_attention_input(residual,previous_pre,stream)? else{return Ok(());};
+        if let Some(sp) = self.sp.as_mut().filter(|sp| sp.use_quantized && !precomputed) {
             self.attention.project_row_shard(self.attn_boundary.input(), positions, locations,
                 cache, comm, sp.quantized.as_mut().ok_or_else(|| anyhow::anyhow!("quantized shard absent"))?, sp.use_local_qkv, stream)?;
         } else {
-            Self::gather_input(&mut self.sp, &self.attn_boundary, comm, stream)?;
-            self.attention.project_distributed_quantized(
-                match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
-                self.attn_boundary.quantized_input(),
-                positions, locations, cache, Some(comm), stream,
-            )?;
+            self.project_attention_input(precomputed,positions,locations,cache,comm,stream)?;
         }
         self.finish_compressed(
             residual, positions, cache, candidates, tokens, source, comm, stream,
@@ -692,18 +803,8 @@ impl SwaLayer {
             (21..=23).contains(&self.layer) && source.layer_id() == 20 && self.engram.is_none(),
             "decoder source20 replay contract"
         );
-        self.attn_boundary
-            .prepare(residual, Some(previous_pre), stream)?;
-        Self::gather_input(&mut self.sp, &self.attn_boundary, comm, stream)?;
-        self.attention.project_distributed_quantized(
-            match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
-            self.attn_boundary.quantized_input(),
-            positions,
-            locations,
-            cache,
-            Some(comm),
-            stream,
-        )?;
+        let Some(precomputed)=self.prepare_attention_input(residual,previous_pre,stream)? else{return Ok(());};
+        self.project_attention_input(precomputed,positions,locations,cache,comm,stream)?;
         self.finish_auxiliary(
             residual,
             positions,
@@ -761,18 +862,8 @@ impl SwaLayer {
             self.layer == index.layer_id() && owner.layer_id() == 20 && self.engram.is_none(),
             "read-index layer contract"
         );
-        self.attn_boundary
-            .prepare(residual, Some(previous_pre), stream)?;
-        Self::gather_input(&mut self.sp, &self.attn_boundary, comm, stream)?;
-        self.attention.project_distributed_quantized(
-            match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
-            self.attn_boundary.quantized_input(),
-            positions,
-            locations,
-            cache,
-            Some(comm),
-            stream,
-        )?;
+        let Some(precomputed)=self.prepare_attention_input(residual,previous_pre,stream)? else{return Ok(());};
+        self.project_attention_input(precomputed,positions,locations,cache,comm,stream)?;
         if self.attention.query_overlap_enabled() {
             index.run(
                 match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
@@ -824,18 +915,8 @@ impl SwaLayer {
                 && self.engram.is_none(),
             "shared read-index layer contract"
         );
-        self.attn_boundary
-            .prepare(residual, Some(previous_pre), stream)?;
-        Self::gather_input(&mut self.sp, &self.attn_boundary, comm, stream)?;
-        self.attention.project_distributed_quantized(
-            match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
-            self.attn_boundary.quantized_input(),
-            positions,
-            locations,
-            cache,
-            Some(comm),
-            stream,
-        )?;
+        let Some(precomputed)=self.prepare_attention_input(residual,previous_pre,stream)? else{return Ok(());};
+        self.project_attention_input(precomputed,positions,locations,cache,comm,stream)?;
         self.finish_auxiliary(
             residual,
             positions,
@@ -877,7 +958,36 @@ impl SwaLayer {
             Some(self.attn_boundary.pre()),
             stream,
         )?;
+        if self.pair_deferred_ffn {return Ok(());}
         self.run_ffn(tokens, comm, stream)?;
+        self.finish_ffn(comm,stream)
+    }
+    /// Explicitly admitted paired execution stops after preparing this owner's normalized
+    /// FFN input. Its canonical collective and residual boundary resume only
+    /// after the pooled or separate expert work has produced its own output.
+    pub(crate) fn defer_pair_ffn(&mut self,enabled:bool)->Result<()> {
+        ensure!((std::env::var("CANADA_SCRATCH_PAIRED_MODEL_SCREEN").as_deref()==Ok("1")
+            || crate::config::paired_serving_requested())
+            && self.sp.is_none() && self.ffn.output().len()==6*5120,
+            "deferred FFN requires explicitly admitted nonsharded M6 pair");
+        self.pair_deferred_ffn=enabled;Ok(())
+    }
+    pub(crate) fn finish_pair_ffn(&mut self,comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(self.pair_deferred_ffn,"paired FFN was not prepared");
+        self.finish_ffn(comm,stream)
+    }
+    pub(crate) fn finish_pair_ffn_reduced(&mut self,reduced:&Buffer<bf16>,cuda:&Cuda,stream:&Stream)->Result<()> {
+        ensure!(self.pair_deferred_ffn&&self.sp.is_none()&&reduced.len()>0
+            &&reduced.len()<=self.ffn_reduced.len()&&reduced.len()%5120==0
+            &&cuda.owns_buffer(reduced)&&cuda.owns_buffer(&self.ffn_reduced),"paired FFN reduction owner");
+        self.ffn.prefetch_join(stream)?;
+        if let Some(hint)=&self.next_input_prefetch {hint.begin(stream)?;}
+        unsafe{cuda.copy_device(self.ffn_reduced.ptr(),reduced.ptr(),reduced.bytes(),stream)?;}
+        self.ffn_boundary.finish(&self.ffn_reduced,self.attn_boundary.output(),stream)?;
+        if let Some(hint)=&self.next_input_prefetch {hint.join(stream)?;}
+        Ok(())
+    }
+    fn finish_ffn(&mut self,comm:&Roce,stream:&Stream)->Result<()> {
         self.ffn.prefetch_join(stream)?;
         if let Some(hint) = &self.next_input_prefetch {
             hint.begin(stream)?;
@@ -905,6 +1015,14 @@ impl SwaLayer {
     pub(crate) fn set_mhc_two_mma_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
         self.attn_boundary.set_two_mma_for_probe(enabled,stream)?;
         self.ffn_boundary.set_two_mma_for_probe(enabled,stream)
+    }
+    pub(crate) fn set_mhc_pdl_pair_for_probe(&mut self, mode: u8) -> Result<()> {
+        ensure!(mode <= 3, "MHC PDL screen mode");
+        for boundary in [&mut self.attn_boundary, &mut self.ffn_boundary] {
+            boundary.set_pdl_pair_for_probe(mode & 1 != 0)?;
+            boundary.set_pdl_stats_for_probe(mode & 2 != 0)?;
+        }
+        Ok(())
     }
     pub(crate) fn set_append_bf16_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
         self.attention.set_append_bf16_for_probe(enabled,stream)

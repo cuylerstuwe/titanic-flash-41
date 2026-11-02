@@ -8,13 +8,15 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'deploy'))
-from fleet import validate
+from fleet import validate, vision_encoder_rank, rank_data_paths
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('inventory', type=Path)
     a = ap.parse_args()
     cfg = validate(json.loads(a.inventory.read_text()))
+    profile = json.loads((Path(__file__).resolve().parents[1]/'deploy/profile.json').read_text())
+    vision_rank = vision_encoder_rank(profile)
     root = Path(cfg['root'])
     for rank, node in enumerate(cfg['nodes'][1:], 1):
         host = node['ssh']
@@ -23,9 +25,7 @@ def main():
         import shlex
         subprocess.run(['ssh', host, shlex.join(['mkdir', '-p', str(root/'data')])], check=True)
         paths = ['runtime/', 'model/', 'kernels/']
-        paths += [f'staged/layer{layer}-v1/r{rank}/' for layer in range(40)]
-        paths += [f'staged/model-io-v1/r{rank}/', f'staged/dspark-mtp-v1/r{rank}/']
-        paths += [f'engram/engram-l{layer}-r{rank}of4.{ext}' for layer in [1, 14] for ext in ['bin', 'json']]
+        paths += rank_data_paths(rank, vision_rank)
         assert all((root/'data'/p).exists() for p in paths), f'missing staged data for rank {rank}'
         with tempfile.NamedTemporaryFile(mode='w') as listing:
             listing.write('\n'.join(paths)+'\n'); listing.flush()

@@ -179,6 +179,8 @@ pub struct Layer {
     layer: usize,
     ratio: usize,
     projection: SourceProjection,
+    precision_alternative: Option<SourceProjection>,
+    precise_projection_active: bool,
     source: Source,
     wk: IndexProjection,
     keys: KeyCache,
@@ -188,6 +190,14 @@ pub struct Layer {
 enum SourceProjection {
     Pair(Projection<f32>),
     Single(Projection<bf16>),
+}
+pub(crate) fn source20_fp32_reduction_enabled() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_SOURCE20_FP32_REDUCTION") {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(v) if v == "0" => Ok(false),
+        Ok(v) if v == "1" => Ok(true),
+        _ => anyhow::bail!("source20 FP32 reduction must be 0 or 1"),
+    }
 }
 impl Layer {
     pub(crate) fn set_sort_shuffle_before_capture(&mut self, enabled: bool) -> Result<()> {
@@ -293,7 +303,7 @@ impl Layer {
             Some(owner),
         )
     }
-    fn new_rows_owner(
+    pub(crate) fn new_rows_owner(
         cuda: &Cuda,
         stream: &Stream,
         weights: Rc<Weights>,
@@ -320,11 +330,26 @@ impl Layer {
         );
         let native = index::Native::open(cuda, &kernels.join("index-v1"))?;
         let ratio = if layer == 20 { 1 } else { 2 };
+        let precise_projection_active = ratio == 1 && [6,16,32].contains(&rows)
+            && source20_fp32_reduction_enabled()?;
+        let precision_screen = ratio == 1 && rows == 6
+            && std::env::var("CANADA_SCRATCH_SOURCE20_PRECISION_SCREEN").as_deref() == Ok("1");
+        ensure!(!precision_screen || !precise_projection_active,
+            "source20 precision screen needs the ordinary control constructor");
+        // The ordinary vendor handle is shared by all target profiles. Keep
+        // this precision choice on a private handle configured before launch;
+        // changing the shared handle would also alter wide-prefill arithmetic.
+        let precise_blas = if precise_projection_active || precision_screen {
+            let handle = Rc::new(Blas::new_on(cuda,stream)?);
+            handle.require_fp32_reduction()?;
+            Some(handle)
+        } else { None };
         let projection = if ratio == 1 {
             SourceProjection::Single(Projection::new(
                 cuda,
                 weights.clone(),
-                blas.clone(),
+                if precise_projection_active { precise_blas.as_ref().unwrap().clone() }
+                    else { blas.clone() },
                 &format!("layers.{layer}.attn.compressor.wkv"),
                 rows,
             )?)
@@ -337,6 +362,11 @@ impl Layer {
                 rows,
             )?)
         };
+        let precision_alternative = if precision_screen {
+            Some(SourceProjection::Single(Projection::new(cuda, weights.clone(),
+                precise_blas.as_ref().unwrap().clone(),
+                &format!("layers.{layer}.attn.compressor.wkv"), rows)?))
+        } else { None };
         let source = if let Some(owner) = owner {
             ensure!(
                 owner.layer == layer && owner.source.matches_static(&weights, &frequency),
@@ -344,7 +374,7 @@ impl Layer {
             );
             owner
                 .source
-                .share_rows(cuda, rows, &kernels.join("compression-v2"))?
+                .share_rows(cuda, rows, &kernels.join(if rows==32 {"compression-verify32-v1"} else {"compression-v2"}))?
         } else {
             Source::new(
                 cuda,
@@ -356,7 +386,7 @@ impl Layer {
                 kv_pages,
                 if phase == Phase::Extend { 64 } else { 32 },
                 frequency.clone(),
-                &kernels.join("compression-v2"),
+                &kernels.join(if rows==32 {"compression-verify32-v1"} else {"compression-v2"}),
             )?
         };
         let wk = IndexProjection::new(
@@ -392,6 +422,12 @@ impl Layer {
             slots.len(),
             slots.len(),
             rows,
+            if crate::config::wide_rows(rows)
+                &&std::env::var("CANADA_SCRATCH_WIDE_INDEX_KEYS_SCREEN").as_deref()==Ok("1") {
+                ensure!(crate::config::shared_owner_profiles_requested(),
+                    "finite wide key sharing admission");
+                Some(&owner.ok_or_else(||anyhow::anyhow!("wide gathered-key donor missing"))?.query)
+            }else{None},
         )?;
         let mapping = Map::new(
             cuda,
@@ -413,12 +449,25 @@ impl Layer {
             layer,
             ratio,
             projection,
+            precision_alternative,
+            precise_projection_active,
             source,
             wk,
             keys,
             query,
             mapping,
         })
+    }
+    pub(crate) fn set_source20_precision_for_probe(&mut self, enabled: bool) -> Result<()> {
+        ensure!(self.layer == 20 && self.ratio == 1 && self.rows == 6
+            && self.phase == Phase::Verify && self.precision_alternative.is_some()
+            && std::env::var("CANADA_SCRATCH_SOURCE20_PRECISION_SCREEN").as_deref() == Ok("1")
+            && !source20_fp32_reduction_enabled()?, "source20 finite precision switch");
+        if self.precise_projection_active != enabled {
+            std::mem::swap(&mut self.projection, self.precision_alternative.as_mut().unwrap());
+            self.precise_projection_active = enabled;
+        }
+        Ok(())
     }
     pub fn run(
         &mut self,
@@ -554,6 +603,9 @@ impl Layer {
     pub(crate) fn keys_mut(&mut self) -> &mut KeyCache {
         &mut self.keys
     }
+    pub(crate) fn share_score_scratch(&mut self, storage: Rc<Buffer<f32>>) -> Result<usize> {
+        self.query.share_score_scratch(storage)
+    }
     pub fn query(&self) -> &Branch {
         &self.query
     }
@@ -631,6 +683,7 @@ impl ReadIndex {
                 slots.len(),
                 slots.len(),
                 owner.rows,
+                None,
             )?,
             mapping: Map::new(
                 cuda,
@@ -683,6 +736,9 @@ impl ReadIndex {
     }
     pub fn error(&self) -> Result<u32> {
         self.mapping.error()
+    }
+    pub(crate) fn share_score_scratch(&mut self, storage: Rc<Buffer<f32>>) -> Result<usize> {
+        self.query.share_score_scratch(storage)
     }
     pub fn query(&self) -> &Branch {
         &self.query

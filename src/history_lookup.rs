@@ -201,10 +201,36 @@ impl HistoryLookup {
     /// Extend only a64-token match with15 already committed source tokens.
     /// No future target draw or likelihood participates in proposal selection.
     pub(crate) fn propose_long(&self, start:u64, anchor:u32)->Result<Option<(Proposal,[u32;15])>> {
-        let Some(proposal)=self.propose(start,anchor)? else{return Ok(None)};
-        if proposal.matched<64 || proposal.source_end+16>self.tokens.len() {return Ok(None)}
-        let tokens=self.tokens[proposal.source_end+1..proposal.source_end+16].try_into().unwrap();
-        Ok(Some((proposal,tokens)))
+        Ok(self.propose_block::<16>(start,anchor)?.map(|(source,inputs)|
+            (source,inputs[1..].try_into().unwrap())))
+    }
+    /// A whole block is chosen from committed history before target sampling.
+    /// The anchor is included so the caller's const geometry also covers the
+    /// final bonus row, without an allocation or an unchecked trailing suffix.
+    pub(crate) fn propose_block<const ROWS:usize>(&self,start:u64,anchor:u32)
+        ->Result<Option<(Proposal,[u32;ROWS])>> {
+        self.propose_block_minimum::<ROWS>(start,anchor,64)
+    }
+    /// The width threshold is a proposal policy, not an acceptance shortcut.
+    /// Every selected token must still come from committed source storage.
+    pub(crate) fn propose_block_minimum<const ROWS:usize>(&self,start:u64,anchor:u32,minimum:usize)
+        ->Result<Option<(Proposal,[u32;ROWS])>> {
+        ensure!([16,32].contains(&ROWS)&&[16,24,32,48,64].contains(&minimum),"history block geometry/minimum");
+        let Some(mut proposal)=self.propose(start,anchor)? else{return Ok(None)};
+        if proposal.source_end+ROWS>self.tokens.len() {return Ok(None)}
+        if proposal.matched<minimum {
+            // Optional intermediate thresholds use the existing shorter table
+            // and prove the extra *past* tokens literally. No additional table
+            // or future proposal/target draw is needed. Preserve the original
+            // indexed32/64 decisions, including their collision behavior.
+            let required_key=match minimum{24=>16,48=>32,_=>return Ok(None)};
+            if proposal.matched<required_key||proposal.source_end+1<minimum||self.tokens.len()+1<minimum
+                ||self.tokens[proposal.source_end+1-minimum..proposal.source_end]
+                    !=self.tokens[self.tokens.len()+1-minimum..] {return Ok(None)}
+            proposal.matched=minimum;
+        }
+        let inputs=self.tokens[proposal.source_end..proposal.source_end+ROWS].try_into().unwrap();
+        Ok(Some((proposal,inputs)))
     }
     pub(crate) fn propose(&self, start: u64, anchor: u32) -> Result<Option<Proposal>> {
         ensure!(start == self.position() && anchor < 129280, "history lookup query frontier/token");
@@ -251,6 +277,55 @@ impl HistoryLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relaxed_block_gate_keeps_source_committed_and_default_strong() {
+        let mut prefix=(100..132).collect::<Vec<_>>();prefix.extend(300..350);prefix.extend(100..131);
+        let lookup=HistoryLookup::with_maximum(256,&prefix,SLOTS,64).unwrap();
+        assert!(lookup.propose_block::<32>(lookup.position(),131).unwrap().is_none());
+        let (proposal,ids)=lookup.propose_block_minimum::<32>(lookup.position(),131,32).unwrap().unwrap();
+        assert_eq!(proposal.matched,32);assert_eq!(ids[0],131);
+        assert_eq!(ids[1..],(300..331).collect::<Vec<_>>()[..]);
+        let periodic=(0..96).map(|i|100+i%8).collect::<Vec<_>>();
+        let recent=HistoryLookup::with_maximum(256,&periodic,SLOTS,64).unwrap();
+        assert!(recent.propose_block_minimum::<16>(recent.position(),100,32).unwrap().is_none());
+        assert!(lookup.propose_block_minimum::<32>(lookup.position(),131,12).is_err());
+    }
+
+    #[test]
+    fn intermediate_block_gate_proves_the_extra_past_prefix() {
+        for proof in [24usize,48] {
+            let key=if proof==24{16}else{32};let anchor=99+proof as u32;
+            let mut prefix=(100..=anchor).collect::<Vec<_>>();prefix.extend(300..350);prefix.extend(100..anchor);
+            let lookup=HistoryLookup::with_maximum(256,&prefix,SLOTS,64).unwrap();
+            assert_eq!(lookup.propose(lookup.position(),anchor).unwrap().unwrap().matched,key);
+            let (p,_)=lookup.propose_block_minimum::<16>(lookup.position(),anchor,proof).unwrap().unwrap();
+            assert_eq!(p.matched,proof);
+            assert!(lookup.propose_block_minimum::<16>(lookup.position(),anchor,key*2).unwrap().is_none());
+            let n=prefix.len();prefix[n+1-proof]=999;
+            let changed=HistoryLookup::with_maximum(256,&prefix,SLOTS,64).unwrap();
+            assert!(changed.propose_block_minimum::<16>(changed.position(),anchor,key).unwrap().is_some());
+            assert!(changed.propose_block_minimum::<16>(changed.position(),anchor,proof).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn wide_history_block_has_only_committed_tokens_and_keeps_narrow_source() {
+        let mut prefix=(100..164).collect::<Vec<_>>();prefix.extend(300..350);prefix.extend(100..163);
+        let lookup=HistoryLookup::with_maximum(256,&prefix,SLOTS,64).unwrap();
+        let (narrow,a)=lookup.propose_block::<16>(lookup.position(),163).unwrap().unwrap();
+        let (wide,b)=lookup.propose_block::<32>(lookup.position(),163).unwrap().unwrap();
+        assert_eq!(narrow,wide);assert_eq!(a,b[..16]);assert_eq!(b[0],163);
+        assert_eq!(b[1..],(300..331).collect::<Vec<_>>()[..]);
+        // A recent repeated key can have enough source continuation for M16
+        // while M32 would run into the pending, uncommitted part of the request.
+        let periodic=(0..128).map(|i|100+i%16).collect::<Vec<_>>();
+        let overlap=HistoryLookup::with_maximum(256,&periodic,SLOTS,64).unwrap();
+        assert!(overlap.propose_block::<16>(overlap.position(),100).unwrap().is_some());
+        assert!(overlap.propose_block::<32>(overlap.position(),100).unwrap().is_none());
+        assert!(lookup.propose_block::<32>(lookup.position()+1,163).is_err());
+        assert!(lookup.propose_block::<8>(lookup.position(),163).is_err());
+    }
 
     #[test]
     fn long_proposal_requires_strong_match_and_committed_continuation() {

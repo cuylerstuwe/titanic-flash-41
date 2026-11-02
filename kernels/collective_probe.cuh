@@ -76,3 +76,21 @@ extern "C" __global__ void ca_sequence_check(const __nv_bfloat16* y,const uint32
  }
 }
 extern "C" __global__ void ca_sequence_advance(uint32_t* epoch){if(threadIdx.x==0)++*epoch;}
+
+// Encoded FP4 fixtures for score-buffer ownership tests. No CPU model arithmetic.
+extern "C" __global__ void ca_mqa_score_pool_fixture(
+ unsigned char* q,int* qs,float* qw,unsigned char* k,int* ks,int rows,int keys,int phase){
+ for(size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<(size_t)keys*64;i+=(size_t)gridDim.x*blockDim.x){
+  unsigned lo=(unsigned)((i*17+i/19+phase*7)%16),hi=(unsigned)((i*11+i/23+phase*3)%16);
+  k[i]=(unsigned char)(lo|(hi<<4));
+ }
+ for(size_t i=blockIdx.x*blockDim.x+threadIdx.x;i<(size_t)rows*32*64;i+=(size_t)gridDim.x*blockDim.x){
+  unsigned lo=(unsigned)((i*7+i/13+phase*5)%16),hi=(unsigned)((i*3+i/29+phase*11)%16);
+  q[i]=phase==2?0:(unsigned char)(lo|(hi<<4));
+ }
+ for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<keys;i+=gridDim.x*blockDim.x)ks[i]=0x7f7f7f7f;
+ for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<rows*32;i+=gridDim.x*blockDim.x){
+  qs[i]=phase==1?0x7e7e7e7e:0x7f7f7f7f;
+  qw[i]=(float)((i%9)-4)*0.125f;
+ }
+}

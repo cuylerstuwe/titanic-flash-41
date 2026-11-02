@@ -44,6 +44,8 @@ pub struct Entry {
     pub grid: Grid,
     pub ptx_parameters: Vec<(String, String)>,
     pub artifact_sha256: String,
+    #[serde(default)]
+    pub programmatic_stream_serialization: bool,
 }
 #[derive(Deserialize)]
 struct Manifest {
@@ -136,6 +138,10 @@ impl Operator {
             self.entry.grid.z,
         ];
         let function = self.module.function(&self.entry.symbol)?;
+        if self.entry.programmatic_stream_serialization {
+            return unsafe { function.launch_pdl(grid, [32 * self.entry.metadata.num_warps, 1, 1],
+                self.entry.metadata.shared, stream, &mut pointers) };
+        }
         unsafe {
             function.launch(
                 grid,

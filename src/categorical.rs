@@ -294,6 +294,21 @@ impl Categorical {
     pub(crate) fn device_errors(&self) -> &Buffer<u32> {
         &self.errors
     }
+    /// Raw-byte checks for the isolated vocabulary-sharded sampler prototype.
+    /// No CPU probability calculation, and no extra work in ordinary sampling.
+    pub(crate) fn compare_cdf_for_sharded_probe(&self,maxima:&Buffer<f32>,sums:&Buffer<f64>,
+        tiles:&Buffer<i32>,fractions:&Buffer<f64>)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_SHARDED_CATEGORICAL_SCREEN").as_deref()==Ok("1"),
+            "finite sharded CDF comparison");
+        ensure!(self.maxima.download()?.iter().map(|x|x.to_bits()).eq(maxima.download()?.iter().map(|x|x.to_bits())),
+            "sharded categorical maxima bits");
+        ensure!(self.sums.download()?.iter().map(|x|x.to_bits()).eq(sums.download()?.iter().map(|x|x.to_bits())),
+            "sharded categorical partial sum bits");
+        ensure!(self.tiles.download()?==tiles.download()?,"sharded categorical tile choice");
+        ensure!(self.fractions.download()?.iter().map(|x|x.to_bits()).eq(fractions.download()?.iter().map(|x|x.to_bits())),
+            "sharded categorical conditional fraction bits");
+        Ok(())
+    }
     /// Materialize q on GPU only when rejection sampling needs it. Wide
     /// prefill profiles never allocate a full probability matrix.
     pub(crate) fn probabilities(

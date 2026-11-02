@@ -44,7 +44,9 @@ The numbers above are illustrative. `prompt_n` counts uncached prompt tokens; `c
 
 ## Foreground and background
 
-Requests default to foreground. Set `X-LocalAI-Mode: background` for background work, or explicitly use `foreground`. Background requests are peers with each other; foreground requests are peers with each other. While foreground work is present, background work pauses at safe boundaries and resumes with its accepted state intact. This transition can take a few seconds and is not a hard real-time preemption promise.
+Requests default to foreground. Set `X-LocalAI-Mode: background` for background work, or explicitly use `foreground`. Background requests are peers with each other; foreground requests are peers with each other. Among admitted requests, foreground work pauses background work at safe boundaries; background work resumes with its accepted state intact. This transition can take a few seconds and is not a hard real-time preemption promise.
+
+At most **two requests are admitted**, each retaining the full 1,048,576-token context capacity. Additional requests wait FIFO. An admitted request keeps its slot until its final response, terminal error, client cancellation/disconnection or terminal stall timeout. A temporary output stall, priority hold or pause does not release the slot. A queued third foreground request does not displace two admitted background requests. A completed tool-call response ends that request; submitting tool results creates a new request. Model state is retained in memory, without SSD parking.
 
 The internal priority-control endpoint uses the separate control key. Ordinary client integrations should use the request header. Do not expose or log the control credential. Background qualification is separate from normal foreground performance measurement.
 
@@ -58,4 +60,8 @@ Worker event diagnostics default to bounded **RAM** history. The portable launch
 
 Do not modify `deploy/profile.json` casually: it is the accumulated qualified model profile. Some internal environment variables retain a legacy `CANADA_SCRATCH_` prefix as an implementation compatibility detail. Diagnostic CLI commands and the `storage-fault-injection` feature are not part of the production build.
 
-The launcher intentionally leaves networking, NVMe power policy, other model services and external routers under the operator's control. Store rollback versions outside the active runtime. Keep model weights and Engram backing on local storage; moving cold build outputs or archived versions is independent of moving hot inference data.
+The inventory explicitly selects the temporary host policies: a 2350 MHz GPU cap or `0` to leave clocks unmanaged, and optional `/dev/nvme0` APST disablement per node. The clock helper assumes stock clocks as its restoration baseline; do not use it over an unrelated administrator's clock lock. The NVMe helper saves and restores the exact original feature value and table. Independent systemd timers restore settings if short leases stop renewing. Delayed checks from an older generation cannot overwrite a newer owner's policy. Healthy renewals remain in RAM; only activation, failure and restoration transitions write durable records.
+
+A transient management failure appears as `host_policy_status: degraded`; it does not immediately discard a healthy model. Local timers can restore host settings while the controller retries, so performance during that degraded interval is not comparable to a fully active fixed-clock run. Check policy status alongside Ready when collecting benchmarks. Failure during initial policy arming prevents model launch and attempts restoration on every node.
+
+The launcher leaves firmware, networking, other model services and external routers under the operator's control. Store rollback versions outside the active runtime. Keep model weights and Engram backing on local storage; moving cold build outputs or archived versions is independent of moving hot inference data.

@@ -138,7 +138,7 @@ impl Metadata {
                 && ((ratio == 1 && draft == 1)
                     || (ratio == 2
                         && (2..=64).contains(&ring)
-                        && (1..=16).contains(&draft)
+                        && (1..=32).contains(&draft)
                         && positions.len() % draft == 0
                         && (draft == 1 || ring > draft))),
             "compressor metadata geometry"

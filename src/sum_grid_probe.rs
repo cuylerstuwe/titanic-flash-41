@@ -15,6 +15,7 @@ fn bits(i:usize,rank:usize,phase:usize)->u16 {
 }
 
 pub fn run(rank:usize,endpoint:&str,nonce:&[u8],root:&Path)->Result<Value>{
+    let paired=std::env::var("CANADA_SCRATCH_PAIRED_SUM_GRID_SCREEN").as_deref()==Ok("1");
     let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;let stream=cuda.stream()?;
     let mut comm=Roce::local(&cuda,&root.join("roce-v0"),rank)?;
     comm.attach_gather(&root.join("roce-gather-v1"))?;
@@ -24,7 +25,7 @@ pub fn run(rank:usize,endpoint:&str,nonce:&[u8],root:&Path)->Result<Value>{
     let all=crate::rendezvous::exchange_blob(rank,endpoint.parse()?,nonce,&comm.blob()?)?;
     comm.connect(&all)?;
     let affinity=std::env::var("CANADA_SCRATCH_PROXY_AFFINITY_SCREEN").as_deref()==Ok("1");
-    ensure!(!(notify&&affinity),"separate notification and affinity screens");
+    ensure!(!(notify&&affinity)&&!(paired&&(notify||affinity)),"separate geometry/notification/affinity screens");
     let original_cpus=if affinity{comm.proxy_cpus_for_probe()?}else{Vec::new()};
     let mut capacities=Vec::new();
     for &cpu in &original_cpus{
@@ -43,7 +44,7 @@ pub fn run(rank:usize,endpoint:&str,nonce:&[u8],root:&Path)->Result<Value>{
     gathered_input.upload(&vec![f32::from_bits(0x7fc00010+rank as u32);8])?;
     let mut gathered_output=cuda.allocate::<f32>(32)?;
     let mut results=Vec::new();
-    for rows in [1usize,6,16]{
+    for rows in if paired{[6usize,9,12]}else{[1usize,6,16]}{
         let columns=5120usize;let mut input=cuda.allocate::<u16>(rows*columns)?;
         let mut output=cuda.allocate::<u16>(rows*columns)?;
         input.zero()?;stream.join_default()?;
@@ -116,8 +117,10 @@ pub fn run(rank:usize,endpoint:&str,nonce:&[u8],root:&Path)->Result<Value>{
             else if affinity{vec!["original-default-grid","original-half-grid","pinned-default-grid","pinned-half-grid"]}else{vec!["default","half","double"]},
         "notification_probe":notify,
         "poll_probe":poll,
+        "paired_geometry_probe":paired,
         "proxy_affinity_probe":affinity,"original_cpus":original_cpus,"cpu_capacities":capacities,"fast_cpu":fast_cpu,
-        "scope":if poll{"Relaxed system flag polling followed by either a checked acquire load or system acquire/release fence. Retains original staging/poison/tail/epoch and fixed-rank math; original bounded unsuccessful-poll limit. Current M1/6/16 grids2/4/8; two finite inputs, four rotated/reversed orders, exact four-peer bytes and mixed gathers. Component only."}
+        "scope":if paired{"Same native BF16 sum primitive, fixed-rank arithmetic, and protocol at combined M6/M9/M12. Grids8/4/16, two changed operands and reversed warm timings. Exact outputs across geometries and mixed raw gathers. No weights or full model; excludes pair packing/scattering and is not a whole-model performance claim."}
+            else if poll{"Relaxed system flag polling followed by either a checked acquire load or system acquire/release fence. Retains original staging/poison/tail/epoch and fixed-rank math; original bounded unsuccessful-poll limit. Current M1/6/16 grids2/4/8; two finite inputs, four rotated/reversed orders, exact four-peer bytes and mixed gathers. Component only."}
             else if notify{"SC versus acquire/release system staging fences; retains acquire of other CTAs, payload publication, peer acquire waits, poison/epoch/tail and fixed-rank math. Stock/fresh-control/final-only/both-staging-fences. Current M1/6/16 grids2/4/8. Two finite inputs, four rotated/reversed timing orders, exact four-peer bytes and mixed gathers. Component only."}
             else if affinity{"Native BF16 sums; only the isolated RDMA progress thread is pinned to an allowed faster CPU, crossed with default/half GPU grid. Hidden5120 M1/6/16; two finite inputs, four rotated/reversed timing orders each, exact outputs and mixed gathers. Affinity restored afterward. No host-global or serving policy change, component only."}else{"Same native BF16 sum primitive, precision, reduction order and protocol. Hidden5120 M1/6/16 launch grids default/half/double. Two finite changed patterns, opposite timing orders, exact outputs against baseline and mixed raw gathers. Component only."}}))
 }

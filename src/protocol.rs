@@ -602,6 +602,10 @@ pub fn parse_report(tokenizer: &Path, request: &Path, completion: &Path) -> Resu
 }
 
 #[cfg(test)]
+#[path = "protocol_recipe_tests.rs"]
+mod recipe_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

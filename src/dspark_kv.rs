@@ -4,7 +4,7 @@
 use crate::{
     attention::{Candidates, PagedKv},
     checkpoint::Dtype,
-    cuda::{Buffer, Cuda, Stream},
+    cuda::{Buffer, Cuda, Module, Stream},
     kv::{RowLocations, Store},
     prelude::FrequencyTable,
     weights::Weights,
@@ -81,6 +81,7 @@ pub struct State {
     poisoned: bool,
     query_ready: bool,
     query_prepared: bool,
+    queued_copy: Option<(u64,usize,usize)>,
 }
 impl State {
     pub fn new(
@@ -145,6 +146,7 @@ impl State {
             poisoned: false,
             query_ready: false,
             query_prepared: false,
+            queued_copy: None,
         })
     }
     fn guard(&self, stream: &Stream) -> Result<()> {
@@ -157,6 +159,11 @@ impl State {
     pub fn position(&self) -> Result<u64> {
         ensure!(!self.poisoned, "DSpark KV poisoned");
         Ok(self.frontier)
+    }
+    pub(crate) fn independent_from(&self,other:&Self)->Result<bool> {
+        let a=self.image_regions()?;let b=other.image_regions()?;
+        Ok(!Rc::ptr_eq(&self.image_owner,&other.image_owner)
+            &&a.iter().all(|x|b.iter().all(|y|!x.overlaps(y))))
     }
     pub(crate) fn accepted_replay_digests(&self, root: Option<&Path>) -> Result<serde_json::Value> {
         use sha2::{Digest,Sha256};
@@ -298,6 +305,37 @@ impl State {
         self.frontier += accepted as u64;
         self.poisoned = false;
         Ok(())
+    }
+    /// Private transaction: position/read/query/image APIs remain poisoned
+    /// until every chunk has completed. In-flight KV writes cannot be exposed
+    /// through an accepted frontier, query or saved state before publication.
+    pub(crate) fn begin_copy_commit(&mut self,start:u64,total:usize,stream:&Stream)->Result<()> {
+        self.guard(stream)?;
+        ensure!(self.queued_copy.is_none()&&(1..=32).contains(&total)&&start==self.frontier
+            &&start.checked_add(total as u64).is_some_and(|n|n<=self.frequencies.rows()as u64),
+            "queued copy commit frontier/extent");
+        self.poisoned=true;self.query_ready=false;self.query_prepared=false;
+        self.queued_copy=Some((start,total,0));Ok(())
+    }
+    pub(crate) fn enqueue_copy_chunk(&mut self,raw:[&Buffer<bf16>;3],live:usize,
+        module:&Module,stream:&Stream)->Result<()> {
+        let(start,total,written)=self.queued_copy.ok_or_else(||anyhow::anyhow!("no queued copy transaction"))?;
+        ensure!(self.poisoned&&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize
+            &&(1..=6).contains(&live)&&written+live<=total
+            &&raw.iter().all(|b|b.len()==6*512&&self.cuda.owns_buffer(b)),"queued copy chunk bounds/context");
+        self.six.enqueue_ring(&self.cuda,module,start as usize+written,live,HISTORY_BASE,HISTORY_RING,stream)?;
+        for stage in 0..3 {
+            self.store.run(raw[stage],512,&self.norms[stage],self.frequencies.values(),
+                &self.six,&mut self.caches[stage],stream)?;
+        }
+        self.queued_copy=Some((start,total,written+live));Ok(())
+    }
+    pub(crate) fn finish_copy_commit(&mut self,stream:&Stream)->Result<()> {
+        let(start,total,written)=self.queued_copy.ok_or_else(||anyhow::anyhow!("no queued copy transaction"))?;
+        ensure!(self.poisoned&&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize
+            &&self.frontier==start&&written==total,"queued copy final frontier");
+        stream.synchronize()?;
+        self.frontier=start+total as u64;self.queued_copy=None;self.poisoned=false;Ok(())
     }
     pub fn store_queries(
         &mut self,

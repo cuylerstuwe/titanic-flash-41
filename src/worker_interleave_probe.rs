@@ -4,7 +4,7 @@
 use super::*;
 
 const BUDGET: usize = 2 * 1024usize.pow(3);
-use super::request_checkpoint::{RequestCheckpoint,try_checkpoint,suspend,restore};
+use super::request_checkpoint::{RequestCheckpoint,try_checkpoint,suspend,restore,try_exchange};
 
 fn checkpoint(w: &mut Worker, other_charge: usize) -> Result<(RequestCheckpoint, Value)> {
     try_checkpoint(w,other_charge,usize::from(other_charge>0))?
@@ -51,6 +51,9 @@ pub(super) fn run(w: &mut Worker,p: &WorkerConfig) -> Result<Value> {
         && std::env::var("CANADA_SCRATCH_COMPACT_STATE_IMAGE").as_deref()==Ok("1")
         && std::env::var("CANADA_SCRATCH_DRAFT_TEMPERATURE").as_deref()==Ok("0.7"),
         "worker interleave probe requires isolated current candidate");
+    if std::env::var("CANADA_SCRATCH_WORKER_STATE_EXCHANGE_SCREEN").as_deref()==Ok("1"){
+        return run_exchange(w,p);
+    }
     let raw=include_bytes!("../tests/fixtures/long-context-continuation-v2.json");
     let fixture:Value=serde_json::from_slice(raw)?;
     let corpus:Vec<u32>=serde_json::from_value(fixture["tokens"].clone())?;
@@ -112,4 +115,55 @@ pub(super) fn run(w: &mut Worker,p: &WorkerConfig) -> Result<Value> {
     serde_json::to_writer_pretty(&mut file,&result)?;file.write_all(b"\n")?;
     Ok(json!({"type":"worker_interleave_probe","rank":p.rank,"all_exact":true,
         "http_interleaving_enabled":false,"production_qualified":false}))
+}
+
+fn run_exchange(w:&mut Worker,p:&WorkerConfig)->Result<Value>{
+    ensure!(std::env::var("CANADA_SCRATCH_STATE_EXCHANGE").as_deref()==Ok("1"),"exchange screen requires exchange storage");
+    let fixture:Value=serde_json::from_slice(include_bytes!("../tests/fixtures/long-context-continuation-v2.json"))?;
+    let corpus:Vec<u32>=serde_json::from_value(fixture["tokens"].clone())?;
+    let mut receipts=Vec::new();
+    execute(w,Command::Begin{images:Vec::new(),id:1,seed:2026311081,greedy:false,limit:192,tokens:corpus[..131072].to_vec()})?;
+    advance(w,64)?;ensure!(w.history.step_limit()?>0,"parent ended before exchange boundary");
+    let(mut inactive,receipt)=checkpoint(w,0)?;receipts.push(receipt);let parent_digest=inactive.probe_digest()?;
+    let(parent_control,parent_seconds)=advance(w,usize::MAX)?;let parent_final=finish(w)?;
+    restore(w,&inactive)?;suspend(w)?;
+    execute(w,Command::Begin{images:Vec::new(),id:2,seed:2026311082,greedy:false,limit:128,tokens:corpus[65536..262144].to_vec()})?;
+    advance(w,32)?;ensure!(w.history.step_limit()?>0,"child ended before exchange boundary");
+    let(child,receipt)=checkpoint(w,inactive.charge)?;receipts.push(receipt);let child_digest=child.probe_digest()?;
+    let(child_control,child_seconds)=advance(w,usize::MAX)?;let child_final=finish(w)?;
+    restore(w,&child)?;drop(child);
+    // At every transition there is exactly one inactive full state. The
+    // diagnostic snapshot below is deliberately short-context evidence only.
+    for repeat in 0..3{
+        let event=try_exchange(w,&mut inactive)?.ok_or_else(||anyhow::anyhow!("exchange preparation refused"))?;
+        ensure!(w.current==Some(1)&&inactive.id==2&&inactive.probe_digest()?==child_digest,"child saved state changed during exchange");
+        let(current,_)=checkpoint(w,inactive.charge)?;
+        ensure!(current.probe_digest()?==parent_digest,"parent live state changed during exchange");drop(current);
+        receipts.push(json!({"repeat":repeat,"direction":"child-to-parent","event":event,"saved_and_live_exact":true}));
+        if repeat<2{
+            let event=try_exchange(w,&mut inactive)?.ok_or_else(||anyhow::anyhow!("reverse exchange refused"))?;
+            ensure!(w.current==Some(2)&&inactive.id==1&&inactive.probe_digest()?==parent_digest,"parent saved state changed during exchange");
+            let(current,_)=checkpoint(w,inactive.charge)?;
+            ensure!(current.probe_digest()?==child_digest,"child live state changed during exchange");drop(current);
+            receipts.push(json!({"repeat":repeat,"direction":"parent-to-child","event":event,"saved_and_live_exact":true}));
+        }
+    }
+    let boundary=w.emitted+32;let(mut parent_resumed,_)=advance(w,boundary)?;
+    receipts.push(try_exchange(w,&mut inactive)?.ok_or_else(||anyhow::anyhow!("advanced exchange refused"))?);
+    let(child_resumed,_)=advance(w,usize::MAX)?;let child_resumed_final=finish(w)?;
+    ensure!(child_control==child_resumed&&child_final==child_resumed_final,"child exchange changed continuation or final state");
+    receipts.push(restore(w,&inactive)?);drop(inactive);
+    let(rest,_)=advance(w,usize::MAX)?;parent_resumed.extend(rest);let parent_resumed_final=finish(w)?;
+    ensure!(parent_control==parent_resumed&&parent_final==parent_resumed_final,"parent exchange changed continuation or final state");
+    execute(w,Command::Shutdown)?;
+    let result=json!({"type":"worker_state_exchange_probe","rank":p.rank,"all_exact":true,
+        "parent_prompt_tokens":131072,"child_prompt_tokens":196608,"context_capacity":p.context,
+        "target_temperature":1.,"target_top_p":1.,"checkpoint_budget_bytes":BUDGET,"receipts":receipts,
+        "parent_control_seconds":parent_seconds,"child_control_seconds":child_seconds,
+        "parent_control":parent_control,"parent_resumed":parent_resumed,"parent_final":parent_final,
+        "child_control":child_control,"child_resumed":child_resumed,"child_final":child_final,
+        "scope":"Six complete-state exchanges, including larger incoming storage growth, exact model/drafter/sampler/history byte comparisons, and unchanged continuations through original request completion. Short component-to-model promotion screen; not2x1M qualification or HTTP scheduling."});
+    let output=p.events.parent().unwrap().join("worker-state-exchange.json");
+    serde_json::to_writer_pretty(std::fs::OpenOptions::new().write(true).create_new(true).open(output)?,&result)?;
+    Ok(json!({"type":"worker_state_exchange_probe","rank":p.rank,"all_exact":true,"production_qualified":false}))
 }

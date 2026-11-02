@@ -1,0 +1,179 @@
+{
+  "date": "2026-11-01",
+  "date_timezone": "America/Los_Angeles",
+  "engine_release": "s1173",
+  "single_stream": true,
+  "client": "head GB10, loopback HTTP directly to server",
+  "model_parallelism": "TP4",
+  "hardware": "3 ASUS GX10 + 1 NVIDIA DGX Spark, dual 100 Gb/s switched RoCE",
+  "compiler_source_sha256": "203eb99934f2169016a734670bf5aa57c6e1dc9ce69dbf59a328acf15eaa31ad",
+  "profile_sha256": "9b1a334e208b15572b6466bcf0bbdae5cfa6bd09301410cc2f8ad017c4a2c537",
+  "artifact_inventory_sha256": "d3a27877f9933120540f88bb793ac9cf67f04e07bee55d1cf47ead110d87f8fd",
+  "runtime_sha256": {
+    "provenance.json": "7113122d30db843e6c1eb7e8a4bcdc576410a50e91f0d5047cb096a8ab3929a8",
+    "core.cubin": "f5927422ba451aabbab9cdfa7cf01b998dd1837da86fdb86d77561adaef915e5",
+    "vision.cubin": "6b9daa1fa6cf56901b1660b63eac1d7203cc1e00afe4abb3423387279eb70ec5",
+    "titanic-flash": "e9c8f13be0ec9d2fd5dcb63fc172c2de2f00e9c6ee1822706b8d5c13bcfe510d"
+  },
+  "source_url": "https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa",
+  "source_revision": "7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2",
+  "settings": {
+    "temperature": 0,
+    "top_p": 1,
+    "thinking": false,
+    "max_tokens": 512,
+    "repetitions": 3
+  },
+  "host_profile": {
+    "gpu_clock_cap_mhz": 2350,
+    "driver": "580.178.04",
+    "nvme_apst": "Temporarily disabled on the Spark; unchanged on the three GX10s."
+  },
+  "measurement_conditions": "Portable s1173 build, existing validated atlases, direct head loopback. Same boot after two failed portable GPU startups; no reboot or allocation-bandwidth normalization. No other inference traffic.",
+  "rows": [
+    {
+      "context": "clean",
+      "workload": "code",
+      "titanic_decode_tps": {
+        "median": 113.21962226873568,
+        "min": 112.73322845704189,
+        "max": 114.11337064527197,
+        "stdev": 0.571562921621038,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.15382511001371313,
+        "min": 0.15243261300201993,
+        "max": 0.1591899530030787,
+        "stdev": 0.0029132309691785366,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 71.57781042288849,
+        "sglang-tuned": 103.0501327003324,
+        "tensorfold": 110.8839365430241
+      }
+    },
+    {
+      "context": "clean",
+      "workload": "prose",
+      "titanic_decode_tps": {
+        "median": 61.92764737558714,
+        "min": 61.024433511816035,
+        "max": 62.132725125265566,
+        "stdev": 0.4814517937751818,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.14906977499776985,
+        "min": 0.13864351299707778,
+        "max": 0.14955004899820779,
+        "stdev": 0.005032010090593543,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 32.92104872709232,
+        "sglang-tuned": 46.315845996857675,
+        "tensorfold": 57.67837667994458
+      }
+    },
+    {
+      "context": "clean",
+      "workload": "prose2",
+      "titanic_decode_tps": {
+        "median": 57.74302271424465,
+        "min": 57.19474105241973,
+        "max": 58.53251010406316,
+        "stdev": 0.5490931063440363,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.12988571799360216,
+        "min": 0.12395071200444363,
+        "max": 0.13219162500172388,
+        "stdev": 0.0034713774123408927,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 26.7517911172939,
+        "sglang-tuned": 43.72182796367915,
+        "tensorfold": 56.30457268437747
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "code",
+      "titanic_decode_tps": {
+        "median": 101.87067119023376,
+        "min": 99.95016347909475,
+        "max": 103.77672317526327,
+        "stdev": 1.5621901700469052,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.24557590400218032,
+        "min": 0.2421262829884654,
+        "max": 0.27772302299854346,
+        "stdev": 0.016029365566739923,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 57.358793189004516,
+        "sglang-tuned": 85.98516855760624,
+        "tensorfold": 94.67134822472953
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "prose",
+      "titanic_decode_tps": {
+        "median": 57.864192811025035,
+        "min": 56.97409311287736,
+        "max": 58.05444214594696,
+        "stdev": 0.4708887950030972,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.36167224899691064,
+        "min": 0.32243903299968224,
+        "max": 0.3726988650014391,
+        "stdev": 0.02156870729872157,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 31.99416760975024,
+        "sglang-tuned": 45.76539923068635,
+        "tensorfold": 57.66456969748044
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "prose2",
+      "titanic_decode_tps": {
+        "median": 54.1375927377376,
+        "min": 52.71678604595163,
+        "max": 54.49241006880614,
+        "stdev": 0.7672047144152175,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.32787887900485657,
+        "min": 0.3238629480038071,
+        "max": 0.3551575539895566,
+        "stdev": 0.0139028621135258,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 28.12880041612874,
+        "sglang-tuned": 44.12675113346383,
+        "tensorfold": 53.74595055288519
+      }
+    }
+  ],
+  "cold_131k_first_token_seconds": {
+    "titanic": 21.220901670996682,
+    "sglang_tuned": 32.44752314499965,
+    "tensorfold": 56.01667726300366
+  },
+  "scope": "Short capped throughput diagnostics. Competitor values are previously published measurements on a different four-Spark system. No task-quality or recommended-sampler claim."
+}

@@ -21,7 +21,8 @@ pub(crate) struct Features {
 }
 impl Features {
     pub(crate) fn new(cuda: &Cuda, core: &[u8], capacity: usize) -> Result<Self> {
-        ensure!([6, 16, 128].contains(&capacity), "DSpark feature capacity");
+        ensure!([6, 16, 128].contains(&capacity)
+            || (capacity==32 && crate::config::history32_enabled()), "DSpark feature capacity");
         let module = cuda.module(core)?;
         module.function("ca_dspark_target_features")?;
         Ok(Self {

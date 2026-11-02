@@ -2,7 +2,7 @@
   "libraries": [
     {
       "id": "primitive",
-      "root": "/scratch/primitive-exports/fp8-shared-w13-r0-m6-fence-v1",
+      "root": "/data/kernels/fp8-shared-w13-r0-m6-fence-v1",
       "library": "libcanada_primitives.so",
       "bindings": "bindings.json"
     }

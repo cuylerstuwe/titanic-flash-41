@@ -1,0 +1,137 @@
+{
+  "source": "qualified Canada adapter /opt/dsv41/adapter/draft_head_fp8_tp4.py",
+  "source_commit": "image sha256:82bb585723d16d25423646dd9b1300c51f5913f28c5e3900d5cc8eaf52f8aa4d",
+  "source_sha256": "d34a862327ba988edec0fd350cc718c18f4187f01ea50e0b7610cd0ea681ae20",
+  "license": "Qualified local adapter; no separate license declared",
+  "quantizer": "New project GPU implementation of the same 32x32 scale/quantization contract",
+  "contract": "Draft-only private E4M3 copy, BF16 activations/dequantized operands, FP32 accumulation/output; target canonical weights untouched; actual proposal probabilities required",
+  "compiler": "3.7.1",
+  "entries": [
+    {
+      "name": "draft_head_m10",
+      "symbol": "_head_fp8_kernel",
+      "architecture": 121,
+      "physical_sms": 48,
+      "arguments": [
+        {
+          "name": "X",
+          "kind": "*bf16"
+        },
+        {
+          "name": "W8",
+          "kind": "*fp8e4nv"
+        },
+        {
+          "name": "S",
+          "kind": "*u8"
+        },
+        {
+          "name": "Y",
+          "kind": "*fp32"
+        }
+      ],
+      "signature": {
+        "X": "*bf16",
+        "W8": "*fp8e4nv",
+        "S": "*u8",
+        "Y": "*fp32"
+      },
+      "constexprs": {
+        "M": 10,
+        "N": 32320,
+        "K": 5120,
+        "BM": 16,
+        "BN": 32,
+        "BK": 256
+      },
+      "metadata": {
+        "allowed_dot_input_precisions": [
+          "tf32",
+          "tf32x3",
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "sm121",
+        "backend_name": "cuda",
+        "debug": false,
+        "default_dot_input_precision": "tf32",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b15"
+        ],
+        "enable_fp_fusion": true,
+        "enable_reflect_ftz": true,
+        "extern_libs": [
+          [
+            "libdevice",
+            "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+          ]
+        ],
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "401893ac60f89a3ec80890b3ccb8e2a2455e275e965481a3338259212114a3ff",
+        "instrumentation_mode": "",
+        "ir_override": null,
+        "launch_cooperative_grid": false,
+        "launch_pdl": false,
+        "max_num_imprecise_acc_default": 0,
+        "maxnreg": null,
+        "name": "_head_fp8_kernel",
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 4,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "ptx_options": null,
+        "ptx_version": null,
+        "sanitize_overflow": true,
+        "shared": 49152,
+        "supported_fp8_dtypes": [
+          "fp8e4b15",
+          "fp8e4nv",
+          "fp8e5"
+        ],
+        "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+        "tensordesc_meta": [],
+        "tmem_size": 0,
+        "triton_version": "3.7.1",
+        "warp_size": 32
+      },
+      "grid": {
+        "rows_div": 32,
+        "x_mul": 1,
+        "y": 1,
+        "z": 1
+      },
+      "ptx_parameters": [
+        [
+          "u64",
+          "_head_fp8_kernel_param_0"
+        ],
+        [
+          "u64",
+          "_head_fp8_kernel_param_1"
+        ],
+        [
+          "u64",
+          "_head_fp8_kernel_param_2"
+        ],
+        [
+          "u64",
+          "_head_fp8_kernel_param_3"
+        ],
+        [
+          "u64",
+          "_head_fp8_kernel_param_4"
+        ],
+        [
+          "u64",
+          "_head_fp8_kernel_param_5"
+        ]
+      ],
+      "source_sha256": "d34a862327ba988edec0fd350cc718c18f4187f01ea50e0b7610cd0ea681ae20",
+      "selected_source_sha256": "afea6b3e8d81dffe904950eb6463401e6c0cbba1398f8ca23c4b95e971189947",
+      "artifact_sha256": "236e4854586055d35fc03488c9d5c8c26ab2282c9bbf5f8d3ba9e2b686ee9709"
+    }
+  ]
+}

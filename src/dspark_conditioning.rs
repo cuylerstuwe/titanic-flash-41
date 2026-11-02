@@ -188,7 +188,10 @@ impl Conditioning {
     )->Result<()>{
         self.live=0;
         self.validate_input(features,live,comm,stream)?;
-        ensure!(self.rows==6,"conditioning replay is bounded to six physical rows");
+        ensure!(self.rows==6 || (self.rows==128
+            && (std::env::var("CANADA_SCRATCH_COPY_CONDITIONING_SCREEN").as_deref()==Ok("1")
+                || std::env::var("CANADA_SCRATCH_COPY_WIDE_CONDITIONING").as_deref()==Ok("1"))),
+            "wide conditioning replay requires explicit copy admission");
         let comm_instance=if self.rank.is_some(){comm.map(Roce::instance)}else{None};
         if let Some(replay)=&self.replay {
             ensure!(replay.comm_instance==comm_instance,"conditioning replay communicator changed");
@@ -213,6 +216,11 @@ impl Conditioning {
         Ok(())
     }
     fn projected(&self)->&Buffer<bf16>{self.gathered.as_ref().unwrap_or_else(||self.main.output())}
+    pub(crate) fn release_replay(&mut self,stream:&Stream)->Result<()> {
+        ensure!(self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
+            "conditioning replay release stream");
+        stream.synchronize()?;self.replay=None;self.live=0;Ok(())
+    }
     pub fn outputs(&self) -> Result<(&Buffer<bf16>, [&Buffer<bf16>; 3], usize)> {
         ensure!(self.live > 0, "DSpark conditioning output not ready");
         Ok((
@@ -221,6 +229,86 @@ impl Conditioning {
             self.live,
         ))
     }
+}
+
+/// Small TP4 component screen: existing split M6 chunks versus the existing
+/// replicated M128 projection. Only accepted feature rows are copied; all other
+/// rows are zero. This does not mutate the live drafter or target state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn probe_copy_width(
+    cuda:&Cuda,core:&[u8],stream:&Stream,weights:Rc<Weights>,kernels:&Path,
+    rank:usize,features:&Buffer<bf16>,comm:&Roce,
+)->Result<serde_json::Value>{
+    use serde_json::json;
+    ensure!(std::env::var("CANADA_SCRATCH_COPY_CONDITIONING_SCREEN").as_deref()==Ok("1")
+        && features.len()==128*15360 && comm.rank()==rank,"copy conditioning screen admission");
+    let mut narrow=Conditioning::new_split(cuda,core,stream,weights.clone(),kernels,rank)?;
+    let mut wide=Conditioning::new(cuda,core,stream,weights,kernels,128)?;
+    let chunk=cuda.allocate::<bf16>(6*15360)?;
+    let padded=cuda.allocate::<bf16>(128*15360)?;
+    let output=cuda.allocate::<bf16>(32*512*3)?;
+    let eviction=cuda.allocate::<u8>(128*1024*1024)?;
+    let mut barrier_in=cuda.allocate::<f32>(4)?;barrier_in.upload(&[0.;4])?;
+    let mut barrier_out=cuda.allocate::<f32>(16)?;stream.join_default()?;
+    let mut execute=|mode:usize,live:usize,offset:usize|->Result<()> {
+        ensure!(live>0&&live<=32&&offset+live<=128,"copy conditioning extent");
+        unsafe{cuda.zero_device(output.ptr(),output.bytes(),stream)?;}
+        if mode==0 {
+            for begin in (0..live).step_by(6) {
+                let n=(live-begin).min(6);
+                unsafe{cuda.zero_device(chunk.ptr(),chunk.bytes(),stream)?;
+                    cuda.copy_device(chunk.ptr(),features.ptr()+((offset+begin)*15360*2)as u64,n*15360*2,stream)?;}
+                narrow.run_cached_distributed(&chunk,n,Some(comm),stream)?;
+                let(_,kv,_)=narrow.outputs()?;
+                for (stage,raw)in kv.into_iter().enumerate(){unsafe{
+                    cuda.copy_device(output.ptr()+((stage*32+begin)*512*2)as u64,raw.ptr(),n*512*2,stream)?;}}
+            }
+        }else{
+            unsafe{cuda.zero_device(padded.ptr(),padded.bytes(),stream)?;
+                cuda.copy_device(padded.ptr(),features.ptr()+(offset*15360*2)as u64,live*15360*2,stream)?;}
+            wide.run_cached_distributed(&padded,live,Some(comm),stream)?;
+            let(_,kv,_)=wide.outputs()?;
+            for(stage,raw)in kv.into_iter().enumerate(){unsafe{
+                cuda.copy_device(output.ptr()+(stage*32*512*2)as u64,raw.ptr(),live*512*2,stream)?;}}
+        }Ok(())
+    };
+    // First-use capture is excluded from the paired timings.
+    for mode in 0..2 {execute(mode,32,0)?;stream.synchronize()?;comm.health()?;}
+    let read=||->Result<Vec<u8>>{unsafe{cuda.read_device(output.ptr(),output.bytes())}};
+    let mut records=Vec::new();
+    for (live,offset)in[(7,0),(12,0),(16,0),(24,0),(32,0),(32,32)] {
+        let mut expected=Vec::new();
+        for mode in 0..2 {
+            execute(mode,live,offset)?;stream.synchronize()?;comm.health()?;
+            let raw=read()?;
+            ensure!(raw.chunks_exact(2).all(|x|u16::from_le_bytes([x[0],x[1]])&0x7f80!=0x7f80),
+                "copy conditioning produced nonfinite KV");
+            expected.push(raw);
+        }
+        let mut pairs=Vec::new();
+        for cold in [false,true] {for repeat in 0..2 {
+            let mut ms=[0.;2];let mut wall=[0.;2];
+            for mode in if repeat==0{[0,1]}else{[1,0]} {
+                let replays=if cold{1}else{8};
+                if cold{unsafe{cuda.zero_device(eviction.ptr(),eviction.bytes(),stream)?;}}
+                else{execute(mode,live,offset)?;}
+                unsafe{comm.gather_f32(&barrier_in,&mut barrier_out,4,stream)?;}
+                stream.synchronize()?;comm.health()?;
+                let begin=cuda.event()?;let end=cuda.event()?;let start=std::time::Instant::now();
+                begin.record(stream)?;for _ in 0..replays{execute(mode,live,offset)?;}end.record(stream)?;
+                ms[mode]=f64::from(end.elapsed_since(&begin)?)/replays as f64;
+                wall[mode]=start.elapsed().as_secs_f64()*1000./replays as f64;comm.health()?;
+                ensure!(read()?==expected[mode],"copy conditioning replay changed output");
+            }
+            pairs.push(json!({"cold":cold,"repeat":repeat,"timeline_ms":ms,"wall_ms":wall}));
+        }}
+        records.push(json!({"live":live,"feature_offset":offset,"pairs":pairs,
+            "kv_sha256":expected.iter().map(|x|format!("{:x}",Sha256::digest(x))).collect::<Vec<_>>(),
+            "different_bf16_values":expected[0].chunks_exact(2).zip(expected[1].chunks_exact(2)).filter(|(a,b)|a!=b).count(),
+            "replay_exact":true,"finite":true}));
+    }
+    Ok(json!({"rank":rank,"records":records,"all_replays_exact":true,
+        "scope":"Accepted-only real features, split cached M6 chunks versus replicated cached M128 projection. Includes padding/input copies and KV output copies, excludes actual draft KV commit. Six small row/offset cases, hot8-replay and128MiB displaced single calls in opposite orders. Different width arithmetic is reported, not assumed equivalent. No serving change or generation-speed claim."}))
 }
 
 /// Eager versus cached split conditioning, including stable-input copy cost.

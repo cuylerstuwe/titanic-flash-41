@@ -32,10 +32,16 @@ mod interleave_probe;
 mod request_checkpoint;
 #[path = "encoder_prompt_cache_probe.rs"]
 mod encoder_cache_probe;
+#[path = "restore_initial_probe.rs"]
+mod restore_initial_probe;
 #[path = "mask_storage_probe.rs"]
 mod mask_storage_probe;
+#[path = "index_score_model_probe.rs"]
+mod index_score_model_probe;
 #[path = "history_associativity_probe.rs"]
 mod history_associativity_probe;
+#[path = "history_confidence_probe.rs"]
+mod history_confidence_probe;
 #[path = "dense_live_rows_probe.rs"]
 mod dense_live_rows_probe;
 #[cfg(any(test, feature = "storage-fault-injection"))]
@@ -57,18 +63,67 @@ mod source_prior_probe;
 mod sampler_readout_probe;
 #[path = "fixed_prefix_quality_probe.rs"]
 mod fixed_prefix_quality_probe;
+#[path = "matched_path_probe.rs"]
+mod matched_path_probe;
+#[path = "chunk_plan_probe.rs"]
+mod chunk_plan_probe;
+#[path = "prefill_wait_probe.rs"]
+mod prefill_wait_probe;
+#[path = "verify_wait_probe.rs"]
+mod verify_wait_probe;
+#[path = "mhc_pdl_probe.rs"]
+mod mhc_pdl_probe;
+#[path = "clock_verify_probe.rs"]
+mod clock_verify_probe;
+#[path = "clock_workload_probe.rs"]
+mod clock_workload_probe;
+#[path = "sampler_law_probe.rs"]
+mod sampler_law_probe;
+#[path = "step_budget_probe.rs"]
+mod step_budget_probe;
 #[path = "block_progress_probe.rs"]
 mod block_progress_probe;
+#[path = "confidence_economics_probe.rs"]
+mod confidence_economics_probe;
+#[path = "confidence_policy_probe.rs"]
+mod confidence_policy_probe;
 #[path = "pooled_route_probe.rs"]
 mod pooled_route_probe;
+#[path = "history_copy_route_probe.rs"]
+mod history_copy_route_probe;
+#[path = "history32_probe.rs"]
+mod history32_probe;
+#[path = "history32_generation_probe.rs"]
+mod history32_generation_probe;
+#[path = "history32_fresh_probe.rs"]
+mod history32_fresh_probe;
+#[path = "history_minimum_probe.rs"]
+mod history_minimum_probe;
+#[path = "compact32_index_probe.rs"]
+mod compact32_index_probe;
+#[path = "swa_precision_probe.rs"]
+mod swa_precision_probe;
 #[path = "private_int8_probe.rs"]
 mod private_int8_probe;
 #[path = "worker_background_prefill.rs"]
 mod background_prefill;
 use background_prefill::PendingPrefill;
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum PrefillDirective { Continue, Cancel, Yield }
 #[cfg(feature = "serving")]
 #[path = "worker_interleave_http.rs"]
 mod interleave_http;
+#[cfg(feature = "serving")]
+#[path = "peer_prefill_probe.rs"]
+mod peer_prefill_probe;
+#[path = "independent_owner_probe.rs"]
+mod independent_owner_probe;
+#[path = "resident_bank.rs"]
+mod resident_bank;
+#[path = "pair_step_profile_probe.rs"]
+mod pair_step_profile_probe;
+#[path = "attention16_refresh_probe.rs"]
+mod attention16_refresh_probe;
 
 fn adaptive_sparse_policy(sparse: Option<&str>, adaptive: Option<&str>) -> Result<bool> {
     let flag = |value| -> Result<bool> {
@@ -86,6 +141,7 @@ fn adaptive_sparse_policy(sparse: Option<&str>, adaptive: Option<&str>) -> Resul
 fn redact_http_event(event:&mut Value) {
     event.as_object_mut().unwrap().remove("output_ids");
     event.as_object_mut().unwrap().remove("pending");
+    if let Some(peer)=event.get_mut("paired_peer") {redact_http_event(peer);}
     if let Some(cache)=event.get_mut("retained_session_cache").and_then(Value::as_object_mut) {
         if let Some(anchor)=cache.remove("exact_prompt_anchor") {
             cache.insert("exact_prompt_hit".into(),json!(anchor.is_u64()));
@@ -272,11 +328,19 @@ impl Command {
     }
 }
 
+struct CachedCompleteImage {
+    session:crate::dspark_generation::StateImage,
+    bank_ancestors:Vec<crate::target::BankEncoderWitness>,
+}
+impl CachedCompleteImage {
+    fn device_bytes(&self)->usize {self.session.device_bytes()}
+}
 enum CachedState {
-    Complete {image:crate::dspark_generation::StateImage,pending:u32},
+    Complete {image:CachedCompleteImage,pending:u32},
     Encoder {image:crate::target::EncoderPrefixImage,history:Option<crate::history_lookup::HistoryLookup>,policy:crate::dspark_generation::ProposalPolicyImage},
 }
 struct CachedSession {
+    owner: u8,
     prefix:Vec<u32>,
     media:crate::prompt_media::Identity,
     image:CachedState,
@@ -335,6 +399,26 @@ fn cache_evictions_with_optional(entries:&[(usize,usize)], optional:&[bool],
     Some(removed)
 }
 
+/// A completed continuation can be reconstructed from an already saved parent.
+/// Do not replace that parent with another child merely because it is slightly
+/// longer: sibling completions cannot serve a regeneration or another branch.
+/// This reservation applies only to optional completed-turn saves; advancing
+/// prompt checkpoints and mandatory suspended requests keep their own policy.
+fn completed_cache_evictions(entries:&[(usize,usize)], optional:&[bool], ancestors:&[bool],
+    incoming:(usize,usize),budget:usize,long_first:bool,slots:usize)->Option<Vec<usize>> {
+    if entries.len()!=optional.len()||entries.len()!=ancestors.len(){return None;}
+    let mut reserved=0usize;let mut count=0;
+    let mut retained=Vec::new();
+    for (i,&parent) in ancestors.iter().enumerate() {
+        if parent{reserved=reserved.checked_add(entries[i].1)?;count+=1;}
+        else{retained.push(i);}
+    }
+    let rest=retained.iter().map(|&i|entries[i]).collect::<Vec<_>>();
+    let optional=retained.iter().map(|&i|optional[i]).collect::<Vec<_>>();
+    Some(cache_evictions_with_optional(&rest,&optional,incoming,budget.checked_sub(reserved)?,
+        long_first,slots.checked_sub(count)?)?.into_iter().map(|i|retained[i]).collect())
+}
+
 /// The restored parent is a live reservation, not an eviction candidate.
 /// A successor must coexist with it even during allocation. Otherwise a late
 /// refusal or cancellation could destroy the only reusable shared prefix.
@@ -379,6 +463,7 @@ fn reclaim_optional_cache(cuda:&Cuda,control:&mut ControlChannel,
     let mut proof=b"optional-cache-reclaim-v1".to_vec();
     proof.extend_from_slice(&(cached.len() as u64).to_le_bytes());
     for entry in cached.iter() {
+        proof.push(entry.owner);
         proof.extend_from_slice(&(entry.prefix.len() as u64).to_le_bytes());
         proof.extend_from_slice(&(entry.charge as u64).to_le_bytes());
         proof.push(u8::from(entry.opportunistic_logits()));
@@ -403,16 +488,21 @@ fn reclaim_optional_cache(cuda:&Cuda,control:&mut ControlChannel,
 struct Worker {
     // Captured graph owners must drop before their NCCL/RoCE communicator,
     // including when any request, socket operation or output write fails.
+    resident_pair: Option<crate::target::PairExecutor>,
+    peer_bank: Option<resident_bank::Bank>,
+    bank_id: u8,
     session: Option<GreedySession>,
     cached_sessions: Vec<CachedSession>,
     #[cfg(feature = "storage-fault-injection")]
     cache_save_fault: cache_admission_fault::Fault,
     session_cache_budget: usize,
     shared_image_budget: usize,
+    parking_extra_slots: bool,
     suspended_image_bytes: usize,
     suspended_image_count: usize,
     loaded_request_is_suspended: bool,
     session_cache_long_first: bool,
+    session_cache_shared_ancestors: bool,
     cache_pressure_reclaim: bool,
     prompt_checkpoint: bool,
     encoder_prompt_checkpoint: bool,
@@ -428,6 +518,9 @@ struct Worker {
     verify: Target,
     long_verify: Option<Target>,
     long_history_buffers: Option<LongHistoryBuffers>,
+    copy32_verify: Option<Target>,
+    copy32_buffers: Option<LongHistoryBuffers>,
+    copy32_admission: Value,
     wides: Vec<Target>,
     large: Target,
     comm: Roce,
@@ -446,6 +539,10 @@ struct Worker {
     active_media: Option<std::rc::Rc<crate::prompt_media::Bindings>>,
     media_receipt: Value,
     background_prefill_enabled: bool,
+    peer_prefill_enabled: bool,
+    peer_prefill_slice: Duration,
+    trim_free_host_pages: bool,
+    state_pressure_trim: Option<Value>,
     emitted: usize,
     limit: usize,
     identity: String,
@@ -453,6 +550,7 @@ struct Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         self.history.retire();
+        if let Some(peer)=&mut self.peer_bank {peer.retire();}
         // Close CPU control before destroying collective objects, so peers
         // leave a blocked control read even if communicator teardown is slow.
         self.control.retire();
@@ -471,6 +569,7 @@ impl Worker {
         self.large.clear_prompt_media_rows(&self.stream)?;
         self.verify.clear_prompt_media_rows(&self.stream)?;
         if let Some(target)=&mut self.long_verify {target.clear_prompt_media_rows(&self.stream)?;}
+        if let Some(target)=&mut self.copy32_verify {target.clear_prompt_media_rows(&self.stream)?;}
         for target in &mut self.wides {target.clear_prompt_media_rows(&self.stream)?;}
         if self.verify.profile_is_current() {self.verify.set_prompt_media(media.clone(),&self.stream)?;}
         else {self.large.set_prompt_media(media.clone(),&self.stream)?;}
@@ -660,6 +759,30 @@ impl Worker {
     }
 
     fn load(p: &WorkerConfig) -> Result<Self> {
+        let use_copy32=crate::config::history32_generation_enabled()?;
+        let peer_prefill_enabled=match std::env::var("CANADA_SCRATCH_PEER_PREFILL") {
+            Ok(v)=>{ensure!(v=="0"||v=="1","invalid peer prefill policy");v=="1"},
+            Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
+        };
+        ensure!(!peer_prefill_enabled||(std::env::var("CANADA_SCRATCH_TWO_STREAM_ADMISSION").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_BACKGROUND_PREFILL").as_deref()==Ok("1")),
+            "peer prefill requires bounded two-owner resumable scheduling");
+        // Same-class fairness is deliberately coarse. A short subagent prompt
+        // normally finishes without paying another owner's decoding quantum.
+        // Cancellation and foreground priority continue to use every boundary.
+        let peer_prefill_slice_ms=match std::env::var("CANADA_SCRATCH_PEER_PREFILL_SLICE_MS") {
+            Ok(v)=>v.parse::<u64>().context("invalid peer prefill slice")?,
+            Err(std::env::VarError::NotPresent)=>12_000,Err(e)=>return Err(e.into()),
+        };
+        ensure!((1_000..=30_000).contains(&peer_prefill_slice_ms),"peer prefill slice must be1000..30000ms");
+        let peer_prefill_slice=Duration::from_millis(peer_prefill_slice_ms);
+        let parking_extra_slots=match std::env::var("CANADA_SCRATCH_PARKING_EXTRA_SLOTS") {
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid parking slot policy");value=="1"},
+            // s1076: count-only parking evictions fell2/1→0/0 with the
+            // same byte budget and reserve. Keep an explicit control switch.
+            Err(std::env::VarError::NotPresent)=>true,
+            Err(error)=>return Err(error.into()),
+        };
         let cache_pressure_reclaim=match std::env::var("CANADA_SCRATCH_CACHE_PRESSURE_RECLAIM") {
             Ok(value)=>{ensure!(value=="0"||value=="1","invalid cache pressure policy");value=="1"},
             Err(std::env::VarError::NotPresent)=>true,
@@ -685,6 +808,11 @@ impl Worker {
             Ok(value)if value=="fifo"=>false,
             Ok(value)if value=="long_parents_and_recent" || value=="longest_prefix"=>true,
             _=>anyhow::bail!("session cache policy must be fifo or long_parents_and_recent"),
+        };
+        let session_cache_shared_ancestors=match std::env::var("CANADA_SCRATCH_CACHE_SHARED_ANCESTORS") {
+            Err(std::env::VarError::NotPresent)=>false,
+            Ok(v)if v=="0"=>false,Ok(v)if v=="1"=>true,
+            _=>anyhow::bail!("shared ancestor cache policy must be0or1"),
         };
         let prompt_checkpoint=match std::env::var("CANADA_SCRATCH_PROMPT_CHECKPOINT") {
             Err(std::env::VarError::NotPresent)=>false,
@@ -832,7 +960,11 @@ impl Worker {
         let cuda = Cuda::open(0)?;
         cuda.qualify_gb10()?;
         let stream = cuda.stream()?;
+        if std::env::var("CANADA_SCRATCH_CORE_MODULE_CACHE_SCREEN").as_deref()==Ok("1") {
+            cuda.share_immutable_core(&core_bytes)?;
+        }
         let core = cuda.module(&core_bytes)?;
+        let startup_padding=crate::allocation_placement_probe::padding(&cuda,&stream)?;
         let mut large = Target::load(
             &cuda,
             &core,
@@ -850,6 +982,12 @@ impl Worker {
             128,
             p.context,
         )?;
+        if !startup_padding.is_empty(){
+            stream.synchronize()?;
+            ensure!(cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3),"startup padding consumed physical reserve");
+            drop(startup_padding);
+            eprintln!("startup padding released before profile forks: {}",json!(cuda.admission_memory()?));
+        }
         large.set_graph_replay(true)?;
         large.set_prefill_last_head(true)?;
         large.enable_decoder_tail(&core_bytes)?;
@@ -863,8 +1001,13 @@ impl Worker {
                 "resident wide profile duplicated state"
             );
         }
-        let mut verify =
-            large.fork_profile(&core, &core_bytes, &stream, &p.kernels, 6, Phase::Verify)?;
+        let loan_narrow=std::env::var("CANADA_SCRATCH_NARROW_ARENA_LOAN_SCREEN").as_deref()==Ok("1");
+        let fork_narrow=|rows|->Result<Target> {
+            if loan_narrow {large.fork_profile_lending_prefill_for_probe(&core,&core_bytes,&stream,&p.kernels,
+                rows,Phase::Verify,wides.iter().max_by_key(|t|t.physical_rows()).context("complete prefill arena bank")?)}
+            else{large.fork_profile(&core,&core_bytes,&stream,&p.kernels,rows,Phase::Verify)}
+        };
+        let mut verify = fork_narrow(6)?;
         ensure!(verify.adaptive_sparse_index_layers() == if adaptive_sparse {4} else {0},
             "resident adaptive sparse construction differs from admitted policy");
         let compact=crate::query_index::compact_sparse_index_enabled(p.context,adaptive_sparse)?;
@@ -885,10 +1028,13 @@ impl Worker {
             Ok(v)=>{ensure!(v=="0"||v=="1","invalid long history policy");v=="1"},
             Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
         };
+        let compact_history_sampling=Target::compact_history_sampling_requested()?;
+        ensure!(!compact_history_sampling||use_long_history,"compact sampling needs the long-history verifier");
         let (long_verify,long_history_buffers)=if use_long_history {
             ensure!(p.context==1048576 && history_lookup_enabled,"long history needs full-capacity history lookup");
-            let mut target=large.fork_profile(&core,&core_bytes,&stream,&p.kernels,16,Phase::Verify)?;
+            let mut target=fork_narrow(16)?;
             target.set_graph_replay(true)?;
+            if compact_history_sampling {target.enable_compact_history_sampling(&core_bytes,&stream)?;}
             ensure!(large.shared_state_report(&target)["all_weights_and_causal_storage_shared"]==true,
                 "long history verifier duplicated model state");
             (Some(target),Some(LongHistoryBuffers::new(&cuda,&core_bytes)?))
@@ -904,7 +1050,7 @@ impl Worker {
             &p.kernels,
         )?;
         let prepare_started = Instant::now();
-        let prepared_session = PreparedSession::new(&cuda, &core_bytes, prepared_draft)?
+        let mut prepared_session = PreparedSession::new(&cuda, &core_bytes, prepared_draft)?
             .with_serving_policy(&stream)?;
         stream.synchronize()?;
         let session_prepare_seconds = prepare_started.elapsed().as_secs_f64();
@@ -978,6 +1124,7 @@ impl Worker {
         )?;
         control.agree(&(session_cache_budget as u64).to_le_bytes())?;
         control.agree(&(shared_image_budget as u64).to_le_bytes())?;
+        control.agree(&[u8::from(parking_extra_slots)])?;
         control.agree(&[u8::from(session_cache_long_first)])?;
         control.agree(&[u8::from(cache_pressure_reclaim)])?;
         control.agree(&[u8::from(prompt_checkpoint)])?;
@@ -989,20 +1136,83 @@ impl Worker {
         control.agree(&[u8::from(prompt_cache_logits)])?;
         control.agree(&[u8::from(retain_restored_checkpoint)])?;
         control.agree(&[u8::from(use_long_history)])?;
+        control.agree(&[u8::from(compact_history_sampling)])?;
+        control.agree(&Target::verification_poll_us_requested()?.to_le_bytes())?;
+        control.agree(&[u8::from(crate::mhc::pdl_pair_requested()?)])?;
+        control.agree(&[u8::from(crate::mhc::pdl_stats_requested()?)])?;
+        control.agree(&[u8::from(crate::weights::early_layer_reservation_requested()?)])?;
+        control.agree(&[u8::from(crate::weights::compressed_target_weights_requested()?)])?;
+        control.agree(&[u8::from(crate::weights::external_target_pool_path()?.is_some())])?;
+        control.agree(&[LongHistoryBuffers::minimum_match_requested(16)? as u8,
+            LongHistoryBuffers::minimum_match_requested(32)? as u8])?;
+        let native_prefill_rs=match std::env::var("CANADA_SCRATCH_PREFILL_NATIVE_RS") {
+            Ok(v)=>{ensure!(v=="0"||v=="1","invalid native prefill RS policy");v=="1"},
+            Err(std::env::VarError::NotPresent)=>false,
+            Err(error)=>return Err(error.into()),
+        };
+        control.agree(&[u8::from(native_prefill_rs)])?;
+        if native_prefill_rs {comm.attach_native_prefill_rs(&p.kernels.join("prefill-rs-native-v2"),&stream)?;}
+        // This optional profile shares canonical weights and causal storage.
+        // Admit after vision, drafter and communication allocations, on every
+        // rank. Its measured final workspace is~1.9GiB and construction peaks
+        // around2.7GiB; 12GiB leaves the8GiB physical reserve plus margin.
+        // Refusal keeps M16/M6 serving available under the same memory caps.
+        control.agree(&[u8::from(use_copy32)])?;
+        control.agree(&[u8::from(peer_prefill_enabled)])?;
+        control.agree(&peer_prefill_slice_ms.to_le_bytes())?;
+        control.agree(&[u8::from(LongHistoryBuffers::wide_conditioning_requested()?)])?;
+        let copy32_before=cuda.admission_memory()?;
+        let mut copy32_verify=None;let mut copy32_buffers=None;let mut copy_conditioning_prepared=false;
+        let copy32_fit=use_copy32&&control.all_admit(copy32_before.admitted_available>=12*1024usize.pow(3))?;
+        if copy32_fit {
+            ensure!(use_long_history&&long_verify.is_some(),"M32 requires the existing M16 fallback");
+            let mut target=fork_narrow(32)?;
+            target.set_graph_replay(true)?;
+            if compact_history_sampling {target.enable_compact_history_sampling(&core_bytes,&stream)?;}
+            ensure!(large.shared_state_report(&target)["all_weights_and_causal_storage_shared"]==true,
+                "M32 serving duplicated model state");
+            let buffers=LongHistoryBuffers::with_rows(&cuda,&core_bytes,32)?;
+            copy_conditioning_prepared=prepared_session.prepare_copy_conditioning(&buffers,&comm,&stream)?;
+            stream.synchronize()?;
+            if control.all_admit(cuda.admission_memory()?.admitted_available>=9*1024usize.pow(3))? {
+                copy32_verify=Some(target);copy32_buffers=Some(buffers);
+            }else if copy_conditioning_prepared {
+                prepared_session.release_copy_conditioning(&stream)?;copy_conditioning_prepared=false;
+            }
+        }
+        let copy32_after=cuda.admission_memory()?;
+        ensure!(control.all_admit(copy32_after.admitted_available>=8*1024usize.pow(3))?,
+            "M32 admission consumed physical reserve");
+        let copy32_admission=json!({"requested":use_copy32,"admitted":copy32_verify.is_some(),
+            "compact_history_sampling":compact_history_sampling,
+            "wide_copy_conditioning_prepared":copy_conditioning_prepared,
+            "construction_headroom_bytes":12*1024usize.pow(3),"memory_before":copy32_before,"memory_after":copy32_after});
+        if use_copy32 {eprintln!("rank{} M32 serving admission: {copy32_admission}",p.rank);}
         #[cfg(feature = "storage-fault-injection")]
         control.agree(&[u8::from(std::env::var("CANADA_SCRATCH_CACHE_RETENTION_SCREEN").as_deref()==Ok("1"))])?;
         let history = ResidentHistory::new(p.context, cfg.eos_token_id)?;
+        let trim_free_host_pages = match std::env::var("CANADA_SCRATCH_STATE_PRESSURE_TRIM") {
+            Ok(v) => { ensure!(v=="0" || v=="1", "host allocator trim policy"); v=="1" },
+            Err(std::env::VarError::NotPresent) => false,
+            Err(e) => return Err(e.into()),
+        };
+        control.agree(&[u8::from(trim_free_host_pages)])?;
         Ok(Self {
+            resident_pair: None,
+            peer_bank: None,
+            bank_id: 0,
             session: None,
             cached_sessions:Vec::new(),
             #[cfg(feature = "storage-fault-injection")]
             cache_save_fault: cache_admission_fault::Fault::default(),
             session_cache_budget,
             shared_image_budget,
+            parking_extra_slots,
             suspended_image_bytes:0,
             suspended_image_count:0,
             loaded_request_is_suspended:false,
             session_cache_long_first,
+            session_cache_shared_ancestors,
             cache_pressure_reclaim,
             prompt_checkpoint,
             encoder_prompt_checkpoint,
@@ -1018,6 +1228,9 @@ impl Worker {
             verify,
             long_verify,
             long_history_buffers,
+            copy32_verify,
+            copy32_buffers,
+            copy32_admission,
             wides,
             large,
             comm,
@@ -1028,6 +1241,8 @@ impl Worker {
             core: core_bytes,
             history,
             history_lookup_enabled,
+            trim_free_host_pages,
+            state_pressure_trim: None,
             progress_next: false,
             current: None,
             pending_prefill: None,
@@ -1039,6 +1254,8 @@ impl Worker {
                 Ok(v)=>{ensure!(v=="0"||v=="1","invalid background prefill policy");v=="1"},
                 Err(std::env::VarError::NotPresent)=>false,Err(error)=>return Err(error.into()),
             },
+            peer_prefill_enabled,
+            peer_prefill_slice,
             emitted: 0,
             limit: 0,
             identity: identity.iter().map(|x| format!("{x:02x}")).collect(),
@@ -1102,7 +1319,27 @@ impl Worker {
     fn cache_capacity(&self,extra_bytes:usize,extra_count:usize)->(usize,usize) {
         (self.session_cache_budget.min(self.shared_image_budget
             .saturating_sub(self.suspended_image_bytes.saturating_add(extra_bytes))),
-            4usize.saturating_sub(self.suspended_image_count.saturating_add(extra_count)))
+            self.image_entry_limit().saturating_sub(self.suspended_image_count.saturating_add(extra_count)))
+    }
+
+    // Four cache entries remain available while at most two request images
+    // temporarily coexist. The shared physical byte budget is unchanged.
+    fn image_entry_limit(&self)->usize {
+        4+if self.parking_extra_slots {self.suspended_image_count}else{0}
+    }
+
+    fn complete_cache_ancestor_bytes(&self)->usize {
+        if crate::config::bank_encoder_checkpoint_requested() {
+            self.image_entry_limit()*std::mem::size_of::<crate::target::BankEncoderWitness>()
+        }else{0}
+    }
+
+    fn cache_reserve(&self)->Result<usize> {
+        // Optional images must not spend the working room needed by the next
+        // owner's prefill. Keep the legacy policy outside two-state exchange.
+        let ordinary=8*1024usize.pow(3)
+            +if self.peer_bank.is_some()||request_checkpoint::exchange_enabled()?{256}else{16}*1024usize.pow(2);
+        Ok(ordinary.max(self.cuda.allocation_reserve_bytes()))
     }
 
     /// Plan against the tightest physical rank before dropping any optional
@@ -1110,8 +1347,10 @@ impl Worker {
     /// authorizes allocation; ordinary reserve and late-save checks still do.
     #[allow(clippy::too_many_arguments)]
     fn admit_cache_save(&mut self,eligible:bool,evictions:Option<Vec<usize>>,prefix:&[u32],
-        media:&crate::prompt_media::Identity,required:usize,slots:usize)->Result<CacheSaveAdmission> {
+        media:&crate::prompt_media::Identity,required:usize,slots:usize,protected:&[usize])->Result<CacheSaveAdmission> {
         let mut removed=if eligible {evictions.expect("eligible cache eviction plan")}else{Vec::new()};
+        ensure!(protected.iter().all(|&i|i<self.cached_sessions.len()&&!removed.contains(&i)),
+            "cache admission would evict a protected parent");
         let budget_evictions=removed.len();
         if self.cache_pressure_reclaim {
             let available=self.cuda.admission_memory()?.admitted_available;
@@ -1126,12 +1365,13 @@ impl Worker {
             let optional=self.cached_sessions.iter().map(CachedSession::opportunistic_logits).collect::<Vec<_>>();
             let superseded=self.cached_sessions.iter().map(|c|c.prefix.len()<prefix.len()
                 &&prefix.starts_with(&c.prefix)&&media.matches_prefix(&c.media,c.prefix.len())).collect::<Vec<_>>();
-            self.control.agree(&serde_json::to_vec(&(eligible,&entries,&optional,&superseded,&removed,slots,prefix.len()))?)?;
+            self.control.agree(&serde_json::to_vec(&(eligible,&entries,&optional,&superseded,&removed,protected,slots,prefix.len()))?)?;
             loop {
                 let reclaim=removed.iter().map(|&i|entries[i].1).sum::<usize>();
                 if self.control.all_admit(eligible&&available.saturating_add(reclaim)>=required)?{break;}
+                let excluded=removed.iter().chain(protected).copied().collect::<Vec<_>>();
                 let next=eligible.then(||pressure_cache_victim(&entries,&optional,&superseded,
-                    prefix.len(),slots,self.session_cache_long_first,&removed)).flatten();
+                    prefix.len(),slots,self.session_cache_long_first,&excluded)).flatten();
                 let Some(next)=next else {
                     return Ok(CacheSaveAdmission{admitted:false,available,local_fits:available>=required,
                         evicted:0,pressure_evicted:0,forecast_refused:true});
@@ -1162,10 +1402,27 @@ impl Worker {
             Err(error)=>return Err(error),
         };
         // Actual allocation/metadata costs can exceed the byte estimate.
-        // Keep the ordinary 16MiB preparation allowance after saving too.
+        // Keep the prefill preparation allowance after saving too.
         let fits=image.is_some() && self.cuda.admission_memory()?.admitted_available
-            >=8*1024usize.pow(3)+16*1024usize.pow(2);
+            >=self.cache_reserve()?;
         if self.control.all_admit(fits)? {Ok(image)}else{Ok(None)}
+    }
+
+    fn try_save_cached_session_image(&mut self,anchor:u32,budget:usize)
+        ->Result<Option<CachedCompleteImage>> {
+        let Some(session)=self.try_save_session_image(anchor,budget)?else{return Ok(None);};
+        let mut bank_ancestors=Vec::new();
+        if crate::config::bank_encoder_checkpoint_requested() {
+            bank_ancestors=Vec::with_capacity(self.image_entry_limit());
+            ensure!(self.cached_sessions.len()<=bank_ancestors.capacity(),"ancestor metadata capacity");
+            for cached in &self.cached_sessions {
+                if cached.owner!=self.bank_id {continue;}
+                if let CachedState::Encoder{image,..}=&cached.image {
+                    if let Some(witness)=self.verify.bank_encoder_witness(image){bank_ancestors.push(witness);}
+                }
+            }
+        }
+        Ok(Some(CachedCompleteImage{session,bank_ancestors}))
     }
 
     /// Reclaim optional cache at a committed boundary. The live target/session
@@ -1191,31 +1448,36 @@ impl Worker {
         extra_bytes:usize,extra_count:usize)->Result<Value> {
         ensure!(!prefix.is_empty() && self.verify.position()==prefix.len()as u64,
             "cached prefix and target frontier disagree");
-        if self.cached_sessions.iter().any(|c|c.prefix==prefix && c.media.matches_prefix(&media,prefix.len())) {
+        if self.cached_sessions.iter().any(|c|c.owner==self.bank_id && c.prefix==prefix && c.media.matches_prefix(&media,prefix.len())) {
             return Ok(json!({"saved":false,"already_cached":true,"saved_seconds":0.,
                 "evicted_sessions":0,"capacity_refused":false}));
         }
         let (device_bytes,host_bytes)=self.session.as_ref().unwrap().compact_state_image_bytes(&self.verify)?;
         let charge=device_bytes.checked_add(host_bytes).and_then(|n|n.checked_add(prefix.len()*4+media.metadata_bytes()))
+            .and_then(|n|n.checked_add(self.complete_cache_ancestor_bytes()))
             .ok_or_else(||anyhow::anyhow!("cached session byte overflow"))?;
         let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
         let (budget,slots)=self.cache_capacity(extra_bytes,extra_count);
         let optional=self.cached_sessions.iter().map(CachedSession::opportunistic_logits).collect::<Vec<_>>();
-        let evictions=cache_evictions_with_optional(&entries,&optional,(prefix.len(),charge),
+        let ancestors=self.cached_sessions.iter().map(|c|self.session_cache_shared_ancestors
+            &&c.prefix.len()>=8192&&c.prefix.len()<prefix.len()&&prefix.starts_with(&c.prefix)
+            &&media.matches_prefix(&c.media,c.prefix.len())).collect::<Vec<_>>();
+        let protected=ancestors.iter().enumerate().filter_map(|(i,&yes)|yes.then_some(i)).collect::<Vec<_>>();
+        let evictions=completed_cache_evictions(&entries,&optional,&ancestors,(prefix.len(),charge),
             budget,self.session_cache_long_first,slots);
         let eligible=device_bytes<=2*1024usize.pow(3) && evictions.is_some();
         // The wanted image remains alive during this check, so temporarily
         // retaining both current and wanted sessions is charged to real UMA.
-        let reserve=8*1024usize.pow(3)+16*1024usize.pow(2);
-        let admission=self.admit_cache_save(eligible,evictions,prefix,&media,reserve+charge,slots)?;
+        let reserve=self.cache_reserve()?;
+        let admission=self.admit_cache_save(eligible,evictions,prefix,&media,reserve+charge,slots,&protected)?;
         let admitted=admission.admitted;
         let mut saved_seconds=0.;
         let mut saved=false;
         if admitted {
             let began=Instant::now();
-            if let Some(image)=self.try_save_session_image(pending,device_bytes)? {
+            if let Some(image)=self.try_save_cached_session_image(pending,device_bytes)? {
                 ensure!(image.device_bytes()==device_bytes,"cached image estimate differs from allocation");
-                self.cached_sessions.push(CachedSession{prefix:prefix.to_vec(),media,image:CachedState::Complete{image,pending},charge,prompt_logits:None});
+                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,image:CachedState::Complete{image,pending},charge,prompt_logits:None});
                 saved=true;
             }
             saved_seconds=began.elapsed().as_secs_f64();
@@ -1224,6 +1486,7 @@ impl Worker {
             "evicted_sessions":admission.evicted,"capacity_refused":!eligible,
             "memory_refused":eligible&&!admitted,"local_memory_refused":eligible&&!admission.local_fits,
             "pressure_evicted_sessions":admission.pressure_evicted,"forecast_refused":admission.forecast_refused,
+            "protected_ancestors":protected.len(),
             "admission_available_bytes":admission.available,"admission_required_bytes":reserve+charge}))
     }
 
@@ -1237,15 +1500,17 @@ impl Worker {
         // prompt state/logits under the conversation cache policy, using the
         // same full media identity and fresh target sampling as long prompts.
         if !self.prompt_cache_logits || greedy
-            || (plan.prompt.len()<8192 && plan.media.placements().is_empty()) || (plan.reuse && !cache_hit) {
+            || (plan.prompt.len()<8192 && plan.media.placements().is_empty()
+                && !sampler_law_probe::enabled()) || (plan.reuse && !cache_hit) {
             return Ok((None,json!({"enabled":self.prompt_cache_logits,"saved":false,
                 "active_append_skipped":plan.reuse && !cache_hit,"seconds":0.})));
         }
-        if self.cached_sessions.iter().any(|c|c.prefix==plan.prompt && c.media.matches_prefix(&plan.media,plan.prompt.len()) && c.prompt_logits.is_some()) {
+        if self.cached_sessions.iter().any(|c|c.owner==self.bank_id && c.prefix==plan.prompt && c.media.matches_prefix(&plan.media,plan.prompt.len()) && c.prompt_logits.is_some()) {
             return Ok((None,json!({"enabled":true,"saved":false,"already_cached":true,"seconds":0.})));
         }
         let (device,host)=self.session.as_ref().unwrap().compact_state_image_bytes(&self.large)?;
         let charge=device.checked_add(host).and_then(|n|n.checked_add(plan.prompt.len()*4+plan.media.metadata_bytes()))
+            .and_then(|n|n.checked_add(self.complete_cache_ancestor_bytes()))
             .and_then(|n|n.checked_add(crate::sampling::VOCAB*4))
             .ok_or_else(||anyhow::anyhow!("prompt logit cache size overflow"))?;
         let (budget,slots)=self.cache_capacity(0,0);
@@ -1253,7 +1518,7 @@ impl Worker {
         let evictions=prompt_cache_evictions(&entries,(plan.prompt.len(),charge),budget,
             self.session_cache_long_first,slots,!plan.media.placements().is_empty());
         let eligible=evictions.is_some();
-        let reserve=8*1024usize.pow(3)+16*1024usize.pow(2);
+        let reserve=self.cache_reserve()?;
         let admitted=self.control.all_admit(eligible
             && self.cuda.admission_memory()?.admitted_available>=reserve+charge)?;
         // Admission is conservative while all old allocations still exist.
@@ -1274,46 +1539,57 @@ impl Worker {
     /// optional allocation needs all-rank admission above the8GiB reserve.
     fn reuse_cached_session(&mut self,plan:&mut RequestPlan,allow_exact_logits:bool,allow_encoder:bool)->Result<(Value,Option<CachedSession>)> {
         let started=Instant::now();
-        if self.session_cache_budget==0 || plan.reuse || self.session.is_none() || plan.previous==0 {
+        self.prune_invalid_bank_images();
+        let imports=allow_encoder&&crate::config::encoder_prefix_import_requested()&&self.peer_bank.is_some();
+        if self.session_cache_budget==0 || plan.reuse || (!imports&&(self.session.is_none() || plan.previous==0)) {
             return Ok((json!({"enabled":self.session_cache_budget>0,"hit":false,"saved":false,
                 "active_reuse":plan.reuse,"seconds":started.elapsed().as_secs_f64()}),None));
         }
-        ensure!(self.verify.profile_is_current() && self.verify.position()==plan.previous as u64,
+        ensure!(if self.session.is_some(){self.verify.profile_is_current() && self.verify.position()==plan.previous as u64}
+            else{plan.previous==0&&self.large.position()==0&&self.large.profile_is_current()},
             "cache lookup requires the current accepted owner");
         let hit=self.cached_sessions.iter().enumerate()
-            .filter(|(_,c)|(allow_encoder||matches!(&c.image,CachedState::Complete{..})) && plan.prompt.starts_with(&c.prefix)
+            .filter(|(_,c)|(c.owner==self.bank_id||(imports&&self.can_import_cached_encoder(c)))
+                && (allow_encoder||matches!(&c.image,CachedState::Complete{..})) && plan.prompt.starts_with(&c.prefix)
                 && plan.media.matches_prefix(&c.media,c.prefix.len())
                 && (c.prefix.len()<plan.prompt.len() || (self.prompt_cache_logits && allow_exact_logits
                     && c.prefix.len()==plan.prompt.len() && c.prompt_logits.is_some())))
             .max_by_key(|(_,c)|c.prefix.len()).map(|(i,_)|i);
         let wanted=hit.map(|i|self.cached_sessions.remove(i));
         let current_prefix=self.history.committed().to_vec();
-        let current_pending=self.history.pending().ok_or_else(||anyhow::anyhow!("cached session lacks pending anchor"))?;
         // A displaced unfinished request already owns an immutable image.
         // Do not copy that same loaded prefix into the optional cache too.
         // A wanted cache image remains charged while held outside the vector.
-        let saved=if self.loaded_request_is_suspended {
+        let saved=if self.session.is_none()||current_prefix.is_empty() {
+            json!({"saved":false,"saved_seconds":0.,"evicted_sessions":0,"capacity_refused":false})
+        }else if self.loaded_request_is_suspended {
             json!({"saved":false,"saved_seconds":0.,"evicted_sessions":0,
                 "capacity_refused":false,"already_suspended":true})
         }else{
-            self.retain_cached_prefix_reserved(&current_prefix,current_pending,self.history.media().through(current_prefix.len()),
+            self.retain_cached_prefix_reserved(&current_prefix,self.history.pending().context("cached session lacks pending anchor")?,self.history.media().through(current_prefix.len()),
                 wanted.as_ref().map_or(0,|c|c.charge),usize::from(wanted.is_some()))?
         };
         let transient_image_bytes=self.suspended_image_bytes
             +self.cached_sessions.iter().map(|c|c.charge).sum::<usize>()
             +wanted.as_ref().map_or(0,|c|c.charge);
         let transient_image_count=self.suspended_image_count+self.cached_sessions.len()+usize::from(wanted.is_some());
-        ensure!(transient_image_bytes<=self.shared_image_budget && transient_image_count<=4,
+        ensure!(transient_image_bytes<=self.shared_image_budget && transient_image_count<=self.image_entry_limit(),
             "restoring cache image exceeded the shared inactive budget");
-        let reserve=8*1024usize.pow(3)+16*1024usize.pow(2);
+        let reserve=self.cache_reserve()?;
         let mut restored_tokens=0;let mut restore_seconds=0.;let mut restore_refused=false;
         let mut retained_image=false;let mut retention_evictions=0;
         let mut reconstructed_upgrade=false;let mut upgrade_refused=false;let mut upgrade_seconds=0.;
         let mut upgrade_capacity_refused=false;let mut upgrade_memory_refused=false;
         let mut upgrade_late_memory_refused=false;let mut upgrade_evicted_sessions=0;
-        let mut encoder_reconstructed=false;
+        let mut encoder_reconstructed=false;let mut imported_owner=None;
         let mut exact_prompt_anchor=None;let mut sample_seconds=0.;
         if let Some(cached)=wanted {
+            let imported=cached.owner!=self.bank_id;
+            if imported {
+                ensure!(imports&&self.can_import_cached_encoder(&cached),"cached image belongs to an inadmissible physical owner");
+                self.peer_bank.as_ref().unwrap().encoder_import_source(&cached)?;
+                imported_owner=Some(cached.owner);
+            }
             let extra_history=match &cached.image {CachedState::Encoder{history,..}=>
                 history.as_ref().map_or(0,crate::history_lookup::HistoryLookup::workspace_bytes),_=>0};
             let mut admitted=self.control.all_admit(self.cuda.admission_memory()?.admitted_available>=reserve+extra_history)?;
@@ -1322,14 +1598,16 @@ impl Worker {
                 admitted=self.control.all_admit(self.cuda.admission_memory()?.admitted_available>=reserve+extra_history)?;
             }
             if admitted {
-                self.target_lineage=self.target_lineage.checked_add(1)
+                let prior=if imported {let CachedState::Encoder{image,..}=&cached.image else{unreachable!()};
+                    self.target_lineage.max(image.lineage())}else{self.target_lineage};
+                self.target_lineage=prior.checked_add(1)
                     .ok_or_else(||anyhow::anyhow!("cached target lineage exhausted"))?;
                 let began=Instant::now();
                 if matches!(&cached.image,CachedState::Encoder{..}) && plan.prompt.len()-cached.prefix.len()>=128 {
                     // Transfer the charged parent to the compound operation.
                     // It keeps the parent alive through optional successor
                     // allocation; no incomplete decoder owner escapes.
-                    return Ok((json!({"enabled":true,"hit":true,"encoder_deferred":true,
+                    return Ok((json!({"enabled":true,"hit":true,"encoder_deferred":true,"imported_owner":imported_owner,
                         "restored_tokens":cached.prefix.len(),"saved":saved["saved"],
                         "saved_seconds":saved["saved_seconds"],"evicted_sessions":saved["evicted_sessions"],
                         "capacity_refused":saved["capacity_refused"],"transient_image_bytes":transient_image_bytes,
@@ -1337,26 +1615,34 @@ impl Worker {
                 }
                 let pending=match &cached.image {
                     CachedState::Complete{image,pending}=>{
-                        let restored=self.session.as_mut().unwrap().restore_state_image(&mut self.verify,image,
+                        ensure!(!imported,"complete sessions cannot be imported");
+                        let restored=self.session.as_mut().context("complete cache needs its prepared owner")?.restore_state_image(&mut self.verify,&image.session,
                             self.target_lineage,&self.comm,&self.stream)?;
+                        self.verify.rebind_encoder_ancestors(&image.bank_ancestors)?;
                         ensure!(restored==*pending,"cached anchor differs from session image");restored
                     },
                     CachedState::Encoder{image,history,policy}=>{
                         encoder_reconstructed=true;
                         ensure!(self.encoder_prompt_checkpoint,"encoder cache disabled");
-                        self.large.handoff_from(&self.verify)?;
-                        self.large.restore_encoder_checkpoint_full(image,self.target_lineage,&self.comm,&self.stream)?;
+                        let bank_ancestors=self.bank_ancestors_before_restore(&cached)?;
+                        if self.session.is_some(){self.large.handoff_from(&self.verify)?;}
+                        if imported {
+                            let source=self.peer_bank.as_ref().unwrap().encoder_import_source(&cached)?;
+                            self.large.import_encoder_checkpoint_full(image,source,self.target_lineage,&self.comm,&self.stream)?;
+                        }else{self.large.restore_encoder_checkpoint_full(image,self.target_lineage,&self.comm,&self.stream)?;}
+                        self.large.rebind_encoder_ancestors(&bank_ancestors)?;
                         let index=history.as_ref().map(crate::history_lookup::HistoryLookup::clone_reserved);
                         self.attach_prompt_with_index(false,0,&cached.prefix,&cached.prefix,plan.seed,
                             !allow_exact_logits,Some(index))?;
                         let session=self.session.as_mut().unwrap();
-                        session.restore_proposal_policy(policy,&self.stream)?;
+                        if !imported {session.restore_proposal_policy(policy,&self.stream)?;}
                         if allow_exact_logits {session.configure_sampling(plan.seed,Some(self.cfg.eos_token_id))?;}
                         else{session.configure_greedy(Some(self.cfg.eos_token_id))?;}
                         let pending=self.large.greedy_token(&self.stream)?;
                         self.verify.handoff_from(&self.large)?;pending
                     },
                 };
+                self.prune_invalid_bank_images();
                 ensure!(self.verify.position()==cached.prefix.len()as u64,
                     "cached image and resident prefix disagree");
                 restore_seconds=began.elapsed().as_secs_f64();
@@ -1379,18 +1665,24 @@ impl Worker {
                 // ordinary four-entry/byte policy still governs admission;
                 // a replacement must also charge its still-live original.
                 let checkpoint=self.prompt_checkpoint_positions(plan.prompt.len())[0];
-                if self.retain_restored_checkpoint && (cached.prefix.len()>=8192
+                if self.retain_restored_checkpoint && (imported||((cached.prefix.len()>=8192
+                    || sampler_law_probe::enabled()
                     || (!cached.media.placements().is_empty() && cached.prompt_logits.is_some()))
-                    && checkpoint<=cached.prefix.len() {
+                    && checkpoint<=cached.prefix.len())) {
                     // A short suffix forced reconstruction of a complete
                     // encoder-only parent. Save that already valid state once
                     // so another short branch does not repeat the decoder pass.
-                    let upgrade=self.encoder_upgrade_reconstructed&&matches!(&cached.image,CachedState::Encoder{..});
+                    // A bank tail deliberately avoids duplicating the whole
+                    // compressed prefix. Preserve it on short restores rather
+                    // than replacing it with a near-1M complete snapshot.
+                    let upgrade=!imported&&self.encoder_upgrade_reconstructed
+                        &&matches!(&cached.image,CachedState::Encoder{image,..}if !image.bank_retained());
                     let mut candidate=cached;
                     if upgrade {
                         let at=Instant::now();
                         let (device,host)=self.session.as_ref().unwrap().compact_state_image_bytes(&self.verify)?;
                         let charge=device.checked_add(host).and_then(|n|n.checked_add(candidate.prefix.len()*4+candidate.media.metadata_bytes()))
+                            .and_then(|n|n.checked_add(self.complete_cache_ancestor_bytes()))
                             .ok_or_else(||anyhow::anyhow!("reconstructed cache charge overflow"))?;
                         let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
                         let optional=self.cached_sessions.iter().map(CachedSession::opportunistic_logits).collect::<Vec<_>>();
@@ -1411,7 +1703,7 @@ impl Worker {
                             upgrade_evicted_sessions=indices.len();
                             for i in indices.into_iter().rev(){self.cached_sessions.remove(i);}
                             self.stream.synchronize()?;
-                            let image=self.try_save_session_image(pending,device)?;
+                            let image=self.try_save_cached_session_image(pending,device)?;
                             // Test builds can decline one rank's vote after the
                             // actual copy/admission, before replacing the parent.
                             #[cfg(feature = "storage-fault-injection")]
@@ -1432,7 +1724,7 @@ impl Worker {
                         }else{upgrade_refused=true;}
                         upgrade_seconds=at.elapsed().as_secs_f64();
                     }
-                    if upgrade {
+                    if upgrade||imported {
                         // Both refusal and success still own the reservation;
                         // reinsertion cannot silently discard this parent.
                         retained_image=self.return_encoder_parent(Some(candidate))?;
@@ -1449,7 +1741,10 @@ impl Worker {
                         }
                     }
                 }
-            }else{restore_refused=true;}
+            }else{
+                restore_refused=true;
+                if imported {retained_image=self.return_encoder_parent(Some(cached))?;}
+            }
         }
         Ok((json!({"enabled":true,"hit":restored_tokens>0,"restored_tokens":restored_tokens,
             "exact_prompt_anchor":exact_prompt_anchor,"sample_seconds":sample_seconds,
@@ -1463,7 +1758,7 @@ impl Worker {
             "upgrade_capacity_refused":upgrade_capacity_refused,"upgrade_memory_refused":upgrade_memory_refused,
             "upgrade_late_memory_refused":upgrade_late_memory_refused,"upgrade_evicted_sessions":upgrade_evicted_sessions,
             "upgrade_parent_retained_on_refusal":upgrade_refused&&retained_image,
-            "encoder_reconstructed":encoder_reconstructed,
+            "encoder_reconstructed":encoder_reconstructed,"imported_owner":imported_owner,
             "inactive_sessions":self.cached_sessions.len(),"charged_bytes":self.cached_sessions.iter().map(|c|c.charge).sum::<usize>(),
             "budget_bytes":self.session_cache_budget,"seconds":started.elapsed().as_secs_f64()}),None))
     }
@@ -1477,6 +1772,7 @@ impl Worker {
     fn attach_prompt_with_index(&mut self,reuse:bool,previous:usize,ids:&[u32],prefix:&[u32],
         seed:u64,greedy:bool,index:Option<Option<crate::history_lookup::HistoryLookup>>)->Result<()> {
         ensure!(!reuse||index.is_none(),"active history is already incremental");
+        self.large.trace_prefill_boundary_for_probe("before_draft_attach")?;
         if let Some(session) = &mut self.session {
             if reuse {
                 session.resume_after_extend(
@@ -1511,6 +1807,7 @@ impl Worker {
         }else if self.history_lookup_enabled && !reuse {
             self.session.as_mut().unwrap().configure_history_lookup(&self.large,prefix)?;
         }
+        self.large.trace_prefill_boundary_for_probe("after_draft_attach")?;
         Ok(())
     }
 
@@ -1557,6 +1854,7 @@ impl Worker {
             "selected_sort_shuffle":crate::query_index::selected_sort_shuffle_enabled()?,
             "history_lookup_enabled":self.history_lookup_enabled,"history_lookup_position":lookup.map(|(p,_)|p),
             "history_lookup_workspace_bytes":lookup.map_or(0,|(_,bytes)|bytes)});
+        event["history32_verifier"]=self.copy32_admission.clone();
         for (key,value) in details.as_object().ok_or_else(||anyhow::anyhow!("begin details must be an object"))? {
             ensure!(!event.as_object().unwrap().contains_key(key),"duplicate begin field");
             event[key]=value.clone();
@@ -1626,7 +1924,7 @@ impl Worker {
     /// index advances incrementally, including its collision replacement state.
     fn begin_encoder_prompt(&mut self,mut plan:RequestPlan,greedy:bool,started:Instant,
         mut retained:Value,wanted:Option<CachedSession>,
-        should_cancel:&mut impl FnMut(&mut ControlChannel)->Result<bool>)->Result<Value> {
+        should_cancel:&mut impl FnMut(&mut ControlChannel,usize,&[CachedSession],Option<&CachedSession>)->Result<PrefillDirective>)->Result<Value> {
         use crate::history_lookup::HistoryLookup;
         let active_reuse=plan.reuse&&wanted.is_none();
         let previous=wanted.as_ref().map_or(if plan.reuse{plan.previous}else{0},|c|c.prefix.len());
@@ -1649,7 +1947,9 @@ impl Worker {
                 self.verify.reset(self.target_lineage,&self.comm,&self.stream)?;
             }
             self.large.handoff_from(&self.verify)?;
-        }else{ensure!(!plan.reuse&&wanted.is_none(),"encoder cache before initial session");}
+        }else{ensure!(!plan.reuse&&wanted.as_ref().is_none_or(|c|self.can_import_cached_encoder(c)),
+            "initial encoder session requires a fresh prompt or explicit imported parent");}
+        self.prune_invalid_bank_images();
         let prepared_at=Instant::now();
         let prefix=&plan.prompt[..checkpoint];
         let media=plan.media.through(checkpoint);
@@ -1658,9 +1958,12 @@ impl Worker {
             crate::dspark_generation::history_lookup_reserved_bytes(self.large.context_capacity())?
         }else{0};
         let charge=device_bytes.checked_add(host_bytes).and_then(|x|x.checked_add(prefix.len()*4+media.metadata_bytes()))
+            .and_then(|x|x.checked_add(crate::target::EncoderPrefixImage::binding_bytes()))
             .and_then(|x|x.checked_add(std::mem::size_of::<crate::dspark_generation::ProposalPolicyImage>()))
             .ok_or_else(||anyhow::anyhow!("encoder cache charge overflow"))?;
-        let duplicate=self.cached_sessions.iter().chain(wanted.iter()).any(|c|c.prefix==prefix && c.media.matches_prefix(&media,prefix.len()));
+        let duplicate=self.cached_sessions.iter().chain(wanted.iter()).any(|c|
+            (c.owner==self.bank_id||self.can_import_cached_encoder(c))
+            &&c.prefix==prefix&&c.media.matches_prefix(&media,prefix.len()));
         // Retain the shared parent even when this checkpoint advances into a
         // branch-specific suffix. Both images must fit the existing budget;
         // do not credit the parent's bytes before a successor actually exists.
@@ -1672,10 +1975,10 @@ impl Worker {
         let eligible=!duplicate&&device_bytes<=2*1024usize.pow(3)&&evictions.is_some();
         // One extra index can become the new live index while the checkpoint
         // copy remains immutable. Include that temporary allocation in UMA.
-        let reserve=8*1024usize.pow(3)+16*1024usize.pow(2);
+        let reserve=self.cache_reserve()?;
         let admission_required=reserve+charge+host_bytes;
         let admission=self.admit_cache_save(eligible,evictions,prefix,&media,admission_required,
-            slots.saturating_sub(usize::from(wanted.is_some())))?;
+            slots.saturating_sub(usize::from(wanted.is_some())),&[])?;
         let admitted=admission.admitted;
         let copy_extend=|history:&Option<HistoryLookup>,start:usize,ids:&[u32]|->Result<Option<HistoryLookup>> {
             let mut copy=history.as_ref().map(HistoryLookup::clone_reserved);
@@ -1699,10 +2002,17 @@ impl Worker {
                 "encoder history index exceeds reserved bytes");Some(index)
         }else{None};
         let index_seconds=index_at.elapsed().as_secs_f64();
+        let bank_ancestors=match &wanted {
+            Some(cached)=>self.bank_ancestors_before_restore(cached)?,None=>Vec::new(),
+        };
         let restore=if let Some(cached)=&wanted {
             ensure!(cached.prompt_logits.is_none(),"encoder parent unexpectedly owns prompt logits");
             let CachedState::Encoder{image,..}=&cached.image else{anyhow::bail!("expected encoder cache");};
-            Some(crate::target::EncoderPrefixRestore::Borrowed(image,self.target_lineage))
+            if cached.owner==self.bank_id {Some(crate::target::EncoderPrefixRestore::Borrowed(image,self.target_lineage))}
+            else{
+                let source=self.peer_bank.as_ref().context("encoder import source missing")?.encoder_import_source(cached)?;
+                Some(crate::target::EncoderPrefixRestore::Imported(image,source,self.target_lineage))
+            }
         }else{None};
         // Both callbacks run synchronously on the sole worker owner. Share
         // its ordered CPU control channel without introducing another writer.
@@ -1711,9 +2021,12 @@ impl Worker {
         let fault=&mut self.cache_save_fault;
         #[cfg(feature = "storage-fault-injection")]
         let mut admission_number=0usize;
-        let (image,details,done)=self.large.prefill_with_encoder_checkpoint_interruptible(&mut self.wides,restore,
+        let mut directive=PrefillDirective::Continue;
+        let (image,details,progress)=self.large.prefill_with_encoder_checkpoint_interruptible(&mut self.wides,restore,
             &plan.prompt[previous..checkpoint],&plan.prompt[checkpoint..],admitted.then_some(device_bytes),
-            &self.comm,&self.stream,&mut |_|should_cancel(&mut control.borrow_mut()),
+            &self.comm,&self.stream,&mut |done|{
+                directive=should_cancel(&mut control.borrow_mut(),plan.prompt.len()-previous-done,&self.cached_sessions,wanted.as_ref())?;Ok(directive!=PrefillDirective::Continue)
+            },
             &mut |fits| {
                 #[cfg(feature = "storage-fault-injection")]
                 let fits={
@@ -1724,12 +2037,26 @@ impl Worker {
                 };
                 control.borrow_mut().all_admit(fits)
             })?;
+        self.large.rebind_encoder_ancestors(&bank_ancestors)?;
+        retained["rebound_bank_ancestors"]=json!(bank_ancestors.len());
+        let done=progress.done;
         if previous+done<plan.prompt.len() {
             // A speculative cache image/index may be ahead of the stopped
             // frontier. Release it and rebuild only the committed prefix.
             drop(image);drop(checkpoint_history);
+            let resume=directive==PrefillDirective::Yield;
+            let (index,policy)=if resume {
+                if let Some(cached)=&wanted {
+                    let CachedState::Encoder{history,policy,..}=&cached.image else{unreachable!()};
+                    let index=Some(copy_extend(history,previous,&plan.prompt[previous..previous+done])?);
+                    self.history.restore_cached_media(&mut plan,&cached.prefix,None,false,&cached.media)?;
+                    (index,(cached.owner==self.bank_id).then(||policy.clone()))
+                }else{(None,None)}
+            }else{(None,None)};
             retained["retained_image"]=json!(self.return_encoder_parent(wanted)?);
-            return self.cancel_prefill(plan,greedy,active_reuse,previous,previous+done,started,retained);
+            return self.interrupt_prefill(plan,greedy,active_reuse,previous,previous+done,started,retained,
+                resume,details["target_total_seconds"].as_f64().context("interrupted prefill timing")?,index,policy.as_ref(),
+                if previous+done<checkpoint{vec![checkpoint]}else{Vec::new()},progress.remaining_chunks);
         }
         let prefilled_at=Instant::now();
         let anchor=if greedy{self.large.greedy_token(&self.stream)?}else{self.large.sample_token(plan.seed,&self.stream)?};
@@ -1743,7 +2070,7 @@ impl Worker {
             }else{None};
         self.attach_prompt_with_index(active_reuse,previous,&plan.prompt[previous..],
             &plan.prompt,plan.seed,greedy,live_index)?;
-        let restored_policy=if let Some(cached)=&wanted {
+        let restored_policy=if let Some(cached)=wanted.as_ref().filter(|c|c.owner==self.bank_id) {
             let CachedState::Encoder{policy,..}=&cached.image else{unreachable!()};
             Some(policy)
         }else{None};
@@ -1755,7 +2082,7 @@ impl Worker {
         let checkpoint_saved=image.is_some();
         if let Some(image)=image {
             ensure!(image.bytes()==device_bytes&&image.position()==checkpoint,"encoder cache saved extent");
-            self.cached_sessions.push(CachedSession{prefix:prefix.to_vec(),media,charge,prompt_logits:None,
+            self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,charge,prompt_logits:None,
                 image:CachedState::Encoder{image,history:checkpoint_history.unwrap(),
                     policy:self.session.as_ref().unwrap().proposal_policy_image()?}});
         }
@@ -1768,14 +2095,14 @@ impl Worker {
         let retained_image=self.return_encoder_parent(wanted)?;
         retained["retained_image"]=json!(retained_image);
         ensure!(self.cached_sessions.iter().map(|c|c.charge).sum::<usize>()+self.suspended_image_bytes<=self.shared_image_budget
-            &&self.cached_sessions.len()+self.suspended_image_count<=4,"encoder cache exceeded shared budget");
+            &&self.cached_sessions.len()+self.suspended_image_count<=self.image_entry_limit(),"encoder cache exceeded shared budget");
         let (prompt_image,mut prompt_logit_cache)=self.prepare_prompt_logit_cache(&plan,greedy,retained["hit"]==true)?;
         self.verify.handoff_from(&self.large)?;
         if let Some((logits,device,charge))=prompt_image {
             let save_at=Instant::now();
-            if let Some(image)=self.try_save_session_image(anchor,device)? {
+            if let Some(image)=self.try_save_cached_session_image(anchor,device)? {
                 ensure!(image.device_bytes()==device,"encoder final prompt image estimate differs");
-                self.cached_sessions.push(CachedSession{prefix:plan.prompt.clone(),media:plan.media.clone(),charge,prompt_logits:Some(logits),
+                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt.clone(),media:plan.media.clone(),charge,prompt_logits:Some(logits),
                     image:CachedState::Complete{image,pending:anchor}});
                 prompt_logit_cache["saved"]=json!(true);
             }else{prompt_logit_cache["late_memory_refused"]=json!(true);}
@@ -1784,6 +2111,7 @@ impl Worker {
         let attached_at=Instant::now();
         self.publish_begin(plan,anchor,greedy,started,json!({"retained_session_cache":retained,
             "prompt_checkpoint":{"enabled":true,"encoder_only":true,"saved":checkpoint_saved,"already_cached":duplicate,
+                "bank_retained":crate::config::bank_encoder_checkpoint_requested(),"device_bytes":device_bytes,
                 "active_frontier":live_frontier,
                 "evicted_sessions":admission.evicted,"capacity_refused":!eligible&&!duplicate,"prefix_tokens":checkpoint,
                 "memory_refused":eligible&&!admitted,"local_memory_refused":eligible&&!admission.local_fits,
@@ -1801,13 +2129,19 @@ impl Worker {
     }
 
     fn execute(&mut self, command: Command) -> Result<Value> {
-        self.execute_with_prefill_cancel(command,&mut |_|Ok(false))
+        self.execute_with_prefill_cancel(command,&mut |_,_,_,_|Ok(PrefillDirective::Continue))
     }
 
     /// Reinsert the reservation after success, optional refusal or cancellation.
     /// Admission reserved its slot/bytes, so returning it cannot evict a sibling.
     fn return_encoder_parent(&mut self,parent:Option<CachedSession>)->Result<bool> {
+        self.prune_invalid_bank_images();
         if let Some(parent)=parent.filter(|_|self.retain_restored_checkpoint) {
+            ensure!(self.cached_bank_image_valid(&parent),"encoder parent lost its retained bank prefix");
+            if parent.owner!=self.bank_id {
+                ensure!(self.can_import_cached_encoder(&parent),"returning an unknown foreign encoder parent");
+                self.peer_bank.as_ref().unwrap().encoder_import_source(&parent)?;
+            }
             let (budget,slots)=self.cache_capacity(0,0);
             ensure!(self.cached_sessions.len()<slots
                 &&self.cached_sessions.iter().map(|c|c.charge).sum::<usize>()+parent.charge<=budget,
@@ -1820,26 +2154,41 @@ impl Worker {
     /// A cancelled prefill retains its complete partial target/drafter state,
     /// but publishes no temporary anchor. The next wire command must finish it.
     #[allow(clippy::too_many_arguments)]
-    fn cancel_prefill(&mut self,plan:RequestPlan,greedy:bool,reuse:bool,previous:usize,
-        frontier:usize,started:Instant,retained:Value)->Result<Value> {
+    fn interrupt_prefill(&mut self,plan:RequestPlan,greedy:bool,reuse:bool,previous:usize,
+        frontier:usize,started:Instant,retained:Value,resume:bool,target_seconds:f64,
+        index:Option<Option<crate::history_lookup::HistoryLookup>>,
+        policy:Option<&crate::dspark_generation::ProposalPolicyImage>,
+        checkpoints:Vec<usize>,remaining_chunks:Vec<usize>)->Result<Value> {
         ensure!(frontier>previous&&frontier<plan.prompt.len(),"cancelled prefill frontier");
         let anchor=self.large.greedy_token(&self.stream)?;
-        self.attach_prompt(reuse,previous,&plan.prompt[previous..frontier],
-            &plan.prompt[..frontier],plan.seed,greedy)?;
+        self.attach_prompt_with_index(reuse,previous,&plan.prompt[previous..frontier],
+            &plan.prompt[..frontier],plan.seed,greedy,index)?;
+        if let Some(policy)=policy {
+            let session=self.session.as_mut().unwrap();session.restore_proposal_policy(policy,&self.stream)?;
+            if greedy{session.configure_greedy(Some(self.cfg.eos_token_id))?;}
+            else{session.configure_sampling(plan.seed,Some(self.cfg.eos_token_id))?;}
+        }
         self.verify.handoff_from(&self.large)?;
         self.history.partial_prefilled(frontier,anchor)?;
-        self.current=Some(plan.id);self.emitted=0;self.limit=plan.limit;self.prefill_cancelled=true;
-        self.install_media(None)?;
-        self.agree(&[])?;
-        Ok(json!({"type":"prefill_progress","request_id":plan.id,"cancelled":true,
+        self.current=Some(plan.id);self.emitted=0;self.limit=plan.limit;self.prefill_cancelled=!resume;
+        // A yielded request may still contain image rows after this frontier.
+        // Its bindings travel with the existing lossless request checkpoint.
+        if !resume{self.install_media(None)?;}
+        let elapsed=started.elapsed().as_secs_f64();
+        let event=json!({"type":"prefill_progress","request_id":plan.id,"cancelled":!resume,
             "frontier":frontier,"prompt_tokens":plan.prompt.len(),"emitted_tokens":0,
             "cached_tokens":if plan.reuse{plan.previous}else{retained["restored_tokens"].as_u64().unwrap_or(0)as usize},
-            "seconds":started.elapsed().as_secs_f64(),
-            "retained_session_cache":retained}))
+            "seconds":elapsed,"target_prefill_seconds":target_seconds,
+            "retained_session_cache":retained});
+        if resume {
+            self.pending_prefill=Some(PendingPrefill::foreground(plan,greedy,frontier,retained,
+                target_seconds,elapsed,self.prompt_checkpoint,checkpoints,remaining_chunks)?);
+        }
+        self.agree(&[])?;Ok(event)
     }
 
     fn execute_with_prefill_cancel(&mut self,command:Command,
-        should_cancel:&mut impl FnMut(&mut ControlChannel)->Result<bool>)->Result<Value> {
+        should_cancel:&mut impl FnMut(&mut ControlChannel,usize,&[CachedSession],Option<&CachedSession>)->Result<PrefillDirective>)->Result<Value> {
         let started = Instant::now();
         match command {
             Command::Begin {
@@ -1923,10 +2272,16 @@ impl Worker {
                     let anchor=if checkpoint>append_start {
                         let pre=Instant::now();
                         let control=&mut self.control;
-                        let done=self.large.prefill_wide_interruptible(&mut self.wides,&plan.prompt[append_start..checkpoint],
-                            &self.comm,&self.stream,&mut |_|should_cancel(control))?;
+                        let mut directive=PrefillDirective::Continue;
+                        let progress=self.large.prefill_wide_interruptible(&mut self.wides,&plan.prompt[append_start..checkpoint],
+                            &self.comm,&self.stream,None,&mut |done|{directive=should_cancel(control,plan.prompt.len()-append_start-done,&self.cached_sessions,None)?;Ok(directive!=PrefillDirective::Continue)})?;
+                        let done=progress.done;
                         if append_start+done<checkpoint {
-                            return self.cancel_prefill(plan,greedy,append_reuse,append_start,append_start+done,started,retained_session_cache);
+                            let remaining_checkpoints=std::iter::once(checkpoint)
+                                .chain(checkpoints[index+1..].iter().copied().filter(|&c|c>checkpoint)).collect();
+                            return self.interrupt_prefill(plan,greedy,append_reuse,append_start,append_start+done,started,
+                                retained_session_cache,directive==PrefillDirective::Yield,prefix_prefill_seconds+pre.elapsed().as_secs_f64(),None,None,
+                                remaining_checkpoints,progress.remaining_chunks);
                         }
                         pass_prefill_seconds=pre.elapsed().as_secs_f64();
                         prefix_prefill_seconds+=pass_prefill_seconds;
@@ -1962,10 +2317,14 @@ impl Worker {
                 }
                 let suffix_prefill_at=Instant::now();
                 let control=&mut self.control;
-                let done=self.large.prefill_wide_interruptible(&mut self.wides,&plan.prompt[append_start..],
-                    &self.comm,&self.stream,&mut |_|should_cancel(control))?;
+                let mut directive=PrefillDirective::Continue;
+                let progress=self.large.prefill_wide_interruptible(&mut self.wides,&plan.prompt[append_start..],
+                    &self.comm,&self.stream,None,&mut |done|{directive=should_cancel(control,plan.prompt.len()-append_start-done,&self.cached_sessions,None)?;Ok(directive!=PrefillDirective::Continue)})?;
+                let done=progress.done;
                 if append_start+done<plan.prompt.len() {
-                    return self.cancel_prefill(plan,greedy,append_reuse,append_start,append_start+done,started,retained_session_cache);
+                    return self.interrupt_prefill(plan,greedy,append_reuse,append_start,append_start+done,started,
+                        retained_session_cache,directive==PrefillDirective::Yield,prefix_prefill_seconds+suffix_prefill_at.elapsed().as_secs_f64(),None,None,
+                        Vec::new(),progress.remaining_chunks);
                 }
                 let prefilled_at = Instant::now();
                 let prefill_phases = serde_json::to_value(self.large.append_metrics()?)?;
@@ -1979,9 +2338,9 @@ impl Worker {
                 self.verify.handoff_from(&self.large)?;
                 if let Some((logits,device,charge))=prompt_image {
                     let save_at=Instant::now();
-                    if let Some(image)=self.try_save_session_image(anchor,device)? {
+                    if let Some(image)=self.try_save_cached_session_image(anchor,device)? {
                         ensure!(image.device_bytes()==device,"exact prompt image estimate disagrees");
-                        self.cached_sessions.push(CachedSession{prefix:plan.prompt.clone(),media:plan.media.clone(),
+                        self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt.clone(),media:plan.media.clone(),
                             image:CachedState::Complete{image,pending:anchor},charge,prompt_logits:Some(logits)});
                         prompt_logit_cache["saved"]=json!(true);
                         prompt_logit_cache["image_charge_bytes"]=json!(charge);
@@ -2004,13 +2363,20 @@ impl Worker {
             }
             Command::Step => {
                 ensure!(self.current.is_some(), "decode without resident request");
-                let limit = if self.long_verify.is_some() {self.history.step_limit_for_rows(16)?}
+                let limit = if self.copy32_verify.is_some() {self.history.step_limit_for_rows(32)?}
+                    else if self.long_verify.is_some() {self.history.step_limit_for_rows(16)?}
                     else {self.history.step_limit()?};
                 ensure!(limit > 0, "decode after terminal output");
-                let long=if let (Some(target),Some(buffers))=(&mut self.long_verify,&mut self.long_history_buffers) {
+                let mut long=if let (Some(target),Some(buffers))=(&mut self.copy32_verify,&mut self.copy32_buffers) {
                     self.session.as_mut().unwrap().try_long_history_step(&mut self.verify,target,buffers,
                         self.history.pending().unwrap(),limit,&self.comm,&self.stream)?
                 }else{None};
+                if long.is_none() {
+                    if let (Some(target),Some(buffers))=(&mut self.long_verify,&mut self.long_history_buffers) {
+                        long=self.session.as_mut().unwrap().try_long_history_step(&mut self.verify,target,buffers,
+                            self.history.pending().unwrap(),limit,&self.comm,&self.stream)?;
+                    }
+                }
                 let control = &mut self.control;
                 let step = if let Some(step)=long {step}else{self.session.as_mut().unwrap().step_with_profile_barrier(
                     &mut self.verify,
@@ -2038,6 +2404,9 @@ impl Worker {
                 if let Some(expected) = &step.acceptance_expected_lengths {
                     event["acceptance_expected_lengths"] = json!(expected);
                     event["acceptance_shadow_preserved_draw"] = json!(true);
+                }
+                if confidence_economics_probe::enabled() {
+                    event["draft_confidence"] = json!(step.draft_confidence);
                 }
                 if let Some(probe) = &step.acceptance_temperature_probe {
                     event["acceptance_temperature_probe"] = probe.clone();
@@ -2089,18 +2458,34 @@ impl Worker {
 }
 
 #[cfg(feature = "serving")]
+fn estimated_peer_remaining(job:&crate::http_server::Job,cached:&[CachedSession],held:Option<&CachedSession>)->usize {
+    // The encoder parent stays reusable while the compound prefill temporarily
+    // holds it outside the cache vector. This is only a scheduling estimate;
+    // ordinary cache admission and media identity checks still govern reuse.
+    let prefix=cached.iter().chain(held).filter(|c|job.needs_cached_prefix(&c.prefix,&c.media)
+        &&(c.prefix.len()<job.tokens.len()||c.prompt_logits.is_some()))
+        .map(|c|c.prefix.len()).max().unwrap_or(0);
+    job.tokens.len().saturating_sub(prefix)
+}
+
+#[cfg(feature = "serving")]
 impl Worker {
     fn execute_http(&mut self,command:Command,queue:Option<&crate::http_server::Queue>,
         job:Option<&crate::http_server::Job>)->Result<Value> {
         let reclaim=match &command {Command::ReclaimInputs{headroom}=>Some(*headroom),_=>None};
-        let event=self.execute_with_prefill_cancel(command,&mut |control| {
+        let peers=self.peer_prefill_enabled;let slice=self.peer_prefill_slice;let began=Instant::now();
+        let event=self.execute_with_prefill_cancel(command,&mut |control,remaining,cached,held| {
             // Only rank zero observes sockets. All ranks stop at the same
             // already committed encoder chunk; ordinary chunk widths and
             // numerical execution are unchanged when cancellation is absent.
-            let head=queue.map(|q|[u8::from(q.stopping()||job.is_some_and(|j|j.cancelled()))]);
+            let head=queue.map(|q|->Result<[u8;1]>{
+                Ok([if q.stopping()||job.is_some_and(|j|j.cancelled()){1}
+                    else if peers&&q.prefill_peer_should_yield(job.is_some_and(|j|j.background),remaining,q.prefill_slice_due(began.elapsed(),slice),
+                        |peer|estimated_peer_remaining(peer,cached,held))? {2}else{0}])
+            }).transpose()?;
             let wire=control.command(head.as_ref().map(|v|v.as_slice()))?;
-            ensure!(wire.len()==1&&wire[0]<=1,"foreground prefill cancellation command");
-            Ok(wire[0]==1)
+            ensure!(wire.len()==1&&wire[0]<=2&& (wire[0]!=2||peers),"foreground prefill interruption command");
+            Ok(match wire[0]{0=>PrefillDirective::Continue,1=>PrefillDirective::Cancel,_=>PrefillDirective::Yield})
         })?;
         if let (Some(queue),Some(headroom))=(queue,reclaim) {queue.input_reclaimed(headroom);}
         Ok(event)
@@ -2145,7 +2530,7 @@ impl Worker {
         if let Some(longer)=&mut self.long_verify {
             longer.handoff_from(&self.verify)?;
             longer.begin_verification(&teacher[..16],&self.comm,&self.stream)?;
-            longer.verification_greedy(&self.stream)?;
+            longer.verification_history_sample(0,&self.comm,&self.stream)?;
             longer.finish_verification(0,&self.comm,&self.stream)?;
             if std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1") {
                 longer.set_tiny_extend_for_probe(true,&self.stream)?;
@@ -2157,6 +2542,13 @@ impl Worker {
                 }
                 longer.set_tiny_extend_for_probe(false,&self.stream)?;
             }
+            self.verify.handoff_from(longer)?;
+        }
+        if let Some(longer)=&mut self.copy32_verify {
+            longer.handoff_from(&self.verify)?;
+            longer.begin_verification(&teacher[..32],&self.comm,&self.stream)?;
+            longer.verification_history_sample(0,&self.comm,&self.stream)?;
+            longer.finish_verification(0,&self.comm,&self.stream)?;
             self.verify.handoff_from(longer)?;
         }
         let mut steps=0;
@@ -2194,7 +2586,8 @@ impl Worker {
         ensure!(memory.admitted_available>=8*1024usize.pow(3),"startup warmup consumed runtime reserve");
         Ok(json!({"seconds":started.elapsed().as_secs_f64(),"public_prompt_tokens":128,
             "prewarmed_append_rows":append_rows,
-            "decode_steps":steps,"prewarmed_verify_rows":if self.long_verify.is_some() {vec![1,3,6,16]}else{vec![1,3,6]},"target_frontier":0,
+            "decode_steps":steps,"prewarmed_verify_rows":if self.copy32_verify.is_some(){vec![1,3,6,16,32]}
+                else if self.long_verify.is_some() {vec![1,3,6,16]}else{vec![1,3,6]},"target_frontier":0,
             "resident_frontier":0,"draft_frontier":0,"history_lookup_cleared":true,
             "carry_and_encoder_match_initial_empty":true,
             "no_output_published":true,"memory":memory}))
@@ -2367,11 +2760,83 @@ impl Worker {
 
 /// Finite native qualification driver, retaining the same model allocations
 /// through fresh/retained requests, natural stops, limits and cancellations.
+/// Cheap checks shared by the launcher and real entry points. This deliberately
+/// opens no model files, sockets, events or CUDA contexts. Extend it when a new
+/// configuration-only precondition is introduced; device/state checks stay live.
+fn validate_startup_config(p:&WorkerConfig,http:bool)->Result<()> {
+    crate::dspark_generation::serving_causal_three_threshold()?;
+    let flag=|name:&str|->Result<bool>{match std::env::var(name){
+        Ok(v)=>{ensure!(v=="0"||v=="1","{name} must be0or1");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
+    }};
+    // These constraints also apply to narrow-only diagnostic packages: the
+    // constructors read the capability flags before choosing a row profile.
+    // Reject an incomplete M32-control configuration before any model load.
+    crate::config::history32_generation_enabled()?;
+    for name in ["CANADA_SCRATCH_HISTORY32_SPLIT_ROUTER",
+        "CANADA_SCRATCH_HISTORY32_MATCH_GROUPING","CANADA_SCRATCH_HISTORY32_FP32_ATTENTION"] {
+        ensure!(!flag(name)?||crate::config::history32_enabled(),
+            "{name} requires the admitted native32 capability");
+    }
+    ensure!(p.rank<4&&p.stages.len()==40&&p.context>0&&p.context<=1048576,"worker rank/stages/context");
+    if http {
+        ensure!(p.requests.is_none(),"HTTP worker cannot consume file requests");
+        #[cfg(feature="serving")]
+        ensure!(p.http.is_some()==(p.rank==0),"HTTP source belongs to rank zero only");
+    }else{
+        ensure!(p.requests.is_some()==(p.rank==0),"only rank zero owns file requests");
+        #[cfg(feature="serving")]
+        ensure!(p.http.is_none(),"file worker cannot own an HTTP listener");
+    }
+    let independent=flag("CANADA_SCRATCH_INDEPENDENT_OWNER_SCREEN")?;
+    let ffn=flag("CANADA_SCRATCH_PAIRED_FFN_SCREEN")?;
+    let model=flag("CANADA_SCRATCH_PAIRED_MODEL_SCREEN")?;
+    let actual=flag("CANADA_SCRATCH_PAIRED_ACTUAL_SCREEN")?;
+    let serving=crate::config::paired_serving_requested();
+    ensure!(!independent||Target::independent_probe_context_admitted(p.context),
+        "independent owner diagnostic context needs explicit admission before model loading");
+    ensure!(!actual||(independent&&ffn&&model),"fresh pair screen requires independent/FFN/model admission");
+    for name in ["CANADA_SCRATCH_PAIRED_SHARED_UP","CANADA_SCRATCH_PAIRED_QKV","CANADA_SCRATCH_PAIRED_TARGET_HEAD"] {
+        flag(name)?;
+    }
+    ensure!(!(serving||(independent&&ffn))||!flag("CANADA_SCRATCH_PAIRED_SHARED_UP")?||flag("CANADA_SCRATCH_NORM_QUANT_FUSION")?,
+        "pooled shared-up requires the normalized prequantized input path");
+    ensure!(!flag("CANADA_SCRATCH_PAIRED_DENSE_TIMING_SCREEN")?||(actual
+        &&flag("CANADA_SCRATCH_PAIRED_SHARED_UP")?&&flag("CANADA_SCRATCH_PAIRED_QKV")?
+        &&flag("CANADA_SCRATCH_PAIRED_TARGET_HEAD")?),"dense timing requires all three pair components");
+    if flag("CANADA_SCRATCH_MATCHED_PATH_SCREEN")? {
+        ensure!(!http&&!actual&&!independent,"matched path is an isolated file diagnostic");
+        matched_path_probe::validate()?;
+    }
+    ensure!(!flag("CANADA_SCRATCH_CONFIDENCE_TRANSFER_SCREEN")?||(!http
+        &&confidence_economics_probe::enabled()&&flag("CANADA_SCRATCH_BLOCK_PROGRESS_SCREEN")?),
+        "confidence transfer requires the isolated file-worker economics screen");
+    ensure!(!flag("CANADA_SCRATCH_CONFIDENCE_POLICY_SCREEN")?||(!http
+        &&!confidence_economics_probe::enabled()&&!flag("CANADA_SCRATCH_BLOCK_PROGRESS_SCREEN")?
+        &&flag("CANADA_SCRATCH_LONG_HISTORY_GENERATION")?
+        &&crate::compressed_source::source20_fp32_reduction_enabled()?
+        &&crate::layer_attention::generation_swa_bf16_enabled()?
+        &&crate::dspark_generation::serving_causal_three_threshold()?==0.25),
+        "confidence policy requires the isolated file-worker with configured0.25cutoff");
+    if http&&flag("CANADA_SCRATCH_HTTP_INTERLEAVE")? {
+        ensure!(p.context==1048576,"HTTP scheduling requires full1M capacity");
+        #[cfg(feature="serving")]
+        interleave_http::validate_startup()?;
+    }
+    Ok(())
+}
+pub fn validate_configuration(path:&Path,http:bool)->Result<Value> {
+    let p:WorkerConfig=serde_json::from_slice(&std::fs::read(path)?)?;
+    validate_startup_config(&p,http)?;
+    Ok(json!({"valid":true,"rank":p.rank,"context":p.context,"http":http,
+        "scope":"Known host-only flag and profile dependencies; no model/device work"}))
+}
 pub fn run_file(path: &Path) -> Result<()> {
     let retention_probe=std::env::var("CANADA_SCRATCH_CACHE_RETENTION_SCREEN").as_deref()==Ok("1");
     ensure!(!retention_probe || cfg!(feature="storage-fault-injection"),
         "cache refusal screen requires a non-serving fault-injection build");
     let p: WorkerConfig = serde_json::from_slice(&std::fs::read(path)?)?;
+    validate_startup_config(&p,false)?;
     #[cfg(feature = "serving")]
     ensure!(
         p.http.is_none(),
@@ -2421,6 +2886,99 @@ pub fn run_file(path: &Path) -> Result<()> {
         .open(&p.events)?;
     let mut events = std::io::BufWriter::new(file);
     let mut worker = Worker::load(&p)?;
+    if std::env::var("CANADA_SCRATCH_INDEPENDENT_OWNER_SCREEN").as_deref()==Ok("1") {
+        return independent_owner_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap());
+    }
+    #[cfg(feature="serving")]
+    if std::env::var("CANADA_SCRATCH_PEER_PREFILL_SCREEN").as_deref()==Ok("1") {
+        peer_prefill_probe::run(&mut worker,p.rank,p.events.parent().unwrap())?;
+        if std::env::var("CANADA_SCRATCH_POOLED_ROUTE_CAPTURE").as_deref()==Ok("1") {
+            // Two bounded diagnostics can share a model load. The capture
+            // still begins with ordinary fresh requests and no prompt cache.
+            ensure!(worker.current.is_none(),"prefill diagnostic left an active owner");
+            worker.cached_sessions.clear();worker.session_cache_budget=0;
+            worker.prompt_checkpoint=false;worker.encoder_prompt_checkpoint=false;
+            worker.encoder_active_frontier=false;worker.prompt_cache_logits=false;
+            return pooled_route_probe::run(&mut worker,p.rank,p.events.parent().unwrap(),
+                json!({"preceding_peer_prefill_screen":true}));
+        }
+        if std::env::var("CANADA_SCRATCH_PAIR_STEP_PROFILE").as_deref()==Ok("1") {
+            pair_step_profile_probe::run(&mut worker,p.rank,p.events.parent().unwrap())?;
+        }
+        return Ok(());
+    }
+    if std::env::var("CANADA_SCRATCH_PAIR_STEP_PROFILE").as_deref()==Ok("1") {
+        return pair_step_profile_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_ATTENTION16_REFRESH_SCREEN").as_deref()==Ok("1") {
+        return attention16_refresh_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_INDEX_SCORE_MODEL_SCREEN").as_deref()==Ok("1") {
+        return index_score_model_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_COPY_KV_BATCH_SCREEN").as_deref()==Ok("1") {
+        let corpus:Value=serde_json::from_slice(include_bytes!("../tests/fixtures/long-context-continuation-v2.json"))?;
+        let tokens:Vec<u32>=serde_json::from_value(corpus["tokens"].clone())?;
+        history32_generation_probe::execute(&mut worker,Command::Begin{images:Vec::new(),id:7_891_001,
+            seed:2026111002,greedy:false,limit:1,tokens:tokens[..1013].to_vec()})?;
+        let before=worker.session.as_mut().unwrap().conditioning_state_digest_for_probe(&worker.comm,&worker.stream)?;
+        let report=worker.session.as_mut().unwrap().probe_copy_batched_kv(&worker.comm,&worker.stream,&mut worker.control)?;
+        ensure!(before==worker.session.as_mut().unwrap().conditioning_state_digest_for_probe(&worker.comm,&worker.stream)?,
+            "copy KV batching screen changed accepted drafter state");
+        std::fs::write(p.events.parent().unwrap().join("copy-kv-batch-summary.json"),serde_json::to_vec_pretty(&report)?)?;
+        history32_generation_probe::execute(&mut worker,Command::Finish(Finish::Length))?;
+        history32_generation_probe::execute(&mut worker,Command::Shutdown)?;return Ok(());
+    }
+    if std::env::var("CANADA_SCRATCH_COPY_CONDITIONING_SCREEN").as_deref()==Ok("1") {
+        let corpus:Value=serde_json::from_slice(include_bytes!("../tests/fixtures/long-context-continuation-v2.json"))?;
+        let tokens:Vec<u32>=serde_json::from_value(corpus["tokens"].clone())?;
+        history32_generation_probe::execute(&mut worker,Command::Begin{images:Vec::new(),id:7_890_001,
+            seed:2026111001,greedy:false,limit:1,tokens:tokens[..1024].to_vec()})?;
+        let before=worker.session.as_mut().unwrap().conditioning_state_digest_for_probe(&worker.comm,&worker.stream)?;
+        let mut report=worker.session.as_ref().unwrap().probe_copy_conditioning(&worker.core,&p.kernels,&worker.comm,&worker.stream)?;
+        let after=worker.session.as_mut().unwrap().conditioning_state_digest_for_probe(&worker.comm,&worker.stream)?;
+        ensure!(before==after,"component probe changed accepted drafter state");
+        report["accepted_draft_state_unchanged"]=json!(true);
+        std::fs::write(p.events.parent().unwrap().join("copy-conditioning-summary.json"),serde_json::to_vec_pretty(&report)?)?;
+        history32_generation_probe::execute(&mut worker,Command::Finish(Finish::Length))?;
+        history32_generation_probe::execute(&mut worker,Command::Shutdown)?;return Ok(());
+    }
+    if std::env::var("CANADA_SCRATCH_CLOCK_WORKLOAD_SCREEN").as_deref()==Ok("1") {
+        return clock_workload_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_CLOCK_VERIFY_SCREEN").as_deref()==Ok("1") {
+        return clock_verify_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_VERIFY_WAIT_SCREEN").as_deref()==Ok("1") {
+        return verify_wait_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_MHC_PDL_PAIR_SCREEN").as_deref()==Ok("1") {
+        return mhc_pdl_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if crate::config::history32_probe_enabled() {
+        if std::env::var("CANADA_SCRATCH_HISTORY_MATCH_GENERATION_SCREEN").as_deref()==Ok("1") {
+            return history_minimum_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap());
+        }
+        if std::env::var("CANADA_SCRATCH_COMPACT32_INDEX_SCREEN").as_deref()==Ok("1") {
+            return compact32_index_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap());
+        }
+        if std::env::var("CANADA_SCRATCH_HISTORY32_FRESH_SCREEN").as_deref()==Ok("1") {
+            return history32_fresh_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap());
+        }
+        if std::env::var("CANADA_SCRATCH_HISTORY32_GENERATION_SCREEN").as_deref()==Ok("1") {
+            return history32_generation_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap());
+        }
+        return history32_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_HISTORY_COPY_ROUTE_SCREEN").as_deref()==Ok("1") {
+        return history_copy_route_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_HISTORY_CONFIDENCE_SCREEN").as_deref()==Ok("1") {
+        return history_confidence_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_MATCHED_PATH_SCREEN").as_deref()==Ok("1") {
+        return matched_path_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
     let history_screen=std::env::var("CANADA_SCRATCH_HISTORY_ASSOCIATIVITY_SCREEN").as_deref()==Ok("1");
     let dense_rows_screen=std::env::var("CANADA_SCRATCH_DENSE_LIVE_ROWS_SCREEN").as_deref()==Ok("1");
     if history_screen || dense_rows_screen {
@@ -2464,6 +3022,9 @@ pub fn run_file(path: &Path) -> Result<()> {
     if std::env::var("CANADA_SCRATCH_SPLIT_ATTENTION_GENERATION_SCREEN").as_deref()==Ok("1") {
         return split_generation_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
     }
+    if std::env::var("CANADA_SCRATCH_RESTORE_INITIAL_SCREEN").as_deref()==Ok("1") {
+        return restore_initial_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
     if std::env::var("CANADA_SCRATCH_ENCODER_CACHE_SCREEN").as_deref()==Ok("1") {
         return encoder_cache_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
     }
@@ -2505,7 +3066,26 @@ pub fn run_file(path: &Path) -> Result<()> {
         worker.verify.reset(worker.target_lineage,&worker.comm,&worker.stream)?;
         worker.large.handoff_from(&worker.verify)?;
     }
-    if std::env::var("CANADA_SCRATCH_MOE_INPUT_ADDRESS_SCREEN").as_deref()==Ok("1") {
+    if std::env::var("CANADA_SCRATCH_ALLOCATION_PLACEMENT_SCREEN").as_deref()==Ok("1") {
+        return crate::allocation_placement_probe::run(&worker.cuda,&std::fs::read(&p.core)?,&mut worker.large,&mut worker.verify,
+            &mut worker.wides,&worker.comm,&worker.stream,&mut worker.control,p.events.parent().unwrap(),p.rank);
+    }
+    if std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX_SCREEN").as_deref()==Ok("1") {
+        if std::env::var("CANADA_SCRATCH_KEY_SHARDED16_SCREEN").as_deref()==Ok("1") {
+            return crate::key_sharded16_probe::run(&worker.cuda,&mut worker.large,&mut worker.verify,
+                worker.long_verify.as_mut().ok_or_else(||anyhow::anyhow!("key partition screen needs M16"))?,
+                &mut worker.wides,&worker.comm,&worker.stream,&mut worker.control,p.events.parent().unwrap(),p.rank);
+        }
+        return crate::key_sharded_model_probe::run(&worker.cuda,&mut worker.large,&mut worker.verify,
+            &mut worker.wides,&worker.comm,&worker.stream,&mut worker.control,p.events.parent().unwrap(),p.rank);
+    }
+    if std::env::var("CANADA_SCRATCH_VERIFY_CAPTURE_SCREEN").as_deref()==Ok("1") {
+        return crate::verification_capture_probe::run(&worker.cuda,&mut worker.large,&mut worker.verify,
+            worker.long_verify.as_mut().ok_or_else(||anyhow::anyhow!("verification capture needs M16"))?,
+            &mut worker.wides,&worker.comm,&worker.stream,&mut worker.control,p.events.parent().unwrap(),p.rank);
+    }
+    if std::env::var("CANADA_SCRATCH_MOE_INPUT_ADDRESS_SCREEN").as_deref()==Ok("1")
+        || std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE_SCREEN").as_deref()==Ok("1") {
         return crate::moe_input_address_probe::run(&worker.cuda,&mut worker.large,&mut worker.verify,
             &mut worker.wides,&worker.comm,&worker.stream,&mut worker.control,p.events.parent().unwrap(),p.rank);
     }
@@ -2527,14 +3107,32 @@ pub fn run_file(path: &Path) -> Result<()> {
             worker.long_verify.as_mut().ok_or_else(||anyhow::anyhow!("append diagnostic requires M16"))?,
             &mut worker.wides,&worker.comm,&worker.stream,&mut worker.control,p.events.parent().unwrap(),p.rank);
     }
+    // This finite operator comparison owns the fresh target and must precede
+    // serving warmup, which transfers ownership and builds the append bank.
+    if std::env::var("CANADA_SCRATCH_SWA_PRECISION_WIDE_SCREEN").as_deref()==Ok("1")
+        ||std::env::var("CANADA_SCRATCH_SPARSE_PRECISION_WIDE_SCREEN").as_deref()==Ok("1") {
+        return swa_precision_probe::run_wide(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_SWA_PRECISION_SCREEN").as_deref()==Ok("1")
+        ||std::env::var("CANADA_SCRATCH_SOURCE20_PRECISION_SCREEN").as_deref()==Ok("1") {
+        return swa_precision_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
     #[cfg(feature = "serving")]
     let startup_warmup = if std::env::var("CANADA_SCRATCH_FILE_STARTUP_WARMUP").as_deref()==Ok("1") {
-        Some(worker.warm_before_ready(p.rank)?)
+        Some(worker.warm_resident_before_ready(p.rank)?)
     } else {None};
     #[cfg(not(feature = "serving"))]
     let startup_warmup:Option<Value> = None;
     if std::env::var("CANADA_SCRATCH_POOLED_ROUTE_CAPTURE").as_deref()==Ok("1") {
         return pooled_route_probe::run(&mut worker,p.rank,p.events.parent().unwrap(),
+            serde_json::to_value(startup_warmup)?);
+    }
+    if confidence_economics_probe::enabled() {
+        return confidence_economics_probe::run(&mut worker,p.rank,p.events.parent().unwrap(),
+            serde_json::to_value(startup_warmup)?);
+    }
+    if confidence_policy_probe::enabled() {
+        return confidence_policy_probe::run(&mut worker,p.rank,p.events.parent().unwrap(),
             serde_json::to_value(startup_warmup)?);
     }
     if std::env::var("CANADA_SCRATCH_BLOCK_PROGRESS_SCREEN").as_deref()==Ok("1") {
@@ -2543,6 +3141,18 @@ pub fn run_file(path: &Path) -> Result<()> {
     }
     if std::env::var("CANADA_SCRATCH_FIXED_PREFIX_QUALITY_SCREEN").as_deref()==Ok("1") {
         return fixed_prefix_quality_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_CHUNK_PLAN_SCREEN").as_deref()==Ok("1") {
+        return chunk_plan_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_PREFILL_WAIT_SCREEN").as_deref()==Ok("1") {
+        return prefill_wait_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if sampler_law_probe::enabled() {
+        return sampler_law_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_STEP_BUDGET_SCREEN").as_deref()==Ok("1") {
+        return step_budget_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
     }
     if std::env::var("CANADA_SCRATCH_SAMPLER_READOUT_SCREEN").as_deref()==Ok("1") {
         return sampler_readout_probe::run(&mut worker,p.rank,p.events.parent().unwrap(),
@@ -2568,6 +3178,7 @@ pub fn run_file(path: &Path) -> Result<()> {
         &mut events,
         &json!({"type":"ready","rank":p.rank,"identity":worker.identity,
         "startup_warmup":startup_warmup,
+        "verification_poll_us":Target::verification_poll_us_requested()?,
         "session_prepare_seconds":worker.session_prepare_seconds,
         "prefill_capture_once":worker.large.prefill_capture_once(),
         "coalesced_moe_codec_layers":worker.wides.iter().map(Target::coalesced_codec_layers).sum::<usize>(),
@@ -2667,6 +3278,7 @@ pub fn run_http(path: &Path) -> Result<()> {
     use crate::{http_server, protocol::BackendEvent};
     use deepseek_recipe::stream::InferenceFinishReason;
     let p: WorkerConfig = serde_json::from_slice(&std::fs::read(path)?)?;
+    validate_startup_config(&p,true)?;
     // HTTP upload/conversion and image decoding reserve bounded workspace
     // while they own it. Actual retained inputs remain in host/cgroup charge;
     // an idle server need not permanently reserve the largest possible input.
@@ -2707,6 +3319,10 @@ pub fn run_http(path: &Path) -> Result<()> {
         Err(std::env::VarError::NotPresent)=>false,
         Err(error)=>return Err(error.into()),
     };
+    if http_interleave { interleave_http::validate_startup()?; }
+    ensure!(std::env::var("CANADA_SCRATCH_INDEPENDENT_OWNER_SCREEN").as_deref()!=Ok("1")
+        ||Target::independent_probe_context_admitted(p.context),
+        "independent owner diagnostic context needs explicit admission before model loading");
     let post_http_control = match std::env::var("CANADA_SCRATCH_POST_HTTP_CONTROL") {
         Ok(value) => {
             ensure!(value == "1" && p.context == 1048576 && !post_http_causal && !post_http_capture,
@@ -2743,23 +3359,24 @@ pub fn run_http(path: &Path) -> Result<()> {
         .transpose()?;
     let mut events = crate::event_log::EventLog::from_env(&p.events)?;
     let mut worker = Worker::load(&p)?;
+    let resident_banks=worker.initialize_resident_banks(&p.kernels)?;
     ensure!(!http_interleave || (!post_http_causal && !post_http_capture && !post_http_control
         && !post_http_verify_profile && !post_http_long_quality),
         "HTTP interleave experiment needs an isolated worker");
     let startup_warmup = match std::env::var("CANADA_SCRATCH_WARMUP_BEFORE_READY") {
         Ok(value) => {
             ensure!(value=="0" || value=="1","invalid startup warmup policy");
-            if value=="1" {Some(worker.warm_before_ready(p.rank)?)} else {None}
+            if value=="1" {Some(worker.warm_resident_before_ready(p.rank)?)} else {None}
         }
         // Keep the tiny diagnostic capacity usable; the public warmup needs
         // room for its 128-token prefix and bounded continuation.
         Err(std::env::VarError::NotPresent) if p.context>=256 =>
-            Some(worker.warm_before_ready(p.rank)?),
+            Some(worker.warm_resident_before_ready(p.rank)?),
         Err(std::env::VarError::NotPresent) => None,
         Err(error) => return Err(error.into()),
     };
     worker.progress_next = progress_next;
-    let ready = json!({"type":"ready","rank":p.rank,"identity":worker.identity,
+    let mut ready = json!({"type":"ready","rank":p.rank,"identity":worker.identity,
         "session_cache_budget_bytes":worker.session_cache_budget,"prompt_checkpoint":worker.prompt_checkpoint,
         "encoder_prompt_checkpoint":worker.encoder_prompt_checkpoint,
         "encoder_active_frontier":worker.encoder_active_frontier,
@@ -2771,14 +3388,17 @@ pub fn run_http(path: &Path) -> Result<()> {
         "shared_image_budget_bytes":worker.shared_image_budget,
         "retain_restored_checkpoint":worker.retain_restored_checkpoint,
         "session_cache_policy":if worker.session_cache_long_first {"long_parents_and_recent"}else{"fifo"},
+        "session_cache_shared_ancestors":worker.session_cache_shared_ancestors,
         "engram_staging":worker.verify.engram_input_kind(),
         "paired_engram_io":worker.verify.paired_engram_io_enabled(),
         "session_prepare_seconds":worker.session_prepare_seconds,
         "startup_warmup":startup_warmup,
         "history_verifier":worker.long_verify.as_ref().map(|target|json!({
+            "compact_history_sampling":target.compact_history_sampling_enabled(),
             "compact_index_layers":target.grouped16_index_layers(),
             "query_overlap_layers":target.query_overlap_layers(),
             "coefficient_overlap_layers":target.attention_coefficient_overlap_layers()})),
+        "history32_verifier":worker.copy32_admission,
         "progress_next":worker.progress_next,"http_interleave":http_interleave,
         "prefill_capture_once":worker.large.prefill_capture_once(),
         "live_moe_layers":worker.verify.live_moe_layers(),
@@ -2795,9 +3415,18 @@ pub fn run_http(path: &Path) -> Result<()> {
         "nccl_init_seconds":worker.nccl_init_seconds,
         "nccl_runtime_connect_requested":std::env::var("NCCL_RUNTIME_CONNECT").ok(),
         "context_capacity":p.context,"memory":worker.cuda.admission_memory()?,"production_qualified":false});
+    ready["bank_encoder_checkpoint"]=json!(crate::config::bank_encoder_checkpoint_requested());
+    ready["resident_banks"]=resident_banks;
+    ready["parking_extra_slots"]=json!(worker.parking_extra_slots);
     events.record(&ready)?;
     if let Some(queue) = &queue {
         if http_interleave {
+            // Configure lifetime admission before HTTP can advertise Ready.
+            if interleave_http::two_stream_enabled()? { queue.enable_two_stream_admission(); }
+            if request_checkpoint::exchange_enabled()? {
+                ensure!(interleave_http::two_stream_enabled()?,"state exchange requires two-owner admission");
+                queue.reserve_waiting_image_capacity(worker.shared_image_budget)?;
+            }
             queue.enable_decode_priority();
             if worker.background_prefill_enabled { queue.enable_background_prefill(); }
         }
@@ -2981,12 +3610,15 @@ mod tests {
     fn request_incident_redaction_keeps_cache_counts_without_output_tokens() {
         let mut event=serde_json::json!({"type":"tokens","request_id":7,
             "request_started":true,"output_ids":[41,42],"pending":43,
+            "paired_peer":{"request_id":8,"output_ids":[45,46],"pending":47,"frontier":123905},
             "prompt_tokens":124000,"cached_tokens":123904,
             "retained_session_cache":{"hit":true,"exact_prompt_anchor":44,
                 "restored_tokens":123904},
             "prompt_checkpoint":{"saved":false,"late_memory_refused":true}});
         super::redact_http_event(&mut event);
         assert!(event.get("output_ids").is_none() && event.get("pending").is_none());
+        assert!(event["paired_peer"].get("output_ids").is_none()&&event["paired_peer"].get("pending").is_none());
+        assert_eq!(event["paired_peer"]["frontier"],123905);
         assert!(event["retained_session_cache"].get("exact_prompt_anchor").is_none());
         assert_eq!(event["retained_session_cache"]["exact_prompt_hit"],true);
         assert_eq!(event["cached_tokens"],123904);
@@ -3098,6 +3730,45 @@ mod tests {
         assert_eq!(cache_evictions_with_optional(&entries,&[false,false,false],(150,100),300,true,3),
             cache_evictions(&entries,(150,100),300,true,3));
     }
+    #[test]
+    fn completed_siblings_cannot_displace_their_only_reusable_parents() {
+        // Observed545K case: exact-prompt image is borrowed while restoring a
+        // regeneration. Saving the old completed child would evict its encoder
+        // parent under the unchanged2GiB budget. Decline that optional copy.
+        let encoder=(545024,928409100);let prompt=(545215,934905984);
+        let completed=(545355,934723760);let budget=2147483648;
+        assert_eq!(cache_evictions_with_optional(&[encoder],&[false],completed,
+            budget-prompt.1,true,3),Some(vec![0]));
+        assert!(completed_cache_evictions(&[encoder],&[false],&[true],completed,
+            budget-prompt.1,true,3).is_none());
+        // A later short request must not turn the two retained parents into
+        // two mutually divergent completions that both miss the original input.
+        assert!(completed_cache_evictions(&[encoder,prompt],&[false,true],&[true,true],
+            (545342,934416108),budget,true,4).is_none());
+        assert_eq!(completed_cache_evictions(&[encoder,prompt],&[false,true],&[false,false],
+            (367,12000000),budget,true,4),Some(vec![]));
+    }
+    #[test]
+    fn completed_parent_reservation_preserves_bounds_and_unrelated_evictions() {
+        let entries=[(100000,100),(100200,100),(9000,40)];
+        let optional=[false,true,false];let parents=[true,true,false];
+        assert_eq!(completed_cache_evictions(&entries,&optional,&parents,(100300,50),
+            250,true,3),Some(vec![2]));
+        assert!(completed_cache_evictions(&entries,&optional,&parents,(100300,60),
+            250,true,3).is_none());
+        assert!(completed_cache_evictions(&entries,&optional,&parents,(100300,1),
+            300,true,2).is_none());
+        assert!(completed_cache_evictions(&entries,&optional,&parents[..2],(1,1),
+            300,true,4).is_none());
+        assert_eq!(completed_cache_evictions(&entries,&optional,&[false;3],(100300,80),
+            300,true,4),cache_evictions_with_optional(&entries,&optional,(100300,80),300,true,4));
+        // Physical-pressure planning excludes reserved parents without
+        // crediting their bytes as reclaimed memory.
+        assert_eq!(pressure_cache_victim(&entries,&optional,&[true,true,true],100300,
+            4,true,&[0,1]),Some(2));
+        assert_eq!(pressure_cache_victim(&entries,&optional,&[true,true,true],100300,
+            4,true,&[0,1,2]),None);
+    }
     use super::*;
     #[test]
     fn physical_pressure_prefers_optional_then_longest_superseded_snapshot() {
@@ -3178,6 +3849,35 @@ mod tests {
         assert_eq!(entries,vec![(100,30),(50000,100)],"a refused plan cannot mutate cache or held requests");
         assert!(cache_evictions(&[],(usize::MAX,1),220,true,0).is_none());
         assert_eq!(cache_evictions(&[(1,10),(2,10)],(3,10),220,true,2),Some(vec![0]));
+    }
+    #[test]
+    fn park_budget_refuses_to_spend_parent_and_needed_prefixes() {
+        // Representative charges in MiB: retaining the parent and the other
+        // unfinished owner leaves too little space for another park.
+        let entries=[(800_000,1380),(200_000,370)];
+        assert!(completed_cache_evictions(&entries,&[false;2],&[true,true],
+            (usize::MAX,370),2048-370,true,5).is_none());
+        assert_eq!(cache_evictions(&entries,(usize::MAX,370),2048-370,true,5),Some(vec![0]));
+        // An unrelated stale entry can still yield; this is not a blanket
+        // no-eviction policy that needlessly serializes independent streams.
+        let entries=[(800_000,1000),(20_000,100),(40_000,400)];
+        assert_eq!(completed_cache_evictions(&entries,&[false;3],&[true,true,false],
+            (usize::MAX,300),1600,true,5),Some(vec![2]));
+        assert!(completed_cache_evictions(&entries,&[false;3],&[true,true,false],
+            (usize::MAX,600),1600,true,5).is_none());
+    }
+    #[test]
+    fn dedicated_parking_slots_preserve_cache_entries_but_not_excess_bytes() {
+        let cache=[(100,30),(200,30),(300,30),(400,30)];
+        // One60-byte paused owner plus the new60-byte image fit beside all
+        // four cache entries in240bytes. Entry count alone must not evict.
+        assert_eq!(cache_evictions(&cache,(usize::MAX,60),240-60,true,5),Some(vec![]));
+        assert_eq!(cache_evictions(&cache,(usize::MAX,60),240-60,true,3),Some(vec![0,1]));
+        // Dedicated slots confer no new byte entitlement. With only180bytes
+        // total, exactly two optional entries must still yield; an oversized
+        // request remains refused without touching the saved owner.
+        assert_eq!(cache_evictions(&cache,(usize::MAX,60),180-60,true,5),Some(vec![0,1]));
+        assert!(cache_evictions(&cache,(usize::MAX,121),180-60,true,5).is_none());
     }
     #[test]
     fn resident_admits_adaptive_sparse_but_rejects_unpaired_experiments() {

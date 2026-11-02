@@ -36,6 +36,8 @@ fn proposal_graph_index(sampled: bool, direct: bool, temperature: usize, fused_h
         +TEMPERATURE_GRAPH_STRIDE*8*DRAFT_SCHEDULES*usize::from(scaled)
 }
 pub(crate) struct Markov {
+    history_teacher_graph: Option<(usize,Graph)>,
+    history_teacher_previous: Option<Buffer<i32>>,
     graphs: [Option<Graph>; TEMPERATURE_GRAPH_STRIDE*16*DRAFT_SCHEDULES],
     prefix_graphs: [Option<(Graph,Graph)>; TEMPERATURE_GRAPH_STRIDE*16*DRAFT_SCHEDULES],
     conditional_prefix_graphs: [Option<(u32,crate::markov_conditional::Conditional)>; TEMPERATURE_GRAPH_STRIDE*16*DRAFT_SCHEDULES],
@@ -189,7 +191,7 @@ impl Markov {
             );
         }
         stream.join_default()?;
-        let blas = Rc::new(Blas::new(cuda)?);
+        let blas = Rc::new(Blas::new_on(cuda,stream)?);
         let head = Projection::new(
             cuda,
             weights.clone(),
@@ -312,6 +314,10 @@ impl Markov {
             _=>anyhow::bail!("invalid fused confidence policy"),
         };
         Ok(Self {
+            history_teacher_graph:None,
+            history_teacher_previous:if std::env::var("CANADA_SCRATCH_HISTORY_CONFIDENCE_SCREEN").as_deref()==Ok("1") {
+                Some(cuda.allocate(5)?)
+            }else{None},
             graphs: std::array::from_fn(|_|None),
             prefix_graphs: std::array::from_fn(|_|None),
             conditional_prefix_graphs: std::array::from_fn(|_|None),
@@ -453,6 +459,55 @@ impl Markov {
     fn read_full_result(&mut self)->Result<[u32;5]>{
         let words = self.readout.download()?;
         self.read_full_words(&words)
+    }
+    /// Finite opportunity screen only. Each Markov row is conditioned on the
+    /// known copy predecessor, never a sampled proposal. Discard sampled IDs;
+    /// these q rows must not become a stochastic proposal sequence.
+    pub(crate) fn score_history_for_probe(&mut self,base:&Buffer<f32>,post_hc:&Buffer<bf16>,
+        anchor:u32,copy:&[u32;5],comm:&Roce,stream:&Stream)->Result<([f64;5],[f32;5],bool)> {
+        self.guard(stream)?;
+        ensure!(std::env::var("CANADA_SCRATCH_HISTORY_CONFIDENCE_SCREEN").as_deref()==Ok("1")
+            &&self.history_teacher_previous.is_some()&&!self.correction_cache_active
+            &&base.len()==5*32320&&self.cuda.owns_buffer(base)
+            &&post_hc.len()==5*5120&&self.cuda.owns_buffer(post_hc)
+            &&anchor<VOCAB as u32&&copy.iter().all(|&id|id<VOCAB as u32)
+            &&comm.rank()==self.rank&&self.comm_instance==Some(comm.instance())
+            &&self.base_pointer==Some(base.ptr())&&self.hidden_pointer==Some(post_hc.ptr()),
+            "history scoring requires an isolated warmed Markov query");
+        self.invalidate_results();
+        let result=(||{
+            let previous=[anchor as i32,copy[0]as i32,copy[1]as i32,copy[2]as i32,copy[3]as i32];
+            self.history_teacher_previous.as_mut().unwrap().upload(&previous)?;
+            // Normalization shares the categorical implementation. Draws are
+            // unused and do not supply any later row's conditioning token.
+            for sampler in &mut self.categorical{sampler.upload_uniforms(&[0.5])?;}
+            stream.join_default()?;
+            let index=proposal_graph_index(true,self.direct_gather,self.temperature_index,
+                self.fused_head_active,self.confidence_fused_active,self.draft_schedule,self.correction_cache_active,self.scaled_head_active);
+            let first_capture=self.history_teacher_graph.is_none();
+            if first_capture{
+                let previous=self.history_teacher_previous.as_ref().unwrap().ptr();
+                self.enqueue_segment_previous(base,post_hc,true,comm,stream,0,false,Some(previous))?;
+                stream.synchronize()?;comm.health()?;
+                let graph=stream.capture(||self.enqueue_segment_previous(base,post_hc,true,comm,stream,0,false,Some(previous)))?;
+                self.history_teacher_graph=Some((index,graph));
+            }
+            let(saved_index,graph)=self.history_teacher_graph.as_ref().unwrap();
+            ensure!(*saved_index==index,"history score configuration changed after capture");
+            unsafe{graph.launch(stream)?;}stream.synchronize()?;comm.health()?;
+            self.read_full_result()?;
+            let confidence=self.last_confidence.unwrap().0;
+            let mut q=[0.;5];
+            for i in 0..5{
+                let bytes=unsafe{self.cuda.read_device(self.proposal_probabilities.ptr()+((i*VOCAB+copy[i]as usize)*8)as u64,8)}?;
+                q[i]=f64::from_le_bytes(bytes.try_into().unwrap());
+                ensure!(q[i].is_finite()&&(0. ..=1.).contains(&q[i]),"invalid history conditional probability");
+            }
+            Ok((q,confidence,first_capture))
+        })();
+        self.invalidate_results();
+        if result.is_err(){self.poisoned=true;}
+        result
     }
     fn read_full_words(&mut self,words:&[u32])->Result<[u32;5]>{
         ensure!(words.len()==32,"full Markov readout size");
@@ -636,6 +691,12 @@ impl Markov {
         &mut self, base: &Buffer<f32>, post_hc: &Buffer<bf16>, sampled: bool,
         comm: &Roce, stream: &Stream, first: usize, prefix_only: bool,
     ) -> Result<()> {
+        self.enqueue_segment_previous(base,post_hc,sampled,comm,stream,first,prefix_only,None)
+    }
+    fn enqueue_segment_previous(
+        &mut self, base: &Buffer<f32>, post_hc: &Buffer<bf16>, sampled: bool,
+        comm: &Roce, stream: &Stream, first: usize, prefix_only: bool, previous_override:Option<u64>,
+    ) -> Result<()> {
         ensure!((first == 0 || first == 2) && (!prefix_only || first == 0),
             "Markov segment geometry");
         if (first != 0 || prefix_only) && !self.prefix_stop_enabled &&
@@ -649,7 +710,9 @@ impl Markov {
                 .launch([5,1,1],[256,1,1],0,stream,&mut args)?;}
         }
         for step in first..5 {
-            let mut previous = if step == 0 {
+            let mut previous = if let Some(previous)=previous_override {
+                previous+(step*4)as u64
+            } else if step == 0 {
                 self.anchor.ptr()
             } else if sampled {
                 self.categorical[step - 1].device_output().ptr()

@@ -173,6 +173,22 @@ fn prepare_named(
     }
     stream.synchronize()?;
     weights.finish_expert_layer(layer)?;
+    if layer<40 && std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE_SCREEN").as_deref()==Ok("1") {
+        let bytes=2*experts*sb;
+        ensure!(cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+bytes,
+            "scale-code experiment must preserve the physical memory reserve");
+        let mut codes=cuda.allocate::<u8>(bytes)?;
+        let mut error=cuda.allocate::<u32>(1)?;
+        codes.zero()?;error.zero()?;stream.join_default()?;
+        let mut src=weights.pointer_at(so,bytes)?;
+        let mut dst=codes.ptr();let mut status=error.ptr();let mut matrices=(experts*2)as i32;
+        let mut args:Vec<*mut c_void>=vec![(&mut src as *mut u64).cast(),(&mut dst as *mut u64).cast(),
+            (&mut status as *mut u64).cast(),(&mut matrices as *mut i32).cast()];
+        unsafe {module.function("ca_expert_scale_codes4")?.launch([72,matrices as u32,1],[256,1,1],0,&stream,&mut args)}?;
+        stream.synchronize()?;
+        ensure!(error.download()?[0]==0,"unsupported expert scale-code domain or failed exact GPU roundtrip");
+        weights.install_expert_scale_codes(layer,codes)?;
+    }
     Ok(Prepared {
         layer,
         experts,

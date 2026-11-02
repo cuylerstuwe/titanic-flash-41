@@ -404,6 +404,7 @@ pub struct KeySlots {
     contiguous: bool,
 }
 impl KeySlots {
+    pub(crate) fn contiguous(&self) -> bool { self.contiguous }
     pub(crate) fn values(&self) -> &Buffer<i32> { &self.values }
     pub(crate) fn capacity(&self) -> usize { self.capacity }
     pub fn new(cuda: &Cuda, capacity: usize, values: &[i32]) -> Result<Self> {
@@ -428,6 +429,8 @@ pub struct KeyGather {
     cuda: Cuda,
     module: crate::cuda::Module,
     packed: Option<crate::cuda::Module>,
+    packed_active: Cell<bool>,
+    query_rows: usize,
     cached: Option<CachedGather>,
 }
 struct CachedGather {
@@ -448,7 +451,14 @@ impl KeyGather {
         // The artifact's original receipt covered six queries. Its device-side
         // bound takes the query count at runtime; s575 also checked the exact
         // pinned binary at16, including a maximum in the final query.
-        let packed=if requested && [6,16].contains(&query_rows) {
+        let packed32=match std::env::var("CANADA_SCRATCH_PACKED_INDEX_GATHER32") {
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid M32 packed gather policy");value=="1"},
+            Err(std::env::VarError::NotPresent)=>false,
+            Err(error)=>return Err(error.into()),
+        };
+        let screen32=std::env::var("CANADA_SCRATCH_COMPACT32_INDEX_SCREEN").as_deref()==Ok("1");
+        let packed=if requested && ([6,16].contains(&query_rows)
+            || (query_rows==32 && (packed32||screen32))) {
             let root=kernels.join("index-gather-packed-v1");
             let manifest:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
             let raw=std::fs::read(root.join("gather.cubin"))?;
@@ -489,10 +499,18 @@ impl KeyGather {
             cuda: cuda.clone(),
             module: cuda.module(core)?,
             packed,
+            packed_active:Cell::new(query_rows!=32||packed32),
+            query_rows,
             cached,
         })
     }
-    pub(crate) fn packed_enabled(&self)->bool {self.packed.is_some()}
+    pub(crate) fn packed_enabled(&self)->bool {self.packed.is_some()&&self.packed_active.get()}
+    pub(crate) fn set_packed32_for_probe(&self,enabled:bool)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_COMPACT32_INDEX_SCREEN").as_deref()==Ok("1")
+            &&self.query_rows==32&&self.packed.is_some()&&self.cached.is_none(),
+            "M32 packed gather comparison shape");
+        self.packed_active.set(enabled);Ok(())
+    }
     pub(crate) fn cached_enabled(&self)->bool {self.cached.as_ref().is_some_and(|c|c.enabled.get())}
     pub(crate) fn set_cached16_for_probe(&self,enabled:bool)->Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_CACHED_INDEX16_SCREEN").as_deref()==Ok("1"),"M16 cached gather screen");
@@ -582,7 +600,8 @@ impl KeyGather {
             output.ready.set(true);
             return Ok(());
         }
-        let packed=self.packed.as_ref().filter(|_|[6,16].contains(&queries));
+        let packed=self.packed.as_ref().filter(|_|self.packed_active.get()
+            &&queries as usize==self.query_rows&&[6,16,32].contains(&queries));
         let module=packed.unwrap_or(&self.module);
         let name=if packed.is_some(){"ca_gather_index_k_packed4"}
             else if ends.is_some(){"ca_gather_index_k_bounded"}else{"ca_gather_index_k"};

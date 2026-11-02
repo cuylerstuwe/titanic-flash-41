@@ -94,6 +94,28 @@ fn enabled() -> bool {
     true
 }
 
+/// Experimental physical request owners. Startup validates the flag and the
+/// complete memory/layout prerequisites before any serving request is admitted.
+pub(crate) fn resident_banks_requested() -> bool {
+    std::env::var("CANADA_SCRATCH_RESIDENT_BANKS").as_deref()==Ok("1")
+}
+pub(crate) fn paired_serving_requested() -> bool {
+    std::env::var("CANADA_SCRATCH_PAIRED_SERVING").as_deref()==Ok("1")
+}
+pub(crate) fn paired_draft_head_requested() -> bool {
+    std::env::var("CANADA_SCRATCH_PAIRED_DRAFT_HEAD").as_deref()==Ok("1")
+}
+pub(crate) fn encoder_prefix_import_requested() -> bool {
+    std::env::var("CANADA_SCRATCH_ENCODER_PREFIX_IMPORT").as_deref()==Ok("1")
+}
+pub(crate) fn bank_encoder_checkpoint_requested() -> bool {
+    std::env::var("CANADA_SCRATCH_BANK_ENCODER_CHECKPOINT").as_deref()==Ok("1")
+}
+pub(crate) fn shared_owner_profiles_requested() -> bool {
+    resident_banks_requested()
+        || std::env::var("CANADA_SCRATCH_PAIRED_SERVING_PROFILE_SCREEN").as_deref()==Ok("1")
+}
+
 impl ModelConfig {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let c: Self = serde_json::from_slice(bytes)?;
@@ -327,6 +349,43 @@ pub(crate) fn plan_encoder_chunks(len: usize, widths: &[usize]) -> Vec<usize> {
     }
     plan
 }
+/// A suspended prefill keeps its original physical row sequence. Replanning
+/// the remaining token count can move a small chunk between larger chunks,
+/// changing model arithmetic despite using the same accepted token history.
+pub(crate) fn validate_encoder_chunks(len: usize, chunks: &[usize], widths: &[usize]) -> anyhow::Result<()> {
+    anyhow::ensure!(len>0&&!chunks.is_empty(),"empty resumed encoder plan");
+    let mut remaining=len;
+    for (index,&width) in chunks.iter().enumerate() {
+        anyhow::ensure!(width>0&&widths.contains(&width)&&remaining>0,
+            "resumed encoder width is unavailable or follows the final chunk");
+        if index+1<chunks.len() {
+            anyhow::ensure!(remaining>width,"only the final encoder chunk may be partial");
+            remaining-=width;
+        }else{
+            anyhow::ensure!(remaining<=width,"resumed encoder plan does not cover its input");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod resumed_encoder_tests {
+    use super::validate_encoder_chunks;
+    #[test]
+    fn preserves_interior_small_chunk_and_ragged_final_width() {
+        let widths=[128,8192];
+        for (len,plan) in [(8320,&[128,8192][..]),(8257,&[8192,128][..]),(65,&[128][..])] {
+            assert!(validate_encoder_chunks(len,plan,&widths).is_ok());
+        }
+    }
+    #[test]
+    fn refuses_incomplete_unavailable_and_extra_chunks() {
+        for (len,plan) in [(0,&[128][..]),(1,&[][..]),(129,&[128][..]),
+            (128,&[128,128][..]),(65,&[64,128][..]),(65,&[0,128][..])] {
+            assert!(validate_encoder_chunks(len,plan,&[128,8192]).is_err());
+        }
+    }
+}
 /// Admitted real-prompt agentic fixtures: the SGLang-matched coding prompts,
 /// the explicit transport-error revision, then two prefixes of the frozen
 /// 27319-token repository prompt.
@@ -345,14 +404,39 @@ pub(crate) fn target_rows(rows: usize) -> bool {
     verification_rows(rows) || extend_rows(rows)
 }
 
-/// M16 is admitted only through the explicit isolated history-verifier fork.
-/// It has no request-facing selector until its cost and rollback are qualified.
+/// Explicit target profiles; M32 additionally requires the finite screen or
+/// the independently admitted serving proposal capability.
 pub(crate) fn verification_rows(rows: usize) -> bool {
-    matches!(rows, 6 | 16)
+    matches!(rows, 6 | 16) || (rows == 32 && history32_enabled())
+}
+/// A finite target-only experiment, never selected by the serving scheduler.
+pub(crate) fn history32_probe_enabled() -> bool {
+    std::env::var("CANADA_SCRATCH_HISTORY32_SCREEN").as_deref() == Ok("1")
+}
+pub(crate) fn history32_enabled() -> bool {
+    history32_probe_enabled()
+        || std::env::var("CANADA_SCRATCH_HISTORY32_GENERATION").as_deref()==Ok("1")
+}
+/// Validate the opt-in serving capability before loading GPU state. The finite
+/// probe remains a separate dispatch and never becomes a serving selector.
+pub(crate) fn history32_generation_enabled() -> anyhow::Result<bool> {
+    match std::env::var("CANADA_SCRATCH_HISTORY32_GENERATION") {
+        Err(std::env::VarError::NotPresent)=>Ok(false),Ok(v)if v=="0"=>Ok(false),
+        Ok(v)if v=="1"=>{
+            for flag in ["CANADA_SCRATCH_LONG_HISTORY_GENERATION","CANADA_SCRATCH_HISTORY32_FP32_ATTENTION",
+                "CANADA_SCRATCH_HISTORY32_SPLIT_ROUTER","CANADA_SCRATCH_SOURCE20_FP32_REDUCTION"] {
+                anyhow::ensure!(std::env::var(flag).as_deref()==Ok("1"),"M32 serving requires {flag}=1");
+            }
+            anyhow::ensure!(!history32_probe_enabled(),"M32 serving and finite screen must remain separate");
+            Ok(true)
+        },
+        _=>anyhow::bail!("M32 generation must be0or1"),
+    }
 }
 /// Every profile sharing a compressor owner must use the same carry geometry.
 /// Keep more slots than the speculative width so no live block overwrites the
 /// incoming even partner or another speculative position before commit.
 pub(crate) fn verification_carry_rows() -> usize {
-    if std::env::var("CANADA_SCRATCH_LONG_HISTORY_VERIFY").as_deref() == Ok("1") { 32 } else { 8 }
+    if history32_enabled() { 64 }
+    else if std::env::var("CANADA_SCRATCH_LONG_HISTORY_VERIFY").as_deref() == Ok("1") { 32 } else { 8 }
 }

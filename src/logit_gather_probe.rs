@@ -20,13 +20,26 @@ pub fn run_grid(rank:usize,endpoint:&str,nonce:&[u8],root:&Path)->Result<Value>{
     let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;let stream=cuda.stream()?;
     let mut comm=Roce::local(&cuda,&root.join("roce-v0"),rank)?;
     comm.attach_gather(&root.join("roce-gather-v1"))?;
-    let all=crate::rendezvous::exchange_blob(rank,endpoint.parse()?,nonce,&comm.blob()?)?;
+    let mut endpoint:SocketAddr=endpoint.parse()?;
+    let all=crate::rendezvous::exchange_blob(rank,endpoint,nonce,&comm.blob()?)?;
+    let connect_delay_ms=match std::env::var("CANADA_SCRATCH_LOGIT_GATHER_CONNECT_DELAY_MS") {
+        Ok(v)=>v.parse::<u64>()?,Err(std::env::VarError::NotPresent)=>0,Err(e)=>return Err(e.into()),
+    };
+    ensure!(connect_delay_ms<=250,"finite gather connect delay bound");
+    if connect_delay_ms>0 {std::thread::sleep(std::time::Duration::from_millis(connect_delay_ms));}
     comm.connect(&all)?;
+    // Endpoint exchange publishes INIT queues, not ready-to-send queues. The
+    // full model has a subsequent NCCL rendezvous; this standalone probe must
+    // also wait for every peer's local connect before any native GPU traffic.
+    endpoint.set_port(endpoint.port().checked_add(1).ok_or_else(||anyhow::anyhow!("gather ready port overflow"))?);
+    ensure!(crate::rendezvous::exchange_blob(rank,endpoint,nonce,b"R")?==b"RRRR",
+        "gather peer readiness agreement");
     let mut sum_input=cuda.allocate::<u16>(8)?;
     sum_input.upload(&vec![half::bf16::from_f32((rank+1)as f32).to_bits();8])?;
     let mut sum_output=cuda.allocate::<u16>(8)?;
     let mut results=Vec::new();
-    for rows in [1usize,6,16]{
+    let wide_only=std::env::var("CANADA_SCRATCH_LOGIT_GATHER_GRID32_SCREEN").as_deref()==Ok("1");
+    for &rows in if wide_only{&[32usize][..]}else{&[1usize,6,16][..]}{
         let columns=32320usize;
         let mut input=cuda.allocate::<f32>(rows*columns)?;
         let mut output=cuda.allocate::<f32>(rows*columns*4)?;
@@ -86,6 +99,7 @@ pub fn run_grid(rank:usize,endpoint:&str,nonce:&[u8],root:&Path)->Result<Value>{
     }
     stream.synchronize()?;comm.health()?;
     Ok(json!({"rank":rank,"all_exact":true,"results":results,"variants":[8,16,32],
+        "all_peers_connected_before_gpu":true,"connect_delay_ms":connect_delay_ms,
         "scope":"Same raw FP32 gather primitive, protocol, bytes and ordered stream. Only8/16/32-block launch geometry differs. Two patterns, two opposite orders; counter classes switched back and forth with mixed native reductions. Component only."}))
 }
 

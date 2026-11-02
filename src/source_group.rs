@@ -108,9 +108,10 @@ impl Group {
             None,
             None,
             4,
+            None,
         )
     }
-    pub fn new_rows(
+    pub(crate) fn new_rows(
         cuda: &Cuda,
         module: &Module,
         core: &[u8],
@@ -130,6 +131,7 @@ impl Group {
         vendor_blas: Option<Rc<Blas>>,
         medium_woa: Option<Rc<std::cell::RefCell<crate::woa_medium::Scratch>>>,
         swa_pages: usize,
+        mut reserved: Option<&mut crate::weights::StagedReservation>,
     ) -> Result<Self> {
         ensure!(
             [8, 14].contains(&start) && stages.len() == 6 && frequency.compressed(),
@@ -152,7 +154,7 @@ impl Group {
         for (i, stage) in stages.iter().enumerate() {
             let id = i + start;
             let mut weights =
-                Weights::load_staged(cuda, cp, plan, &[&format!("layers.{id}.")], stage)?;
+                Weights::load_staged_reserved(cuda, cp, plan, &[&format!("layers.{id}.")], stage, reserved.as_deref_mut())?;
             atlas_bytes.push(weights.bytes());
             source_hashes.push(weights.source_sha256.clone());
             let prepared = expert_packing::prepare_layer(cuda, module, &mut weights, id)?;
@@ -247,7 +249,12 @@ impl Group {
         vendor_blas: Rc<Blas>,
         medium_woa: Option<Rc<std::cell::RefCell<crate::woa_medium::Scratch>>>,
         wide: Option<&crate::decoder::WideBuild>,
+        narrow_moe: Option<Rc<crate::moe::Workspace>>,
+        independent: bool,
     ) -> Result<Self> {
+        ensure!(wide.is_none() || narrow_moe.is_none(),"exclusive wide/narrow shared workspaces");
+        ensure!(!independent || (num_rows==128 && phase==Phase::Extend && wide.is_none()
+            && self.source.cache().page_tokens()==64),"independent group geometry");
         let mut layers = Vec::new();
         let mut engram = None;
         let mut source = None;
@@ -265,7 +272,7 @@ impl Group {
                     old.prepared_layout(),
                     kernels,
                     frequency.clone(),
-                    if moe.is_some() { InputMode::Fused } else { InputMode::Split(rank) },
+                    if wide.is_some() { InputMode::Fused } else { InputMode::Split(rank) },
                     num_rows,
                     Some(vendor_blas.clone()),
                     medium_woa.clone(),
@@ -289,14 +296,14 @@ impl Group {
             };
             let (layer, layer_engram) = match wide {
                 Some(w) => w.layer(cuda, id, |moe, sp| build(Some(moe), sp))?,
-                None => build(None, None)?,
+                None => build(narrow_moe.clone(), None)?,
             };
             layers.push(layer);
             if layer_engram.is_some() {
                 engram = layer_engram;
             }
             if i == 0 {
-                source = Some(Source::new_rows_shared(
+                source = Some(Source::new_rows_owner(
                     cuda,
                     stream,
                     weights,
@@ -311,7 +318,7 @@ impl Group {
                     &vec![0; num_rows],
                     num_rows,
                     phase,
-                    &self.source,
+                    (!independent).then_some(&self.source),
                 )?);
             }
         }
@@ -323,7 +330,9 @@ impl Group {
         Ok(Self {
             start: self.start,
             layers,
-            caches: self.caches.clone(),
+            caches: if independent {self.caches.iter()
+                .map(|c|PagedKv::new(cuda,c.pages(),c.page_tokens())).collect::<Result<Vec<_>>>()?}
+                else {self.caches.clone()},
             source: source.ok_or_else(|| anyhow::anyhow!("shared group source absent"))?,
             engram,
             rows,
@@ -387,6 +396,28 @@ impl Group {
             previous = layer.pre();
         }
         Ok(())
+    }
+    /// One ordinary attention/source stage for the finite two-owner executor.
+    /// The caller completes both FFNs before asking for the following layer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_pair_layer(&mut self,index:usize,input:&Buffer<bf16>,pre:&Buffer<f32>,
+        positions:&Positions,locations:&RowLocations,candidates:&Candidates,tokens:&TokenRows,
+        metadata:&Metadata,comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(index<6&&!self.sequence_parallel(),"paired source group layer domain");
+        let input=if index==0 {
+            if let (Some(engram),Some(rows))=(&mut self.engram,&mut self.rows) {
+                engram.run(input,rows,tokens,comm,stream)?;engram.output()
+            }else{input}
+        }else{input};
+        let (previous,rest)=self.layers.split_at_mut(index);let layer=&mut rest[0];
+        let (input,pre)=previous.last().map_or((input,pre),|p|(p.output(),p.pre()));
+        if index==0 {
+            layer.run_indexed_from_previous(input,pre,positions,locations,&mut self.caches[index],
+                candidates,tokens,&mut self.source,metadata,comm,stream)
+        }else{
+            layer.run_shared_from_previous(input,pre,positions,locations,&mut self.caches[index],
+                candidates,tokens,&self.source,comm,stream)
+        }
     }
     /// The group's output is this rank's sequence-parallel row shard.
     pub(crate) fn sequence_parallel(&self) -> bool {

@@ -138,6 +138,20 @@ impl History {
             rows,
         })
     }
+    /// Prepare a fixed-width launch without counting masked padding as model
+    /// context. Preserve ordinary in-range padding hashes; beyond the context
+    /// edge, reuse a valid row that cannot affect any live causal position.
+    pub(crate) fn prepare_padded(&self, tokens: &[u32], live: usize, metadata: &HashMetadata) -> Result<HashBatch> {
+        ensure!(live > 0 && live <= tokens.len()
+            && tokens[live..].iter().all(|&id| id == metadata.pad_token), "invalid Engram live/padding extent");
+        let in_range = (1048576u64.saturating_sub(self.position)).min(tokens.len() as u64) as usize;
+        ensure!(live <= in_range, "Engram context limit");
+        let mut batch = self.prepare(&tokens[..in_range], metadata)?;
+        batch.rows.resize(tokens.len(), *batch.rows.last().unwrap());
+        // Even accidentally asking to publish a masked row must fail.
+        batch.tokens.truncate(live);
+        Ok(batch)
+    }
     /// Raw cache-read hints for one following chunk of already known prompt
     /// input. This preview neither publishes nor advances the causal history.
     /// Reuse the exact hashing path, including image barriers and left padding.
@@ -205,6 +219,29 @@ mod tests {
             primes,
             offsets,
             table_rows: [384000024; 2],
+        }
+    }
+    #[test]
+    fn masked_launch_padding_cannot_spend_context_or_be_committed() {
+        let m = meta();
+        for width in [6, 16, 128, 8192] {
+            for live in [1, 3, 5] {
+                let mut h = History::new(71); h.position = 1048576 - live as u64;
+                h.recent = [8, 129264, 9];
+                let mut tokens = vec![m.pad_token; width];
+                for (i, token) in tokens[..live].iter_mut().enumerate() { *token = 13 + i as u32; }
+                let batch = h.prepare_padded(&tokens, live, &m).unwrap();
+                assert_eq!(batch.rows.len(), width);
+                assert_eq!(&batch.rows[..live], h.prepare(&tokens[..live], &m).unwrap().rows);
+                let before = h.clone();
+                assert!(h.commit(batch, live + 1).is_err()); assert_eq!(h, before);
+                let batch = h.prepare_padded(&tokens, live, &m).unwrap();
+                h.commit(batch, live).unwrap(); assert_eq!(h.position, 1048576);
+                assert!(h.prepare_padded(&tokens, live, &m).is_err());
+                let mut ordinary = before; ordinary.position = 1024;
+                assert_eq!(ordinary.prepare_padded(&tokens, live, &m).unwrap().rows,
+                    ordinary.prepare(&tokens, &m).unwrap().rows);
+            }
         }
     }
     #[test]

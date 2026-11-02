@@ -92,7 +92,8 @@ impl Rejection {
     pub(crate) fn enable_history_expectation_probe(&mut self) -> Result<()> {
         ensure!((std::env::var("CANADA_SCRATCH_HISTORY_OPPORTUNITY").as_deref()==Ok("1")
             || std::env::var("CANADA_SCRATCH_REASONING_DRAFT_SCREEN").as_deref()==Ok("1")
-            || std::env::var("CANADA_SCRATCH_POST_THINKING_DRAFT_SCREEN").as_deref()==Ok("1"))
+            || std::env::var("CANADA_SCRATCH_POST_THINKING_DRAFT_SCREEN").as_deref()==Ok("1")
+            || std::env::var("CANADA_SCRATCH_MATCHED_PATH_SCREEN").as_deref()==Ok("1"))
             && self.shadow_expected.is_none(), "isolated history expectation probe");
         self.shadow_expected=Some(self.cuda.allocate(self.capacity*3+2)?);
         Ok(())

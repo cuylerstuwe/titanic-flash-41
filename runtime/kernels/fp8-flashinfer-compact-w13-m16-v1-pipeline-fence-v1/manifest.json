@@ -78,7 +78,7 @@
     "enable_pdl": true
   },
   "upstream_bundle": {
-    "path": "build-output",
+    "path": "build-reference",
     "hashes": {
       "manifest.json": "cf99509a78df80d9233925b30040757ba67cd6c244295ae6c3aee08a495fdb17",
       "bindings.json": "e24aa6dd185705657bde4ee4e623aed6a798cc646302770f0acb4c867463ac2a",

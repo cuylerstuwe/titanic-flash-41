@@ -2,7 +2,7 @@
 //! device kernel quantizes NOPE from FP32 registers, preserving SGLang's boundary.
 use crate::{
     attention::PagedKv,
-    cuda::{Buffer, Cuda, Stream},
+    cuda::{Buffer, Cuda, Module, Stream},
 };
 use anyhow::{Result, ensure};
 use half::bf16;
@@ -19,6 +19,24 @@ pub struct RowLocations {
     frequency_rows: usize,
 }
 impl RowLocations {
+    /// Publish metadata in the same stream as its consumers, so a following
+    /// chunk cannot overwrite an earlier store's positions or ring locations.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enqueue_ring(&mut self,cuda:&Cuda,module:&Module,start:usize,live:usize,
+        base:usize,ring:usize,stream:&Stream)->Result<()> {
+        ensure!(self.rows<=32&&live>0&&live<=self.rows&&ring>=self.rows
+            &&base.checked_add(ring).is_some_and(|n|n<=self.capacity)
+            &&start.checked_add(live).is_some_and(|n|n<=self.frequency_rows)
+            &&cuda.owns_stream(stream)&&cuda.owns_buffer(&self.positions)&&cuda.owns_buffer(&self.locations),
+            "queued KV ring metadata bounds/context");
+        let mut positions=self.positions.ptr();let mut locations=self.locations.ptr();
+        let mut rows=self.rows as u32;let mut live=live as u32;let mut start=start as u32;
+        let mut base=base as u32;let mut ring=ring as u32;
+        unsafe{module.function("ca_kv_ring_metadata")?.launch([1,1,1],[32,1,1],0,stream,&mut[
+            (&mut positions as *mut u64).cast(),(&mut locations as *mut u64).cast(),
+            (&mut rows as *mut u32).cast(),(&mut live as *mut u32).cast(),
+            (&mut start as *mut u32).cast(),(&mut base as *mut u32).cast(),(&mut ring as *mut u32).cast()])}
+    }
     pub fn update(&mut self, positions: &[i32], locations: &[i32]) -> Result<()> {
         ensure!(
             positions.len() == self.rows

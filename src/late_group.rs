@@ -112,9 +112,10 @@ impl Group {
             None,
             None,
             4,
+            None,
         )
     }
-    pub fn new_rows(
+    pub(crate) fn new_rows(
         cuda: &Cuda,
         module: &Module,
         core: &[u8],
@@ -132,6 +133,7 @@ impl Group {
         vendor_blas: Option<Rc<Blas>>,
         medium_woa: Option<Rc<std::cell::RefCell<crate::woa_medium::Scratch>>>,
         swa_pages: usize,
+        mut reserved: Option<&mut crate::weights::StagedReservation>,
     ) -> Result<Self> {
         ensure!(
             [4, 8, 12, 16, 20].contains(&stages.len()) && frequency.compressed(),
@@ -154,7 +156,7 @@ impl Group {
         let blas = vendor_blas.clone();
         for (i, stage) in stages.iter().enumerate() {
             let id = i + 20;
-            let mut w = Weights::load_staged(cuda, cp, plan, &[&format!("layers.{id}.")], stage)?;
+            let mut w = Weights::load_staged_reserved(cuda, cp, plan, &[&format!("layers.{id}.")], stage, reserved.as_deref_mut())?;
             atlas_bytes.push(w.bytes());
             source_hashes.push(w.source_sha256.clone());
             let prepared = expert_packing::prepare_layer(cuda, module, &mut w, id)?;
@@ -233,7 +235,12 @@ impl Group {
         vendor_blas: Rc<Blas>,
         medium_woa: Option<Rc<std::cell::RefCell<crate::woa_medium::Scratch>>>,
         wide: Option<&crate::decoder::WideBuild>,
+        narrow_moe: Option<Rc<crate::moe::Workspace>>,
+        independent: bool,
     ) -> Result<Self> {
+        ensure!(wide.is_none() || narrow_moe.is_none(),"exclusive wide/narrow shared workspaces");
+        ensure!(!independent || (num_rows==128 && phase==Phase::Extend && wide.is_none()
+            && self.source.cache().page_tokens()==64),"independent group geometry");
         ensure!(!self.encoder_only, "fork from a complete late group");
         let mut layers = Vec::new();
         let mut source = None;
@@ -254,7 +261,7 @@ impl Group {
                     old.prepared_layout(),
                     kernels,
                     frequency.clone(),
-                    if moe.is_some() { InputMode::Fused } else { InputMode::Split(rank) },
+                    if wide.is_some() { InputMode::Fused } else { InputMode::Split(rank) },
                     num_rows,
                     Some(vendor_blas.clone()),
                     medium_woa.clone(),
@@ -264,10 +271,10 @@ impl Group {
             };
             layers.push(match wide {
                 Some(w) => w.layer(cuda, id, |moe, sp| build(Some(moe), sp))?,
-                None => build(None, None)?,
+                None => build(narrow_moe.clone(), None)?,
             });
             if i == 0 {
-                source = Some(Source::new_rows_shared(
+                source = Some(Source::new_rows_owner(
                     cuda,
                     stream,
                     weights,
@@ -282,7 +289,7 @@ impl Group {
                     &vec![0; num_rows],
                     num_rows,
                     phase,
-                    &self.source,
+                    (!independent).then_some(&self.source),
                 )?);
             } else if id % 4 == 0 {
                 indices.push(ReadIndex::new(
@@ -309,7 +316,9 @@ impl Group {
         Ok(Self {
             encoder_only,
             layers,
-            caches: self.caches.clone(),
+            caches: if independent {self.caches.iter()
+                .map(|c|PagedKv::new(cuda,c.pages(),c.page_tokens())).collect::<Result<Vec<_>>>()?}
+                else {self.caches.clone()},
             source,
             indices,
             atlas_bytes: self.atlas_bytes.clone(),
@@ -501,6 +510,29 @@ impl Group {
         }
         Ok(())
     }
+    /// Ordinary source20/decoder attention, one layer at a time for a pair.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_pair_layer(&mut self,index:usize,input:&Buffer<bf16>,pre:&Buffer<f32>,
+        positions:&Positions,locations:&RowLocations,candidates:&Candidates,tokens:&TokenRows,
+        metadata:&Metadata,comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(index<20&&!self.encoder_only&&!self.encoder_sequence_parallel(),"paired late layer domain");
+        let (previous,rest)=self.layers.split_at_mut(index);let layer=&mut rest[0];
+        let (input,pre)=previous.last().map_or((input,pre),|p|(p.output(),p.pre()));
+        let id=index+20;let cache=&mut self.caches[index];
+        if index==0 {
+            layer.run_indexed_from_previous(input,pre,positions,locations,cache,candidates,tokens,
+                &mut self.source,metadata,comm,stream)
+        }else if id<24 {
+            layer.run_shared_candidates_from_previous(input,pre,positions,locations,cache,candidates,tokens,
+                &self.source,self.source.candidates(),comm,stream)
+        }else if id%4==0 {
+            layer.run_reindexed_from_previous(input,pre,positions,locations,cache,candidates,tokens,
+                &self.source,&mut self.indices[(id-24)/4],metadata,None,comm,stream)
+        }else{
+            layer.run_selected_from_previous(input,pre,positions,locations,cache,candidates,tokens,
+                &self.source,&self.indices[(id/4*4-24)/4],comm,stream)
+        }
+    }
     pub fn output(&self) -> &Buffer<bf16> {
         self.layers.last().unwrap().output()
     }
@@ -521,6 +553,11 @@ impl Group {
     }
     pub(crate) fn caches(&self) -> &[PagedKv] {
         &self.caches
+    }
+    pub(crate) fn share_consumer_score_scratch(&mut self, storage: Rc<Buffer<f32>>) -> Result<usize> {
+        let mut bytes=0;
+        for index in &mut self.indices {bytes+=index.share_score_scratch(storage.clone())?;}
+        Ok(bytes)
     }
     pub(crate) fn index(&self, layer: usize) -> Option<&ReadIndex> {
         self.indices.iter().find(|i| i.layer_id() == layer)

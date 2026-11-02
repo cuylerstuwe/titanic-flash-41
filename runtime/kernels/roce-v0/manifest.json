@@ -48,6 +48,19 @@
     "slots": 2
   },
   "proxy_abi": 3,
-  "proxy_source_sha256": "a35f54cf75d6abf2427c5d144300647685816060348883d2cbf51d153efc5c70",
-  "proxy_library_sha256": "5b879dc929ca829ef6b38581136b00576debff7bbcdc7a498f5266c52b6025ad"
+  "proxy_source_sha256": "606a15285d8c728748197e9057a87d7f843027f5d650ee9ff0f6da882333157e",
+  "proxy_library_sha256": "648db88e8886b2455da4bef0d7bd13336fffe72be77622e8b1d37b2d779ac0c0",
+  "traffic_class": 106,
+  "proxy_compile_command": [
+    "gcc",
+    "-O3",
+    "-shared",
+    "-fPIC",
+    "-std=c11",
+    "-pthread",
+    "_roce_proxy.c",
+    "-o",
+    "libcanada_roce_proxy.so",
+    "-libverbs"
+  ]
 }

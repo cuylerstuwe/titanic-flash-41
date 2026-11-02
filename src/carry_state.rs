@@ -73,10 +73,10 @@ impl Snapshot {
     ) -> Result<usize> {
         ensure!(
             live > 0
-                && live <= 16
+                && live <= 32
                 && accepted <= live
                 && self.rings.len() == 3
-                && self.rings.iter().all(|r| [8 * 1024, 32 * 1024].contains(&r.saved.len())
+                && self.rings.iter().all(|r| [8 * 1024, 32 * 1024, 64 * 1024].contains(&r.saved.len())
                     && live < r.saved.len() / 1024)
                 && self.rings.iter().all(|r| r.saved.len() == self.rings[0].saved.len()),
             "canonical verification carry geometry"

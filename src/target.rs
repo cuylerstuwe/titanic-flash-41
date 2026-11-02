@@ -25,13 +25,51 @@ use crate::{
     sampling::Greedy,
     weights::Weights,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
     time::Instant,
 };
+
+#[path = "paired_model_probe.rs"]
+mod paired_model_probe;
+pub(crate) use paired_model_probe::PairExecutor;
+#[path = "published_state_probe.rs"]
+mod published_state_probe;
+
+thread_local! {
+    static PREFILL_BOUNDARY_TRACE: std::cell::RefCell<Option<Vec<serde_json::Value>>>
+        = const {std::cell::RefCell::new(None)};
+    static RESTORE_INITIAL_LOGITS: std::cell::RefCell<Option<Vec<u8>>>
+        = const {std::cell::RefCell::new(None)};
+}
+pub(crate) fn take_restore_initial_logits_for_probe()->Result<Vec<u8>> {
+    ensure!(std::env::var("CANADA_SCRATCH_RESTORE_INITIAL_SCREEN").as_deref()==Ok("1"),
+        "initial logits require the finite restore diagnostic");
+    RESTORE_INITIAL_LOGITS.with(|cell|cell.borrow_mut().take()
+        .context("initial diagnostic did not observe a target draw"))
+}
+pub(crate) fn begin_prefill_boundary_trace_for_probe()->Result<()> {
+    ensure!(std::env::var("CANADA_SCRATCH_PEER_PREFILL_TRACE").as_deref()==Ok("1")
+        &&std::env::var("CANADA_SCRATCH_PEER_PREFILL_NUMERICS").as_deref()==Ok("1")
+        &&std::env::var("CANADA_SCRATCH_PEER_PREFILL_SCREEN").as_deref()==Ok("1"),
+        "finite prefill boundary trace admission");
+    PREFILL_BOUNDARY_TRACE.with(|cell|->Result<()>{
+        let mut value=cell.borrow_mut();ensure!(value.is_none(),"nested prefill trace");
+        *value=Some(Vec::new());Ok(())
+    })
+}
+pub(crate) fn take_prefill_boundary_trace_for_probe()->Result<Vec<serde_json::Value>> {
+    PREFILL_BOUNDARY_TRACE.with(|cell|cell.borrow_mut().take()
+        .ok_or_else(||anyhow::anyhow!("prefill trace not started")))
+}
+
+pub(crate) struct PrefillProgress {
+    pub done: usize,
+    pub remaining_chunks: Vec<usize>,
+}
 
 #[derive(serde::Serialize)]
 pub struct AppendMetrics {
@@ -64,7 +102,7 @@ pub const ROWS: usize = 6;
 /// Same-owner lossless device image. It does not retain weights, communicator
 /// sequence numbers, output buffers or pending speculative transactions.
 pub(crate) struct StateImage {
-    image: crate::state_image::Image,
+    image: crate::state_image::Storage,
     owner: crate::session_lease::Lease,
     history: History,
     context: usize,
@@ -72,13 +110,38 @@ pub(crate) struct StateImage {
     stream: usize,
     compact: bool,
 }
+/// Finite replay diagnostics also compare whole final pages. Preserve their
+/// not-yet-published slack across arms; normal serving correctly omits it.
+pub(crate) struct RepeatPhysicalImage {
+    image: crate::state_image::Image,
+    frontier: usize,
+    extent: usize,
+}
 /// An encoder prefix is deliberately not a complete target/session image.
 /// Restoring it either evaluates a suffix of at least128 tokens or explicitly
 /// reconstructs the bounded decoder tail before returning a complete owner.
-pub(crate) struct EncoderPrefixImage(StateImage);
+pub(crate) struct EncoderPrefixImage(StateImage, Option<bank_encoder_lineage::Binding>);
+#[path = "bank_encoder_lineage.rs"]
+mod bank_encoder_lineage;
+pub(crate) use bank_encoder_lineage::Witness as BankEncoderWitness;
+#[path = "bank_encoder_checkpoint.rs"]
+mod bank_encoder_checkpoint;
 impl EncoderPrefixImage {
     pub(crate) fn bytes(&self)->usize {self.0.bytes()}
     pub(crate) fn position(&self)->usize {self.0.history.position as usize}
+    pub(crate) fn lineage(&self)->u64 {self.0.history.lineage}
+    /// Payload stays immutable; the binding identifies the bank lineage that
+    /// still owns the omitted prefix. Restoring this image can rebind it;
+    /// reset or an unrelated rewind cannot.
+    pub(crate) fn bank_retained(&self)->bool {self.1.is_some()}
+    pub(crate) fn binding_bytes()->usize {
+        if crate::config::bank_encoder_checkpoint_requested(){bank_encoder_lineage::Binding::HEAP_BYTES}else{0}
+    }
+    pub(crate) fn digest_for_import_probe(&self)->Result<String> {
+        ensure!(std::env::var("CANADA_SCRATCH_ENCODER_PREFIX_IMPORT_SCREEN").as_deref()==Ok("1"),
+            "encoder image digest requires finite import screen");
+        self.0.digest()
+    }
     #[cfg(feature = "storage-fault-injection")]
     pub(crate) fn retention_digest(&self)->Result<serde_json::Value> {
         Ok(serde_json::json!({"bytes":self.0.bytes(),"image":self.0.digest()?,"causal_history":self.0.causal_history()}))
@@ -88,10 +151,11 @@ impl EncoderPrefixImage {
 /// Never release it before a successor exists: optional allocation can refuse.
 pub(crate) enum EncoderPrefixRestore<'a> {
     Borrowed(&'a EncoderPrefixImage,u64),
+    Imported(&'a EncoderPrefixImage,&'a Target,u64),
 }
 impl EncoderPrefixRestore<'_> {
     fn image_and_lineage(&self)->(&EncoderPrefixImage,u64) {
-        match self {Self::Borrowed(image,lineage)=>(*image,*lineage)}
+        match self {Self::Borrowed(image,lineage)|Self::Imported(image,_,lineage)=>(*image,*lineage)}
     }
 }
 fn encoder_checkpoint_enabled()->bool {
@@ -123,6 +187,7 @@ pub(crate) fn defer_checkpoint_decoder128()->Result<bool> {
     }
 }
 impl StateImage {
+    pub(crate) fn exchangeable(&self)->bool {matches!(self.image,crate::state_image::Storage::Exchange(_))}
     pub(crate) fn manifest(&self) -> serde_json::Value {
         let mut value=self.image.manifest();value["compact"]=serde_json::json!(self.compact);value
     }
@@ -455,6 +520,8 @@ pub struct Target {
     prefill_partial1024_rows: u8,
     prefill_mhc_live_rows: bool,
     prefill_mhc_live_norm: bool,
+    prefill_blocking_wait: bool,
+    verification_poll_us: u64,
     verification_mhc_live_rows: usize,
     // Destroy captured executables before their owned pointer storage. Each
     // live-row count has a distinct collective capture identity. Retain those
@@ -477,6 +544,9 @@ pub struct Target {
     // Validated first-use optimization. Recording a graph does not execute
     // it: retain the successful eager prefill instead of immediately replaying.
     prefill_capture_once: bool,
+    // Opt-in first-use verification experiment. Keep the successful eager
+    // result pending while recording its future replay, without executing twice.
+    verification_capture_once: bool,
     carry_snapshot: Option<crate::carry_state::Snapshot>,
     carry_saved_start: Option<u64>,
     repeatable_frontier_measurement: bool,
@@ -489,6 +559,10 @@ pub struct Target {
     graph_replay: bool,
     prefill_last_head: bool,
     comm_instance: Option<u64>,
+    // Its sampling graph references IO's local head, so drop before IO.
+    compact_categorical: Option<crate::sharded_categorical_probe::CompactSampler>,
+    compact_sampling_enabled: bool,
+    last_head_local_only: bool,
     cuda: Cuda,
     io: ModelIo,
     sampler: Greedy,
@@ -522,6 +596,10 @@ pub struct Target {
     sp_full: Option<(Buffer<bf16>, Buffer<f32>)>,
     rank: usize,
     stream: usize,
+    // Profiles share transient scores only; graph pointers stay stable and
+    // the existing revision lease still permits exactly one target writer.
+    index_score_arena: Option<Rc<Buffer<f32>>>,
+    index_score_logical_bytes: usize,
     pub atlas_bytes: Vec<usize>,
     pub source_hashes: Vec<String>,
 }
@@ -571,15 +649,27 @@ impl Target {
                 && (rows == 6 || source_phase == Phase::Extend),
             "complete TP4 target construction"
         );
-        if rows > 8 && crate::woa_medium::cached_policy()? {
-            let derived = 40 * 2048 * 4096 * 2usize;
-            ensure!(cuda.admission_memory()?.admitted_available
-                > plan.device_weight_bytes as usize + derived + 8 * 1024usize.pow(3),
-                "target weights plus exact WO-A cache would consume reserved headroom");
-        }
         hashes.validate()?;
         cuda.qualify_gb10()?;
         ensure!(cuda.owns_stream(stream), "target stream context");
+        // An external parent has already physically allocated the target
+        // atlases. Validate and import them before crediting any such bytes
+        // in admission. The environment flag alone is not an admission credit.
+        let mut reserved_weights=if crate::weights::external_target_pool_path()?.is_some() {
+            Some(crate::weights::StagedReservation::target_layers(cuda,cp,plan,stages)?)
+        }else{None};
+        if rows > 8 && crate::woa_medium::cached_policy()? {
+            let derived = 40 * 2048 * 4096 * 2usize;
+            let remaining=(plan.device_weight_bytes as usize)
+                .checked_sub(reserved_weights.as_ref().map_or(0,|r|r.already_allocated_bytes()))
+                .context("imported target weights exceed model weight forecast")?;
+            ensure!(cuda.admission_memory()?.admitted_available
+                > remaining + derived + 8 * 1024usize.pow(3),
+                "target weights plus exact WO-A cache would consume reserved headroom");
+        }
+        if reserved_weights.is_none() && crate::weights::early_layer_reservation_requested()? {
+            reserved_weights=Some(crate::weights::StagedReservation::target_layers(cuda,cp,plan,stages)?);
+        }
         let swa_layout = if std::env::var("CANADA_SCRATCH_SWA_RING").as_deref() == Ok("wide16384") {
             crate::swa_layout::Layout::WideRing16384
         } else if std::env::var("CANADA_SCRATCH_SWA_RING").as_deref() == Ok("wide8192") {
@@ -619,9 +709,9 @@ impl Target {
         // Reject an inconsistent retained-state geometry before loading all
         // forty weight atlases, rather than at later cache activation.
         crate::decoder_tail::Cache::validate_capacity(context, single_pages * page_tokens)?;
-        let vendor_blas = Rc::new(Blas::new(cuda)?);
+        let vendor_blas = Rc::new(Blas::new_on(cuda,stream)?);
         let medium_woa = if rows == 128 {
-            Some(crate::woa_medium::Scratch::new(cuda, core_bytes, rows)?)
+            Some(crate::woa_medium::Scratch::new_on(cuda, core_bytes, rows,stream)?)
         } else {
             None
         };
@@ -632,7 +722,7 @@ impl Target {
         let mut source_hashes = Vec::new();
         for (layer, stage) in stages[..8].iter().enumerate() {
             let mut w =
-                Weights::load_staged(cuda, cp, plan, &[&format!("layers.{layer}.")], stage)?;
+                Weights::load_staged_reserved(cuda, cp, plan, &[&format!("layers.{layer}.")], stage, reserved_weights.as_mut())?;
             atlas_bytes.push(w.bytes());
             source_hashes.push(w.source_sha256.clone());
             let prepared = expert_packing::prepare_layer(cuda, core, &mut w, layer)?;
@@ -695,6 +785,7 @@ impl Target {
             Some(vendor_blas.clone()),
             medium_woa.clone(),
             swa_pages,
+            reserved_weights.as_mut(),
         )?;
         let group14 = crate::source_group::Group::new_rows(
             cuda,
@@ -716,6 +807,7 @@ impl Target {
             Some(vendor_blas.clone()),
             medium_woa.clone(),
             swa_pages,
+            reserved_weights.as_mut(),
         )?;
         let late = crate::late_group::Group::new_rows(
             cuda,
@@ -735,7 +827,12 @@ impl Target {
             Some(vendor_blas.clone()),
             medium_woa.clone(),
             swa_pages,
+            reserved_weights.as_mut(),
         )?;
+        if let Some(reservation)=reserved_weights {
+            eprintln!("rank{} early layer weight reservation consumed: {} bytes, individually owned buffers, lossless_compression={}",
+                plan.rank,reservation.finish()?,crate::weights::compressed_target_weights_requested()?);
+        }
         for (bytes, hashes) in [
             (&group8.atlas_bytes, &group8.source_hashes),
             (&group14.atlas_bytes, &group14.source_hashes),
@@ -786,6 +883,11 @@ impl Target {
             },
             prefill_mhc_live_rows: short_prefill_rows_enabled("CANADA_SCRATCH_PREFILL_MHC_LIVE_ROWS")?,
             prefill_mhc_live_norm: short_prefill_rows_enabled("CANADA_SCRATCH_PREFILL_MHC_LIVE_NORM")?,
+            prefill_blocking_wait: match std::env::var("CANADA_SCRATCH_PREFILL_BLOCKING_WAIT").as_deref() {
+                Err(std::env::VarError::NotPresent)|Ok("0")=>false,Ok("1")=>true,
+                _=>anyhow::bail!("prefill blocking wait must be0or1"),
+            },
+            verification_poll_us: Self::verification_poll_us_requested()?,
             verification_mhc_live_rows: verification_mhc_live_row_limit()?,
             tiny_prefix_sum: source_phase==Phase::Verify && [6,16].contains(&rows)
                 && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1"),
@@ -818,6 +920,14 @@ impl Target {
                 Err(std::env::VarError::NotPresent) => true,
                 Err(error) => return Err(error.into()),
             },
+            verification_capture_once: match std::env::var("CANADA_SCRATCH_VERIFY_CAPTURE_ONCE") {
+                Ok(value) => {
+                    ensure!(value == "0" || value == "1", "invalid verification capture policy");
+                    value == "1"
+                }
+                Err(std::env::VarError::NotPresent) => false,
+                Err(error) => return Err(error.into()),
+            },
             carry_snapshot: None,
             carry_saved_start: None,
             repeatable_frontier_measurement: false,
@@ -834,6 +944,9 @@ impl Target {
             io,
             sampler: Greedy::new(cuda, core_bytes, rows)?,
             categorical: crate::categorical::Categorical::new(cuda, core_bytes, rows)?,
+            compact_categorical: None,
+            compact_sampling_enabled: false,
+            last_head_local_only: false,
             last_live: 0,
             last_append_metrics: None,
             pending: None,
@@ -860,9 +973,12 @@ impl Target {
             sp_full: None,
             rank: plan.rank,
             stream: stream.raw() as usize,
+            index_score_arena: None,
+            index_score_logical_bytes: 0,
             atlas_bytes,
             source_hashes,
         };
+        target.share_index_scores_before_capture(cuda,stream)?;
         target.share_narrow_moe_before_capture(cuda,stream)?;
         target.install_communication_hints(core, stream)?;
         Ok(target)
@@ -879,9 +995,74 @@ impl Target {
         rows: usize,
         phase: Phase,
     ) -> Result<Self> {
-        ensure!([6, 128].contains(&rows) || (rows == 16 && phase == Phase::Verify
-            && crate::config::verification_carry_rows() == 32), "shared execution row profile");
-        self.fork_profile_in(core, core_bytes, stream, kernels, rows, phase, None)
+        ensure!([6, 128].contains(&rows) || ([16,32].contains(&rows) && phase == Phase::Verify
+            && crate::config::verification_rows(rows)
+            && crate::config::verification_carry_rows() > rows), "shared execution row profile");
+        self.fork_profile_in(core, core_bytes, stream, kernels, rows, phase, None, None)
+    }
+    /// All narrow profiles of one owner run sequentially. The two owners use
+    /// different prefill parity arenas, so pairedM6 keeps disjoint transients.
+    /// Causal/constant storage uses allocate(), outside allocate_rows() loans.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fork_profile_lending_prefill_for_probe(
+        &self,core:&Module,core_bytes:&[u8],stream:&Stream,kernels:&Path,
+        rows:usize,phase:Phase,donor:&Self,
+    )->Result<Self> {
+        ensure!(std::env::var("CANADA_SCRATCH_NARROW_ARENA_LOAN_SCREEN").as_deref()==Ok("1")
+            &&crate::config::shared_owner_profiles_requested()
+            &&[6,16,32].contains(&rows)&&phase==Phase::Verify
+            &&self.position()==0&&donor.position()==0&&self.stream==donor.stream
+            &&self.context==donor.context&&self.rank==donor.rank,
+            "finite narrow arena loan needs fresh same-stream profiles");
+        let shared=self.shared_state_report(donor);
+        ensure!(shared["all40layer_atlases_shared"]==true&&shared["IO_atlas_shared"]==true,
+            "narrow arena loan model identity");
+        let slot=usize::from(!self.lease.shares_owner(&donor.lease));
+        let arena=donor.wide.as_ref().context("narrow arena donor")?.transient_arena_for_probe(slot)?;
+        self.cuda.with_row_arena(&arena,||self.fork_profile(core,core_bytes,stream,kernels,rows,phase))
+    }
+    pub(crate) fn independent_probe_context_admitted(context:usize)->bool {
+        context<=65536 || (context<=crate::config::MODEL_CONTEXT
+            &&(std::env::var("CANADA_SCRATCH_PAIRED_LONG_CONTEXT_SCREEN").as_deref()==Ok("1")
+                ||crate::config::resident_banks_requested()))
+    }
+    /// Finite two-owner prototype. Only immutable weights, rotary tables and
+    /// key-addressed Engram row stores are shared. Neither causal storage nor
+    /// prompt-media bindings, history or revision authority cross the boundary.
+    /// The small-context gate is diagnostic admission, never a serving limit.
+    pub(crate) fn independent_owner_for_probe(
+        &self, core: &Module, core_bytes: &[u8], stream: &Stream,
+        kernels: &Path, lineage: u64, prefill_arena:Option<&Self>,
+    ) -> Result<Self> {
+        ensure!((std::env::var("CANADA_SCRATCH_INDEPENDENT_OWNER_SCREEN").as_deref()==Ok("1")
+                ||crate::config::resident_banks_requested())
+            && self.rows==128 && self.source_phase==Phase::Extend && self.wide.is_none()
+            && self.position()==0 && self.pending.is_none() && self.encoder_cache.is_some()
+            && Self::independent_probe_context_admitted(self.context) && lineage>self.history.lineage,
+            "independent owner requires an admitted fresh bounded prototype");
+        let causal_bytes=self.state_image_regions(1,false)?.iter().map(|r|r.bytes()).sum::<usize>();
+        // Includes private row scratch and transient construction before the
+        // new owner coalesces its index arenas. Keep the physical floor intact.
+        ensure!(self.cuda.admission_memory()?.admitted_available
+            > causal_bytes + 4*1024usize.pow(3) + 8*1024usize.pow(3),
+            "independent owner construction would consume reserved headroom");
+        let build=||self.fork_profile_in(core,core_bytes,stream,kernels,128,Phase::Extend,None,Some(lineage));
+        let mut target=if let Some(donor)=prefill_arena {
+            ensure!(crate::config::shared_owner_profiles_requested()
+                &&self.shared_state_report(donor)["all_weights_and_causal_storage_shared"]==true
+                &&donor.position()==0&&self.stream==donor.stream,"independent construction arena authority");
+            let arena=donor.wide.as_ref().context("independent prefill arena donor")?.transient_arena_for_probe(1)?;
+            self.cuda.with_row_arena(&arena,build)?
+        }else{build()?};
+        target.enable_decoder_tail(core_bytes)?;
+        if self.cached_decoder.is_some() {target.enable_cached_extend_floor()?;}
+        target.set_graph_replay(self.graph_replay)?;
+        target.set_prefill_last_head(self.prefill_last_head)?;
+        ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3),
+            "independent owner consumed physical reserve");
+        ensure!(self.independent_state_report(&target)?["independent_causal_owners"]==true,
+            "independent owner construction retained shared mutable state");
+        Ok(target)
     }
     /// Encoder-only wide EXTEND profile over the same atlases, causal storage,
     /// Engram stores and encoder-tail ring. It runs layers0..20 over up to
@@ -929,11 +1110,45 @@ impl Target {
         Ok(bank)
     }
     /// Optional sharing is restricted to sequential profiles of this same
-    /// model/state owner. It never aliases persistent state or MoE route scratch.
+    /// model/state owner. It never aliases persistent state. The separately
+    /// gated wide-MoE experiment also lends route scratch with a layout-change
+    /// clear before each encoder capture/replay.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fork_wide_with_arenas(
         &self, core: &Module, core_bytes: &[u8], stream: &Stream, kernels: &Path,
         rows: usize, sequence_parallel: bool, share: Option<&Self>,
+    ) -> Result<Self> {
+        self.fork_wide_with_arenas_in(core,core_bytes,stream,kernels,rows,sequence_parallel,share,false)
+    }
+    /// Two private causal owners still prefill sequentially. Lend only the
+    /// existing transient parity/candidate arenas, with one ordered stream;
+    /// the separately gated same-width MoE loan keeps that sequential contract.
+    /// This finite experiment keeps both complete width banks available.
+    pub(crate) fn fork_peer_wide_bank_for_probe(
+        &self,core:&Module,core_bytes:&[u8],stream:&Stream,kernels:&Path,owner:&Self,peer:&[Self],
+    )->Result<Vec<Self>> {
+        ensure!(crate::config::shared_owner_profiles_requested()
+            &&self.context==crate::config::MODEL_CONTEXT,"finite peer wide-bank admission");
+        let largest=peer.iter().max_by_key(|t|t.rows).context("peer wide bank")?;
+        // Complete owners expose every causal region; a wide profile exposes
+        // only the encoder's execution layers and cannot be image-audited.
+        ensure!(self.independent_state_report(owner)?["independent_causal_owners"]==true
+            &&owner.shared_state_report(largest)["all_weights_and_causal_storage_shared"]==true,
+            "peer arena donor must belong to the audited independent owner");
+        let mut widths=peer.iter().map(|t|t.rows).collect::<Vec<_>>();widths.sort_unstable();
+        ensure!(widths==[512,1024,2048,4096,8192],"preserve the complete serving width bank");
+        widths.reverse();
+        widths.into_iter().map(|rows| {
+            let donor=if std::env::var("CANADA_SCRATCH_PEER_WIDE_MOE_SHARE_SCREEN").as_deref()==Ok("1") {
+                peer.iter().find(|p|p.rows==rows).context("matching peer MoE geometry")?
+            }else{largest};
+            self.fork_wide_with_arenas_in(core,core_bytes,stream,kernels,rows,true,Some(donor),true)
+        }).collect()
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn fork_wide_with_arenas_in(
+        &self, core: &Module, core_bytes: &[u8], stream: &Stream, kernels: &Path,
+        rows: usize, sequence_parallel: bool, share: Option<&Self>, peer_owner:bool,
     ) -> Result<Self> {
         let share_candidates = match std::env::var("CANADA_SCRATCH_SHARED_CANDIDATE_SCRATCH") {
             Ok(value) => {
@@ -957,20 +1172,41 @@ impl Target {
             "wide prefill needs a decoder-tail owner and enough logical/physical SWA capacity"
         );
         if let Some(prior) = share {
+            let shared=self.shared_state_report(prior);
+            let ownership=if peer_owner {
+                crate::config::shared_owner_profiles_requested()
+                    &&self.context==prior.context&&!self.lease.shares_owner(&prior.lease)
+                    &&shared["all40layer_atlases_shared"]==true&&shared["IO_atlas_shared"]==true
+                    &&shared["Engram_row_stores_shared"]==true&&shared["encoder_tail_cache_shared"]==false
+            }else{shared["all_weights_and_causal_storage_shared"]==true};
             ensure!(std::env::var("CANADA_SCRATCH_SHARED_WIDE_ARENAS").as_deref()==Ok("1")
                 && prior.wide.is_some() && prior.rows >= rows
                 && self.rank==prior.rank && self.stream==prior.stream
                 && self.history.position == 0 && prior.history.position == 0
                 && prior.encoder_graph.is_none() && prior.graphs.iter().all(Option::is_none)
-                && self.shared_state_report(prior)["all_weights_and_causal_storage_shared"]==true,
-                "shared wide arenas require the admitted same-owner construction");
+                && ownership,
+                "shared wide arenas require admitted sequential construction");
+        }else{
+            ensure!(!peer_owner,"peer wide arena source missing");
         }
         if self.context > 65536 {
             // Conservative preflight for the largest new arenas, in addition
             // to the unchanged atlas/cgroup guards. Lazy vendor scratch and
             // the draft network still need reserve after profile construction.
+            let candidates=if crate::candidates::compact_construction_requested() {
+                ensure!(sequence_parallel&&self.context==1048576
+                    &&std::env::var("CANADA_SCRATCH_LOCAL_CANDIDATE_SCORES").as_deref()==Ok("1")
+                    &&std::env::var("CANADA_SCRATCH_ROW_SHARDED_PUBLISHER").as_deref()!=Ok("0"),
+                    "compact candidate preflight geometry");
+                // Two compact score/mask allocations coexist briefly while
+                // finalizing the retained layout, plus selectors and indices.
+                // Full-profile v5 exposed additional non-candidate storage
+                // beyond the compact buffers. Retain2GiB for that construction
+                // until its actual immutable/transient duplication is removed.
+                256*1024usize.pow(2)+2*1024usize.pow(3)
+            }else{rows * self.context.div_ceil(8) * 5};
             let planned = if share.is_some() {0}else{rows * wide_arena_bytes_per_row(sequence_parallel) * 2}
-                + rows * self.context.div_ceil(8) * 5
+                + candidates
                 + self.context * 170 + 4 * 64 * 1024 * 1024;
             ensure!(self.cuda.admission_memory()?.admitted_available > planned + 8 * 1024usize.pow(3),
                 "full-context wide profile would consume reserved host/device headroom");
@@ -991,6 +1227,7 @@ impl Target {
             rows,
             Phase::Extend,
             Some(wide.clone()),
+            None,
         )?;
         if share_candidates && let Some(prior) = share {
             // fork_profile_in synchronizes initialization before the private
@@ -999,12 +1236,13 @@ impl Target {
             target.late.source_mut().share_candidate_scratch_from(prior.late.source())?;
         }
         if sequence_parallel {
-            target.sp_full = Some((
-                self.cuda.allocate(rows * 20480)?,
-                self.cuda.allocate(rows * 4)?,
-            ));
+            let build=||->Result<_>{Ok((self.cuda.allocate_rows(rows*20480)?,self.cuda.allocate_rows(rows*4)?))};
+            target.sp_full=Some(if let Some(arena)=wide.gather_arena() {
+                self.cuda.with_row_arena(arena,build)?
+            }else{build()?});
         }
         target.prefill_last_head = true;
+        self.cuda.report_allocation_sites(&format!("rank{} wideM{rows} peer={peer_owner}",self.rank))?;
         Ok(target)
     }
     /// Engram RAM row-cache counters (shared by every profile of this target).
@@ -1034,6 +1272,7 @@ impl Target {
         rows: usize,
         phase: Phase,
         wide: Option<Rc<crate::decoder::WideBuild>>,
+        fresh_lineage: Option<u64>,
     ) -> Result<Self> {
         ensure!(
             self.lease.is_current()
@@ -1048,7 +1287,14 @@ impl Target {
             rows == 6 || self.source2.cache().page_tokens() == 64,
             "medium prefill requires64-token shared compressed pages"
         );
+        let independent=fresh_lineage.is_some();
+        ensure!(!independent || (rows==128 && phase==Phase::Extend && wide.is_none()
+            && self.position()==0 && fresh_lineage.unwrap()>self.history.lineage),
+            "independent profile geometry and lineage");
         let cuda = &self.cuda;
+        let early_caches=if independent {self.early_caches.iter()
+            .map(|c|PagedKv::new(cuda,c.pages(),c.page_tokens())).collect::<Result<Vec<_>>>()?}
+            else {self.early_caches.clone()};
         let pair_slots = (COMPRESSED_OFFSET..COMPRESSED_OFFSET + self.context / 2)
             .map(|s| s as i32)
             .collect::<Vec<_>>();
@@ -1056,10 +1302,15 @@ impl Target {
             .map(|s| s as i32)
             .collect::<Vec<_>>();
         let medium_woa = if rows > 8 {
-            Some(crate::woa_medium::Scratch::new(cuda, core_bytes, rows)?)
+            Some(crate::woa_medium::Scratch::new_on(cuda, core_bytes, rows,stream)?)
         } else {
             None
         };
+        let share_narrow_during_build=match std::env::var("CANADA_SCRATCH_NARROW_MOE_CONSTRUCTION") {
+            Ok(v)=>{ensure!(v=="0"||v=="1","invalid construction-time MoE sharing policy");v=="1"},
+            Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
+        } && wide.is_none() && SwaLayer::narrow_workspace_sharing_enabled(rows);
+        let mut narrow_moe=None;
         let mut early = Vec::new();
         let mut source2 = None;
         for (id, old) in self.early.iter().enumerate() {
@@ -1077,7 +1328,7 @@ impl Target {
                     } else {
                         self.compressed.clone()
                     },
-                    if moe.is_some() {
+                    if wide.is_some() {
                         InputMode::Fused
                     } else {
                         InputMode::Split(self.rank)
@@ -1091,10 +1342,13 @@ impl Target {
             };
             early.push(match &wide {
                 Some(w) => w.layer(cuda, id, |moe, sp| build(Some(moe), sp))?,
-                None => build(None, None)?,
+                None => build(narrow_moe.clone(), None)?,
             });
+            if id==0 && share_narrow_during_build {
+                narrow_moe=Some(early[0].narrow_workspace());
+            }
             if id == 2 {
-                source2 = Some(Source::new_rows_shared(
+                source2 = Some(Source::new_rows_owner(
                     cuda,
                     stream,
                     weights,
@@ -1109,7 +1363,7 @@ impl Target {
                     &vec![0; rows],
                     rows,
                     phase,
-                    &self.source2,
+                    (!independent).then_some(&self.source2),
                 )?);
             }
         }
@@ -1128,6 +1382,8 @@ impl Target {
             self.vendor_blas.clone(),
             medium_woa.clone(),
             wide.as_deref(),
+            narrow_moe.clone(),
+            independent,
         )?;
         let group14 = self.group14.fork_profile(
             cuda,
@@ -1143,6 +1399,8 @@ impl Target {
             self.vendor_blas.clone(),
             medium_woa.clone(),
             wide.as_deref(),
+            narrow_moe.clone(),
+            independent,
         )?;
         let late = self.late.fork_profile(
             cuda,
@@ -1158,11 +1416,15 @@ impl Target {
             self.vendor_blas.clone(),
             medium_woa,
             wide.as_deref(),
+            narrow_moe,
+            independent,
         )?;
         let rows1 = Rows::new(cuda, rows, &self.row_store1)?;
-        let io = self
-            .io
-            .fork_profile(cuda, core_bytes, stream, kernels, rows)?;
+        let io_build=||if independent {self.io.fork_owner(cuda,core_bytes,stream,kernels,rows)}
+            else {self.io.fork_profile(cuda,core_bytes,stream,kernels,rows)};
+        let io=if let Some(arena)=wide.as_ref().and_then(|w|w.input_arena()) {
+            cuda.with_row_arena(arena,io_build)?
+        }else{cuda.without_row_arena(io_build)?};
         let step = Step::new(
             cuda,
             &source2,
@@ -1177,8 +1439,9 @@ impl Target {
             self.swa_layout,
             phase,
         )?;
-        let mut lease = self.lease.fork();
-        lease.adopt(&self.lease)?;
+        let lease=if independent {crate::session_lease::Lease::new()} else {
+            let mut lease=self.lease.fork();lease.adopt(&self.lease)?;lease
+        };
         stream.synchronize()?;
         let mut target = Self {
             rows,
@@ -1191,6 +1454,8 @@ impl Target {
             prefill_partial1024_rows: self.prefill_partial1024_rows,
             prefill_mhc_live_rows: self.prefill_mhc_live_rows,
             prefill_mhc_live_norm: self.prefill_mhc_live_norm,
+            prefill_blocking_wait: self.prefill_blocking_wait,
+            verification_poll_us: self.verification_poll_us,
             verification_mhc_live_rows: self.verification_mhc_live_rows,
             tiny_prefix_sum: phase==Phase::Verify && [6,16].contains(&rows)
                 && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1"),
@@ -1208,6 +1473,7 @@ impl Target {
             paired_engram_io: self.paired_engram_io,
             graph_captures: 0,
             prefill_capture_once: self.prefill_capture_once,
+            verification_capture_once: self.verification_capture_once,
             carry_snapshot: None,
             carry_saved_start: None,
             repeatable_frontier_measurement: false,
@@ -1215,7 +1481,7 @@ impl Target {
             encoder_graph_live: None,
             decoder_graph: None,
             tiny_append_graphs: None,
-            encoder_cache: self.encoder_cache.clone(),
+            encoder_cache: if independent {None}else{self.encoder_cache.clone()},
             replay: None,
             graph_replay: false,
             prefill_last_head: false,
@@ -1224,11 +1490,14 @@ impl Target {
             io,
             sampler: Greedy::new(cuda, core_bytes, rows)?,
             categorical: crate::categorical::Categorical::new(cuda, core_bytes, rows)?,
+            compact_categorical: None,
+            compact_sampling_enabled: false,
+            last_head_local_only: false,
             last_live: 0,
             last_append_metrics: None,
             pending: None,
             early,
-            early_caches: self.early_caches.clone(),
+            early_caches,
             source2,
             group8,
             group14,
@@ -1239,7 +1508,7 @@ impl Target {
             row_store1: self.row_store1.clone(),
             rows1,
             hashes: self.hashes.clone(),
-            history: self.history.clone(),
+            history: fresh_lineage.map_or_else(||self.history.clone(),History::new),
             lease,
             context: self.context,
             swa_layout: self.swa_layout,
@@ -1250,19 +1519,45 @@ impl Target {
             sp_full: None,
             rank: self.rank,
             stream: self.stream,
+            index_score_arena: if independent {None}else{self.index_score_arena.clone()},
+            index_score_logical_bytes: 0,
             atlas_bytes: self.atlas_bytes.clone(),
             source_hashes: self.source_hashes.clone(),
         };
+        target.share_index_scores_before_capture(cuda,stream)?;
         target.share_narrow_moe_before_capture(cuda,stream)?;
         target.install_communication_hints(core, stream)?;
+        cuda.report_allocation_sites(&format!("rank{} forkM{rows} independent={independent}",self.rank))?;
         Ok(target)
     }
-    fn share_narrow_moe_before_capture(&mut self,cuda:&Cuda,stream:&Stream)->Result<()> {
-        let enabled=match self.rows {
-            16=>std::env::var("CANADA_SCRATCH_VERIFY16_SHARED_MOE").as_deref()==Ok("1"),
-            6|128=>std::env::var("CANADA_SCRATCH_NARROW_SHARED_MOE").as_deref()==Ok("1"),
-            _=>false,
+    fn share_index_scores_before_capture(&mut self,cuda:&Cuda,stream:&Stream)->Result<()> {
+        let requested=match std::env::var("CANADA_SCRATCH_SHARED_INDEX_SCORES") {
+            Ok(v)=>{ensure!(v=="0"||v=="1","invalid shared index scores policy");v=="1"},
+            Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
         };
+        if !requested {ensure!(self.index_score_arena.is_none(),"index score policy changed between profiles");return Ok(());}
+        ensure!(self.graph_captures==0 && self.pending.is_none() && self.position()==0
+            && self.stream==stream.raw()as usize && cuda.owns_stream(stream),
+            "index score sharing must precede target execution/capture");
+        stream.synchronize()?;
+        let storage=match &self.index_score_arena {
+            Some(storage)=>storage.clone(),
+            None=>Rc::new(cuda.allocate::<f32>(64*1024*1024/4)?),
+        };
+        let mut released=0;
+        for source in [&mut self.source2,self.group8.source_mut(),
+            self.group14.source_mut(),self.late.source_mut()] {
+            released+=source.share_score_scratch(storage.clone())?;
+        }
+        released+=self.late.share_consumer_score_scratch(storage.clone())?;
+        self.index_score_logical_bytes=released;
+        self.index_score_arena=Some(storage);
+        eprintln!("rank{} M{} shared index score scratch: logical={} backing={} memory={:?}",
+            self.rank,self.rows,released,64*1024*1024,cuda.admission_memory()?);
+        Ok(())
+    }
+    fn share_narrow_moe_before_capture(&mut self,cuda:&Cuda,stream:&Stream)->Result<()> {
+        let enabled=SwaLayer::narrow_workspace_sharing_enabled(self.rows);
         if !enabled {return Ok(());}
         ensure!(self.graph_captures==0 && self.pending.is_none() && self.position()==0,
             "scratch sharing must precede execution/capture");
@@ -1303,6 +1598,74 @@ impl Target {
         }
         stream.synchronize()?;
         Ok(())
+    }
+    /// Finite component screen over two completed, independently owned M6
+    /// forwards. Attention, reductions and causal publication remain unchanged.
+    pub(crate) fn paired_ffn_screen(&self,other:&Self,pooled:&crate::ffn::Paired,
+        stream:&Stream)->Result<serde_json::Value> {
+        use sha2::{Digest,Sha256};
+        ensure!(std::env::var("CANADA_SCRATCH_PAIRED_FFN_SCREEN").as_deref()==Ok("1")
+            && self.rows==6 && other.rows==6 && self.source_phase==Phase::Verify
+            && other.source_phase==Phase::Verify && self.lease.is_busy_revision()
+            && other.lease.is_busy_revision() && !self.lease.shares_owner(&other.lease)
+            && self.pending.as_ref().is_some_and(|p|p.live==6)
+            && other.pending.as_ref().is_some_and(|p|p.live==6)
+            && self.cuda.owns_stream(stream) && stream.raw()as usize==self.stream
+            && self.stream==other.stream,"paired FFN requires two independent pending M6 owners");
+        stream.synchronize()?;
+        let left=self.layer_owners();let right=other.layer_owners();
+        let mut reports=Vec::new();
+        for index in [0,28] {
+            let a=left[index];let b=right[index];
+            let read=||->Result<Vec<Vec<u8>>>{
+                [a,b].iter().map(|layer|{
+                    let out=layer.ffn().output();
+                    unsafe{self.cuda.read_device(out.ptr(),out.bytes())}
+                }).collect()
+            };
+            let expected=read()?;
+            let run=|mode:usize|->Result<()>{
+                let (a,at,b,bt)=if mode<2 {(a,&self.tokens,b,&other.tokens)}
+                    else {(b,&other.tokens,a,&self.tokens)};
+                if mode%2==0 {
+                    for (layer,tokens)in [(a,at),(b,bt)] {
+                        layer.ffn().run_quantized_input(&layer.narrow_workspace(),
+                            layer.ffn_boundary().input(),layer.ffn_boundary().quantized_input(),tokens,stream)?;
+                    }
+                    Ok(())
+                } else {
+                    pooled.run(a.ffn(),a.ffn_boundary().input(),a.ffn_boundary().quantized_input(),at,
+                        b.ffn(),b.ffn_boundary().input(),b.ffn_boundary().quantized_input(),bt,stream)
+                }
+            };
+            let mut graphs=Vec::new();
+            for mode in 0..4 {
+                run(mode)?;stream.synchronize()?;
+                ensure!(read()?==expected,"paired FFN layer{index} mode{mode} differs from original target forward");
+                graphs.push(stream.capture(||run(mode))?);
+            }
+            let mut records=Vec::new();
+            for repeat in 0..4 {
+                let order=if repeat%2==0 {[0,1,2,3]}else{[3,2,1,0]};
+                let mut milliseconds=[0f32;4];
+                for mode in order {
+                    for _ in 0..2 {unsafe{graphs[mode].launch(stream)?;}}
+                    stream.synchronize()?;
+                    let start=self.cuda.event()?;let end=self.cuda.event()?;start.record(stream)?;
+                    for _ in 0..8 {unsafe{graphs[mode].launch(stream)?;}}
+                    end.record(stream)?;milliseconds[mode]=end.elapsed_since(&start)?/8.;
+                    ensure!(read()?==expected,"paired FFN layer{index} replay mode{mode} changed output");
+                }
+                records.push(serde_json::json!({"repeat":repeat,"order":order,"milliseconds":milliseconds}));
+            }
+            reports.push(serde_json::json!({"layer":index,"all_exact":true,
+                "original_output_sha256":expected.iter().map(|v|format!("{:x}",Sha256::digest(v))).collect::<Vec<_>>(),
+                "prequantized_shared_inputs":[a.ffn_boundary().quantized_input().is_some(),b.ffn_boundary().quantized_input().is_some()],
+                "records":records}));
+        }
+        Ok(serde_json::json!({"all_exact":true,"layers":reports,
+            "modes":["separate_ab","pooled_ab","separate_ba","pooled_ba"],
+            "scope":"Two real pending target M6 forwards. Original routers and shared experts; only routed expert work pooled into twelve live M16 rows. Includes packing and split addition. All local FFN output bits match the original whole-model forward. Excludes attention, TP4 reductions, residual boundaries and weight lookahead; not whole-model throughput."}))
     }
     pub(crate) fn layer_owners(&self) -> Vec<&SwaLayer> {
         self.early
@@ -1357,8 +1720,10 @@ impl Target {
         ensure!(sources.len()==if compact {160}else if deep {560}else{80},"repeat layer coverage");Ok(sources)
     }
     pub(crate) fn repeat_state_digests(&self,stream:&Stream)->Result<serde_json::Value> {
-        ensure!(std::env::var("CANADA_SCRATCH_READOUT_LAYER_TRACE").as_deref()==Ok("1")
+        ensure!((std::env::var("CANADA_SCRATCH_READOUT_LAYER_TRACE").as_deref()==Ok("1")
             &&std::env::var("CANADA_SCRATCH_SAMPLER_READOUT_SCREEN").as_deref()==Ok("1")
+            || std::env::var("CANADA_SCRATCH_ATTENTION16_COMMIT_SCREEN").as_deref()==Ok("1")
+            || std::env::var("CANADA_SCRATCH_INDEPENDENT_OWNER_SCREEN").as_deref()==Ok("1"))
             &&self.lease.is_current()&&self.pending.is_none()
             &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
             "repeat state digest requires a committed owner");
@@ -1366,6 +1731,33 @@ impl Target {
         let digests=self.state_image_regions(self.history.position as usize,true)?
             .iter().map(|r|r.repeat_digest()).collect::<Result<Vec<_>>>()?;
         Ok(serde_json::json!({"position":self.history.position,"regions":digests}))
+    }
+    pub(crate) fn save_repeat_physical_image(&self,comm:&Roce,stream:&Stream)
+        ->Result<RepeatPhysicalImage> {
+        ensure!(std::env::var("CANADA_SCRATCH_ATTENTION16_COMMIT_SCREEN").as_deref()==Ok("1"),
+            "physical replay snapshot is diagnostic only");
+        self.state_image_guard(comm,stream)?;
+        let frontier=self.history.position as usize;
+        let extent=frontier.checked_add(64).context("diagnostic future extent")?;
+        let regions=self.state_image_regions(extent,true)?;
+        let mut image=crate::state_image::Image::try_allocate(&self.cuda,&regions,1<<30,stream)?
+            .ok_or(crate::state_image::CapacityRefused)?;
+        stream.synchronize()?;comm.health()?;self.lease.begin()?;
+        image.save(&regions,stream)?;comm.health()?;self.lease.finish_read()?;
+        Ok(RepeatPhysicalImage{image,frontier,extent})
+    }
+    pub(crate) fn restore_repeat_physical_image(&mut self,saved:&RepeatPhysicalImage,
+        comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_ATTENTION16_COMMIT_SCREEN").as_deref()==Ok("1")
+            &&self.history.position as usize==saved.frontier,
+            "restore ordinary causal frontier before diagnostic page slack");
+        self.state_image_guard(comm,stream)?;
+        let regions=self.state_image_regions(saved.extent,true)?;
+        saved.image.validate(&regions,stream)?;
+        stream.synchronize()?;comm.health()?;self.lease.begin()?;
+        unsafe{saved.image.restore(&regions,stream)}?;
+        drop(regions);comm.health()?;self.lease.finish_write()?;
+        Ok(())
     }
     pub(crate) fn repeat_ffn_sources(&self,live:usize)->Result<Vec<(String,u64,usize)>> {
         ensure!(self.rows==6&&self.source_phase==Phase::Verify
@@ -1414,7 +1806,12 @@ impl Target {
     }
     fn state_image_regions_for_layers(&self, position:usize, compact:bool,encoder_only:bool)
         -> Result<Vec<crate::state_image::Region<'_>>> {
+        self.state_image_regions_for_layers_mode(position,compact,encoder_only,false)
+    }
+    fn state_image_regions_for_layers_mode(&self,position:usize,compact:bool,encoder_only:bool,
+        bank_retained:bool)->Result<Vec<crate::state_image::Region<'_>>> {
         use crate::state_image::Region;
+        ensure!(!bank_retained||(compact&&encoder_only),"bank snapshot is encoder-only and compact");
         ensure!(self.wide.is_none() && self.layer_owners().len() == 40,
             "state image requires a complete target owner");
         let mut regions = Vec::new();
@@ -1442,10 +1839,15 @@ impl Target {
                 let pages=slots.div_ceil(64);
                 ensure!(source.cache().page_tokens()==64 && pages<=source.cache().pages()
                     && pages*64<=source.keys().capacity(),"compact compressed page geometry");
+                // Append/verification metadata writes at or beyond the
+                // published frontier. Keep its whole final page, including
+                // a half-complete C2 pair and packed per-row scales/slack.
+                // Earlier pages remain in this exact bank and lineage.
+                let first=if bank_retained{pages-1}else{0};
                 regions.push(Region::byte_range(&self.cuda,format!("compressed.{layer}.kv"),
-                    source.cache().data(),0..pages*source.cache().page_bytes())?);
+                        source.cache().data(),first*source.cache().page_bytes()..pages*source.cache().page_bytes())?.exchange_prefix());
                 regions.push(Region::byte_range(&self.cuda,format!("compressed.{layer}.keys"),
-                    source.keys().data(),0..pages*64*68)?);
+                        source.keys().data(),first*64*68..pages*64*68)?.exchange_prefix());
             }else{
                 regions.push(Region::new(&self.cuda, format!("compressed.{layer}.kv"), source.cache().data())?);
                 regions.push(Region::new(&self.cuda, format!("compressed.{layer}.keys"), source.keys().data())?);
@@ -1473,6 +1875,53 @@ impl Target {
         ensure!(self.lease.is_current() && self.pending.is_none(),"state size needs a committed owner");
         Ok(self.state_image_regions(self.history.position as usize,true)?.iter().map(|r|r.bytes()).sum())
     }
+    pub(crate) fn exchange_state_image_bytes(&self)->Result<usize> {
+        ensure!(self.lease.is_current()&&self.pending.is_none(),"exchange size needs a committed owner");
+        crate::state_image::exchange::Image::estimate(&self.state_image_regions(self.history.position as usize,true)?,2<<30)
+    }
+    pub(crate) fn save_exchange_state_image(&self,budget:usize,comm:&Roce,stream:&Stream)->Result<StateImage>{
+        self.state_image_guard(comm,stream)?;
+        let regions=self.state_image_regions(self.history.position as usize,true)?;
+        let mut image=crate::state_image::exchange::Image::try_allocate(&self.cuda,&regions,budget,stream)?
+            .ok_or(crate::state_image::CapacityRefused)?;
+        stream.synchronize()?;comm.health()?;self.lease.begin()?;
+        ensure!(self.encoder_cache.as_ref().unwrap().error()?==0,"encoder error before exchange image");
+        image.save(&regions,stream)?;comm.health()?;self.lease.finish_read()?;
+        Ok(StateImage{image:crate::state_image::Storage::Exchange(image),owner:self.lease.fork(),
+            history:self.history.clone(),context:self.context,rank:self.rank,stream:self.stream,compact:true})
+    }
+    fn exchange_guard(&self,saved:&StateImage,comm:&Roce,stream:&Stream)->Result<()> {
+        self.state_image_guard(comm,stream)?;
+        ensure!(self.lease.shares_owner(&saved.owner)&&self.context==saved.context&&self.rank==saved.rank
+            &&self.stream==saved.stream&&saved.compact&&saved.exchangeable(),"exchange owner identity");Ok(())
+    }
+    pub(crate) fn exchange_growth(&self,saved:&StateImage,budget:usize)->Result<(usize,usize)> {
+        ensure!(self.lease.is_current()&&self.pending.is_none(),"exchange growth needs committed state");
+        let crate::state_image::Storage::Exchange(image)=&saved.image else{anyhow::bail!("nonexchange image");};
+        image.growth(&self.state_image_regions(self.history.position as usize,true)?,budget)
+    }
+    pub(crate) fn prepare_exchange(&self,saved:&StateImage,budget:usize,comm:&Roce,stream:&Stream)
+        ->Result<Option<crate::state_image::exchange::Prepared>> {
+        self.exchange_guard(saved,comm,stream)?;
+        let crate::state_image::Storage::Exchange(image)=&saved.image else{unreachable!()};
+        image.validate(&self.state_image_regions(saved.history.position as usize,true)?,stream)?;
+        image.try_prepare(&self.state_image_regions(self.history.position as usize,true)?,budget,stream)
+    }
+    pub(crate) fn exchange_state_image(&mut self,saved:&mut StateImage,prepared:crate::state_image::exchange::Prepared,
+        lineage:u64,comm:&Roce,stream:&Stream)->Result<()> {
+        self.exchange_guard(saved,comm,stream)?;
+        ensure!(lineage>self.history.lineage&&lineage>saved.history.lineage,"exchange lineage must advance");
+        let current=self.state_image_regions(self.history.position as usize,true)?;
+        let previous=self.state_image_regions(saved.history.position as usize,true)?;
+        let crate::state_image::Storage::Exchange(image)=&mut saved.image else{unreachable!()};
+        stream.synchronize()?;comm.health()?;self.lease.begin()?;
+        unsafe{image.exchange(prepared,&current,&previous,self.io.core_module(),stream)}?;
+        drop(current);drop(previous);
+        self.encoder_cache.as_ref().unwrap().restore_image_frontier(saved.history.position as usize,stream)?;
+        comm.health()?;std::mem::swap(&mut self.history,&mut saved.history);self.history.lineage=lineage;
+        self.invalidate_gather_caches();self.last_live=0;self.last_append_metrics=None;self.carry_saved_start=None;
+        self.lease.finish_write()?;Ok(())
+    }
     /// Snapshot only at a fully committed boundary. Budget refusal occurs
     /// before acquiring the writer lease; device failures poison all profiles.
     pub(crate) fn save_state_image(&self, budget: usize, comm: &Roce, stream: &Stream) -> Result<StateImage> {
@@ -1493,7 +1942,7 @@ impl Target {
         image.save(&regions, stream)?;
         comm.health()?;
         self.lease.finish_read()?;
-        Ok(StateImage { image, owner: self.lease.fork(), history: self.history.clone(),
+        Ok(StateImage { image:image.into(), owner: self.lease.fork(), history: self.history.clone(),
             context: self.context, rank: self.rank, stream: self.stream, compact })
     }
     /// Finite mechanism screen only. An incomplete decoder owner never escapes
@@ -1507,10 +1956,21 @@ impl Target {
         let(saved,details)=self.prefill_with_encoder_checkpoint(wides,None,prefix,suffix,Some(budget),comm,stream)?;
         Ok((saved.ok_or_else(||anyhow::anyhow!("requested encoder image missing"))?,details))
     }
+    pub(crate) fn prefill_encoder_prefix_for_restore_probe(&mut self,wides:&mut[Self],
+        prefix:&[u32],comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_RESTORE_INITIAL_SCREEN").as_deref()==Ok("1")
+            &&self.position()==0&&prefix.len()==18688,"finite matched-chunk encoder prefix admission");
+        let (encoder,tiny)=self.default_encoder_graph_policy()?;
+        let lookahead=std::env::var("CANADA_SCRATCH_ENGRAM_PREFETCH").as_deref()==Ok("1");
+        let progress=self.prefill_wide_interruptible_policy(wides,prefix,comm,stream,lookahead,
+            self.graph_replay,encoder,tiny,true,None,&mut |_|Ok(false))?;
+        ensure!(progress.done==prefix.len(),"matched-chunk prefix incomplete");Ok(())
+    }
     pub(crate) fn encoder_checkpoint_image_bytes(&self,position:usize)->Result<usize> {
         ensure!(encoder_checkpoint_enabled()&&self.lease.is_current()&&self.pending.is_none(),
             "encoder checkpoint size requires a healthy admitted owner");
-        Ok(self.state_image_regions_for_layers(position,true,true)?.iter().map(|r|r.bytes()).sum())
+        Ok(self.state_image_regions_for_layers_mode(position,true,true,
+            crate::config::bank_encoder_checkpoint_requested())?.iter().map(|r|r.bytes()).sum())
     }
     /// One indivisible prefill operation. Optionally restore an encoder prefix,
     /// extend it to a new checkpoint, and finish the complete request. All-rank
@@ -1520,9 +1980,9 @@ impl Target {
     pub(crate) fn prefill_with_encoder_checkpoint(&mut self,wides:&mut[Self],
         restore:Option<EncoderPrefixRestore<'_>>,prefix:&[u32],suffix:&[u32],budget:Option<usize>,
         comm:&Roce,stream:&Stream)->Result<(Option<EncoderPrefixImage>,serde_json::Value)> {
-        let (image,details,done)=self.prefill_with_encoder_checkpoint_interruptible(wides,
+        let (image,details,progress)=self.prefill_with_encoder_checkpoint_interruptible(wides,
             restore,prefix,suffix,budget,comm,stream,&mut |_|Ok(false),&mut |admit|Ok(admit))?;
-        ensure!(done==prefix.len()+suffix.len(),"uninterrupted encoder checkpoint extent");
+        ensure!(progress.done==prefix.len()+suffix.len(),"uninterrupted encoder checkpoint extent");
         Ok((image,details))
     }
     /// Keep the ordinary encoder/checkpoint/suffix plan until cancellation.
@@ -1533,7 +1993,7 @@ impl Target {
         restore:Option<EncoderPrefixRestore<'_>>,prefix:&[u32],suffix:&[u32],budget:Option<usize>,
         comm:&Roce,stream:&Stream,should_yield:&mut impl FnMut(usize)->Result<bool>,
         admit_image:&mut impl FnMut(bool)->Result<bool>,
-    )->Result<(Option<EncoderPrefixImage>,serde_json::Value,usize)> {
+    )->Result<(Option<EncoderPrefixImage>,serde_json::Value,PrefillProgress)> {
         let previous=restore.as_ref().map_or(self.history.position as usize,|r|r.image_and_lineage().0.position());
         ensure!(encoder_checkpoint_enabled()&&suffix.len()>=128&&previous+prefix.len()>=128
             && prefix.len()+suffix.len()<=self.context.saturating_sub(previous)
@@ -1542,7 +2002,10 @@ impl Target {
         let started=Instant::now();
         if let Some(restore)=&restore {
             let (image,lineage)=restore.image_and_lineage();
-            self.restore_encoder_prefix(image,lineage,comm,stream)?;
+            match restore {
+                EncoderPrefixRestore::Borrowed(..)=>self.restore_encoder_prefix(image,lineage,comm,stream)?,
+                EncoderPrefixRestore::Imported(_,source,_)=>self.import_encoder_prefix(image,source,lineage,comm,stream)?,
+            }
         }
         // Source lifetime is held by the caller, including asynchronous copies
         // and either late allocation refusal. Preserve the diagnostic field.
@@ -1555,19 +2018,19 @@ impl Target {
         // s788/s796 each exercised the128 omission twice (the other requests
         // were controls). The one s785 sampled divergence remains unexplained.
         let defer128=defer_checkpoint_decoder128()?;
-        let done=if prefix.len()>=256 || (defer128&&prefix.len()>=128&&previous>0) {
+        let progress=if prefix.len()>=256 || (defer128&&prefix.len()>=128&&previous>0) {
             self.prefill_wide_interruptible_policy(wides,prefix,comm,stream,lookahead,
-                self.graph_replay,encoder_graph,tiny_encoder_graph,true,should_yield)?
+                self.graph_replay,encoder_graph,tiny_encoder_graph,true,None,should_yield)?
         }else if !prefix.is_empty(){
             // Retain the established small-increment numerical path. Its
             // intermediate decoder result is unused and the final suffix
             // still replaces the entire decoder/drafter window.
-            self.prefill_wide_interruptible(wides,prefix,comm,stream,should_yield)?
-        }else{0};
-        if done<prefix.len() {
+            self.prefill_wide_interruptible(wides,prefix,comm,stream,None,should_yield)?
+        }else{PrefillProgress{done:0,remaining_chunks:Vec::new()}};
+        if progress.done<prefix.len() {
             return Ok((None,serde_json::json!({"interrupted":true,"restore_seconds":restore_seconds,
                 "consumed_parent":consumed_parent,"target_total_seconds":started.elapsed().as_secs_f64(),
-                "partial_phases":self.append_metrics()?}),done));
+                "partial_phases":self.append_metrics()?}),progress));
         }
         self.state_image_guard(comm,stream)?;
         let prefix_seconds=prefix_at.elapsed().as_secs_f64();
@@ -1579,7 +2042,8 @@ impl Target {
             let fits=self.cuda.admission_memory()?.admitted_available
                 >=8*1024usize.pow(3)+16*1024usize.pow(2)+budget;
             if admit_image(fits)? {
-                let regions=self.state_image_regions_for_layers(self.history.position as usize,true,true)?;
+                let bank_retained=crate::config::bank_encoder_checkpoint_requested();
+                let regions=self.state_image_regions_for_layers_mode(self.history.position as usize,true,true,bank_retained)?;
                 let mut allocation=crate::state_image::Image::try_allocate(&self.cuda,&regions,budget,stream)?;
                 let fits=allocation.is_some() && self.cuda.admission_memory()?.admitted_available
                     >=8*1024usize.pow(3)+16*1024usize.pow(2);
@@ -1588,8 +2052,9 @@ impl Target {
                     stream.synchronize()?;comm.health()?;self.lease.begin()?;
                     ensure!(self.encoder_cache.as_ref().unwrap().error()?==0,"encoder checkpoint cache fault");
                     image.save(&regions,stream)?;comm.health()?;self.lease.finish_read()?;
-                    Some(EncoderPrefixImage(StateImage{image,owner:self.lease.fork(),history:self.history.clone(),
-                        context:self.context,rank:self.rank,stream:self.stream,compact:true}))
+                    Some(EncoderPrefixImage(StateImage{image:image.into(),owner:self.lease.fork(),history:self.history.clone(),
+                        context:self.context,rank:self.rank,stream:self.stream,compact:true},
+                        bank_retained.then(||bank_encoder_lineage::Binding::new(self.history.lineage))))
                 }else{None}
             }else{None}
         }else{None};
@@ -1620,11 +2085,15 @@ impl Target {
             }
             stream.synchronize()?;comm.health()?;self.lease.finish_write()?;
         }
-        let suffix_done=self.prefill_wide_interruptible(wides,suffix,comm,stream,should_yield)?;
+        // Report progress over the whole compound append, including the
+        // already completed prefix. Scheduling uses the uncached remainder.
+        let mut progress=self.prefill_wide_interruptible(wides,suffix,comm,stream,None,
+            &mut |done|should_yield(prefix.len()+done))?;
+        progress.done+=prefix.len();
         Ok((saved,serde_json::json!({"restore_seconds":restore_seconds,"consumed_parent":consumed_parent,"prefix_seconds":prefix_seconds,"save_seconds":save_seconds,
             "poisoned_decoder_bytes":poisoned_decoder_bytes,
             "finite_swa_poison":finite_swa_poison,
-            "target_total_seconds":started.elapsed().as_secs_f64(),"suffix_phases":self.append_metrics()?}),prefix.len()+suffix_done))
+            "target_total_seconds":started.elapsed().as_secs_f64(),"suffix_phases":self.append_metrics()?}),progress))
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore_encoder_checkpoint_for_probe(&mut self,wides:&mut[Self],saved:&EncoderPrefixImage,
@@ -1644,6 +2113,27 @@ impl Target {
         ensure!(encoder_checkpoint_enabled()&&self.rows==128 && saved.0.history.position>=128,
             "encoder checkpoint reconstruction admission");
         self.restore_encoder_prefix(saved,lineage,comm,stream)?;
+        self.reconstruct_encoder_checkpoint_tail(comm,stream)
+    }
+    pub(crate) fn encoder_prefix_belongs_to(&self,saved:&EncoderPrefixImage)->bool {
+        self.lease.shares_owner(&saved.0.owner)
+    }
+    pub(crate) fn encoder_prefix_reusable_from(&self,saved:&EncoderPrefixImage)->bool {
+        self.encoder_prefix_belongs_to(saved)&&saved.1.as_ref().is_none_or(|lineage|
+            self.lease.is_current()&&self.history.lineage==lineage.get()
+                &&self.history.position>=saved.position()as u64)
+    }
+    /// The source owns the image; the destination remains an independent
+    /// request. Only canonical encoder state is imported, never a drafter,
+    /// sampler, pending transaction, media binding or request authority.
+    pub(crate) fn import_encoder_checkpoint_full(&mut self,saved:&EncoderPrefixImage,source:&Self,
+        lineage:u64,comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(encoder_checkpoint_enabled()&&self.rows==128&&saved.position()>=128,
+            "encoder import reconstruction admission");
+        self.import_encoder_prefix(saved,source,lineage,comm,stream)?;
+        self.reconstruct_encoder_checkpoint_tail(comm,stream)
+    }
+    fn reconstruct_encoder_checkpoint_tail(&mut self,comm:&Roce,stream:&Stream)->Result<()> {
         let end=self.history.position as usize;let start=end-128;
         let cache=self.encoder_cache.as_ref().unwrap().clone();
         self.lease.begin()?;
@@ -1656,16 +2146,55 @@ impl Target {
         ensure!(cache.error()?==0,"encoder checkpoint reconstructed tail fault");
         self.last_live=128;self.lease.finish_write()?;Ok(())
     }
+    fn import_encoder_prefix(&mut self,saved:&EncoderPrefixImage,source:&Self,lineage:u64,
+        comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(crate::config::encoder_prefix_import_requested(),"encoder prefix import requires explicit admission");
+        self.state_image_guard(comm,stream)?;source.state_image_guard(comm,stream)?;
+        ensure!(source.encoder_prefix_reusable_from(saved),"encoder import donor prefix is no longer resident");
+        let bank_retained=saved.bank_retained();
+        let copies=if bank_retained{self.bank_encoder_prefix_copy_plan(source,saved.position())?}else{Vec::new()};
+        let saved=&saved.0;
+        ensure!(encoder_checkpoint_enabled()&&self.rows==128&&saved.history.position>=128
+            &&source.lease.shares_owner(&saved.owner)&&!self.lease.shares_owner(&saved.owner)
+            &&self.context==saved.context&&source.context==saved.context&&self.swa_layout==source.swa_layout
+            &&self.rank==saved.rank&&source.rank==saved.rank&&self.stream==saved.stream&&source.stream==saved.stream
+            &&lineage>self.history.lineage&&lineage>saved.history.lineage,
+            "encoder import owner/context/lineage");
+        ensure!(self.independent_state_report(source)?["independent_causal_owners"]==true,
+            "encoder import requires the same immutable model and independent causal storage");
+        let original=source.state_image_regions_for_layers_mode(saved.history.position as usize,true,true,bank_retained)?;
+        let destination=self.state_image_regions_for_layers_mode(saved.history.position as usize,true,true,bank_retained)?;
+        saved.image.validate_import(&original,&destination,stream)?;
+        stream.synchronize()?;comm.health()?;self.lease.begin()?;
+        // The source bank owns the omitted immutable pages. Copy them without
+        // allocating another full image or mutating the donor's authority.
+        if !copies.is_empty() {
+            let copied=(||->Result<()>{for(dst,src,bytes)in copies{
+                unsafe{self.cuda.copy_device(dst,src,bytes,stream)}?;
+            }Ok(())})();
+            let completed=stream.synchronize();copied.and(completed)?;
+        }
+        unsafe{saved.image.import(&original,&destination,stream)}?;
+        drop(original);drop(destination);
+        self.encoder_cache.as_ref().unwrap().restore_image_frontier(saved.history.position as usize,stream)?;
+        comm.health()?;self.history=saved.history.clone();self.history.lineage=lineage;
+        self.invalidate_gather_caches();self.last_live=0;self.last_append_metrics=None;self.carry_saved_start=None;
+        self.lease.finish_write()?;Ok(())
+    }
     // Only compound operations above may expose this restored encoder owner;
     // each completes its decoder before returning successfully.
     fn restore_encoder_prefix(&mut self,saved:&EncoderPrefixImage,lineage:u64,
         comm:&Roce,stream:&Stream)->Result<()> {
         self.state_image_guard(comm,stream)?;
+        let bank_retained=saved.bank_retained();
+        ensure!(self.encoder_prefix_reusable_from(saved),
+            "bank-retained encoder prefix was invalidated by reset or rewind");
+        let binding=saved.1.as_ref();
         let saved=&saved.0;
         ensure!(self.lease.shares_owner(&saved.owner)&&self.context==saved.context
             && self.rank==saved.rank&&self.stream==saved.stream&&lineage>self.history.lineage
             && lineage>saved.history.lineage,"encoder checkpoint owner/lineage");
-        let regions=self.state_image_regions_for_layers(saved.history.position as usize,true,true)?;
+        let regions=self.state_image_regions_for_layers_mode(saved.history.position as usize,true,true,bank_retained)?;
         saved.image.validate(&regions,stream)?;
         stream.synchronize()?;comm.health()?;self.lease.begin()?;
         unsafe{saved.image.restore(&regions,stream)}?;
@@ -1674,6 +2203,7 @@ impl Target {
         comm.health()?;self.history=saved.history.clone();self.history.lineage=lineage;
         self.invalidate_gather_caches();self.last_live=0;self.last_append_metrics=None;self.carry_saved_start=None;
         self.lease.finish_write()?;
+        if let Some(binding)=binding{binding.set(lineage);}
         Ok(())
     }
     /// Restore storage into the same loaded model owner, assigning a new
@@ -1706,6 +2236,22 @@ impl Target {
         self.carry_saved_start = None;
         self.lease.finish_write()?;
         Ok(())
+    }
+    pub(crate) fn independent_state_report(&self,other:&Self)->Result<serde_json::Value> {
+        let shared=self.shared_state_report(other);
+        let left=self.state_image_regions(1,false)?;
+        let right=other.state_image_regions(1,false)?;
+        let disjoint=left.iter().all(|a|right.iter().all(|b|!a.overlaps(b)));
+        let immutable=shared["all40layer_atlases_shared"]==true
+            &&shared["IO_atlas_shared"]==true&&shared["Engram_row_stores_shared"]==true;
+        let private=!self.lease.shares_owner(&other.lease)&&!self.io.shares_media_owner(&other.io)
+            &&shared["encoder_tail_cache_shared"]==false&&disjoint;
+        Ok(serde_json::json!({"shared":shared,"all_causal_regions_disjoint":disjoint,
+            "causal_regions":[left.len(),right.len()],"prompt_media_owners_disjoint":!self.io.shares_media_owner(&other.io),
+            "independent_causal_owners":immutable&&private}))
+    }
+    pub(crate) fn shares_lossless_target_head(&self,other:&Self)->bool {
+        self.io.shares_lossless_head(&other.io)
     }
     pub fn shared_state_report(&self, other: &Self) -> serde_json::Value {
         // The wide encoder profile owns layers0..20 only; compare that prefix.
@@ -1773,11 +2319,29 @@ impl Target {
         self.prefill_capture_once = enabled;
         Ok(())
     }
+    /// Force first-use capture without changing weights, state allocations or
+    /// numerical policy. Only the finite verification diagnostic may call this.
+    pub(crate) fn set_verification_capture_once_for_probe(&mut self, enabled: bool, stream: &Stream) -> Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_VERIFY_CAPTURE_SCREEN").as_deref() == Ok("1")
+            && [6,16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay
+            && self.wide.is_none() && self.tiny_append_graphs.is_none()
+            && self.cuda.owns_stream(stream) && stream.raw() as usize == self.stream,
+            "verification capture screen requires an idle graph-enabled verifier");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.verification_capture_once = enabled;
+        Ok(())
+    }
     pub(crate) fn query_overlap_layers(&self) -> usize {
         self.layer_owners().iter().filter(|l| l.attention().query_overlap_enabled()).count()
     }
     pub(crate) fn grouped16_index_layers(&self) -> usize {
         self.index_queries().into_iter().flatten().filter(|q|q.grouped16_enabled()).count()
+    }
+    pub(crate) fn compact_index_layers(&self) -> usize {
+        self.index_queries().into_iter().flatten().filter(|q|q.compact_index_enabled()).count()
     }
     pub(crate) fn attention_coefficient_overlap_layers(&self) -> usize {
         self.layer_owners().iter().filter(|l| l.attention_coefficients_overlap()).count()
@@ -1789,10 +2353,12 @@ impl Target {
         self.set_verify16_schedule_for_probe(if enabled {3}else{0},stream)
     }
     pub(crate) fn set_split_attention_for_probe(&mut self,path:u8,stream:&Stream)->Result<()> {
-        ensure!(std::env::var("CANADA_SCRATCH_SPLIT_ATTENTION_SCREEN").as_deref()==Ok("1")
-            && path<=2 && self.rows==6 && self.source_phase==Phase::Verify && self.pending.is_none()
+        ensure!(((self.rows==6&&std::env::var("CANADA_SCRATCH_SPLIT_ATTENTION_SCREEN").as_deref()==Ok("1"))
+            ||(self.rows==16&&std::env::var("CANADA_SCRATCH_SPARSE_PRECISION_WIDE_SCREEN").as_deref()==Ok("1")
+                &&!crate::layer_attention::generation_fp32_attention16_enabled()?))
+            && path<=2 && self.source_phase==Phase::Verify && self.pending.is_none()
             && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
-            && stream.raw()as usize==self.stream && self.tiny_append_graphs.is_none(),
+            && stream.raw()as usize==self.stream && self.tiny_append_graphs.is_none()&&self.cached_decoder.is_none(),
             "split attention comparison requires idle verifier before append-bank warmup");
         stream.synchronize()?;
         for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) {*graph=None;}
@@ -1801,6 +2367,40 @@ impl Target {
         for layer in self.early.iter_mut().chain(self.group8.layers_mut())
             .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
             layer.set_split_attention_for_probe(path,stream)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_source20_precision_for_probe(&mut self, enabled:bool, stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_SOURCE20_PRECISION_SCREEN").as_deref()==Ok("1")
+            && !crate::compressed_source::source20_fp32_reduction_enabled()?
+            && self.rows==6 && self.source_phase==Phase::Verify && self.pending.is_none()
+            && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw()as usize==self.stream && self.tiny_append_graphs.is_none()
+            && self.cached_decoder.is_none(),
+            "source20 precision comparison requires idle verifier before append-bank warmup");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) {*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) {*graph=None;}
+        self.decoder_graph=None;
+        self.late.source_mut().set_source20_precision_for_probe(enabled)
+    }
+    /// Isolate only the first two SWA operators using the already allocated
+    /// BF16 append workspaces. This finite screen never creates an append bank.
+    pub(crate) fn set_swa_precision_for_probe(&mut self, enabled:bool, stream:&Stream)->Result<()> {
+        ensure!((std::env::var("CANADA_SCRATCH_SWA_PRECISION_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_SWA_PRECISION_WIDE_SCREEN").as_deref()==Ok("1"))
+            && !crate::layer_attention::generation_swa_bf16_enabled()?
+            && [6,16].contains(&self.rows) && self.source_phase==Phase::Verify && self.pending.is_none()
+            && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw()as usize==self.stream && self.tiny_append_graphs.is_none()
+            && self.cached_decoder.is_none() && self.early.len()>=2,
+            "SWA precision comparison requires an idle verifier before append-bank warmup");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) {*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) {*graph=None;}
+        self.decoder_graph=None;
+        for layer in self.early.iter_mut().take(2) {
+            layer.set_append_bf16_for_probe(enabled,stream)?;
         }
         Ok(())
     }
@@ -1878,6 +2478,27 @@ impl Target {
         }
         Ok(())
     }
+    pub(crate) fn set_compact32_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_COMPACT32_INDEX_SCREEN").as_deref()==Ok("1")
+            &&self.rows==32&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none()
+            &&self.adaptive_sparse_index_layers()==0
+            &&self.index_queries().into_iter().flatten().all(|q|!q.has_key_sharded())
+            &&self.index_queries().into_iter().flatten().filter(|q|q.has_compact32()).count()==4,
+            "idle M32 compact-index comparison");
+        let active=self.index_queries().into_iter().flatten().filter(|q|q.compact32_active()).count();
+        ensure!(active==0||active==4,"mixed M32 compact consumers");
+        if (active==4)==enabled {return Ok(())}
+        stream.synchronize()?;
+        // M32 has no adaptive M6 or key-partition topology. Reuse its otherwise
+        // empty second graph bank, retaining both warmed comparison arms.
+        std::mem::swap(&mut self.graphs,&mut self.alternate_index_graphs);
+        std::mem::swap(&mut self.engram_graphs,&mut self.alternate_index_engram_graphs);
+        self.decoder_graph=None;
+        for query in self.index_queries().into_iter().flatten() {query.set_compact32_for_probe(enabled)?;}
+        Ok(())
+    }
     pub(crate) fn set_grouped16_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_GROUPED_SPARSE16_SCREEN").as_deref()==Ok("1")
             && self.rows==16 && self.source_phase==Phase::Verify && self.pending.is_none()
@@ -1927,6 +2548,56 @@ impl Target {
         for layer in self.layer_owners(){layer.narrow_workspace().set_input_address_for_probe(enabled,stream)?;}
         Ok(())
     }
+    pub(crate) fn set_moe_fc_pdl_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_FC_PDL_SCREEN").as_deref()==Ok("1")
+            &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),
+            "idle FC PDL screen ownership");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        for layer in self.layer_owners(){layer.narrow_workspace().set_fc_pdl_for_probe(enabled,stream)?;}
+        Ok(())
+    }
+    pub(crate) fn set_key_sharded_index_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        let publisher_only=std::env::var("CANADA_SCRATCH_KEY_SHARDED_PUBLISHER_SCREEN").as_deref()==Ok("1");
+        ensure!(std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX_SCREEN").as_deref()==Ok("1")
+            &&[6,16].contains(&self.rows)&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none()
+            &&self.index_queries().into_iter().flatten().filter(|q|q.has_key_sharded()).count()==if publisher_only{4}else{3},
+            "idle key-shard screen ownership");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        let automatic_screen=std::env::var("CANADA_SCRATCH_KEY_SHARD_AUTO_SCREEN").as_deref()==Ok("1");
+        let automatic=enabled&&automatic_screen;
+        for query in self.index_queries().into_iter().flatten(){
+            if publisher_only&&!automatic_screen&&!query.has_key_sharded_publisher(){continue;}
+            query.set_key_sharded_auto(automatic);
+            query.set_key_sharded_for_probe(enabled&&(!automatic||query.key_sharded_eligible_at(self.history.position)));
+        }
+        Ok(())
+    }
+    pub(crate) fn active_key_sharded_layers(&self)->usize {
+        self.index_queries().into_iter().flatten().filter(|q|q.key_sharded_active()).count()
+    }
+    pub(crate) fn set_moe_scale_codes_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE_SCREEN").as_deref()==Ok("1")
+            &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),
+            "idle scale-code screen ownership");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        for layer in self.layer_owners(){layer.narrow_workspace().set_scale_codes_for_probe(enabled,stream)?;}
+        Ok(())
+    }
     pub(crate) fn prepare_wo_b_alternates_for_probe(&self,kernels:&Path)->Result<Vec<crate::fp8_linear::Linear>> {
         ensure!(std::env::var("CANADA_SCRATCH_WO_B_PDL_SCREEN").as_deref()==Ok("1")
             &&self.rows==6&&self.pending.is_none()&&self.lease.is_current()
@@ -1947,6 +2618,22 @@ impl Target {
         for(layer,alternate)in self.early.iter_mut().chain(self.group8.layers_mut())
             .chain(self.group14.layers_mut()).chain(self.late.layers_mut()).zip(other){
             layer.set_wo_b_pdl_for_probe(mode,alternate)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_mhc_pdl_pair_for_probe(&mut self, mode: u8, stream: &Stream) -> Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MHC_PDL_PAIR_SCREEN").as_deref() == Ok("1")
+            && mode <= 3 && self.rows == 6 && self.source_phase == Phase::Verify && self.pending.is_none()
+            && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none()
+            && self.cached_decoder.is_none(), "idle M6 PDL graph owner");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            layer.set_mhc_pdl_pair_for_probe(mode)?;
         }
         Ok(())
     }
@@ -2136,7 +2823,24 @@ impl Target {
         ensure!(self.compact_sparse_index_layers()==4,"compact consumer count");
         Ok(())
     }
-    fn select_index_graph_bank(&mut self)->Result<()> {
+    fn select_index_graph_bank(&mut self,stream:&Stream)->Result<()> {
+        if self.index_queries().into_iter().flatten().any(|q|q.key_sharded_transition(self.history.position).is_some()) {
+            // Switching this early index changes captured graph topology. Drop
+            // both consumer-index banks and the inactive tiny-append bank; none
+            // may retain a graph using the old mode after a long/short restore.
+            stream.synchronize()?;
+            for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+            for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+            self.decoder_graph=None;
+            if let Some(bank)=&mut self.tiny_append_graphs {
+                for graph in bank.graphs.iter_mut().chain(&mut bank.alternate_index_graphs){*graph=None;}
+                for graph in bank.engram_graphs.iter_mut().chain(&mut bank.alternate_index_engram_graphs){*graph=None;}
+                bank.decoder_graph=None;
+            }
+            for query in self.index_queries().into_iter().flatten(){
+                if let Some(enabled)=query.key_sharded_transition(self.history.position){query.set_key_sharded_for_probe(enabled);}
+            }
+        }
         let layers=self.adaptive_sparse_index_layers();
         ensure!(layers==0 || (layers==4 && self.rows==6 && (self.source_phase==Phase::Verify
             || (self.source_phase==Phase::Extend
@@ -2153,17 +2857,21 @@ impl Target {
         ensure!(self.active_sparse_index_layers()==if sparse {4}else{0},"adaptive graph/scorer mismatch");
         Ok(())
     }
-    /// Bounded read-only capture after a completed neural Verify6. Each layer
+    /// Bounded read-only capture after a completed finite Verify6/Verify16. Each layer
     /// owns normalized input and router output buffers; only expert workspace
     /// is shared. Commit restores carry and publishes encoder rows without
     /// recomputing these buffers. Caller excludes all capture IO from timing.
     pub(crate) fn capture_expert_components(&self,root:&Path,stream:&Stream)->Result<serde_json::Value> {
         use sha2::{Digest,Sha256};
-        ensure!(std::env::var("CANADA_SCRATCH_POOLED_ROUTE_CAPTURE").as_deref()==Ok("1")
-            &&self.rows==6&&self.source_phase==Phase::Verify&&self.lease.is_current()
-            &&self.pending.is_none()&&self.last_live>0&&self.last_live<=6
+        let cost_pending=std::env::var("CANADA_SCRATCH_PAIR_COST_SCREEN").as_deref()==Ok("1")
+            &&[6,16].contains(&self.rows)&&self.pending.is_some()&&self.lease.is_busy_revision();
+        let admitted=cost_pending||(self.rows==6&&std::env::var("CANADA_SCRATCH_POOLED_ROUTE_CAPTURE").as_deref()==Ok("1"))
+            ||(self.rows==16&&std::env::var("CANADA_SCRATCH_HISTORY_COPY_ROUTE_SCREEN").as_deref()==Ok("1"));
+        let live=if cost_pending{self.pending.as_ref().unwrap().live}else{self.last_live};
+        ensure!(admitted&&self.source_phase==Phase::Verify
+            &&(cost_pending||(self.lease.is_current()&&self.pending.is_none()))&&live>0&&live<=self.rows
             &&self.cuda.owns_stream(stream)&&stream.raw()as usize==self.stream&&!root.exists(),
-            "pooled component capture needs a committed neural Verify6");
+            "expert component capture requires its finite committed verification screen");
         stream.synchronize()?;
         let owners=self.layer_owners();ensure!(owners.len()==40,"pooled capture layer count");
         let unique_inputs:std::collections::BTreeSet<_>=owners.iter().map(|l|l.ffn_boundary().input().ptr()).collect();
@@ -2173,13 +2881,21 @@ impl Target {
         let mut reports=Vec::new();
         for (layer,l)in owners.iter().enumerate() {
             let ids=l.ffn().router().ids().download()?;
-            ensure!(ids.len()==36&&ids.iter().all(|id|(0..384).contains(id)),"six live router rows");
+            let routed_rows=if cost_pending{live}else{self.rows};
+            ensure!(ids.len()==self.rows*6&&ids[..routed_rows*6].iter().all(|id|(0..384).contains(id)),
+                "invalid live router rows at layer{layer}, physical={}, live={routed_rows}",self.rows);
+            if routed_rows<self.rows {
+                let weights=l.ffn().router().routing().download()?;
+                ensure!(ids[routed_rows*6..].iter().all(|&id|id == -1)
+                    &&weights.len()==self.rows*6&&weights[routed_rows*6..].iter().all(|&v|v == 0.0),
+                    "nonempty padded router rows at layer{layer}");
+            }
             let mut taps=Vec::new();
             if [0,28].contains(&layer) {
                 let input=l.ffn_boundary().input();let weights=l.ffn().router().routing();
-                ensure!(input.len()==6*5120&&weights.len()==36,"pooled capture tensor geometry");
+                ensure!(input.len()==self.rows*5120&&weights.len()==self.rows*6,"expert capture tensor geometry");
                 for (name,ptr,bytes)in [("input",input.ptr(),input.bytes()),
-                    ("ids",l.ffn().router().ids().ptr(),36*4),("routing",weights.ptr(),36*4)] {
+                    ("ids",l.ffn().router().ids().ptr(),self.rows*6*4),("routing",weights.ptr(),self.rows*6*4)] {
                     let raw=unsafe{self.cuda.read_device(ptr,bytes)}?;let file=format!("layer{layer}-{name}.bin");
                     if self.rank==3{std::fs::write(root.join(&file),&raw)?;}
                     taps.push(serde_json::json!({"name":name,"file":file,"bytes":bytes,"sha256":format!("{:x}",Sha256::digest(&raw))}));
@@ -2187,9 +2903,10 @@ impl Target {
             }
             reports.push(serde_json::json!({"layer":layer,"ids":ids,"taps":taps}));
         }
-        let index=serde_json::json!({"rank":self.rank,"rows":6,"position":self.history.position,
-            "accepted_rows":self.last_live,"layers":reports,"owned_inputs_and_routes":true,
-            "scope":"Public task actual Verify6 buffers after commit; only canonical input/ids/routing for layers0,28 saved onrank3. No expert workspace or causalcache used as a component oracle."});
+        let index=serde_json::json!({"rank":self.rank,"rows":self.rows,"position":self.history.position,
+            "accepted_rows":self.last_live,"live_rows":live,"pending_verification":cost_pending,
+            "layers":reports,"owned_inputs_and_routes":true,
+            "scope":"Public-task fixed-input verification buffers; pending/committed and physical/live rows recorded explicitly. Pending padding must contain id=-1 and weight=0. Only canonical input/ids/routing for layers0,28 saved onrank3. No expert workspace or causalcache used as a component oracle."});
         if self.rank==3{std::fs::write(root.join("index.json"),serde_json::to_vec_pretty(&index)?)?;}
         Ok(index)
     }
@@ -2244,6 +2961,37 @@ impl Target {
             layer.set_norm_fusion(enabled)?;
         }
         Ok(())
+    }
+    /// The completion fence is outside every capture. It can change between
+    /// isolated trials while preserving captured kernels and causal storage.
+    pub(crate) fn set_prefill_blocking_for_probe(&mut self, enabled: bool, stream: &Stream) -> Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_PREFILL_WAIT_SCREEN").as_deref()==Ok("1")
+            && self.source_phase==Phase::Extend && self.pending.is_none()
+            && self.cuda.owns_stream(stream) && self.stream==stream.raw() as usize,
+            "prefill completion-wait probe owner");
+        stream.synchronize()?;
+        self.prefill_blocking_wait=enabled;
+        Ok(())
+    }
+    fn wait_encoder_chunk(&self, stream: &Stream)->Result<()> {
+        if self.prefill_blocking_wait && self.rows>=1024 {
+            stream.synchronize_blocking()
+        } else {stream.synchronize()}
+    }
+    pub(crate) fn set_verification_poll_for_probe(&mut self,microseconds:u64,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_VERIFY_WAIT_SCREEN").as_deref()==Ok("1")
+            &&[0,25,50].contains(&microseconds)&&self.source_phase==Phase::Verify
+            &&self.pending.is_none()&&self.lease.is_current()&&self.cached_decoder.is_none()
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
+            "isolated verification completion-polling owner");
+        stream.synchronize()?;self.verification_poll_us=microseconds;Ok(())
+    }
+    pub(crate) fn verification_poll_us_requested()->Result<u64> {
+        match std::env::var("CANADA_SCRATCH_VERIFY_POLL_US") {
+            Ok(value)=>match value.as_str(){"0"=>Ok(0),"25"=>Ok(25),
+                _=>anyhow::bail!("verification polling interval must be0or25microseconds")},
+            Err(std::env::VarError::NotPresent)=>Ok(0),Err(error)=>Err(error.into()),
+        }
     }
     pub(crate) fn fullk_boundaries(&self) -> usize {
         self.layer_owners().iter().map(|layer|layer.fullk_boundaries()).sum()
@@ -2361,6 +3109,29 @@ impl Target {
             .map(|cache| cache.digest())
             .transpose()
     }
+    /// Opt-in diagnostic on the CUDA owner thread. Hash only retained encoder
+    /// windows/rings, after already-drained operations; no serving trace writes.
+    pub(crate) fn trace_prefill_boundary_for_probe(&self,stage:&str)->Result<()> {
+        if !PREFILL_BOUNDARY_TRACE.with(|cell|cell.borrow().is_some()){return Ok(());}
+        use sha2::{Digest,Sha256};
+        ensure!(self.profile_is_current()&&self.pending.is_none(),"prefill trace owner");
+        let position=self.history.position as usize;
+        let pages=saved_swa_pages(self.swa_layout,position);
+        let mut swa=Vec::new();
+        for cache in self.early_caches.iter().chain(self.group8.caches())
+            .chain(self.group14.caches()).chain(self.late.caches()).take(21) {
+            let mut hash=Sha256::new();
+            for &(first,end) in &pages {
+                let bytes=(end-first)*cache.page_bytes();
+                hash.update(unsafe{self.cuda.read_device(cache.data().ptr()+(first*cache.page_bytes())as u64,bytes)}?);
+            }
+            swa.push(format!("{:x}",hash.finalize()));
+        }
+        let value=serde_json::json!({"stage":stage,"rows":self.rows,"position":position,
+            "encoder":self.encoder_tail_digest()?,"carry":self.carry_digests()?,"swa":swa});
+        PREFILL_BOUNDARY_TRACE.with(|cell|cell.borrow_mut().as_mut().unwrap().push(value));
+        Ok(())
+    }
     pub(crate) fn capture_statistics(&self) -> (Vec<usize>, usize) {
         (
             self.graphs
@@ -2370,13 +3141,14 @@ impl Target {
                     || self.alternate_index_graphs[live].is_some()
                     || self.alternate_index_engram_graphs[live].is_some()).then_some(live))
                 .collect(),
-            self.graph_captures,
+            self.graph_captures+self.compact_categorical.as_ref().map_or(0,|s|s.captures()),
         )
     }
     /// Inspect the bank that the next append will select, not the union of
     /// dense and sparse captures retained for other context lengths.
     pub(crate) fn verification_graph_is_warm(&self, live:usize)->bool {
         if !self.graph_replay || live==0 || live>self.rows {return false;}
+        if self.index_queries().into_iter().flatten().any(|q|q.key_sharded_transition(self.history.position).is_some()){return false;}
         let alternate=self.adaptive_sparse_index_layers()>0
             && (self.history.position>=65536)!=self.adaptive_sparse_active;
         if self.engram_overlap {
@@ -2667,6 +3439,57 @@ impl Target {
         Ok(())
     }
 
+    pub(crate) fn compact_history_sampling_requested()->Result<bool> {
+        match std::env::var("CANADA_SCRATCH_COMPACT_HISTORY_SAMPLING") {
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid compact history sampling policy");Ok(value=="1")},
+            Err(std::env::VarError::NotPresent)=>Ok(false),Err(error)=>Err(error.into()),
+        }
+    }
+    pub(crate) fn enable_compact_history_sampling(&mut self,core:&[u8],stream:&Stream)->Result<()> {
+        ensure!(Self::compact_history_sampling_requested()?&&[16,32].contains(&self.rows)
+            &&self.source_phase==Phase::Verify&&self.history.position==0&&self.lease.is_current()
+            &&self.pending.is_none()&&self.graph_replay&&!self.prefill_last_head
+            &&self.cached_decoder.is_none()&&self.tiny_append_graphs.is_none()
+            &&self.graphs.iter().chain(&self.alternate_index_graphs).all(Option::is_none)
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
+            "compact history sampling requires a fresh copy verifier");
+        ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024usize.pow(2),
+            "compact sampler preserves physical reserve");
+        self.compact_categorical=Some(crate::sharded_categorical_probe::CompactSampler::new(
+            &self.cuda,core,self.rows,self.rank)?);
+        self.compact_sampling_enabled=true;Ok(())
+    }
+    pub(crate) fn compact_history_sampling_enabled(&self)->bool {self.compact_sampling_enabled}
+
+    /// Finite transport screen. Clear the affected captures when changing the
+    /// head's communication topology; accepted causal storage is untouched.
+    pub(crate) fn set_compact_sampling_for_probe(&mut self,enabled:bool,core:&[u8],stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_SHARDED_CATEGORICAL_MODEL_SCREEN").as_deref()==Ok("1")
+            &&[16,32].contains(&self.rows)&&self.source_phase==Phase::Verify
+            &&self.pending.is_none()&&self.lease.is_current()&&self.graph_replay
+            &&!self.prefill_last_head&&self.cached_decoder.is_none()
+            &&self.tiny_append_graphs.as_ref().is_none_or(|bank|bank.decoder.is_some())
+            &&self.encoder_graph.is_none()&&self.decoder_graph.is_none()
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
+            "finite compact sampler requires an idle full-row copy profile");
+        if enabled==self.compact_sampling_enabled{return Ok(())}
+        stream.synchronize()?;
+        if enabled&&self.compact_categorical.is_none() {
+            ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024usize.pow(2),
+                "compact sampler preserves physical reserve");
+            self.compact_categorical=Some(crate::sharded_categorical_probe::CompactSampler::new(
+                &self.cuda,core,self.rows,self.rank)?);
+        }
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.compact_sampling_enabled=enabled;Ok(())
+    }
+    fn compact_sampling_active(&self)->bool {
+        // The alternate M16 EXTEND bank still publishes full prompt logits.
+        // Its graph topology remains independent of ordinary copy verification.
+        self.compact_sampling_enabled&&self.cached_decoder.is_none()
+    }
+
     /// Start a new sequence without reloading immutable weights or discarding
     /// immutable Engram row-cache entries. Complete causal KV, compression
     /// rings, index keys and hash history are cleared together. Captured
@@ -2818,12 +3641,14 @@ impl Target {
         self.last_append_metrics = None;
         self.carry_saved_start = None;
         let begin = Instant::now();
-        self.select_index_graph_bank()?;
+        self.select_index_graph_bank(stream)?;
         let mut marks = vec![("begin", begin)];
         let mut captured_new_graph = false;
         let mut split_engram14=self.engram_split14 && (!self.engram_split14_m3_only || ids.len()==3);
         let retain_warm_prefill = self.prefill_capture_once && !verification
             && self.rows == 128 && self.source_phase == Phase::Extend;
+        let retain_warm_result = retain_warm_prefill || (self.verification_capture_once
+            && verification && [6,16].contains(&self.rows) && self.source_phase == Phase::Verify);
         let p = Plan::append_with_layout(
             self.history.position,
             ids.len(),
@@ -2833,7 +3658,7 @@ impl Target {
         )?;
         let mut padded = vec![2u32; self.rows];
         padded[..ids.len()].copy_from_slice(ids);
-        let batch = self.history.prepare(&padded, &self.hashes)?;
+        let batch = self.history.prepare_padded(&padded, ids.len(), &self.hashes)?;
         marks.push(("history_hash", Instant::now()));
         ensure!(!self.engram_overlap || (verification && self.graph_replay && self.rows == 6),
             "experimental Engram overlap is verification-only");
@@ -2934,9 +3759,10 @@ impl Target {
                 comm.health()?;
                 marks.push(("graph_warmup", Instant::now()));
                 // The control restores incoming carry before replaying. The
-                // prefill candidate instead retains the successful eager
-                // output: recording a graph performs no model execution.
-                if !retain_warm_prefill {
+                // candidate instead retains the successful eager output:
+                // recording a graph performs no model execution. Verification
+                // keeps the incoming snapshot for partial acceptance/rollback.
+                if !retain_warm_result {
                     unsafe {
                         self.carry_snapshot.as_ref().unwrap().restore(stream)?;
                     }
@@ -2965,7 +3791,12 @@ impl Target {
                 }
                 marks.push(("graph_capture", Instant::now()));
             }
-            if self.engram_overlap {
+            if captured_new_graph && retain_warm_result {
+                // All Engram rows were prepared before the eager first use;
+                // only existing graph replays may defer those uploads. Both
+                // ordinary and split graphs now describe the next execution.
+                ensure!(!deferred_rows, "first capture unexpectedly deferred Engram rows");
+            } else if self.engram_overlap {
                 unsafe { self.engram_graphs[ids.len()].as_ref().unwrap()[0].launch(stream)?; }
                 marks.push(("initial_enqueue", Instant::now()));
                 if deferred_rows {
@@ -2995,14 +3826,16 @@ impl Target {
                     let tail_index=if self.engram_split14_adaptive {3}else{2};
                     unsafe{self.engram_graphs[ids.len()].as_ref().unwrap()[tail_index].launch(stream)?;}
                 }
-            } else if !(captured_new_graph && retain_warm_prefill) {
+            } else {
                 unsafe { self.graphs[ids.len()].as_ref().unwrap().launch(stream)?; }
             }
         } else {
             self.enqueue(comm, stream)?;
         }
         marks.push(("forward_enqueue", Instant::now()));
-        stream.synchronize()?;
+        if verification&&self.verification_poll_us>0&&self.cached_decoder.is_none() {
+            stream.synchronize_polling(self.verification_poll_us)?;
+        }else{stream.synchronize()?;}
         comm.health()?;
         marks.push(("gpu_completion", Instant::now()));
         self.check_candidates()?;
@@ -3010,6 +3843,7 @@ impl Target {
             ensure!(cache.error()? == 0, "encoder tail publication fault");
         }
         marks.push(("candidate_checks", Instant::now()));
+        self.last_head_local_only=self.compact_sampling_active();
         if verification {
             self.pending = Some(PendingVerification {
                 hash_batch: batch,
@@ -3053,7 +3887,20 @@ impl Target {
         });
         Ok(())
     }
+    /// Read every local vocabulary column without changing the compact head's
+    /// graph or adding an all-gather. The finite screen compares all four ranks.
+    pub(crate) fn pending_local_logits_for_probe(&self) -> Result<(&Buffer<f32>, usize)> {
+        ensure!(std::env::var("CANADA_SCRATCH_INDEX_SCORE_MODEL_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_PAIR_STEP_PROFILE").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_ATTENTION16_REFRESH_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_INDEPENDENT_OWNER_SCREEN").as_deref()==Ok("1"),
+            "local logit readout requires finite score storage screen");
+        let pending=self.pending.as_ref().context("no completed verification")?;
+        ensure!(self.lease.is_busy_revision(),"local logit readout lost writer revision");
+        Ok((self.io.local_logits(),pending.live))
+    }
     pub fn pending_logits(&self) -> Result<(&Buffer<f32>, usize)> {
+        ensure!(!self.last_head_local_only,"compact verification has no gathered full-vocabulary logits");
         let pending = self
             .pending
             .as_ref()
@@ -3090,6 +3937,17 @@ impl Target {
         let result = self.categorical.sample(self.io.logits(), 0, live, 1., seed,
             crate::categorical::TARGET_DOMAIN, self.history.position + 1, stream);
         if result.is_err() { self.pending = None; } // Keep shared owner poisoned.
+        result
+    }
+    pub(crate) fn verification_history_sample(&mut self,seed:u64,comm:&Roce,stream:&Stream)->Result<Vec<u32>> {
+        if !self.last_head_local_only{return self.verification_sample(seed,stream)}
+        let pending=self.pending.as_ref().ok_or_else(||anyhow::anyhow!("no completed compact verification"))?;
+        ensure!(self.compact_sampling_active()&&self.lease.is_busy_revision()&&pending.live==self.rows&&[16,32].contains(&self.rows)
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize
+            &&self.comm_instance==Some(comm.instance()),"compact pending verification ownership");
+        let result=self.compact_categorical.as_mut().ok_or_else(||anyhow::anyhow!("compact sampler storage absent"))?
+            .sample(self.io.local_logits(),seed,self.history.position+1,comm,stream);
+        if result.is_err(){self.pending=None;} // Leave the causal writer poisoned.
         result
     }
     /// Commit only the accepted input prefix (anchor included). Future KV and
@@ -3328,7 +4186,7 @@ impl Target {
             )?;
             let mut padded = vec![2u32; 128];
             padded[..chunk.len()].copy_from_slice(chunk);
-            let batch = self.history.prepare(&padded, &self.hashes)?;
+            let batch = self.history.prepare_padded(&padded, chunk.len(), &self.hashes)?;
             self.prepare_engram_rows(&batch.rows)?;
             self.io.update_tokens(&mut self.tokens, self.history.position as usize,
                 &padded.iter().copied().map(i64::from).collect::<Vec<_>>(),
@@ -3414,9 +4272,9 @@ impl Target {
             Err(error) => return Err(error.into()),
         };
         let (encoder_graph,tiny_encoder_graph)=self.default_encoder_graph_policy()?;
-        let done=self.prefill_wide_interruptible_policy(wides,ids,comm,stream,lookahead,
-            tail_graph,encoder_graph,tiny_encoder_graph,false,&mut |_|Ok(false))?;
-        ensure!(done==ids.len(),"uninterrupted prefill must consume its complete input");
+        let progress=self.prefill_wide_interruptible_policy(wides,ids,comm,stream,lookahead,
+            tail_graph,encoder_graph,tiny_encoder_graph,false,None,&mut |_|Ok(false))?;
+        ensure!(progress.done==ids.len(),"uninterrupted prefill must consume its complete input");
         Ok(())
     }
     // s551: full128-row encoder graphs preserve exact model/state results and
@@ -3453,9 +4311,9 @@ impl Target {
         tail_graph: bool,
         encoder_graph: bool,
     ) -> Result<()> {
-        let done=self.prefill_wide_interruptible_policy(wides,ids,comm,stream,lookahead,
-            tail_graph,encoder_graph,false,false,&mut |_|Ok(false))?;
-        ensure!(done==ids.len(),"uninterrupted prefill must consume its complete input");
+        let progress=self.prefill_wide_interruptible_policy(wides,ids,comm,stream,lookahead,
+            tail_graph,encoder_graph,false,false,None,&mut |_|Ok(false))?;
+        ensure!(progress.done==ids.len(),"uninterrupted prefill must consume its complete input");
         Ok(())
     }
     /// Cooperative scheduling/cancellation hook. The callback runs at an already
@@ -3463,8 +4321,9 @@ impl Target {
     /// the existing bounded decoder tail before returning a snapshotable owner.
     pub(crate) fn prefill_wide_interruptible(
         &mut self,wides:&mut [Self],ids:&[u32],comm:&Roce,stream:&Stream,
+        resume_chunks:Option<Vec<usize>>,
         should_yield:&mut impl FnMut(usize)->Result<bool>,
-    )->Result<usize> {
+    )->Result<PrefillProgress> {
         let lookahead=std::env::var("CANADA_SCRATCH_ENGRAM_PREFETCH").as_deref()==Ok("1");
         let tail_graph=match std::env::var("CANADA_SCRATCH_PREFILL_TAIL_GRAPH") {
             Ok(value)=>{ensure!(value=="0"||value=="1","invalid prefill tail graph policy");value=="1"},
@@ -3473,14 +4332,15 @@ impl Target {
         };
         let (encoder_graph,tiny_encoder_graph)=self.default_encoder_graph_policy()?;
         self.prefill_wide_interruptible_policy(wides,ids,comm,stream,lookahead,
-            tail_graph,encoder_graph,tiny_encoder_graph,false,should_yield)
+            tail_graph,encoder_graph,tiny_encoder_graph,false,resume_chunks,should_yield)
     }
     #[allow(clippy::too_many_arguments)]
     fn prefill_wide_interruptible_policy(
         &mut self,wides:&mut [Self],ids:&[u32],comm:&Roce,stream:&Stream,
         lookahead:bool,tail_graph:bool,encoder_graph:bool,tiny_encoder_graph:bool,defer_decoder:bool,
+        resume_chunks:Option<Vec<usize>>,
         should_yield:&mut impl FnMut(usize)->Result<bool>,
-    )->Result<usize> {
+    )->Result<PrefillProgress> {
         ensure!(!defer_decoder || (encoder_checkpoint_enabled() && (ids.len()>=256
             || (ids.len()>=128&&self.history.position>0
                 &&defer_checkpoint_decoder128()?))),
@@ -3510,14 +4370,16 @@ impl Target {
                     .all(|w| w.wide.is_some() && w.context == self.context),
             "wide prefill owner/context/stream"
         );
-        if ids.len() < 128 || (self.history.position == 0 && ids.len() == 128) {
+        // A ragged final chunk of an interrupted wide plan must keep that
+        // plan's encoder/tail path, even when fewer than128 tokens remain.
+        if resume_chunks.is_none() && (ids.len() < 128 || (self.history.position == 0 && ids.len() == 128)) {
             ensure!(self.history.position == 0 || self.cached_decoder.is_some(),
                 "small retained EXTEND needs a stable decoder-floor profile");
             // The new request has fewer than128 rows. Its decoder begins at
             // this request's first row, not at the previous128-row history tail.
             // The persistent cached Step is allocated before graph capture.
             self.append(ids, comm, stream)?;
-            return Ok(ids.len());
+            return Ok(PrefillProgress{done:ids.len(),remaining_chunks:Vec::new()});
         }
         let previous = self.history.position as usize;
         let begin = Instant::now();
@@ -3561,7 +4423,9 @@ impl Target {
             .ok().map(|v|v.parse::<usize>()).transpose()?;
         ensure!(profile_start.is_none() || (!encoder_graph && profile_start==Some(131072)),
             "bounded encoder profile requires the current eager path at131072");
-        let chunks = crate::config::plan_encoder_chunks(ids.len(), &available);
+        let chunks=if let Some(chunks)=resume_chunks {
+            crate::config::validate_encoder_chunks(ids.len(),&chunks,&available)?;chunks
+        }else{crate::config::plan_encoder_chunks(ids.len(), &available)};
         for (chunk_index, &rows) in chunks.iter().enumerate() {
             let profile = wides.iter().position(|w| w.rows == rows);
             let remaining = ids.len() - done;
@@ -3651,6 +4515,7 @@ impl Target {
         marks.push(("decoder_tail", Instant::now()));
         self.last_live = 128;
         self.lease.finish_write()?;
+        self.trace_prefill_boundary_for_probe("decoder_tail")?;
         }
         self.last_append_metrics = Some(AppendMetrics {
             live_rows: done,
@@ -3674,7 +4539,7 @@ impl Target {
                 .collect(),
             total_ms: marks.last().unwrap().1.duration_since(begin).as_secs_f64() * 1000.,
         });
-        Ok(done)
+        Ok(PrefillProgress{done,remaining_chunks:chunks[widths.len()..].to_vec()})
     }
     /// One committed encoder chunk (layers0..20 plus encoder-tail publication)
     /// on this extend profile, as its own write transaction.
@@ -3755,7 +4620,7 @@ impl Target {
         let p = Plan::append_with_layout(previous as u64, chunk.len(), rows, self.context, self.swa_layout)?;
         let mut padded = vec![2u32; rows];
         padded[..chunk.len()].copy_from_slice(chunk);
-        let batch = self.history.prepare(&padded, &self.hashes)?;
+        let batch = self.history.prepare_padded(&padded, chunk.len(), &self.hashes)?;
         self.prepare_engram_rows(&batch.rows)?;
         self.io.update_tokens(&mut self.tokens, self.history.position as usize,
             &padded.iter().copied().map(i64::from).collect::<Vec<_>>(),
@@ -3765,6 +4630,7 @@ impl Target {
         comm.select_decode_reduction(false, stream)?;
         comm.select_prefill_rows(chunk.len(), rows, stream)?;
         stream.join_default()?;
+        if let Some(wide)=&self.wide {wide.prepare_moe_scratch(stream)?;}
         let _partial_rows=crate::fp8_linear::LivePrefillRowsScope::new(
             self.prefill_partial_dense_rows && rows==512 && (129..512).contains(&chunk.len())
                 ||self.prefill_partial1024_rows>0&&rows==1024&&(513..1024).contains(&chunk.len()),
@@ -3818,7 +4684,7 @@ impl Target {
                     Ok(worker_started.elapsed().as_secs_f64()*1000.)
                 });
                 let executed = (|| -> Result<()> {
-                    stream.synchronize()?;
+                    self.wait_encoder_chunk(stream)?;
                     comm.health()?;
                     self.check_candidates()?;
                     ensure!(cache.error()? == 0, "prefill encoder publication fault");
@@ -3835,7 +4701,7 @@ impl Target {
                 Ok(LookaheadMetrics {next_rows:next.len(),worker_ms,gpu_wait_ms,join_wait_ms})
             })?)
         } else {
-            stream.synchronize()?;
+            self.wait_encoder_chunk(stream)?;
             comm.health()?;
             self.check_candidates()?;
             ensure!(cache.error()? == 0, "prefill encoder publication fault");
@@ -3854,6 +4720,7 @@ impl Target {
         self.history.commit(batch, chunk.len())?;
         cache.commit(end)?;
         self.lease.finish_write()?;
+        self.trace_prefill_boundary_for_probe("encoder_chunk")?;
         Ok((prepared, captured, lookahead_metrics))
     }
     /// Diagnostic copy of the last prompt row's full FP32 vocabulary logits.
@@ -4050,7 +4917,7 @@ impl Target {
         )?;
         let mut padded = vec![2u32; self.rows];
         padded[..ids.len()].copy_from_slice(ids);
-        let batch = self.history.prepare(&padded, &self.hashes)?;
+        let batch = self.history.prepare_padded(&padded, ids.len(), &self.hashes)?;
         self.prepare_engram_rows(&batch.rows)?;
         self.io.update_tokens(&mut self.tokens, self.history.position as usize,
             &padded.iter().copied().map(i64::from).collect::<Vec<_>>(),
@@ -4190,6 +5057,7 @@ impl Target {
             .map(|_| Ok((self.cuda.event()?, self.cuda.event()?)))
             .collect::<Result<Vec<_>>>()?;
         medium.lease.begin()?;
+        if let Some(wide)=&self.wide {wide.prepare_moe_scratch(stream)?;}
         let encoder = self.encoder_graph.as_ref().unwrap();
         let decoder = medium.decoder_graph.as_ref().unwrap();
         for _ in 0..100 {
@@ -4432,7 +5300,7 @@ impl Target {
         } else {
             self.io
                 .run_head(self.late.output(), self.late.pre(), stream)?;
-            self.io.gather_logits(comm, stream)?;
+            if !self.compact_sampling_active() {self.io.gather_logits(comm, stream)?;}
         }
         Ok(())
     }
@@ -4442,7 +5310,7 @@ impl Target {
     pub fn valid_output_digests(&self) -> Result<serde_json::Value> {
         use sha2::{Digest, Sha256};
         ensure!(
-            self.lease.is_current() && self.last_live > 0,
+            self.lease.is_current() && self.last_live > 0 && !self.last_head_local_only,
             "output digest needs a completed active result"
         );
         let tensors = [
@@ -4473,7 +5341,7 @@ impl Target {
     }
     pub fn logits(&self) -> Result<&Buffer<f32>> {
         ensure!(
-            self.lease.is_current() && self.history.position > 0 && self.last_live > 0,
+            self.lease.is_current() && self.history.position > 0 && self.last_live > 0 && !self.last_head_local_only,
             "target logits are not publishable"
         );
         Ok(self.io.logits())
@@ -4486,6 +5354,7 @@ impl Target {
             self.lease.is_current()
                 && self.history.position > 0
                 && self.last_live > 0
+                && !self.last_head_local_only
                 && self.cuda.owns_stream(stream)
                 && stream.raw() as usize == self.stream,
             "target greedy result is not publishable on this stream"
@@ -4499,20 +5368,32 @@ impl Target {
     /// Sample the next uncommitted token at the model card's T=1, top_p=1.
     /// Position is the absolute predicted output position, including prefill.
     pub(crate) fn sample_token(&mut self, seed: u64, stream: &Stream) -> Result<u32> {
-        ensure!(self.lease.is_current() && self.history.position > 0 && self.last_live > 0
+        ensure!(self.lease.is_current() && self.history.position > 0 && self.last_live > 0 && !self.last_head_local_only
             && self.cuda.owns_stream(stream) && stream.raw() as usize == self.stream,
             "target stochastic result is not publishable on this stream");
         self.lease.begin()?;
         let ids = self.categorical.sample(self.io.logits(), self.last_live - 1, 1, 1., seed,
             crate::categorical::TARGET_DOMAIN, self.history.position, stream)?;
         self.lease.finish_read()?;
+        self.record_restore_initial_logits_for_probe(self.io.logits(),self.last_live-1)?;
         Ok(ids[0])
+    }
+    fn record_restore_initial_logits_for_probe(&self,logits:&Buffer<f32>,row:usize)->Result<()> {
+        if std::env::var("CANADA_SCRATCH_RESTORE_INITIAL_SCREEN").as_deref()!=Ok("1"){return Ok(());}
+        ensure!(self.lease.is_current()&&self.cuda.owns_buffer(logits)
+            &&(row+1)*crate::sampling::VOCAB<=logits.len(),"initial diagnostic row/context");
+        // The draw has already completed. Retain one bounded CPU byte image;
+        // no GPU arithmetic or cache admission is changed. These captures
+        // are not performance measurements.
+        let bytes=unsafe{self.cuda.read_device(logits.ptr()+(row*crate::sampling::VOCAB*4)as u64,
+            crate::sampling::VOCAB*4)}?;
+        RESTORE_INITIAL_LOGITS.with(|cell|*cell.borrow_mut()=Some(bytes));Ok(())
     }
     /// Copy the current prompt's final canonical FP32 logit row. The caller
     /// must first admit this optional allocation together with its state image.
     pub(crate) fn snapshot_prompt_logits(&mut self, stream:&Stream)->Result<Buffer<f32>> {
         ensure!(self.lease.is_current() && self.pending.is_none() && self.history.position>0
-            && self.last_live>0 && self.cuda.owns_stream(stream) && stream.raw()as usize==self.stream,
+            && self.last_live>0 && !self.last_head_local_only && self.cuda.owns_stream(stream) && stream.raw()as usize==self.stream,
             "prompt logits require a committed current owner");
         let output=self.cuda.allocate_rows(crate::sampling::VOCAB)?;
         self.lease.begin()?;
@@ -4535,6 +5416,7 @@ impl Target {
         self.lease.begin()?;
         let ids=self.categorical.sample(logits,0,1,1.,seed,crate::categorical::TARGET_DOMAIN,position,stream)?;
         self.lease.finish_read()?;
+        self.record_restore_initial_logits_for_probe(logits,0)?;
         Ok(ids[0])
     }
     pub fn position(&self) -> u64 {
@@ -4829,6 +5711,124 @@ impl Target {
             "first_absolute_row":previous+chunk.len()-128,"last_absolute_row":previous+chunk.len()-1,
             "tail_token_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&chunk[chunk.len()-128..])?)),
             "taps":taps,"scope":"Immediate layer0 prefill taps, before row-arena reuse. Eager diagnostic interrupts enqueue; compare downstream logits against the prior ordinary graph path."}))?)?;
+        Ok(())
+    }
+    /// Bounded first-divergence taps for the finite M16/M32 screen. Read only
+    /// current forward workspaces, without downloading the full causal caches.
+    pub(crate) fn dump_history32_trace(&self, root:&Path)->Result<()> {
+        use anyhow::Context;
+        use sha2::{Digest,Sha256};
+        ensure!(crate::config::history32_probe_enabled() && [16,32].contains(&self.rows)
+            // Logits are complete, but acceptance has not committed the writer.
+            // Match pending_logits(): the completed speculative revision is busy.
+            && self.source_phase==Phase::Verify && self.lease.is_busy_revision()
+            && self.pending.is_some() && self.history.position>0 && !root.exists(),
+            "bounded history32 trace ownership");
+        std::fs::create_dir_all(root)?;
+        let detailed_start=match std::env::var("CANADA_SCRATCH_HISTORY32_TRACE_DETAIL_START") {
+            Ok(value)=>value.parse::<usize>().context("history32 trace detail start")?,
+            Err(std::env::VarError::NotPresent)=>0,
+            Err(error)=>return Err(error.into()),
+        };
+        ensure!(detailed_start<=36,"history32 trace detail range");
+        let layers=self.layer_owners();
+        ensure!(layers.len()==40,"history32 complete layer ownership");
+        // Hash only the identical first16 causal rows at every layer boundary.
+        // The hashes locate the first differing stage without writing hundreds
+        // of megabytes of activation files or reading mutable MoE scratch.
+        let mut boundaries=Vec::new();
+        for (id,layer) in layers.iter().enumerate() {
+            let mut taps=Vec::new();
+            for (name,b) in [("attn_input",layer.attn_boundary().input()),
+                ("attn_reduced",layer.attn_reduced()),("ffn_input",layer.ffn_boundary().input()),
+                ("ffn_reduced",layer.ffn_reduced()),("residual",layer.output())] {
+                ensure!(b.bytes()%self.rows==0&&b.bytes()/self.rows<=20480*2,
+                    "history32 boundary row extent");
+                let bytes=unsafe{self.cuda.read_device(b.ptr(),16*(b.bytes()/self.rows))}?;
+                taps.push(serde_json::json!({"name":name,"common_rows":16,
+                    "bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(&bytes))}));
+            }
+            boundaries.push(serde_json::json!({"layer":id,"taps":taps}));
+        }
+        let mut entries=Vec::new();
+        for (id,layer) in layers.iter().enumerate().skip(detailed_start).take(4) {
+            let dir=root.join(format!("layer{id}"));std::fs::create_dir(&dir)?;
+            let mut taps=Vec::new();
+            let mut save=|name:&str,dtype:&str,bytes:Vec<u8>|->Result<()> {
+                let element=match dtype {"u8"=>1,"bf16"=>2,_=>4};
+                ensure!(!bytes.is_empty() && bytes.len()%(self.rows*element)==0
+                    && bytes.len()<=self.rows*20480*4,"bounded row-major history32 tap");
+                let file=format!("{name}.bin");std::fs::write(dir.join(&file),&bytes)?;
+                taps.push(serde_json::json!({"name":name,"dtype":dtype,"file":file,
+                    "row_values":bytes.len()/self.rows/element,"bytes":bytes.len(),
+                    "sha256":format!("{:x}",Sha256::digest(&bytes))}));Ok(())
+            };
+            let input=if id==0 {self.io.input()}else if id==1 {
+                layer.engram().ok_or_else(||anyhow::anyhow!("history32 Engram1 absent"))?.output()
+            }else if id==14 {
+                self.group14.engram().ok_or_else(||anyhow::anyhow!("history32 Engram14 absent"))?.0.output()
+            }else{layers[id-1].output()};
+            save("input_residual","bf16",crate::layer_probe::bf16_bytes(input)?)?;
+            for (name,boundary) in [("attn",layer.attn_boundary()),("ffn",layer.ffn_boundary())] {
+                for (suffix,b) in [("input",boundary.input()),("output",boundary.output())] {
+                    save(&format!("mhc_{name}_{suffix}"),"bf16",crate::layer_probe::bf16_bytes(b)?)?;
+                }
+                for (suffix,b) in [("pre",boundary.pre()),("post",boundary.post()),("comb",boundary.comb())] {
+                    save(&format!("mhc_{name}_{suffix}"),"f32",unsafe{self.cuda.read_device(b.ptr(),b.bytes())}?)?;
+                }
+            }
+            for (name,ptr,bytes,stride) in layer.attention().taps() {
+                if !["qa","kv","normalized","qb","q_rope","inverse_attention","woa","output"].contains(&name) {continue;}
+                let raw=if stride==0 {unsafe{self.cuda.read_device(ptr,bytes)}?}else{
+                    ensure!(bytes%self.rows==0,"history32 strided tap");let mut raw=Vec::with_capacity(bytes);
+                    for row in 0..self.rows {raw.extend(unsafe{self.cuda.read_device(ptr+(row*stride)as u64,bytes/self.rows)}?);}
+                    raw
+                };
+                save(&format!("attn_{name}"),"bf16",raw)?;
+            }
+            let f=layer.ffn();
+            // Routed MoE scratch is shared across layers. Its final contents
+            // belong to the last layer, so only layer-owned results are tapped.
+            for (name,b) in [("attn_reduced",layer.attn_reduced()),("ffn_reduced",layer.ffn_reduced()),
+                ("ffn_shared_up",f.shared_up()),("ffn_activation",f.activation()),
+                ("ffn_shared_down",f.shared_down()),("ffn_output",f.output())] {
+                save(name,"bf16",crate::layer_probe::bf16_bytes(b)?)?;
+            }
+            for (name,b) in [("ffn_logits",f.router().logits()),("ffn_routing",f.router().routing())] {
+                save(name,"f32",unsafe{self.cuda.read_device(b.ptr(),b.bytes())}?)?;
+            }
+            let ids=f.router().ids();save("ffn_ids","i32",unsafe{self.cuda.read_device(ids.ptr(),ids.bytes())}?)?;
+            if id==20 {
+                // Source20 owns these projections and selected/remapped IDs.
+                // Publisher scratch and full padded score matrices are shared
+                // or layout-dependent, so do not interpret them after forward.
+                let source=self.late.source();
+                let crate::compression::Input::Ratio1(projection)=source.projection() else {
+                    anyhow::bail!("history32 source20 projection kind");
+                };
+                save("source_projection","bf16",crate::layer_probe::bf16_bytes(projection)?)?;
+                for (name,b) in [("source_latent",source.source().latent()),("source_wk",source.wk()),
+                    ("index_query",source.query().query_projection()),("index_heads",source.query().head_projection())] {
+                    save(name,"bf16",crate::layer_probe::bf16_bytes(b)?)?;
+                }
+                let q=source.query().packed_query();
+                for (name,dtype,ptr,bytes) in [
+                    ("index_payload","u8",q.payload().ptr(),q.payload().bytes()),
+                    ("index_scales","i32",q.scales().ptr(),q.scales().bytes()),
+                    ("index_weights","f32",q.weights().ptr(),q.weights().bytes()),
+                    ("index_selected","i32",source.query().selected().ptr(),source.query().selected().bytes()),
+                    ("index_mapped","i32",source.candidates().ids().ptr(),source.candidates().ids().bytes()),
+                    ("index_lengths","i32",source.candidates().lengths().ptr(),source.candidates().lengths().bytes())] {
+                    save(name,dtype,unsafe{self.cuda.read_device(ptr,bytes)}?)?;
+                }
+            }
+            entries.push(serde_json::json!({"layer":id,"taps":taps}));
+        }
+        ensure!(entries.len()==4,"history32 four-layer detailed trace");
+        std::fs::write(root.join("index.json"),serde_json::to_vec_pretty(&serde_json::json!({
+            "rows":self.rows,"position":self.history.position,"layers":entries,
+            "detailed_start":detailed_start,"boundaries":boundaries,
+            "scope":"Common-first16 boundary hashes for all40 layers and four selected detailed layers of one ordinary forward, recorded after logits. No injected intermediates, cache dump, or serving policy. Hash differences locate arithmetic changes, not quality loss."}))?)?;
         Ok(())
     }
     pub fn dump_layer_trace(&self, root: &Path) -> Result<serde_json::Value> {

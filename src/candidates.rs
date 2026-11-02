@@ -20,6 +20,9 @@ pub(crate) const WINDOW: usize = BLOCK * TOP_BLOCKS;
 pub(crate) fn needed(columns: usize) -> bool {
     columns > WINDOW
 }
+pub(crate) fn compact_construction_requested()->bool {
+    std::env::var("CANADA_SCRATCH_COMPACT_CANDIDATE_CONSTRUCTION_SCREEN").as_deref()==Ok("1")
+}
 fn launch(module: &Module, name: &str, threads: usize, args: &mut [*mut c_void], stream: &Stream) -> Result<()> {
     unsafe {
         module.function(name)?.launch(
@@ -84,29 +87,44 @@ impl Publisher {
             Err(std::env::VarError::NotPresent)=>true,
             Err(error)=>return Err(error.into()),
         } && columns==1048576;
+        // Encoder-only wide profiles immediately compact these buffers below.
+        // Avoid briefly allocating the full-context/full-row intermediates.
+        let compact_build=compact_construction_requested()&&crate::config::wide_rows(rows);
+        if compact_build {
+            ensure!(columns==1048576&&score_shards==4&&bounded_scores
+                &&crate::config::shared_owner_profiles_requested(),
+                "finite compact publisher construction geometry");
+            for key in ["CANADA_SCRATCH_RETAINED_CANDIDATE_PUBLICATION",
+                "CANADA_SCRATCH_COMPACT_RETAINED_MASK","CANADA_SCRATCH_COMPACT_RETAINED_SCORES"] {
+                ensure!(matches!(std::env::var(key).as_deref(),Ok("1")|Err(std::env::VarError::NotPresent)),
+                    "compact publisher construction requires its retained policy");
+            }
+        }
+        let score_rows=if compact_build{128}else{rows/score_shards};
+        let mask_rows=if compact_build{128}else{rows};
         let storage = Rc::new(PublisherStorage {
-            scores: cuda.allocate(rows / score_shards * block_stride)?,
-            mask: cuda.allocate(rows * blocks)?,
+            scores: cuda.allocate(score_rows * block_stride)?,
+            mask: cuda.allocate(mask_rows * blocks)?,
         });
-        Ok(Self {
+        let mut publisher=Self {
             cuda: cuda.clone(),
             module: cuda.module(core)?,
             rows,
             score_shards,
             blocks,
             block_stride,
-            scores: unsafe { storage.scores.view(0, rows / score_shards * block_stride)? },
+            scores: unsafe { storage.scores.view(0, score_rows * block_stride)? },
             windows: Windows::new(cuda, blocks, &vec![0; rows], &vec![0; rows], &vec![0; rows])?,
             top_lengths: cuda.allocate(rows)?,
             selection: Selection::new(
                 cuda,
                 topk::Native::open(cuda, &kernels.join("topk-v2"))?,
-                rows,
+                if compact_build&&rows>512{128}else{rows},
                 blocks,
                 block_stride,
                 TOP_BLOCKS,
             )?,
-            mask: unsafe { storage.mask.view(0, rows * blocks)? },
+            mask: unsafe { storage.mask.view(0, mask_rows * blocks)? },
             bounded_scores,
             compact_mask: false,
             compact_score_windows: None,
@@ -115,7 +133,13 @@ impl Publisher {
             compact_retained_ids: None,
             storage,
             shared_scratch: false,
-        })
+        };
+        if compact_build {
+            publisher.enable_retained_publication()?;
+            ensure!(publisher.compact_mask&&publisher.score_storage_rows()==128
+                &&publisher.retained_raw_lengths.is_some(),"compact publisher constructor not finalized");
+        }
+        Ok(publisher)
     }
     /// Construction-only sharing between sequential wide profiles of the same
     /// target owner. Target checks the common stream, lease and empty history.
@@ -161,6 +185,7 @@ impl Publisher {
     /// Construction-only opt-in by an encoder-only group. Complete layer
     /// groups must still publish every row for their following decoder layers.
     pub(crate) fn enable_retained_publication(&mut self) -> Result<()> {
+        if self.retained_raw_lengths.is_some(){return Ok(());}
         let requested = match std::env::var("CANADA_SCRATCH_RETAINED_CANDIDATE_PUBLICATION") {
             Ok(value) => {ensure!(value == "0" || value == "1", "invalid retained publication policy"); value == "1"},
             Err(std::env::VarError::NotPresent) => true,
@@ -309,6 +334,20 @@ impl Publisher {
                 [16,rows.len()as u32,1],[256,1,1],0,stream,&mut args)?;}
             Ok(())
         }else{launch(&self.module, "ca_candidate_block_scores", rows.len() * self.blocks, &mut args, stream)}
+    }
+    /// Publish an already merged exact top2048 block list. Source20 key
+    /// partition owns score reduction and causal filtering. Inspect every
+    /// valid global ID; merged negative padding need not form a suffix.
+    pub(crate) fn publish_selected(&mut self,selected:&Buffer<i32>,windows:&Windows,stream:&Stream)->Result<()> {
+        ensure!([6,16].contains(&self.rows)&&self.score_shards==1&&self.blocks==131072
+            &&self.retained_raw_lengths.is_none()&&!self.compact_mask
+            &&windows.rows()==self.rows&&selected.len()==self.rows*TOP_BLOCKS
+            &&self.cuda.owns_buffer(selected)&&self.cuda.owns_stream(stream),"merged candidate publication ownership");
+        unsafe{self.cuda.zero_device(self.mask.ptr(),self.mask.bytes(),stream)?;}
+        let(mut ids,mut mask,mut rows,mut stride)=(selected.ptr(),self.mask.ptr(),self.rows as i32,self.blocks as i32);
+        let mut args=[(&mut ids as *mut u64).cast(),(&mut mask as *mut u64).cast(),
+            (&mut rows as *mut i32).cast(),(&mut stride as *mut i32).cast()];
+        launch(&self.module,"ca_key_publisher_make_mask",self.rows*TOP_BLOCKS,&mut args,stream)
     }
     /// After every row's block maxima: keep the best 2048 blocks per row.
     /// Reachable blocks follow the score windows of the same step on GPU.

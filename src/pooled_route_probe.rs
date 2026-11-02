@@ -2,7 +2,10 @@
 use super::*;
 pub(super) fn run(w:&mut Worker,rank:usize,out:&Path,startup:Value)->Result<()> {
     ensure!(std::env::var("CANADA_SCRATCH_POOLED_ROUTE_CAPTURE").as_deref()==Ok("1")
-        &&w.current.is_none()&&w.history.frontier()==0&&w.session_cache_budget==0
+        &&w.current.is_none()&&(w.history.frontier()==0
+            ||std::env::var("CANADA_SCRATCH_ATTENTION16_COMMIT_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_PEER_PREFILL_SCREEN").as_deref()==Ok("1"))
+        &&w.session_cache_budget==0
         &&!w.prompt_checkpoint&&!w.prompt_cache_logits,"finite pooled route capture admission");
     let short:Value=serde_json::from_slice(include_bytes!("../tests/fixtures/root-feedback-exploration-tokens-v1.json"))?;
     ensure!(short["thinking_mode"]=="thinking"&&short["reasoning_effort"]=="high","canonical public templates");
@@ -13,10 +16,22 @@ pub(super) fn run(w:&mut Worker,rank:usize,out:&Path,startup:Value)->Result<()> 
     let c=saved["cases"].as_array().unwrap().iter().find(|c|c["id"]=="offline-product-ideation-answer-3").unwrap();
     let mut idea:Vec<u32>=serde_json::from_value(c["input_ids"].clone())?;idea.push(c["anchor"].as_u64().unwrap()as u32);
     let tokens:Vec<u32>=serde_json::from_value(long["tokens"].clone())?;
-    let mut records=Vec::new();let mut id=1;
+    let inherited=std::env::var("CANADA_SCRATCH_POOLED_INHERITED_ROUTE_CAPTURE").as_deref()==Ok("1");
+    let cases:Vec<(String,String,Vec<u32>)>=if inherited {
+        let f:Value=serde_json::from_slice(include_bytes!("../tests/fixtures/inherited-route-pair-v1.json"))?;
+        ensure!(f["shared_prefix_tokens"].as_u64().is_some_and(|n|n>=18000),"inherited route fixture prefix");
+        f["cases"].as_array().context("inherited route cases")?.iter().map(|c|Ok((
+            c["id"].as_str().context("route case id")?.to_owned(),"reasoning".to_owned(),
+            serde_json::from_value(c["input_ids"].clone())?))).collect::<Result<_>>()?
+    }else{vec![("go-concurrency".into(),"reasoning".into(),go),
+        ("product-ideation".into(),"answer".into(),idea),
+        ("repository-131k".into(),"continuation".into(),tokens[..131072].to_vec())]};
+    ensure!(cases.len()==3,"bounded route capture case count");
+    // The optional preceding committed-state/prefill screens use IDs below8M.
+    // Preserve the ordinary monotonic identity contract in this finite chain.
+    let mut records=Vec::new();let mut id=8_684_001;
     let mut progress=std::fs::OpenOptions::new().create_new(true).write(true).open(out.join("pooled-route-records.jsonl"))?;
-    for (ordinal,(name,phase,prompt))in [("go-concurrency","reasoning",go),("product-ideation","answer",idea),
-        ("repository-131k","continuation",tokens[..131072].to_vec())].into_iter().enumerate() {
+    for (ordinal,(name,phase,prompt))in cases.into_iter().enumerate() {
         let seed=202684000+ordinal as u64;let cap=192;
         let begin=w.execute(Command::Begin{images: Vec::new(),id,seed,greedy:false,limit:cap,tokens:prompt.clone()})?;id+=1;
         ensure!(begin["target_temperature"]==1.&&begin["target_top_p"]==1.
@@ -47,7 +62,7 @@ pub(super) fn run(w:&mut Worker,rank:usize,out:&Path,startup:Value)->Result<()> 
     }
     w.execute(Command::Shutdown)?;
     std::fs::write(out.join("pooled-route-summary.json"),serde_json::to_vec_pretty(&json!({"rank":rank,"startup":startup,
-        "records":records,"all_frontiers_checked":true,
-        "scope":"Three public tasks: Go reasoning, ideation answer and131Krepositorycontinuation;192token cap each, at mosttwo actualM6snapshots per case. CaptureIO excluded from step times; no timingclaim or completed-taskquality. Foregroundonly, current targetT1/P1/FP32attention and actual-q sampling unchanged."}))?)?;
+        "records":records,"all_frontiers_checked":true,"inherited_pair":inherited,
+        "scope":"Three public tasks; optional inherited-prefix edit/test pair plus independent review.192token cap each, at mosttwo actualM6snapshots per case. CaptureIO excluded from step times; no timingclaim or completed-taskquality. Foregroundonly, current targetT1/P1/FP32attention and actual-q sampling unchanged."}))?)?;
     Ok(())
 }

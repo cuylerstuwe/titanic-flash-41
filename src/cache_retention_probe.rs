@@ -153,9 +153,9 @@ pub(super) fn run(w:&mut Worker,rank:usize,out:&Path)->Result<()> {
     let encoded=command.encode()?;
     let wire=w.control.command((rank==0).then_some(encoded.as_slice()))?;
     ensure!(wire==encoded,"cancellation command replicas disagree");
-    let cancelled=w.execute_with_prefill_cancel(Command::decode(&wire)?,&mut |control|{
+    let cancelled=w.execute_with_prefill_cancel(Command::decode(&wire)?,&mut |control,_,_,_|{
         let decision=control.command((rank==0).then_some(&[1u8][..]))?;
-        ensure!(decision==[1],"cancellation decision mismatch");Ok(true)
+        ensure!(decision==[1],"cancellation decision mismatch");Ok(PrefillDirective::Cancel)
     })?;
     ensure!(cancelled["cancelled"]==true&&cancelled["emitted_tokens"]==0
         &&cancelled["cached_tokens"]==8704&&cancelled["retained_session_cache"]["retained_image"]==true,

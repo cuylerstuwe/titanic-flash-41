@@ -71,6 +71,10 @@ pub struct Boundary {
     use_full_stats: bool,
     norm_quant: Option<NormQuant>,
     quant_ready: bool,
+    pdl_pair: bool,
+    alternate_pdl_pair: Option<(Operator, Operator)>,
+    pdl_stats: bool,
+    alternate_pdl_stats: Option<(Operator, Operator)>,
 }
 /// Keep both canonical BF16 routing inputs and the projection's exact native
 /// MXFP8 representation. These are transient, profile-owned graph buffers.
@@ -95,6 +99,18 @@ struct DeferredStats {
 pub(crate) fn overlap_enabled() -> bool {
     std::env::var("CANADA_SCRATCH_MHC_OVERLAP").as_deref() == Ok("1")
 }
+pub(crate) fn pdl_pair_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_MHC_PDL_PAIR") {
+        Ok(value) => { ensure!(value == "0" || value == "1", "invalid mHC PDL pair policy"); Ok(value == "1") },
+        Err(std::env::VarError::NotPresent) => Ok(false), Err(error) => Err(error.into()),
+    }
+}
+pub(crate) fn pdl_stats_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_MHC_PDL_STATS") {
+        Ok(value) => { ensure!(value == "0" || value == "1", "invalid mHC PDL stats policy"); Ok(value == "1") },
+        Err(std::env::VarError::NotPresent) => Ok(false), Err(error) => Err(error.into()),
+    }
+}
 pub(crate) fn attention16_overlap_enabled() -> Result<bool> {
     match std::env::var("CANADA_SCRATCH_ATTENTION16_OVERLAP") {
         Ok(value) => {
@@ -104,6 +120,22 @@ pub(crate) fn attention16_overlap_enabled() -> Result<bool> {
         Err(std::env::VarError::NotPresent) => Ok(true),
         Err(error) => Err(error.into()),
     }
+}
+/// Explicit opt-in for compact M16 attention after the dense pipeline fix.
+/// Older packages keep the original serial guard and cannot select this by
+/// setting the old overlap flag alone.
+pub(crate) fn compact16_overlap_enabled() -> Result<bool> {
+    let enabled=match std::env::var("CANADA_SCRATCH_ATTENTION16_COMPACT_OVERLAP") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid compact M16 overlap policy");v=="1"},
+        Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
+    };
+    if enabled {
+        ensure!(std::env::var("CANADA_SCRATCH_DENSE_PIPELINE_FENCE").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_GROUPED_SPARSE16").as_deref()==Ok("1")
+            &&attention16_overlap_enabled()?,
+            "compact M16 overlap requires the explicit pipeline fence and compact indexing");
+    }
+    Ok(enabled)
 }
 pub(crate) fn prefill_norm_fusion_enabled() -> Result<bool> {
     match std::env::var("CANADA_SCRATCH_PREFILL_NORM_FUSION") {
@@ -219,7 +251,7 @@ impl Boundary {
             )
         }?;
         let root = kernels.join("triton-hc-v2");
-        let stats = Operator::load(
+        let mut stats = Operator::load(
             cuda,
             &root,
             if rows <= 8 {
@@ -230,7 +262,7 @@ impl Boundary {
                 "hc_stats_mb16_s1"
             },
         )?;
-        let reduce = Operator::load(cuda, &root, "hc_reduce80")?;
+        let mut reduce = Operator::load(cuda, &root, "hc_reduce80")?;
         let two_mma_requested=match std::env::var("CANADA_SCRATCH_MHC_TWO_MMA") {
             Ok(v)=>{ensure!(v=="0"||v=="1","invalid two-MMA policy");v=="1"},
             Err(std::env::VarError::NotPresent)=>false,
@@ -265,7 +297,7 @@ impl Boundary {
                 Err(std::env::VarError::NotPresent) => false,
                 Err(e) => return Err(e.into()),
             };
-        let post_op = if post_tiles {
+        let mut post_op = if post_tiles {
             Operator::load(cuda, &kernels.join("mhc-post-tiles-v1"), "hc_post_b128_w1")?
         } else {
             Operator::load(cuda, &kernels.join("mhc-post-v1"), "mhc_post")?
@@ -384,7 +416,7 @@ impl Boundary {
             Some(FullStats { stats, reduce: reduced,
                 mix: cuda.allocate_rows(rows * 24)?, square: cuda.allocate_rows(rows)? })
         } else { None };
-        let norm_quant = if rows == 6 && !id.is_draft()
+        let mut norm_quant = if rows == 6 && !id.is_draft()
             && std::env::var("CANADA_SCRATCH_NORM_QUANT_FUSION").as_deref() == Ok("1") {
             ensure!(!crate::fp8_linear::narrow_enabled(), "norm/quant fusion requires the checked legacy input quantizer");
             let layout8 = std::env::var("CANADA_SCRATCH_NORM_QUANT_LAYOUT8").as_deref() == Ok("1");
@@ -393,13 +425,64 @@ impl Boundary {
                 if layout8 {"hc_norm_quant_p2"} else {"hc_norm_quant_p4"})?;
             abi(&op, &[("X","*bf16"),("P","*fp32"),("W","*bf16"),("Y","*bf16"),
                 ("Q","*fp8e4nv"),("SR","*u8"),("SM","*u8")])?;
-            let mut mma_scales = cuda.allocate_rows(20480)?;
+            // The unused MMA tile lanes keep their initialization across
+            // executions; they cannot borrow another profile's row arena.
+            let mut mma_scales = cuda.allocate(20480)?;
             mma_scales.zero()?;
             stream.join_default()?;
             Some(NormQuant {op, values:cuda.allocate_rows(rows*5120)?,
                 row_scales:cuda.allocate_rows(rows*160)?, mma_scales})
         } else {None};
+        let pdl_pair = rows == 6 && !id.is_draft() && pdl_pair_requested()?;
+        let pdl_screen = rows == 6 && !id.is_draft()
+            && std::env::var("CANADA_SCRATCH_MHC_PDL_PAIR_SCREEN").as_deref() == Ok("1");
+        let mut alternate_pdl_pair = if pdl_pair || pdl_screen {
+            ensure!(post_tiles && norm_quant.is_some()
+                && std::env::var("CANADA_SCRATCH_NORM_QUANT_LAYOUT8").as_deref() == Ok("1"),
+                "mHC PDL pair requires the qualified M6 tile and layout8 quantizer");
+            let root = kernels.join("mhc-pdl-pair-v1");
+            let pair = (Operator::load(cuda, &root, "hc_post_b128_w1")?,
+                Operator::load(cuda, &root, "hc_norm_quant_p2")?);
+            for (candidate, control) in [(&pair.0, &post_op), (&pair.1, &norm_quant.as_ref().unwrap().op)] {
+                ensure!(candidate.entry.programmatic_stream_serialization
+                    && candidate.entry.arguments.iter().map(|a| (&a.name, &a.kind))
+                        .eq(control.entry.arguments.iter().map(|a| (&a.name, &a.kind))),
+                    "mHC PDL operator contract mismatch");
+            }
+            Some(pair)
+        } else { None };
+        if pdl_pair {
+            let pair = alternate_pdl_pair.as_mut().unwrap();
+            std::mem::swap(&mut post_op, &mut pair.0);
+            std::mem::swap(&mut norm_quant.as_mut().unwrap().op, &mut pair.1);
+            if !pdl_screen { alternate_pdl_pair = None; }
+        }
+        let pdl_stats = rows == 6 && !id.is_draft() && pdl_stats_requested()?;
+        let mut alternate_pdl_stats = if pdl_stats || pdl_screen {
+            ensure!(!two_mma_requested && !use_full_stats,
+                "mHC PDL stats requires the original 80-slice statistics path");
+            let root = kernels.join("mhc-pdl-stats-v1");
+            let pair = (Operator::load(cuda, &root, "hc_stats_mb8_s2")?,
+                Operator::load(cuda, &root, "hc_reduce80")?);
+            for (candidate, control) in [(&pair.0, &stats), (&pair.1, &reduce)] {
+                ensure!(candidate.entry.programmatic_stream_serialization
+                    && candidate.entry.arguments.iter().map(|a| (&a.name, &a.kind))
+                        .eq(control.entry.arguments.iter().map(|a| (&a.name, &a.kind))),
+                    "mHC PDL statistics contract mismatch");
+            }
+            Some(pair)
+        } else { None };
+        if pdl_stats {
+            let pair = alternate_pdl_stats.as_mut().unwrap();
+            std::mem::swap(&mut stats, &mut pair.0);
+            std::mem::swap(&mut reduce, &mut pair.1);
+            if !pdl_screen { alternate_pdl_stats = None; }
+        }
         let result = Self {
+            pdl_stats,
+            alternate_pdl_stats,
+            pdl_pair,
+            alternate_pdl_pair,
             cuda: cuda.clone(),
             fn_pointer: weights.ptr(&format!("{prefix}_fn"))?,
             base_pointer: weights.ptr(&format!("{prefix}_base"))?,
@@ -485,6 +568,31 @@ impl Boundary {
     }
     pub(crate) fn fullk_active(&self) -> bool { self.use_full_stats }
     pub(crate) fn norm_quant_enabled(&self) -> bool { self.norm_quant.is_some() }
+    pub(crate) fn set_pdl_pair_for_probe(&mut self, enabled: bool) -> Result<()> {
+        ensure!(self.rows == 6 && self.alternate_pdl_pair.is_some()
+            && std::env::var("CANADA_SCRATCH_MHC_PDL_PAIR_SCREEN").as_deref() == Ok("1"),
+            "mHC PDL swap requires the isolated M6 screen");
+        if self.pdl_pair != enabled {
+            let pair = self.alternate_pdl_pair.as_mut().unwrap();
+            std::mem::swap(&mut self.post_op, &mut pair.0);
+            std::mem::swap(&mut self.norm_quant.as_mut().unwrap().op, &mut pair.1);
+            self.pdl_pair = enabled;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_pdl_stats_for_probe(&mut self, enabled: bool) -> Result<()> {
+        ensure!(self.rows == 6 && !self.use_two_mma && !self.use_full_stats
+            && self.alternate_pdl_stats.is_some()
+            && std::env::var("CANADA_SCRATCH_MHC_PDL_PAIR_SCREEN").as_deref() == Ok("1"),
+            "mHC PDL statistics swap requires the isolated M6 screen");
+        if self.pdl_stats != enabled {
+            let pair = self.alternate_pdl_stats.as_mut().unwrap();
+            std::mem::swap(&mut self.stats, &mut pair.0);
+            std::mem::swap(&mut self.reduce, &mut pair.1);
+            self.pdl_stats = enabled;
+        }
+        Ok(())
+    }
     pub(crate) fn quantized_input(&self) -> Option<(&Buffer<u8>, &Buffer<u8>)> {
         self.norm_quant.as_ref().filter(|_|self.quant_ready).map(|q|(&q.values,&q.mma_scales))
     }

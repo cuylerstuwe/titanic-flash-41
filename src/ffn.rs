@@ -21,6 +21,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{cell::Cell, ffi::c_void, path::Path, rc::Rc};
 
+#[path = "paired_ffn.rs"]
+mod paired;
+pub(crate) use paired::Paired;
+
 #[derive(Deserialize)]
 struct NativeContract {
     abi: u32,
@@ -171,11 +175,18 @@ impl Router {
         vendor_blas: Option<Rc<Blas>>,
     ) -> Result<Self> {
         ensure!(
-            (1..=16).contains(&rows) || crate::config::extend_rows(rows),
+            (1..=16).contains(&rows) || crate::config::target_rows(rows),
             "router row capacity"
         );
         let experts = id.experts();
         let topk = id.topk();
+        let split_native = match std::env::var("CANADA_SCRATCH_HISTORY32_SPLIT_ROUTER").as_deref() {
+            Ok("1") => true,
+            Ok("0") | Err(_) => false,
+            _ => anyhow::bail!("history32 split router must be 0 or 1"),
+        };
+        ensure!(!split_native || crate::config::history32_enabled(),
+            "split router requires the admitted native32 capability");
         let p = format!("{}.ffn.gate", id.prefix());
         for (kind, dtype, shape) in [
             ("weight", Dtype::Bf16, vec![experts as u64, 5120]),
@@ -252,7 +263,7 @@ impl Router {
                 if id.is_draft() { "bias" } else { "bias_vl" }
             ))?,
             rows,
-            scores: if rows <= 16 {
+            scores: if rows <= 16 || (rows==32 && split_native && !id.is_draft()) {
                 Scores::Tiny {
                     weight: weights.ptr(&format!("{p}.weight"))?,
                     output: cuda.allocate_rows(rows * experts)?,
@@ -290,18 +301,25 @@ impl Router {
         );
         self.stream.set(s);
         match &self.scores {
-            Scores::Tiny { weight, output } => ensure!(
+            Scores::Tiny { weight, output } => {
+              // The native primitive's arithmetic and <=16-row admission stay
+              // unchanged; only the finite M32 profile issues a second call.
+              let experts=output.len()/self.rows;
+              for offset in (0..self.rows).step_by(16) {
+                ensure!(
                 unsafe {
                     (self.native.logits)(
-                        self.rows as i32,
-                        input.ptr() as *const c_void,
+                        (self.rows-offset).min(16) as i32,
+                        (input.ptr()+(offset*5120*2)as u64) as *const c_void,
                         *weight as *const c_void,
-                        output.ptr() as *mut c_void,
+                        (output.ptr()+(offset*experts*4)as u64) as *mut c_void,
                         stream.raw(),
                     )
                 } == 0,
                 "tiny router GPU launch failed"
-            ),
+                );
+              }
+            },
             Scores::Vendor(p) => p.run(input, stream)?,
         }
         unsafe {

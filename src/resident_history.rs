@@ -188,7 +188,7 @@ impl ResidentHistory {
         self.step_limit_for_rows(6)
     }
     pub(crate) fn step_limit_for_rows(&self, rows: usize) -> Result<usize> {
-        ensure!([6,16].contains(&rows), "resident verification capacity");
+        ensure!([6,16,32].contains(&rows), "resident verification capacity");
         let Phase::Generating { limit, emitted, .. } = self.phase else {
             anyhow::bail!("resident request is not generating")
         };
@@ -213,7 +213,7 @@ impl ResidentHistory {
         };
         ensure!(
             !inputs.is_empty()
-                && inputs.len() <= 16
+                && inputs.len() <= 32
                 && inputs.len() <= limit - emitted
                 && inputs.first() == self.pending.as_ref()
                 && inputs.iter().all(|&t| t < 129280 && t != self.eos)
@@ -256,6 +256,15 @@ impl ResidentHistory {
     pub fn retire(&mut self) {
         self.phase = Phase::Poisoned;
     }
+    /// Physical owners keep their phase and token buffers in place. Switching
+    /// the selected owner must still preserve the group-wide request-ID floor.
+    pub(crate) fn synchronize_request_ids(&mut self,other:&mut Self)->Result<()> {
+        ensure!(self.capacity==other.capacity&&self.eos==other.eos
+            &&!matches!(self.phase,Phase::Poisoned)&&!matches!(other.phase,Phase::Poisoned),
+            "resident bank identity/phase");
+        let newest=self.last_id.max(other.last_id);
+        self.last_id=newest;other.last_id=newest;Ok(())
+    }
     /// Keep the currently loaded model's token identity while another request
     /// is selected. The caller must already own a complete GPU/sampler image.
     pub(crate) fn suspend(&mut self) -> Result<()> {
@@ -275,6 +284,24 @@ impl ResidentHistory {
         *self = saved.clone();
         self.last_id = newest_id;
         Ok(())
+    }
+    /// Both requests stay admitted. Move host ownership with the matching GPU
+    /// exchange, preserving the global request-ID high-water mark on both.
+    pub(crate) fn exchange(&mut self,saved:&mut Self)->Result<()> {
+        let active=|h:&Self|matches!(h.phase,Phase::Generating{..}|Phase::Prefilling{..})&&h.pending.is_some();
+        ensure!(active(self)&&active(saved)&&self.capacity==saved.capacity&&self.eos==saved.eos,
+            "exchanged request history ownership/phase");
+        let newest=self.last_id.max(saved.last_id);std::mem::swap(self,saved);
+        self.last_id=newest;saved.last_id=newest;Ok(())
+    }
+    /// A partially prefilling request still needs its complete original input,
+    /// including any cached prefix beyond its current committed frontier.
+    pub(crate) fn needs_prefix(&self, prefix: &[u32], media: &MediaIdentity) -> bool {
+        let (tokens, identity) = match &self.phase {
+            Phase::Prefilling { prompt, media, .. } => (prompt.as_slice(), media),
+            _ => (self.committed.as_slice(), &self.media),
+        };
+        tokens.starts_with(prefix) && identity.matches_prefix(media, prefix.len())
     }
     pub fn frontier(&self) -> usize {
         self.committed.len()
@@ -323,7 +350,10 @@ mod tests {
         h.partial_prefilled(2,9).unwrap();
         assert_eq!(h.media().placements()[0].tokens,3);
         assert!(h.owned_token_bytes()>(prompt.len()+2)*4);
+        assert!(h.needs_prefix(&prompt[..4],&a), "a pending prompt needs prefixes past its committed frontier");
+        assert!(!h.needs_prefix(&prompt[..4],&media(&prompt,2)), "equal image placeholders are not equal input");
         let saved=h.clone();h.suspend().unwrap();
+        assert!(saved.needs_prefix(&prompt[..4],&a), "the parked original input retains its needed prefixes");
         h.prepare(2,vec![20,21],1,8).unwrap();h.prefilled(2,22).unwrap();h.finish(Finish::Length).unwrap();
         h.resume(&saved).unwrap();assert_eq!(h.media(),&a);h.finish(Finish::Cancelled).unwrap();
         let mut plan=h.prepare_with_media(3,prompt.clone(),media(&prompt,2),1,9).unwrap();
@@ -352,6 +382,8 @@ mod tests {
         let mut h=ResidentHistory::new(128,1).unwrap();
         h.prepare(1,vec![2,3,4,5,6,7,8,9],3,7).unwrap();
         h.partial_prefilled(4,1).unwrap(); // Even an EOS metadata anchor is not output.
+        assert!(h.needs_prefix(&[2,3,4,5,6,7],&MediaIdentity::default()));
+        assert!(!h.needs_prefix(&[2,3,4,5,6,8],&MediaIdentity::default()));
         assert_eq!(h.owned_token_bytes(),(8+4)*4);
         assert!(h.step_limit().is_err());
         let saved=h.clone();h.suspend().unwrap();
@@ -384,6 +416,44 @@ mod tests {
         assert_eq!(h.step_limit().unwrap(),0);h.finish(Finish::Length).unwrap();
         assert!(h.prepare(2,vec![30],1,9).is_err());
         h.prepare(3,vec![30],1,9).unwrap();
+    }
+    #[test]
+    fn exchange_moves_budgets_and_preserves_global_id_after_either_owner_finishes(){
+        let mut a=ResidentHistory::new(128,1).unwrap();
+        a.prepare(1,vec![2,3],5,7).unwrap();a.prefilled(2,4).unwrap();
+        a.committed_step(&[4],5,3).unwrap();
+        let mut b=a.clone();b.suspend().unwrap();
+        b.prepare(2,vec![20,21,22],3,8).unwrap();b.prefilled(3,23).unwrap();
+        a.exchange(&mut b).unwrap();
+        assert_eq!(a.committed(),[20,21,22]);assert_eq!(a.pending(),Some(23));assert_eq!(a.step_limit().unwrap(),2);
+        assert_eq!(b.committed(),[2,3,4]);assert_eq!(b.pending(),Some(5));assert_eq!(b.step_limit().unwrap(),3);
+        a.exchange(&mut b).unwrap();a.finish(Finish::Cancelled).unwrap();b.finish(Finish::Cancelled).unwrap();
+        assert!(a.exchange(&mut b).is_err());
+        assert!(a.prepare(2,vec![30],1,9).is_err());assert!(b.prepare(2,vec![30],1,9).is_err());
+        a.prepare(3,vec![30],1,9).unwrap();b.prepare(3,vec![31],1,10).unwrap();
+    }
+    #[test]
+    fn physical_banks_preserve_progress_and_global_ids_without_snapshot_copies(){
+        let mut a=ResidentHistory::new(128,1).unwrap();
+        let mut b=ResidentHistory::new(128,1).unwrap();
+        a.prepare(1,vec![2,3],5,7).unwrap();a.prefilled(2,4).unwrap();
+        a.committed_step(&[4],5,3).unwrap();
+        let storage=a.committed.as_ptr();
+        a.synchronize_request_ids(&mut b).unwrap();
+        assert!(b.prepare(1,vec![20,21],3,8).is_err());
+        b.prepare(2,vec![20,21],3,8).unwrap();b.partial_prefilled(1,22).unwrap();
+        b.synchronize_request_ids(&mut a).unwrap();
+        assert_eq!(a.committed.as_ptr(),storage);
+        assert_eq!(a.committed(),[2,3,4]);assert_eq!(a.pending(),Some(5));
+        assert_eq!(a.step_limit().unwrap(),3);
+        b.finish(Finish::Cancelled).unwrap();
+        a.finish(Finish::Cancelled).unwrap();
+        assert!(a.prepare(2,vec![30],1,9).is_err());
+        a.prepare(3,vec![30],1,9).unwrap();a.prefilled(1,31).unwrap();
+        a.synchronize_request_ids(&mut b).unwrap();
+        assert!(b.prepare(3,vec![40],1,10).is_err());
+        b.prepare(4,vec![40],1,10).unwrap();
+        a.retire();assert!(a.synchronize_request_ids(&mut b).is_err());
     }
     #[test]
     fn encoder_prefix_adoption_has_no_invented_anchor() {
@@ -489,11 +559,12 @@ mod tests {
     }
     #[test]
     fn all_eos_positions_and_budget_edges_preserve_one_pending_token() {
-        for n in 1..=16 {
+        for n in 1..=32 {
             let mut h = ResidentHistory::new(128, 1).unwrap();
             h.prepare(1, vec![0, 42], n + 1, 7).unwrap();
             h.prefilled(2, 50).unwrap();
-            assert_eq!(h.step_limit_for_rows(16).unwrap(), n);
+            assert_eq!(h.step_limit_for_rows(16).unwrap(), n.min(16));
+            assert_eq!(h.step_limit_for_rows(32).unwrap(), n);
             assert_eq!(h.step_limit().unwrap(), n.min(6));
             let input: Vec<_> = (50..50 + n as u32).collect();
             let emitted = h.committed_step(&input, 1, 2 + n).unwrap();
@@ -512,5 +583,16 @@ mod tests {
             h.prepare(1, vec![0, 42], 8, 7).is_err(),
             "request IDs cannot be replayed"
         );
+    }
+    #[test]
+    fn oversized_blocks_and_remaining_budget_overruns_publish_nothing() {
+        for (rows,limit) in [(33usize,64usize),(32,32)] {
+            let mut h=ResidentHistory::new(128,1).unwrap();
+            h.prepare(1,vec![0,42],limit,7).unwrap();h.prefilled(2,50).unwrap();
+            let inputs=(50..50+rows as u32).collect::<Vec<_>>();
+            assert!(h.committed_step(&inputs,90,2+rows).is_err());
+            assert_eq!(h.frontier(),2);assert_eq!(h.pending(),Some(50));
+            assert!(h.finish(Finish::Length).is_err());
+        }
     }
 }

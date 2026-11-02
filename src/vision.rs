@@ -292,9 +292,10 @@ impl Vision {
         );
         let layout = WorkspacePlan::new(g)?;
         let needed = layout.admission_bytes(false); // patches are already resident
+        let reserve = self.cuda.allocation_reserve_bytes();
         let memory_before = self.cuda.admission_memory()?;
         ensure!(
-            needed + (8usize << 30) < memory_before.admitted_available,
+            needed + reserve < memory_before.admitted_available,
             "vision workspace exceeds available UMA above reserve"
         );
         let [x, norm, qkv, q, k, v, attn, delta, gate_up, gated,
@@ -326,10 +327,10 @@ impl Vision {
         stream.join_default()?;
         let memory_allocated = self.cuda.admission_memory()?;
         eprintln!("vision workspace admission: {}", serde_json::json!({
-            "geometry":g,"admission_bytes":needed,"memory_before":memory_before,
+            "geometry":g,"admission_bytes":needed,"reserve_bytes":reserve,"memory_before":memory_before,
             "memory_allocated":memory_allocated
         }));
-        ensure!(memory_allocated.admitted_available > (8usize << 30),
+        ensure!(memory_allocated.admitted_available > reserve,
             "vision allocations consumed the UMA reserve");
         // Every local tensor/module outlives queued work even if a tap errors.
         let run = (|| -> Result<()> {

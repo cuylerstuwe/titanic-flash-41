@@ -6,7 +6,7 @@ Commands below run on the head unless another location is specified. Do not run 
 
 ## 1. Host and fabric prerequisites
 
-On **every node**, install a supported DGX OS / Ubuntu Arm64 NVIDIA driver, Docker Engine, NVIDIA Container Toolkit and RDMA userspace (`rdma-core`, `ibverbs-utils`). Install `python3`, `rsync`, `git` and `openssh-client`. Verify:
+On **every node**, install a supported DGX OS / Ubuntu Arm64 NVIDIA driver, Docker Engine, NVIDIA Container Toolkit and RDMA userspace (`rdma-core`, `ibverbs-utils`). Install `python3`, `rsync`, `git`, `openssh-client`, `nvme-cli` and systemd. Verify:
 
 ```sh
 uname -m
@@ -20,6 +20,8 @@ ip -br address
 `uname -m` must report `aarch64`; the GPU must be GB10 / SM121. CUDA 13.0.88 inside the pinned container must work with the host driver. Keep swap available for the OS, but do not rely on swap for model allocations. At startup the portable launcher requires at least 110 GiB available RAM and 35 GiB free SSD space per node; containers are capped at 96 GiB with no extra swap allowance.
 
 Configure two independent reachable RoCE fabrics, one port from every node on each fabric. Both switched fabrics and an equivalently reachable supported fabric are possible; the recipe assumes all four nodes can address every other node on both rails. Do not assume arbitrary point-to-point ring wiring satisfies that requirement. Confirm matching MTUs end to end and working bidirectional RDMA before loading the model. Logical NCCL ring algorithms do not require a physically ring-shaped network.
+
+The checked profile uses IP traffic class **106** on both NCCL and the custom RoCE proxy. Account for it in switch QoS configuration; changing only `NCCL_IB_TC` does not change the separately compiled proxy. The recipe does not change switch settings automatically.
 
 Record the HCA names, IP addresses, socket interface and **RoCEv2 GID index** on each node. For example:
 
@@ -47,6 +49,10 @@ chmod 600 /srv/titanic-flash-41/state/fleet.json
 
 Edit `state/fleet.json` with the four actual `hostname` outputs, the three SSH aliases, both HCA/IP pairs per node, the socket interface and GID indices. Rank 0 has `ssh: null`; the inventory must run on that head. The example's `192.0.2.*` / `198.51.100.*` addresses and `spark-*` hostnames are documentation placeholders, not an automatic network setup. Use a root without spaces or shell metacharacters.
 
+The example explicitly selects a **2350 MHz** maximum GPU clock and temporary APST disablement on `/dev/nvme0` on each Spark. Before using the NVMe option, confirm that this controller backs the local Engram files and supports feature 12 with a 256-byte APST table (`sudo nvme get-feature /dev/nvme0 -f 12 -H`). Set a node's `disable_nvme0_apst` to `false` if that option is inapplicable. The helper does not alter another NVMe controller. Set `gpu_clock_cap_mhz` to `0` to leave clocks under host control; for a stock-clock comparison, restore stock clocks before startup. No lower automatic thermal cap is enabled.
+
+Host-policy helpers run as the deployment account and need noninteractive administrative access to the documented `nvidia-smi`, `nvme`, runtime-directory provisioning and systemd timer operations. Have an administrator establish that access on the selected nodes; do not rely on an expiring cached sudo password. If unavailable, select the explicit host-policy overrides above. Arming fails before model startup if independent restoration cannot be established. Keep the original host settings and do not run a second host-policy manager over the same devices.
+
 Leave `http_bind` at `127.0.0.1:8000` for an on-head client or SSH tunnel. To serve a trusted LAN, choose one specific private interface address and set `allow_remote: true`; wildcard binds are rejected. The API port must not overlap the five reserved cohort ports.
 
 ```sh
@@ -65,7 +71,7 @@ Read [the third-party notices](../THIRD_PARTY_NOTICES.md), including the separat
 ```sh
 cd /srv/titanic-flash-41/source
 docker build -f deploy/Dockerfile -t titanic-flash-41:toolchain .
-docker run --rm --cpus=2 --memory=3g --memory-swap=3g \
+docker run --rm --cpus=2 --memory=8g --memory-swap=8g \
   -v /srv/titanic-flash-41/source:/project:ro \
   -v /srv/titanic-flash-41/data:/data \
   --entrypoint /bin/bash titanic-flash-41:toolchain /project/tools/build.sh
@@ -144,7 +150,7 @@ docker run --rm --gpus all --ipc=host --memory=96g --memory-swap=96g \
   /project/tools/stage_weights.py --rank all
 ```
 
-This writes 40 layer atlases per rank, model-I/O and MTP atlases per rank, the rank-0 vision atlas, and a checkpoint manifest. Each output records its rank, tensor selection, byte count and SHA-256. Existing complete outputs are verified before reuse. A partial staging directory is preserved for inspection; do not rename it into place or edit hashes to bypass a failed check.
+This writes 40 layer atlases per rank, model-I/O and MTP atlases per rank, the canonical `vision-v1/r0` atlas, and a checkpoint manifest. **Rank 3 owns image encoding in the current profile.** Distribution places that unchanged canonical vision atlas on rank 3; its `r0` metadata describes the atlas, not the serving host. Each output records its rank, tensor selection, byte count and SHA-256. Existing complete outputs are verified before reuse. A partial staging directory is preserved for inspection; do not rename it into place or edit hashes to bypass a failed check.
 
 Copy only the correct rank's data to each worker:
 
@@ -162,7 +168,7 @@ Ensure all four GPUs are idle. Start the controller on the head in a persistent 
 python3 deploy/fleet.py serve /srv/titanic-flash-41/state/fleet.json
 ```
 
-It checks node identities, available memory/disk, image identity, runtime hashes and required files; writes a fresh private rendezvous ticket; launches four owned containers; and waits for Ready. Initial load and graph setup can take several minutes. A failed rank stops the entire owned cohort. The controller never stops another project's containers.
+It checks node identities, available memory/disk, image identity, runtime hashes and required files; installs immutable host-policy helpers; arms the selected temporary policies with node-local restoration timers; writes a fresh private rendezvous ticket; launches four owned containers; and waits for Ready. Initial load and graph setup can take several minutes. A failed rank stops the entire owned cohort. The controller never stops another project's containers.
 
 In a second head terminal:
 
@@ -187,4 +193,4 @@ After that succeeds, install the example systemd unit if unattended supervision 
 
 Keep the known-good source commit, image ID, runtime provenance, kernel inventory and private fleet inventory together. Updates should use a separate data/runtime directory and be hash-verified before replacing a stopped service. Stop all four owned ranks before changing an image, kernel, source profile or inventory. Restore the complete previous set on failure; never mix ranks from different versions or reuse a rendezvous ticket between cohorts. A successful build is not sufficient qualification for a new kernel, quantization or protocol change.
 
-The portable launcher does not modify NVMe firmware/power policies, system networking, router configuration or other inference services. These remain host-administration responsibilities. See [operations](OPERATIONS.md), [validation scope](VALIDATION.md) and [benchmark reproduction](BENCHMARKS.md).
+The selected clock/APST policies are temporary, restored on stop, and protected by independent node-local lease expiry. Only transitions write durable state; renewals use private tmpfs. Retain `state/host-policy-code/` and the saved restoration records until the associated generations have been restored. Firmware, networking, router configuration and other inference services remain host-administration responsibilities. See [operations](OPERATIONS.md), [validation scope](VALIDATION.md) and [benchmark reproduction](BENCHMARKS.md).

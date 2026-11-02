@@ -6,12 +6,70 @@ use std::{
     cell::RefCell,
     ffi::{CStr, CString, c_char, c_int, c_uint, c_void},
     marker::PhantomData,
+    os::fd::{AsRawFd, OwnedFd},
     ptr,
     rc::{Rc, Weak},
 };
 
 type Handle = *mut c_void;
 type CuResult = c_int;
+
+// CUDA 13.0 public VMM ABI. Used only for opt-in, individually owned,
+// losslessly compressible weight storage. The finite external-pool experiment
+// can import allocations from its direct parent in the same memory cgroup.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MemLocation { kind: c_int, id: c_int }
+#[repr(C)]
+#[derive(Default)]
+struct MemAllocationProp {
+    kind: c_int,
+    handle_types: c_int,
+    location: MemLocation,
+    windows_metadata: *mut c_void,
+    compression: u8,
+    rdma: u8,
+    usage: u16,
+    reserved: [u8; 4],
+}
+#[repr(C)]
+struct MemAccessDesc { location: MemLocation, flags: c_int }
+const _: () = {
+    assert!(std::mem::size_of::<MemLocation>() == 8);
+    assert!(std::mem::size_of::<MemAllocationProp>() == 32);
+    assert!(std::mem::offset_of!(MemAllocationProp, location) == 8);
+    assert!(std::mem::offset_of!(MemAllocationProp, windows_metadata) == 16);
+    assert!(std::mem::offset_of!(MemAllocationProp, compression) == 24);
+    assert!(std::mem::size_of::<MemAccessDesc>() == 12);
+    assert!(std::mem::offset_of!(MemAccessDesc, flags) == 8);
+};
+
+// CUDA's public CUlaunchConfig / CUlaunchAttribute ABI (cuda.h 13.0).
+// Only programmatic stream serialization is exposed here. A PDL consumer
+// must wait for its predecessor before reading any dependent global memory.
+#[repr(C)]
+struct LaunchAttribute {
+    id: c_int,
+    pad: [u8; 4],
+    value: [u64; 8],
+}
+#[repr(C)]
+struct LaunchConfig {
+    grid: [c_uint; 3],
+    block: [c_uint; 3],
+    shared: c_uint,
+    stream: Handle,
+    attrs: *mut LaunchAttribute,
+    count: c_uint,
+}
+const _: () = {
+    assert!(std::mem::size_of::<LaunchAttribute>() == 72);
+    assert!(std::mem::offset_of!(LaunchAttribute, value) == 8);
+    assert!(std::mem::size_of::<LaunchConfig>() == 56);
+    assert!(std::mem::offset_of!(LaunchConfig, stream) == 32);
+    assert!(std::mem::offset_of!(LaunchConfig, attrs) == 40);
+    assert!(std::mem::offset_of!(LaunchConfig, count) == 48);
+};
 
 macro_rules! api {
     ($($field:ident : $ty:ty = $sym:literal;)+) => {
@@ -31,10 +89,21 @@ api! {
     device_attribute: unsafe extern "C" fn(*mut c_int,c_int,c_int)->CuResult = "cuDeviceGetAttribute";
     primary_retain: unsafe extern "C" fn(*mut Handle,c_int)->CuResult = "cuDevicePrimaryCtxRetain";
     primary_release: unsafe extern "C" fn(c_int)->CuResult = "cuDevicePrimaryCtxRelease_v2";
+    context_flags: unsafe extern "C" fn(*mut c_uint)->CuResult = "cuCtxGetFlags";
     set_current: unsafe extern "C" fn(Handle)->CuResult = "cuCtxSetCurrent";
     context_sync: unsafe extern "C" fn()->CuResult = "cuCtxSynchronize";
     alloc: unsafe extern "C" fn(*mut u64,usize)->CuResult = "cuMemAlloc_v2";
     free: unsafe extern "C" fn(u64)->CuResult = "cuMemFree_v2";
+    mem_create: unsafe extern "C" fn(*mut u64,usize,*const MemAllocationProp,u64)->CuResult = "cuMemCreate";
+    mem_release: unsafe extern "C" fn(u64)->CuResult = "cuMemRelease";
+    mem_granularity: unsafe extern "C" fn(*mut usize,*const MemAllocationProp,c_int)->CuResult = "cuMemGetAllocationGranularity";
+    mem_properties: unsafe extern "C" fn(*mut MemAllocationProp,u64)->CuResult = "cuMemGetAllocationPropertiesFromHandle";
+    mem_import: unsafe extern "C" fn(*mut u64,*mut c_void,c_int)->CuResult = "cuMemImportFromShareableHandle";
+    address_reserve: unsafe extern "C" fn(*mut u64,usize,usize,u64,u64)->CuResult = "cuMemAddressReserve";
+    address_free: unsafe extern "C" fn(u64,usize)->CuResult = "cuMemAddressFree";
+    mem_map: unsafe extern "C" fn(u64,usize,usize,u64,u64)->CuResult = "cuMemMap";
+    mem_unmap: unsafe extern "C" fn(u64,usize)->CuResult = "cuMemUnmap";
+    mem_access: unsafe extern "C" fn(u64,usize,*const MemAccessDesc,usize)->CuResult = "cuMemSetAccess";
     info: unsafe extern "C" fn(*mut usize,*mut usize)->CuResult = "cuMemGetInfo_v2";
     zero_async: unsafe extern "C" fn(u64,u8,usize,Handle)->CuResult = "cuMemsetD8Async";
     htod: unsafe extern "C" fn(u64,*const c_void,usize)->CuResult = "cuMemcpyHtoD_v2";
@@ -52,11 +121,13 @@ api! {
     module_loading_mode: unsafe extern "C" fn(*mut c_int)->CuResult = "cuModuleGetLoadingMode";
     get_function: unsafe extern "C" fn(*mut Handle,Handle,*const c_char)->CuResult = "cuModuleGetFunction";
     launch: unsafe extern "C" fn(Handle,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,c_uint,Handle,*mut *mut c_void,*mut *mut c_void)->CuResult = "cuLaunchKernel";
+    launch_ex: unsafe extern "C" fn(*const LaunchConfig,Handle,*mut *mut c_void,*mut *mut c_void)->CuResult = "cuLaunchKernelEx";
     error_string: unsafe extern "C" fn(CuResult,*mut *const c_char)->CuResult = "cuGetErrorString";
     event_create: unsafe extern "C" fn(*mut Handle,c_uint)->CuResult = "cuEventCreate";
     event_destroy: unsafe extern "C" fn(Handle)->CuResult = "cuEventDestroy_v2";
     event_record: unsafe extern "C" fn(Handle,Handle)->CuResult = "cuEventRecord";
     event_sync: unsafe extern "C" fn(Handle)->CuResult = "cuEventSynchronize";
+    event_query: unsafe extern "C" fn(Handle)->CuResult = "cuEventQuery";
     event_elapsed: unsafe extern "C" fn(*mut f32,Handle,Handle)->CuResult = "cuEventElapsedTime";
     profiler_start: unsafe extern "C" fn()->CuResult = "cuProfilerStart";
     profiler_stop: unsafe extern "C" fn()->CuResult = "cuProfilerStop";
@@ -95,6 +166,12 @@ struct ContextOwner {
     coefficients: RefCell<Option<(usize, Weak<Stream>)>>,
     queries: RefCell<Option<(usize, Weak<Stream>)>>,
     row_arena: RefCell<Option<Rc<RowArena>>>,
+    // A weak entry avoids a ContextOwner -> ModuleOwner -> ContextOwner cycle.
+    // Only explicitly registered, immutable core code is eligible.
+    shared_core: RefCell<Option<([u8;32],usize,Weak<ModuleOwner>)>>,
+    allocation_floor_screen: bool,
+    allocation_floor_pending: std::cell::Cell<usize>,
+    allocation_sites: Option<RefCell<std::collections::BTreeMap<u64,(&'static std::panic::Location<'static>,usize)>>>,
 }
 impl ContextOwner {
     fn current(&self) -> Result<()> {
@@ -299,6 +376,11 @@ impl Cuda {
                 coefficients: RefCell::new(None),
                 queries: RefCell::new(None),
                 row_arena: RefCell::new(None),
+                shared_core: RefCell::new(None),
+                allocation_floor_screen: std::env::var("CANADA_SCRATCH_ALLOCATION_FLOOR_SCREEN").as_deref()==Ok("1"),
+                allocation_sites: (std::env::var("CANADA_SCRATCH_ALLOCATION_SITES_SCREEN").as_deref()==Ok("1"))
+                    .then(||RefCell::new(std::collections::BTreeMap::new())),
+                allocation_floor_pending: std::cell::Cell::new(0),
             }),
             mapped_metadata_bytes: None,
             staged_metadata: None,
@@ -313,6 +395,13 @@ impl Cuda {
             "device attribute",
         )?;
         Ok(v)
+    }
+    pub(crate) fn context_flags(&self) -> Result<u32> {
+        self.owner.current()?;
+        let mut flags = 0;
+        self.owner.api.check(unsafe { (self.owner.api.context_flags)(&mut flags) },
+            "read context scheduling flags")?;
+        Ok(flags)
     }
     /// Report the initialized driver's policy rather than assuming that an
     /// inherited environment variable selected the intended loading mode.
@@ -356,11 +445,11 @@ impl Cuda {
         let (free, total) = self.memory()?;
         crate::memory::Available::gb10(free, total)
     }
-    /// Construct one layer's row-sized transient storage inside `arena`.
-    /// Every `allocate_rows` call made by `build` carves from the arena start,
-    /// so layers built in the same arena alias each other's bytes. Callers
-    /// must alternate arenas between adjacent layers and only build layers
-    /// that execute sequentially on one ordered stream.
+    /// Carve the row-sized transient allocations made by `build` into `arena`.
+    /// Each invocation restarts at the arena's beginning. Separate invocations
+    /// therefore alias and must execute sequentially. Wide layers alternate
+    /// parity arenas; a complete narrow profile may instead carve all layers
+    /// in one invocation, with a distinct arena for a concurrently paired owner.
     pub fn with_row_arena<R>(&self, arena: &Rc<RowArena>, build: impl FnOnce() -> Result<R>) -> Result<R> {
         ensure!(
             Rc::ptr_eq(&self.owner, &arena.storage.owner)
@@ -375,6 +464,7 @@ impl Cuda {
     }
     /// Row-proportional transient storage. Outside a row-arena scope this is an
     /// ordinary owned allocation, so existing profiles are unchanged.
+    #[track_caller]
     pub fn allocate_rows<T: DeviceElement>(&self, len: usize) -> Result<Buffer<T>> {
         let arena = self.owner.row_arena.borrow().clone();
         let Some(arena) = arena else {
@@ -401,6 +491,15 @@ impl Cuda {
             _element: PhantomData,
         })
     }
+    /// Keep terminal IO outside a lent transient arena. In particular, a
+    /// completed prefill's logits must survive the next owner's prefill.
+    pub(crate) fn without_row_arena<R>(&self,build:impl FnOnce()->Result<R>)->Result<R> {
+        let previous=self.owner.row_arena.borrow_mut().take();
+        let result=build();
+        *self.owner.row_arena.borrow_mut()=previous;
+        result
+    }
+    #[track_caller]
     pub fn row_arena(&self, bytes: usize) -> Result<Rc<RowArena>> {
         Ok(Rc::new(RowArena {
             storage: self.allocate(bytes)?,
@@ -408,6 +507,44 @@ impl Cuda {
             high_water: std::cell::Cell::new(0),
         }))
     }
+    /// Dynamic callers must admit a complete workspace above the same floor
+    /// that individual allocations enforce. Otherwise a successful preflight
+    /// can fail halfway through a distributed image/cache operation.
+    pub(crate) fn allocation_reserve_bytes(&self)->usize {
+        8*1024usize.pow(3)+if self.owner.allocation_floor_screen {512*1024usize.pow(2)}else{0}
+    }
+    fn check_allocation_floor(&self,bytes:usize)->Result<()> {
+        if !self.owner.allocation_floor_screen{return Ok(());}
+        let pending=self.owner.allocation_floor_pending.get().saturating_add(bytes);
+        self.owner.allocation_floor_pending.set(pending);
+        if bytes<1024*1024&&pending<16*1024*1024{return Ok(());}
+        self.owner.allocation_floor_pending.set(0);
+        let available=self.admission_memory()?.admitted_available;
+        let required=self.allocation_reserve_bytes().saturating_add(bytes);
+        if available<required {
+            self.report_allocation_sites("before allocation-floor refusal")?;
+        }
+        // Keep the physical8GiB floor plus512MiB for untracked host/vendor
+        // activity. This opt-in guard also applies to later dynamic allocations;
+        // image/cache preflight must therefore include the same allowance.
+        ensure!(available>=required,
+            "construction allocation of {bytes} bytes would consume physical reserve; available={available}");
+        Ok(())
+    }
+    pub(crate) fn report_allocation_sites(&self,label:&str)->Result<()> {
+        let Some(sites)=&self.owner.allocation_sites else{return Ok(());};
+        let mut grouped=std::collections::BTreeMap::<String,(usize,usize)>::new();
+        for (site,bytes)in sites.borrow().values() {
+            let item=grouped.entry(format!("{}:{}",site.file(),site.line())).or_default();
+            item.0+=bytes;item.1+=1;
+        }
+        let total:usize=grouped.values().map(|v|v.0).sum();
+        let mut sorted=grouped.into_iter().collect::<Vec<_>>();sorted.sort_by_key(|(_,v)|std::cmp::Reverse(v.0));
+        eprintln!("allocation_sites {}",serde_json::json!({"label":label,"ordinary_live_bytes_ge64KiB":total,
+            "top":sorted.into_iter().take(32).map(|(site,(bytes,count))|serde_json::json!({"site":site,"bytes":bytes,"count":count})).collect::<Vec<_>>(),
+            "memory":self.admission_memory()?}));Ok(())
+    }
+    #[track_caller]
     pub fn allocate<T: DeviceElement>(&self, len: usize) -> Result<Buffer<T>> {
         ensure!(len > 0, "zero-size allocation");
         let bytes = len
@@ -429,11 +566,15 @@ impl Cuda {
             return Ok(Buffer {owner:self.owner.clone(),ptr,len,storage:Storage::MappedMetadata(region),_element:PhantomData});
         }
         self.owner.current()?;
+        self.check_allocation_floor(bytes)?;
         let mut ptr = 0;
         self.owner.api.check(
             unsafe { (self.owner.api.alloc)(&mut ptr, bytes) },
             "allocate device memory",
         )?;
+        if bytes>=65536&&let Some(sites)=&self.owner.allocation_sites {
+            sites.borrow_mut().insert(ptr,(std::panic::Location::caller(),bytes));
+        }
         Ok(Buffer {
             owner: self.owner.clone(),
             ptr,
@@ -441,6 +582,76 @@ impl Cuda {
             storage: Storage::Owned,
             _element: PhantomData,
         })
+    }
+    fn compressible_properties(&self) -> Result<MemAllocationProp> {
+        self.owner.current()?;
+        ensure!(self.attribute(102)? != 0 && self.attribute(107)? != 0,
+            "device lacks VMM or generic lossless memory compression");
+        Ok(MemAllocationProp {kind:1,location:MemLocation {kind:1,id:self.owner.device},
+            compression:1,..MemAllocationProp::default()})
+    }
+    pub(crate) fn compressible_bytes(&self, bytes: usize) -> Result<usize> {
+        ensure!(bytes > 0, "zero-size compressible allocation");
+        let prop=self.compressible_properties()?;
+        let mut granularity=0usize;
+        self.owner.api.check(unsafe{(self.owner.api.mem_granularity)(&mut granularity,&prop,0)},
+            "query compressible allocation granularity")?;
+        ensure!(granularity.is_power_of_two(),"invalid VMM granularity");
+        let rounded=bytes.checked_add(granularity-1).context("compressible size overflow")?;
+        Ok(rounded/granularity*granularity)
+    }
+    pub(crate) fn allocate_compressible<T: DeviceElement>(&self, len: usize) -> Result<Buffer<T>> {
+        let bytes=len.checked_mul(size_of::<T>()).context("compressible buffer size overflow")?;
+        let mapped_bytes=self.compressible_bytes(bytes)?;
+        let prop=self.compressible_properties()?;
+        let api=&self.owner.api;
+        let mut allocation=VmmAllocation {owner:self.owner.clone(),ptr:0,bytes:mapped_bytes,handle:0,mapped:false};
+        api.check(unsafe{(api.mem_create)(&mut allocation.handle,mapped_bytes,&prop,0)},"create compressible memory")?;
+        let mut obtained=MemAllocationProp::default();
+        api.check(unsafe{(api.mem_properties)(&mut obtained,allocation.handle)},"check compressible memory properties")?;
+        ensure!(obtained.compression==1 && obtained.location.kind==1 && obtained.location.id==self.owner.device,
+            "requested lossless compression/device was not obtained");
+        api.check(unsafe{(api.address_reserve)(&mut allocation.ptr,mapped_bytes,0,0,0)},"reserve compressible address range")?;
+        api.check(unsafe{(api.mem_map)(allocation.ptr,mapped_bytes,0,allocation.handle,0)},"map compressible memory")?;
+        allocation.mapped=true;
+        let access=MemAccessDesc {location:prop.location,flags:3};
+        api.check(unsafe{(api.mem_access)(allocation.ptr,mapped_bytes,&access,1)},"set compressible memory access")?;
+        Ok(Buffer {owner:self.owner.clone(),ptr:allocation.ptr,len,storage:Storage::Vmm(allocation),_element:PhantomData})
+    }
+    /// Exclusive writable import: the unchanged loader uploads and prepares
+    /// every canonical byte before use. The parent never reads or writes while
+    /// this child is alive. Both share one memory cgroup; startup also checks
+    /// physical host headroom because GB10 GPU pages are not fully cgroup-charged.
+    pub(crate) fn import_compressible(&self, fd: OwnedFd, bytes: usize, mapped_bytes: usize)
+        -> Result<Buffer<u8>> {
+        ensure!(mapped_bytes==self.compressible_bytes(bytes)?,"external weight mapping geometry");
+        let api=&self.owner.api;
+        let mut allocation=VmmAllocation {owner:self.owner.clone(),ptr:0,bytes:mapped_bytes,handle:0,mapped:false};
+        api.check(unsafe{(api.mem_import)(&mut allocation.handle,fd.as_raw_fd() as isize as *mut c_void,1)},
+            "import compressible target weights")?;
+        let mut obtained=MemAllocationProp::default();
+        api.check(unsafe{(api.mem_properties)(&mut obtained,allocation.handle)},"check imported weight properties")?;
+        // GB10's driver reports DEVICE on creation but HOST_NUMA after FD
+        // import. Accept only this integrated GPU's closest host NUMA node,
+        // or the ordinary device location; never equate NUMA IDs and ordinals.
+        let local_location=match obtained.location.kind {
+            1=>obtained.location.id==self.owner.device,
+            3=>self.attribute(18)?==1 && obtained.location.id>=0
+                && obtained.location.id==self.attribute(134)?,
+            _=>false,
+        };
+        ensure!(obtained.kind==1 && obtained.compression==1 && local_location,
+            "invalid imported weights: type={} compression={} location={}:{} device={}",
+            obtained.kind,obtained.compression,obtained.location.kind,
+            obtained.location.id,self.owner.device);
+        api.check(unsafe{(api.address_reserve)(&mut allocation.ptr,mapped_bytes,0,0,0)},"reserve imported weight addresses")?;
+        api.check(unsafe{(api.mem_map)(allocation.ptr,mapped_bytes,0,allocation.handle,0)},"map imported weights")?;
+        allocation.mapped=true;
+        // Access is granted to the consuming GPU even when the physical
+        // allocation property is reported as host NUMA memory.
+        let access=MemAccessDesc {location:MemLocation {kind:1,id:self.owner.device},flags:3};
+        api.check(unsafe{(api.mem_access)(allocation.ptr,mapped_bytes,&access,1)},"set exclusive imported weight access")?;
+        Ok(Buffer {owner:self.owner.clone(),ptr:allocation.ptr,len:bytes,storage:Storage::Vmm(allocation),_element:PhantomData})
     }
     pub fn stream(&self) -> Result<Stream> {
         self.owner.current()?;
@@ -452,7 +663,11 @@ impl Cuda {
         let mut stream = Stream {
             owner: self.owner.clone(),
             raw,
+            identity: Rc::new(()),
+            graph_stream_bound: std::cell::Cell::new(false),
             upload_fence: ptr::null_mut(),
+            blocking_fence: std::cell::Cell::new(ptr::null_mut()),
+            polling_fence: std::cell::Cell::new(ptr::null_mut()),
         };
         self.owner.api.check(
             unsafe { (self.owner.api.event_create)(&mut stream.upload_fence, 2) },
@@ -518,22 +733,42 @@ impl Cuda {
             raw,
         })
     }
+    pub(crate) fn share_immutable_core(&self,artifact:&[u8])->Result<()> {
+        use sha2::Digest;
+        ensure!(!artifact.is_empty(),"empty shared core");
+        let digest:[u8;32]=sha2::Sha256::digest(artifact).into();
+        let mut entry=self.owner.shared_core.borrow_mut();
+        if let Some((old,bytes,_))=entry.as_ref() {
+            ensure!(*old==digest&&*bytes==artifact.len(),"shared core identity changed");
+        }else{*entry=Some((digest,artifact.len(),Weak::new()));}
+        Ok(())
+    }
     pub fn module(&self, artifact: &[u8]) -> Result<Module> {
         ensure!(!artifact.is_empty(), "empty kernel artifact");
         self.owner.current()?;
+        let shared={
+            use sha2::Digest;
+            let entry=self.owner.shared_core.borrow();
+            entry.as_ref().is_some_and(|(digest,bytes,_)|*bytes==artifact.len()
+                &&sha2::Sha256::digest(artifact).as_slice()==digest)
+        };
+        if shared&&let Some(inner)=self.owner.shared_core.borrow().as_ref().unwrap().2.upgrade() {
+            return Ok(Module{inner});
+        }
         let mut data = artifact.to_vec();
         data.push(0); // PTX needs NUL; cubin ignores trailing byte.
+        self.check_allocation_floor(16*1024*1024)?;
         let mut raw = ptr::null_mut();
         self.owner.api.check(
             unsafe { (self.owner.api.module_load)(&mut raw, data.as_ptr().cast()) },
             "load CUDA module",
         )?;
-        Ok(Module {
-            inner: Rc::new(ModuleOwner {
+        let inner=Rc::new(ModuleOwner {
                 owner: self.owner.clone(),
                 raw,
-            }),
-        })
+            });
+        if shared {self.owner.shared_core.borrow_mut().as_mut().unwrap().2=Rc::downgrade(&inner);}
+        Ok(Module{inner})
     }
     pub fn event(&self) -> Result<Event> {
         let mut raw = ptr::null_mut();
@@ -607,6 +842,7 @@ pub struct Buffer<T: DeviceElement> {
 }
 enum Storage {
     Owned,
+    Vmm(#[allow(dead_code)] VmmAllocation),
     // Created only by the scoped integer-metadata allocator above.
     MappedMetadata(MappedHost),
     StagedMetadata { arena: Rc<MetadataStaging>, offset: usize },
@@ -614,6 +850,26 @@ enum Storage {
     Arena(#[allow(dead_code)] Rc<RowArena>),
     // A borrowed row range of another buffer (see Buffer::view).
     View,
+}
+struct VmmAllocation {
+    owner: Rc<ContextOwner>,
+    ptr: u64,
+    bytes: usize,
+    handle: u64,
+    mapped: bool,
+}
+impl Drop for VmmAllocation {
+    fn drop(&mut self) {
+        // Unlike cuMemFree, unmapping does not implicitly join GPU users.
+        // Draining here also makes partial-constructor/error cleanup safe.
+        if self.owner.current().is_err() { return; }
+        let api=&self.owner.api;
+        unsafe {
+            if self.mapped { (api.context_sync)(); (api.mem_unmap)(self.ptr,self.bytes); }
+            if self.ptr != 0 { (api.address_free)(self.ptr,self.bytes); }
+            if self.handle != 0 { (api.mem_release)(self.handle); }
+        }
+    }
 }
 /// Pinned CPU writes are coalesced into one transfer to ordinary device memory.
 /// The device allocation drops before the pinned source, including on errors.
@@ -771,6 +1027,7 @@ impl<T: DeviceElement> Drop for Buffer<T> {
         if !matches!(self.storage, Storage::Owned) {
             return;
         }
+        if let Some(sites)=&self.owner.allocation_sites {sites.borrow_mut().remove(&self.ptr);}
         let _ = self.owner.current();
         unsafe {
             (self.owner.api.free)(self.ptr);
@@ -781,9 +1038,18 @@ impl<T: DeviceElement> Drop for Buffer<T> {
 pub struct Stream {
     owner: Rc<ContextOwner>,
     raw: Handle,
+    // A retained identity token prevents scratch caches from confusing a new
+    // stream with a destroyed stream whose CUDA handle address was recycled.
+    identity: Rc<()>,
+    graph_stream_bound: std::cell::Cell<bool>,
     upload_fence: Handle,
+    blocking_fence: std::cell::Cell<Handle>,
+    polling_fence: std::cell::Cell<Handle>,
 }
 impl Stream {
+    pub(crate) fn identity_token(&self) -> Rc<()> { self.identity.clone() }
+    pub(crate) fn identity_key(&self) -> usize { Rc::as_ptr(&self.identity) as usize }
+    pub(crate) fn bind_captured_scratch(&self) { self.graph_stream_bound.set(true); }
     /// Join prior legacy-default-stream uploads/zeroes before nonblocking work.
     /// Pageable HtoD APIs may return after staging, before final DMA completes.
     /// Call at the host preparation boundary, outside capture; this queues a
@@ -817,6 +1083,54 @@ impl Stream {
             unsafe { (self.owner.api.stream_sync)(self.raw) },
             "synchronize stream",
         )
+    }
+    /// Host-only completion wait for long encoder chunks. The event follows
+    /// the same stream work as synchronize(); it changes no device dependency.
+    /// Keep decode on its existing wait, avoiding the measured ~1ms wake cost.
+    pub(crate) fn synchronize_blocking(&self) -> Result<()> {
+        self.owner.current()?;
+        let mut capture = 0;
+        self.owner.api.check(unsafe {
+            (self.owner.api.stream_capture_status)(self.raw, &mut capture)
+        }, "query blocking fence capture status")?;
+        ensure!(capture == 0, "blocking completion fence cannot run during capture");
+        let mut fence = self.blocking_fence.get();
+        if fence.is_null() {
+            // CU_EVENT_BLOCKING_SYNC | CU_EVENT_DISABLE_TIMING.
+            self.owner.api.check(unsafe { (self.owner.api.event_create)(&mut fence, 3) },
+                "create blocking completion fence")?;
+            self.blocking_fence.set(fence);
+        }
+        self.owner.api.check(unsafe { (self.owner.api.event_record)(fence, self.raw) },
+            "record blocking completion fence")?;
+        self.owner.api.check(unsafe { (self.owner.api.event_sync)(fence) },
+            "wait blocking completion fence")
+    }
+    /// Sleep between nonblocking event queries, avoiding the driver's blocking
+    /// wake latency. Success retains the CUDA completion/UMA visibility contract:
+    /// https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EVENT.html
+    /// Stream/context/thread ownership and capture rejection match other fences.
+    pub(crate) fn synchronize_polling(&self,microseconds:u64)->Result<()> {
+        ensure!([25,50].contains(&microseconds),"bounded completion polling interval");
+        self.owner.current()?;
+        let mut capture=0;
+        self.owner.api.check(unsafe{(self.owner.api.stream_capture_status)(self.raw,&mut capture)},
+            "query polling fence capture status")?;
+        ensure!(capture==0,"polling completion fence cannot run during capture");
+        let mut fence=self.polling_fence.get();
+        if fence.is_null() {
+            self.owner.api.check(unsafe{(self.owner.api.event_create)(&mut fence,2)},
+                "create polling completion fence")?;
+            self.polling_fence.set(fence);
+        }
+        self.owner.api.check(unsafe{(self.owner.api.event_record)(fence,self.raw)},
+            "record polling completion fence")?;
+        loop {
+            let code=unsafe{(self.owner.api.event_query)(fence)};
+            if code==0{return Ok(())}
+            if code!=600{return self.owner.api.check(code,"query completion fence")}
+            std::thread::sleep(std::time::Duration::from_micros(microseconds));
+        }
     }
     pub fn capture(&self, f: impl FnOnce() -> Result<()>) -> Result<Graph> {
         self.owner.current()?;
@@ -875,6 +1189,7 @@ impl Stream {
         Ok(Graph {
             owner: self.owner.clone(),
             exec,
+            required_stream: self.graph_stream_bound.get().then(||self.identity.clone()),
         })
     }
 }
@@ -884,6 +1199,12 @@ impl Drop for Stream {
         unsafe {
             if !self.upload_fence.is_null() {
                 (self.owner.api.event_destroy)(self.upload_fence);
+            }
+            if !self.blocking_fence.get().is_null() {
+                (self.owner.api.event_destroy)(self.blocking_fence.get());
+            }
+            if !self.polling_fence.get().is_null() {
+                (self.owner.api.event_destroy)(self.polling_fence.get());
             }
             (self.owner.api.stream_destroy)(self.raw);
         }
@@ -904,7 +1225,7 @@ impl Module {
         self.inner.owner.api.check(
             unsafe { (self.inner.owner.api.get_function)(&mut raw, self.inner.raw, name.as_ptr()) },
             "get kernel",
-        )?;
+        ).with_context(|| format!("CUDA module symbol {}",name.to_string_lossy()))?;
         Ok(Function { module: self, raw })
     }
 }
@@ -921,6 +1242,24 @@ pub struct Function<'a> {
     raw: Handle,
 }
 impl Function<'_> {
+    /// Safety: the ordinary launch ABI/lifetime contract applies. The kernel
+    /// additionally executes griddepcontrol.wait before dependent global reads;
+    /// every predecessor's programmatic trigger is legal for that dependency.
+    pub(crate) unsafe fn launch_pdl(
+        &self, grid: [u32; 3], block: [u32; 3], shared: u32,
+        stream: &Stream, args: &mut [*mut c_void],
+    ) -> Result<()> {
+        ensure!(Rc::ptr_eq(&stream.owner, &self.module.inner.owner), "mixed CUDA contexts");
+        ensure!(grid.iter().all(|n| *n > 0) && block.iter().all(|n| *n > 0), "empty launch");
+        self.module.inner.owner.current()?;
+        let mut attribute = LaunchAttribute { id: 6, pad: [0; 4], value: [0; 8] };
+        attribute.value[0] = 1; // int programmaticStreamSerializationAllowed, little endian
+        let config = LaunchConfig { grid, block, shared, stream: stream.raw,
+            attrs: &mut attribute, count: 1 };
+        self.module.inner.owner.api.check(unsafe {
+            (self.module.inner.owner.api.launch_ex)(&config, self.raw, args.as_mut_ptr(), ptr::null_mut())
+        }, "launch programmatic dependent kernel")
+    }
     pub fn opt_in_shared_memory(&self, bytes: u32) -> Result<()> {
         self.module.inner.owner.api.check(
             unsafe { (self.module.inner.owner.api.function_attr)(self.raw, 8, bytes as i32) },
@@ -1020,6 +1359,7 @@ impl Drop for Event {
 pub struct Graph {
     owner: Rc<ContextOwner>,
     exec: Handle,
+    required_stream: Option<Rc<()>>,
 }
 impl Graph {
     /// Safety: every captured pointer must still be allocated and exclusively
@@ -1029,6 +1369,8 @@ impl Graph {
             Rc::ptr_eq(&self.owner, &stream.owner),
             "mixed graph/stream context"
         );
+        ensure!(self.required_stream.as_ref().is_none_or(|id|Rc::ptr_eq(id,&stream.identity)),
+            "graph with pooled scratch must replay on its capture stream");
         self.owner.api.check(
             unsafe { (self.owner.api.graph_launch)(self.exec, stream.raw) },
             "launch graph",
@@ -1093,6 +1435,56 @@ pub fn probe_staged_metadata() -> Result<serde_json::Value> {
     Ok(serde_json::json!({"all_correct":true,"cycles":cycles,"payload_bytes":stage.bytes(),
         "transfer_bytes":stage.transfer_bytes(),"deferred_visibility":true,"allocator_drop_safe":true,
         "large_allocation_fallback":true,"full_engine_acceptance":false}))
+}
+
+/// Compare duplicate core-module loads with shared immutable code. Buffers,
+/// stream arguments and captured graphs retain their ordinary ownership.
+pub fn probe_core_module_reuse(core:&std::path::Path)->Result<serde_json::Value> {
+    use sha2::Digest;
+    let artifact=std::fs::read(core)?;
+    let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;
+    let stream=cuda.stream()?;
+    ensure!(cuda.admission_memory()?.admitted_available>=16*1024usize.pow(3),"module screen headroom");
+    let mut input=cuda.allocate::<u32>(2)?;
+    let output=cuda.allocate::<u32>(2)?;
+    // Resolve the diagnostic entry once before the alternating load panel.
+    let warm=cuda.module(&artifact)?;let _=warm.function("ca_probe_read_word")?;drop(warm);
+    let mut arms=Vec::new();
+    for (arm,shared)in [false,true,true,false].into_iter().enumerate() {
+        *cuda.owner.shared_core.borrow_mut()=None;
+        if shared{cuda.share_immutable_core(&artifact)?;}
+        let before=cuda.admission_memory()?;
+        let began=std::time::Instant::now();
+        let modules=(0..64).map(|_|cuda.module(&artifact)).collect::<Result<Vec<_>>>()?;
+        let load_ms=began.elapsed().as_secs_f64()*1000.;
+        let after=cuda.admission_memory()?;
+        let distinct=modules.iter().map(|m|Rc::as_ptr(&m.inner)as usize)
+            .collect::<std::collections::BTreeSet<_>>().len();
+        ensure!(distinct==if shared{1}else{64},"module reuse identity");
+        let keep=[modules[0].clone(),modules[63].clone()];drop(modules);
+        let graph=stream.capture(|| {
+            for (i,module)in keep.iter().enumerate() {
+                let(mut source,mut dest)=(input.ptr()+(i*4)as u64,output.ptr()+(i*4)as u64);
+                let mut args=[(&mut source as *mut u64).cast(),(&mut dest as *mut u64).cast()];
+                unsafe{module.function("ca_probe_read_word")?.launch([1,1,1],[32,1,1],0,&stream,&mut args)?;}
+            }Ok(())
+        })?;
+        for cycle in 0..3u32 {
+            let expected=[91+cycle+arm as u32*11,127-cycle+arm as u32*17];
+            input.upload(&expected)?;stream.join_default()?;
+            unsafe{graph.launch(&stream)?;}stream.synchronize()?;
+            ensure!(output.download()?==expected,"shared module crossed private arguments or graph lifetime");
+        }
+        drop(graph);drop(keep);
+        ensure!(!shared||cuda.owner.shared_core.borrow().as_ref().unwrap().2.upgrade().is_none(),
+            "weak module cache retained GPU code after its final owner");
+        arms.push(serde_json::json!({"arm":arm,"shared":shared,"copies":64,"distinct_modules":distinct,
+            "load_ms":load_ms,"before":before,"after":after,"released":cuda.admission_memory()?,
+            "private_arguments_exact":true,"graph_lifetime_exact":true,"weak_release":true}));
+    }
+    Ok(serde_json::json!({"all_exact":true,"artifact_bytes":artifact.len(),
+        "artifact_sha256":format!("{:x}",sha2::Sha256::digest(&artifact)),"arms":arms,
+        "scope":"Immutable in-tree core module only; ABBA64loads, changed private pointer data and graph lifetime. Not full-model numerical or performance qualification."}))
 }
 
 /// GPU-only diagnostic of the real stream join, with a bounded delayed default

@@ -48,6 +48,12 @@ pub struct Scratch {
 }
 impl Scratch {
     pub fn new(cuda: &Cuda, core: &[u8], rows: usize) -> Result<Rc<RefCell<Self>>> {
+        Self::with_blas(cuda,core,rows,Blas::new(cuda)?)
+    }
+    pub(crate) fn new_on(cuda:&Cuda,core:&[u8],rows:usize,stream:&Stream)->Result<Rc<RefCell<Self>>> {
+        Self::with_blas(cuda,core,rows,Blas::new_on(cuda,stream)?)
+    }
+    fn with_blas(cuda:&Cuda,core:&[u8],rows:usize,blas:Blas)->Result<Rc<RefCell<Self>>> {
         ensure!(
             (9..=384).contains(&rows) || crate::config::wide_rows(rows),
             "medium WO-A rows"
@@ -55,7 +61,7 @@ impl Scratch {
         Ok(Rc::new(RefCell::new(Self {
             cuda: cuda.clone(),
             module: cuda.module(core)?,
-            blas: Blas::new(cuda)?,
+            blas,
             rows,
             decoded: cuda.allocate(2048 * 4096)?,
             grouped: cuda.allocate(rows * 2048)?,

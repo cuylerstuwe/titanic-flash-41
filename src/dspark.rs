@@ -25,6 +25,9 @@ use anyhow::{Result, ensure};
 use half::bf16;
 use std::{path::Path, rc::Rc};
 
+#[path = "dspark_pair_query.rs"]
+mod pair_query;
+
 struct Stage {
     attention: Attention,
     ffn: LayerFfn,
@@ -146,6 +149,8 @@ impl Stage {
 pub struct QueryNetwork {
     // Drop the captured executable before any pointer storage.
     graph: Option<Graph>,
+    pair_body_graph:Option<Graph>,
+    pair_head:Option<crate::draft_head::Pair>,
     cuda: Cuda,
     module: Module,
     stream: usize,
@@ -154,6 +159,7 @@ pub struct QueryNetwork {
     markov: crate::dspark_markov::Markov,
     last_anchor: Option<u32>,
     weights: Rc<Weights>,
+    prepared_layouts: Vec<Prepared>,
     io: ModelIo,
     private_head: Option<crate::draft_head::DraftHead>,
     private_head_active: bool,
@@ -162,6 +168,7 @@ pub struct QueryNetwork {
     split_six: Option<Conditioning>,
     conditioning_split: bool,
     conditioning_graph: bool,
+    full_commit_device_metadata: bool,
     wide: Conditioning,
     stages: Vec<Stage>,
     workspace: Workspace,
@@ -176,8 +183,30 @@ pub struct QueryNetwork {
     poisoned: bool,
 }
 impl QueryNetwork {
+    pub(crate) fn independent_for_probe(&self,target:&crate::target::Target,core:&[u8],
+        stream:&Stream,kernels:&Path)->Result<Self> {
+        self.guard(stream)?;
+        ensure!(std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1")
+            ||crate::config::resident_banks_requested(),
+            "independent drafter requires finite pairing admission");
+        let (io,frequencies)=target.draft_resources(core,stream,kernels)?;
+        let mut fork=Self::from_prepared(&self.cuda,core,stream,self.cuda.module(core)?,
+            self.weights.clone(),self.prepared_layouts.clone(),self.rank,kernels,io,frequencies)?;
+        if std::env::var("CANADA_SCRATCH_SHARED_DRAFT_HEAD").as_deref()==Ok("1") {
+            ensure!(fork.graph.is_none()&&fork.pair_body_graph.is_none()&&!fork.ready,
+                "shared draft encoding must precede every peer graph");
+            let source=self.private_head.as_ref().ok_or_else(||anyhow::anyhow!("shared draft head source absent"))?;
+            let destination=fork.private_head.as_mut().ok_or_else(||anyhow::anyhow!("shared draft head destination absent"))?;
+            let reclaimed=destination.share_encoding_from(source,stream)?;
+            eprintln!("rank{} shared immutable draft-head encoding: reclaimed {} explicit bytes; private query/output/policy retained",self.rank,reclaimed);
+        }
+        ensure!(Rc::ptr_eq(&self.weights,&fork.weights)&&self.state.independent_from(&fork.state)?
+            &&self.io.local_logits().ptr()!=fork.io.local_logits().ptr()
+            &&self.normalized.ptr()!=fork.normalized.ptr(),"independent drafter aliased mutable storage");
+        Ok(fork)
+    }
     pub(crate) fn sampled_graphs_ready(&self) -> bool {
-        !self.poisoned && self.graph.is_some() && self.markov.sampled_graph_ready()
+        !self.poisoned && (self.graph.is_some()||self.pair_body_graph.is_some()) && self.markov.sampled_graph_ready()
     }
     #[allow(clippy::too_many_arguments)]
     pub fn for_target(
@@ -261,7 +290,15 @@ impl QueryNetwork {
                 stage,
             )?);
         }
-        let weights = Rc::new(weights);
+        Self::from_prepared(cuda,core,stream,module,Rc::new(weights),prepared,rank,kernels,io,frequencies)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn from_prepared(cuda:&Cuda,core:&[u8],stream:&Stream,module:Module,weights:Rc<Weights>,
+        prepared:Vec<Prepared>,rank:usize,kernels:&Path,io:ModelIo,frequencies:Rc<FrequencyTable>)->Result<Self> {
+        ensure!(prepared.len()==3&&rank<4&&weights.in_context(cuda)&&cuda.owns_stream(stream)
+            &&io.matches_profile(rank,QUERY_ROWS,cuda)&&!frequencies.compressed()
+            &&cuda.owns_buffer(frequencies.values()),"prepared DSpark owner/geometry");
+        let prepared_layouts=prepared.clone();
         let state = State::new(cuda, stream, &weights, kernels, frequencies.clone())?;
         let mut stages = Vec::new();
         for (stage, layout) in prepared.into_iter().enumerate() {
@@ -323,8 +360,20 @@ impl QueryNetwork {
             Err(std::env::VarError::NotPresent)=>false,
             Err(e)=>return Err(e.into()),
         };
+        let full_commit_device_metadata=match std::env::var("CANADA_SCRATCH_FULL_COMMIT_DEVICE_METADATA") {
+            Ok(v)=>{ensure!(v=="0"||v=="1","invalid full-commit metadata policy");v=="1"},
+            Err(std::env::VarError::NotPresent)=>false,
+            Err(e)=>return Err(e.into()),
+        };
         let result = Self {
             graph: None,
+            pair_body_graph:None,
+            pair_head:if crate::config::paired_draft_head_requested(){
+                ensure!(crate::config::paired_serving_requested()
+                    ||std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1"),
+                    "paired draft head requires independent generation owners");
+                Some(crate::draft_head::Pair::new(cuda,&kernels.join("draft-head-pool-m10-v1"),stream)?)
+            }else{None},
             cuda: cuda.clone(),
             module,
             stream: stream.raw() as usize,
@@ -333,7 +382,7 @@ impl QueryNetwork {
             markov: crate::dspark_markov::Markov::new(cuda, core, stream, rank, weights.clone(), kernels)?,
             last_anchor: None,
             six: Conditioning::new(cuda, core, stream, weights.clone(), kernels, 6)?,
-            split_six,conditioning_split,conditioning_graph,
+            split_six,conditioning_split,conditioning_graph,full_commit_device_metadata,
             wide: Conditioning::new(cuda, core, stream, weights.clone(), kernels, 128)?,
             positions: Positions::upload(cuda, &[0, 1, 2, 3, 4], frequencies.rows())?,
             tokens: TokenRows::new(cuda, &[128799; QUERY_ROWS], QUERY_ROWS)?,
@@ -343,6 +392,7 @@ impl QueryNetwork {
             combined: cuda.allocate(QUERY_ROWS * 5120)?,
             normalized: cuda.allocate(QUERY_ROWS * 5120)?,
             weights,
+            prepared_layouts,
             io,
             private_head_active: private_head.is_some(),
             private_head,
@@ -371,6 +421,20 @@ impl QueryNetwork {
             kernels,self.rank,features,comm)
     }
     pub(crate) fn conditioning_split(&self)->bool{self.conditioning_split}
+    pub(crate) fn set_full_commit_metadata_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        self.guard(stream)?;
+        ensure!(std::env::var("CANADA_SCRATCH_COPY_COMMIT_GENERATION_SCREEN").as_deref()==Ok("1"),
+            "full-commit metadata switch requires finite generation screen");
+        self.state.position()?;stream.synchronize()?;
+        self.full_commit_device_metadata=enabled;Ok(())
+    }
+    pub(crate) fn probe_copy_conditioning(
+        &self,core:&[u8],kernels:&Path,features:&Buffer<bf16>,comm:&Roce,stream:&Stream,
+    )->Result<serde_json::Value>{
+        self.guard(stream)?;
+        crate::dspark_conditioning::probe_copy_width(&self.cuda,core,stream,self.weights.clone(),
+            kernels,self.rank,features,comm)
+    }
     pub(crate) fn set_conditioning_kv_reuse_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()>{
         self.guard(stream)?;
         ensure!(!self.conditioning_graph,"isolate KV reuse from the cached-graph variant");
@@ -511,17 +575,192 @@ impl QueryNetwork {
         start: u64,
         stream: &Stream,
     ) -> Result<()> {
-        self.inject_inner(features,live,accepted,start,None,stream)
+        self.inject_inner(features,live,accepted,start,None,false,stream)
     }
     pub(crate) fn inject_distributed(
         &mut self,features:&Buffer<bf16>,live:usize,accepted:usize,start:u64,comm:&Roce,stream:&Stream,
     )->Result<()>{
         ensure!(comm.rank()==self.rank&&self.comm_instance.is_none_or(|c|c==comm.instance()),
             "conditioning communicator changed");
-        self.inject_inner(features,live,accepted,start,Some(comm),stream)
+        self.inject_inner(features,live,accepted,start,Some(comm),false,stream)
     }
+    pub(crate) fn inject_copy_wide(&mut self,features:&Buffer<bf16>,accepted:usize,start:u64,
+        comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_COPY_WIDE_CONDITIONING").as_deref()==Ok("1")
+            &&(19..=32).contains(&accepted)&&features.len()==128*15360
+            &&comm.rank()==self.rank&&self.comm_instance.is_none_or(|c|c==comm.instance()),
+            "wide accepted-copy conditioning admission");
+        self.inject_inner(features,accepted,accepted,start,Some(comm),true,stream)
+    }
+    /// Capture the local wide projection before serving advertises readiness.
+    /// This writes projection scratch only: no accepted KV, sampler or query
+    /// state is advanced, and the caller owns the zeroed padded input.
+    pub(crate) fn prepare_copy_wide(&mut self,features:&Buffer<bf16>,comm:&Roce,stream:&Stream)->Result<()> {
+        self.guard(stream)?;
+        ensure!(std::env::var("CANADA_SCRATCH_COPY_WIDE_CONDITIONING").as_deref()==Ok("1")
+            &&self.state.position()?==0&&features.len()==128*15360&&comm.rank()==self.rank,
+            "wide copy preparation requires a fresh admitted drafter");
+        self.wide.run_cached_distributed(features,32,Some(comm),stream)?;
+        stream.synchronize()
+    }
+    pub(crate) fn release_prepared_copy_wide(&mut self,stream:&Stream)->Result<()> {
+        self.guard(stream)?;
+        ensure!(self.state.position()?==0,"only a fresh optional graph may be released");
+        self.wide.release_replay(stream)
+    }
+    /// Keep the existing six-row projection arithmetic, but publish accepted
+    /// KV once after all chunks. Projection never reads the retained KV ring.
+    /// Staging copies share the projection stream, before its next overwrite.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn inject_copy_batched(&mut self,features:&Buffer<bf16>,accepted:usize,start:u64,
+        chunk:&Buffer<bf16>,raw:[&Buffer<bf16>;3],comm:&Roce,stream:&Stream)->Result<()> {
+        self.guard(stream)?;
+        ensure!(std::env::var("CANADA_SCRATCH_COPY_KV_BATCH_SCREEN").as_deref()==Ok("1")
+            &&(7..=32).contains(&accepted)&&[16*15360,32*15360,128*15360].contains(&features.len())
+            &&accepted<=features.len()/15360&&self.cuda.owns_buffer(features)
+            &&chunk.len()==6*15360&&self.cuda.owns_buffer(chunk)
+            &&raw.iter().all(|b|b.len()==128*512&&self.cuda.owns_buffer(b))
+            &&start==self.state.position()?&&comm.rank()==self.rank
+            &&self.comm_instance.is_none_or(|c|c==comm.instance()),"batched copy KV admission");
+        self.ready=false;self.last_anchor=None;self.markov.invalidate_results();
+        let result=(|| {
+            for dst in raw {unsafe{self.cuda.zero_device(dst.ptr(),dst.bytes(),stream)?;}}
+            let conditioning=if self.conditioning_split {
+                self.split_six.as_mut().ok_or_else(||anyhow::anyhow!("split conditioning absent"))?
+            }else{&mut self.six};
+            for offset in (0..accepted).step_by(6) {
+                let live=(accepted-offset).min(6);
+                unsafe {
+                    self.cuda.zero_device(chunk.ptr(),chunk.bytes(),stream)?;
+                    self.cuda.copy_device(chunk.ptr(),features.ptr()+(offset*15360*2)as u64,live*15360*2,stream)?;
+                }
+                if self.conditioning_graph {conditioning.run_cached_distributed(chunk,live,Some(comm),stream)?;}
+                else{conditioning.run_distributed(chunk,live,Some(comm),stream)?;}
+                let(_,projected,n)=conditioning.outputs()?;ensure!(n==live,"copy chunk extent");
+                for stage in 0..3 {unsafe {
+                    self.cuda.copy_device(raw[stage].ptr()+(offset*512*2)as u64,
+                        projected[stage].ptr(),live*512*2,stream)?;
+                }}
+            }
+            self.state.commit(raw,accepted,accepted,start,stream)
+        })();
+        if result.is_err(){self.poisoned=true;self.state.invalidate();}result
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn inject_copy_queued(&mut self,features:&Buffer<bf16>,accepted:usize,start:u64,
+        chunk:&Buffer<bf16>,comm:&Roce,stream:&Stream)->Result<()> {
+        self.guard(stream)?;
+        ensure!(std::env::var("CANADA_SCRATCH_COPY_KV_QUEUED_SCREEN").as_deref()==Ok("1")
+            &&(1..=32).contains(&accepted)&&[16*15360,32*15360,128*15360].contains(&features.len())
+            &&accepted<=features.len()/15360&&self.cuda.owns_buffer(features)
+            &&chunk.len()==6*15360&&self.cuda.owns_buffer(chunk)
+            &&start==self.state.position()?&&comm.rank()==self.rank
+            &&self.comm_instance.is_none_or(|c|c==comm.instance()),"queued copy KV admission");
+        self.ready=false;self.last_anchor=None;self.markov.invalidate_results();
+        let result=(|| {
+            self.state.begin_copy_commit(start,accepted,stream)?;
+            let conditioning=if self.conditioning_split {
+                self.split_six.as_mut().ok_or_else(||anyhow::anyhow!("split conditioning absent"))?
+            }else{&mut self.six};
+            for offset in (0..accepted).step_by(6) {
+                let live=(accepted-offset).min(6);
+                unsafe {
+                    self.cuda.zero_device(chunk.ptr(),chunk.bytes(),stream)?;
+                    self.cuda.copy_device(chunk.ptr(),features.ptr()+(offset*15360*2)as u64,live*15360*2,stream)?;
+                }
+                if self.conditioning_graph {conditioning.run_cached_distributed(chunk,live,Some(comm),stream)?;}
+                else{conditioning.run_distributed(chunk,live,Some(comm),stream)?;}
+                let(_,raw,n)=conditioning.outputs()?;ensure!(n==live,"queued copy chunk extent");
+                self.state.enqueue_copy_chunk(raw,live,&self.module,stream)?;
+            }
+            self.state.finish_copy_commit(stream)
+        })();
+        if result.is_err(){self.poisoned=true;self.state.invalidate();}result
+    }
+    /// Finite same-owner comparison including actual weighted norm/RoPE KV
+    /// stores and their completion boundary. No target or sampler is executed.
+    pub(crate) fn probe_copy_batched_kv(&mut self,features:&Buffer<bf16>,comm:&Roce,stream:&Stream,
+        control:&mut crate::control_channel::ControlChannel)
+        ->Result<serde_json::Value>{
+        use serde_json::json;
+        self.guard(stream)?;
+        ensure!(std::env::var("CANADA_SCRATCH_COPY_KV_BATCH_SCREEN").as_deref()==Ok("1")
+            &&features.len()==128*15360,"copy KV batch finite screen");
+        let queued=std::env::var("CANADA_SCRATCH_COPY_KV_QUEUED_SCREEN").as_deref()==Ok("1");
+        let short=std::env::var("CANADA_SCRATCH_COPY_KV_SHORT_SCREEN").as_deref()==Ok("1");
+        ensure!(!short||queued,"short KV metadata screen requires queued stores");
+        let original=self.save_state_image(4*1024*1024,comm,stream)?;
+        let original_digest=original.digest()?;let start=self.position()?;
+        let input=self.cuda.allocate::<bf16>(128*15360)?;
+        let chunk=self.cuda.allocate::<bf16>(6*15360)?;
+        let raw:[Buffer<bf16>;3]=[self.cuda.allocate(128*512)?,self.cuda.allocate(128*512)?,self.cuda.allocate(128*512)?];
+        let mut barrier_input=self.cuda.allocate::<f32>(4)?;
+        barrier_input.upload(&[0.;4])?;
+        let mut barrier_output=self.cuda.allocate::<f32>(16)?;
+        stream.join_default()?;
+        let mut records=Vec::new();
+        let cases=if short{&[(1usize,0usize),(3,0),(6,32),(7,0),(12,0),(16,0),(18,0),(32,32)][..]}
+            else{&[(7usize,0usize),(12,0),(16,0),(18,0),(32,32)][..]};
+        for &(accepted,offset) in cases {
+            unsafe {
+                self.cuda.zero_device(input.ptr(),input.bytes(),stream)?;
+                self.cuda.copy_device(input.ptr(),features.ptr()+(offset*15360*2)as u64,
+                    (128-offset)*15360*2,stream)?;
+            }
+            stream.synchronize()?;
+            let mut expected=None;let mut trials=Vec::new();
+            for (trial,batched) in [false,true,true,false,false,true,true,false,false,true].into_iter().enumerate() {
+                self.restore_state_image(&original,comm,stream)?;
+                control.agree(&[accepted as u8,offset as u8,trial as u8,u8::from(queued)])?;
+                // TCP agreement returns to peers at different instants. Drain
+                // one native collective before timing so its wakeup skew is
+                // not charged to the first conditioning projection.
+                // Raw gather does not inherit the target's active-row bounds,
+                // unlike a BF16 model activation reduction on this communicator.
+                unsafe{comm.gather_f32(&barrier_input,&mut barrier_output,4,stream)?;}
+                stream.synchronize()?;
+                let began=std::time::Instant::now();
+                if batched&&queued {self.inject_copy_queued(&input,accepted,start,&chunk,comm,stream)?;}
+                else if batched {self.inject_copy_batched(&input,accepted,start,&chunk,raw.each_ref(),comm,stream)?;}
+                else {
+                    for row in (0..accepted).step_by(6) {
+                        let live=(accepted-row).min(6);
+                        unsafe {
+                            self.cuda.zero_device(chunk.ptr(),chunk.bytes(),stream)?;
+                            self.cuda.copy_device(chunk.ptr(),input.ptr()+(row*15360*2)as u64,live*15360*2,stream)?;
+                        }
+                        self.inject_distributed(&chunk,live,live,start+row as u64,comm,stream)?;
+                    }
+                }
+                stream.synchronize()?;let milliseconds=began.elapsed().as_secs_f64()*1000.;
+                ensure!(self.position()?==start+accepted as u64,"copy KV batch frontier");
+                let digest=self.save_state_image(4*1024*1024,comm,stream)?.digest()?;
+                if let Some(previous)=&expected{ensure!(previous==&digest,"copy KV batching changed retained state");}
+                else{expected=Some(digest.clone());}
+                trials.push(json!({"warmup":trial<2,"batched":batched,"milliseconds":milliseconds,"digest":digest}));
+            }
+            // The input contains real future rows. Erasing them must leave
+            // the accepted result identical, including a partial final chunk.
+            self.restore_state_image(&original,comm,stream)?;
+            unsafe{self.cuda.zero_device(input.ptr()+(accepted*15360*2)as u64,(128-accepted)*15360*2,stream)?;}
+            if queued {self.inject_copy_queued(&input,accepted,start,&chunk,comm,stream)?;}
+            else {self.inject_copy_batched(&input,accepted,start,&chunk,raw.each_ref(),comm,stream)?;}
+            ensure!(Some(self.save_state_image(4*1024*1024,comm,stream)?.digest()?)==expected,
+                "rejected future features affected copy KV");
+            records.push(json!({"accepted":accepted,"feature_offset":offset,"trials":trials,"future_independent":true}));
+        }
+        self.restore_state_image(&original,comm,stream)?;
+        ensure!(self.position()?==start&&self.save_state_image(4*1024*1024,comm,stream)?.digest()?==original_digest,
+            "copy KV batch screen did not restore original state");
+        Ok(json!({"rank":self.rank,"position":start,"records":records,"all_states_exact":true,
+            "original_state_restored":true,"ordinary_conditioning_graph":self.conditioning_graph,
+            "implementation":if queued{"queued_metadata_and_stores"}else{"staged_raw_kv"},
+            "pretrial_peer_barrier":true,"pretrial_device_barrier":true}))
+    }
+    #[allow(clippy::too_many_arguments)]
     fn inject_inner(
-        &mut self,features:&Buffer<bf16>,live:usize,accepted:usize,start:u64,comm:Option<&Roce>,stream:&Stream,
+        &mut self,features:&Buffer<bf16>,live:usize,accepted:usize,start:u64,comm:Option<&Roce>,
+        copy_wide:bool,stream:&Stream,
     )->Result<()>{
         self.guard(stream)?;
         ensure!(
@@ -544,11 +783,18 @@ impl QueryNetwork {
             } else {
                 &mut self.wide
             };
-            if self.conditioning_graph && features.len()==6*15360 {
+            if copy_wide || (self.conditioning_graph && features.len()==6*15360) {
                 conditioning.run_cached_distributed(features,live,comm,stream)?;
             }else{conditioning.run_distributed(features, live, comm, stream)?;}
             let (_, raw, n) = conditioning.outputs()?;
-            self.state.commit(raw, n, accepted, start, stream)
+            if self.full_commit_device_metadata&&features.len()==6*15360&&n==6&&accepted==6 {
+                // s1054: exact full-six-row store, with one GPU metadata write
+                // replacing two host uploads. Keep the ordinary completion
+                // boundary; wider transaction queuing did not show a gain.
+                self.state.begin_copy_commit(start,accepted,stream)?;
+                self.state.enqueue_copy_chunk(raw,accepted,&self.module,stream)?;
+                self.state.finish_copy_commit(stream)
+            }else{self.state.commit(raw,n,accepted,start,stream)}
         })();
         if result.is_err() {
             self.poisoned = true;
@@ -631,6 +877,19 @@ impl QueryNetwork {
         result
     }
     fn enqueue(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
+        self.enqueue_body(comm,stream)?;
+        if self.private_head_active {
+            let head = self.private_head.as_ref().ok_or_else(||anyhow::anyhow!("private draft head absent"))?;
+            self.io.run_private_draft_head(head, &self.normalized, stream)?;
+        } else {
+            self.io.run_normalized_head(&self.normalized, stream)?;
+        }
+        if self.gather_base_logits {
+            self.io.gather_logits(comm, stream)?;
+        }
+        Ok(())
+    }
+    fn enqueue_body(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
         self.io.run_input(&self.tokens, comm, stream)?;
         for stage in 0..3 {
             let (previous, current) = self.stages.split_at_mut(stage);
@@ -679,15 +938,6 @@ impl QueryNetwork {
             5120,
             stream,
         )?;
-        if self.private_head_active {
-            let head = self.private_head.as_ref().ok_or_else(||anyhow::anyhow!("private draft head absent"))?;
-            self.io.run_private_draft_head(head, &self.normalized, stream)?;
-        } else {
-            self.io.run_normalized_head(&self.normalized, stream)?;
-        }
-        if self.gather_base_logits {
-            self.io.gather_logits(comm, stream)?;
-        }
         Ok(())
     }
     /// Generation consumes local FP32 base logits through Markov correction;
@@ -725,6 +975,16 @@ impl QueryNetwork {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("draft position overflow"))?;
         self.proposals(Some((seed, position)), None, comm, stream)
+    }
+    pub(crate) fn score_history_for_probe(&mut self,copy:&[u32;5],comm:&Roce,stream:&Stream)
+        ->Result<([f64;5],[f32;5],bool)> {
+        self.guard(stream)?;
+        ensure!(self.ready&&self.comm_instance==Some(comm.instance())&&comm.rank()==self.rank,
+            "history score query owner");
+        let anchor=self.last_anchor.ok_or_else(||anyhow::anyhow!("history score query anchor absent"))?;
+        let result=self.markov.score_history_for_probe(self.io.local_logits(),&self.combined,anchor,copy,comm,stream);
+        if result.is_err(){self.poisoned=true;self.ready=false;self.state.invalidate();}
+        result
     }
     pub(crate) fn stochastic_proposals_causal_three(
         &mut self,seed:u64,threshold:f32,comm:&Roce,stream:&Stream,

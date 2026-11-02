@@ -51,6 +51,9 @@ impl Sparse6 {
             ("compact_selected",c.selection.indices().ptr(),c.selection.indices().bytes()),
         ]))
     }
+    pub(crate) fn share_score_scratch(&mut self, storage: Rc<Buffer<f32>>) -> Result<usize> {
+        self.dense.share_score_scratch(storage)
+    }
     pub(crate) fn gathered_keys(&self)->&KeyMatrix {&self.keys}
     pub(crate) fn new(
         cuda: &Cuda,

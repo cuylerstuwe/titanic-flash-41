@@ -19,15 +19,29 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from host_state import atomic, atomic_bytes
 
 PROJECT = 'titanic-flash-41'
 SOURCE = Path(__file__).resolve().parents[1]
 
-def atomic(path, value):
-    temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(value, indent=2)+'\n')
-    temp.chmod(0o600)
-    temp.replace(path)
+def vision_encoder_rank(profile):
+    value = profile['CANADA_SCRATCH_VISION_ENCODER_RANK']
+    assert value in ('0', '1', '2', '3'), 'vision encoder rank must be an explicit TP4 rank'
+    return int(value)
+
+def rank_data_paths(rank, vision_rank):
+    """Relative immutable shard paths; atlas rank is distinct from its host."""
+    assert type(rank) is int and 0 <= rank < 4
+    assert type(vision_rank) is int and 0 <= vision_rank < 4
+    paths = [f'staged/layer{layer}-v1/r{rank}/' for layer in range(40)]
+    paths += [f'staged/model-io-v1/r{rank}/', f'staged/dspark-mtp-v1/r{rank}/']
+    paths += [f'engram/engram-l{layer}-r{rank}of4.{ext}'
+              for layer in (1, 14) for ext in ('bin', 'json')]
+    if rank == vision_rank:
+        # Vision is replicated, not TP-sharded: preserve the canonical r0 atlas
+        # bytes/metadata even when another device owns image encoding.
+        paths.append('staged/vision-v1/r0/')
+    return paths
 
 def validate(cfg):
     assert len(cfg['nodes']) == 4 and cfg['nodes'][0]['ssh'] is None
@@ -35,6 +49,8 @@ def validate(cfg):
     assert root.is_absolute() and len(root.parts) >= 3 and '..' not in root.parts
     assert re.fullmatch(r'/[A-Za-z0-9_./-]+', str(root)), 'use a root without whitespace or shell metacharacters'
     assert re.fullmatch(r'[A-Za-z0-9_./:@-]+', cfg['image'])
+    assert type(cfg.get('gpu_clock_cap_mhz')) is int and cfg['gpu_clock_cap_mhz'] in (0, 2350), \
+        'choose the qualified 2350 MHz cap or explicit stock-clock override 0'
     assert 1024 <= cfg['rendezvous_port'] <= 65530
     host, port = cfg['http_bind'].rsplit(':', 1)
     ip = ipaddress.ip_address(host)
@@ -43,6 +59,7 @@ def validate(cfg):
     assert ip.is_loopback or (cfg['allow_remote'] and ip.is_private and not ip.is_unspecified)
     addresses = []
     for rank, node in enumerate(cfg['nodes']):
+        assert type(node.get('disable_nvme0_apst')) is bool, 'select the NVMe policy explicitly for every node'
         assert re.fullmatch(r'[A-Za-z0-9_.-]+', node['hostname'])
         if rank:
             assert isinstance(node['ssh'], str) and re.fullmatch(r'[A-Za-z0-9_@.-]+', node['ssh'])
@@ -62,6 +79,8 @@ def validate(cfg):
 class Fleet:
     def __init__(self, inventory):
         self.cfg = validate(json.loads(inventory.read_text()))
+        self.profile = json.loads((SOURCE/'deploy/profile.json').read_text())
+        self.vision_rank = vision_encoder_rank(self.profile)
         self.root = Path(self.cfg['root'])
         self.state_dir = self.root/'state'
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -69,6 +88,83 @@ class Fleet:
         self.state_file = self.state_dir/'cohort.json'
         self.stop_file = self.state_dir/'stop-requested'
         self.digest = hashlib.sha256(json.dumps(self.cfg, sort_keys=True).encode()).hexdigest()
+        self.next_policy_attempt = 0
+        self.policy_retry_delay = 5
+
+    def prepare_host_policy(self):
+        cap = self.cfg['gpu_clock_cap_mhz']
+        apst = [rank for rank, node in enumerate(self.cfg['nodes']) if node['disable_nvme0_apst']]
+        if not cap and not apst:
+            return None
+        # Timer commands point to immutable code, so updating the checkout
+        # cannot change how an already armed generation restores its settings.
+        files = {name:(SOURCE/'deploy'/name).read_bytes()
+                 for name in ['host_state.py', 'host_clock.py', 'host_apst.py']}
+        fingerprint = hashlib.sha256(b''.join(name.encode()+b'\0'+raw
+                                    for name, raw in sorted(files.items()))).hexdigest()
+        directory = self.state_dir/'host-policy-code'/fingerprint
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for name, raw in files.items():
+            path = directory/name
+            if path.exists():
+                assert path.read_bytes() == raw, 'immutable host-policy source changed'
+            else:
+                atomic_bytes(path, raw)
+        for rank, node in enumerate(self.cfg['nodes']):
+            if rank:
+                self.run(['mkdir', '-p', directory], rank)
+                self.run(['chmod', '700', directory], rank)
+                subprocess.run(['rsync', '-rt', '--ignore-existing', '--chmod=F600,D700',
+                    str(directory)+'/', node['ssh']+':'+str(directory)+'/'], check=True, timeout=60)
+            observed = self.run(['sha256sum', *[directory/name for name in files]], rank).stdout.splitlines()
+            assert [line.split()[0] for line in observed] == [hashlib.sha256(raw).hexdigest() for raw in files.values()], \
+                'host-policy source differs on a node'
+        return dict(code=str(directory), source_sha256=fingerprint, cap_mhz=cap, apst_ranks=apst)
+
+    def host_policies(self, action, state):
+        policy = state.get('host_policy')
+        if not policy:
+            return []
+        results, errors = [], []
+        directory = Path(policy['code'])
+        assert directory == self.state_dir/'host-policy-code'/policy['source_sha256']
+        for rank in range(4):
+            kinds = (['clock'] if policy['cap_mhz'] else []) + (['apst'] if rank in policy['apst_ranks'] else [])
+            for kind in kinds:
+                cmd = ['python3', directory/f'host_{kind}.py', self.state_dir, state['generation'], action]
+                if kind == 'clock' and action == 'arm':
+                    cmd += ['--cap-mhz', str(policy['cap_mhz'])]
+                try:
+                    result = json.loads(self.run(cmd, rank, timeout=90).stdout)
+                    allowed = ('armed',) if action == 'arm' else ('renewed', 'rearmed') if action == 'ensure' \
+                        else ('restored', 'not-armed', 'superseded')
+                    assert result['action'] in allowed, 'host policy did not retain this generation'
+                    results.append(dict(rank=rank, kind=kind, result=result))
+                except Exception as e:
+                    errors.append(f'rank {rank} {kind}: {type(e).__name__}: {e}')
+        if errors:
+            raise RuntimeError('host policy '+action+' incomplete: '+str(errors))
+        return results
+
+    def maintain_host_policy(self, state):
+        if not state.get('host_policy') or time.monotonic() < self.next_policy_attempt:
+            return
+        try:
+            self.host_policies('ensure', state)
+        except Exception as e:
+            status, error = 'degraded', str(e)
+            self.next_policy_attempt = time.monotonic() + self.policy_retry_delay
+            self.policy_retry_delay = min(30, self.policy_retry_delay * 2)
+        else:
+            status, error = 'active', None
+            self.next_policy_attempt = time.monotonic() + 30
+            self.policy_retry_delay = 5
+        # Node-local timers restore stock settings after a lost controller.
+        # A transient management outage need not retire a healthy model. Write
+        # only status transitions; ordinary renewal remains entirely in tmpfs.
+        if state.get('host_policy_status') != status or state.get('host_policy_error') != error:
+            state.update(host_policy_status=status, host_policy_error=error)
+            atomic(self.state_file, state)
 
     def run(self, args, rank=0, check=True, timeout=40):
         args = list(map(str, args))
@@ -118,6 +214,10 @@ class Fleet:
                 self.run(['docker', 'rm', c['Id']], rank)
             except Exception as e:
                 errors.append(f'rank {rank}: {e}')
+        try:
+            self.host_policies('restore', state)
+        except Exception as e:
+            errors.append(str(e))
         if errors:
             raise RuntimeError('coordinated stop incomplete: '+str(errors))
         state.update(stopped=True, stopped_epoch=time.time())
@@ -139,11 +239,10 @@ class Fleet:
             for name in ['titanic-flash', 'core.cubin', 'vision.cubin', 'provenance.json']:
                 local = hashlib.sha256((self.root/'data/runtime'/name).read_bytes()).hexdigest()
                 assert self.run(['sha256sum', self.root/'data/runtime'/name], rank).stdout.split()[0] == local
-            paths = [self.root/f'data/staged/layer{layer}-v1/r{rank}/atlas.json' for layer in range(40)]
-            paths += [self.root/f'data/staged/{kind}/r{rank}/atlas.json' for kind in ['model-io-v1', 'dspark-mtp-v1']]
-            paths += [self.root/f'data/engram/engram-l{layer}-r{rank}of4.bin' for layer in [1, 14]]
-            if rank == 0:
-                paths.append(self.root/'data/staged/vision-v1/r0/atlas.json')
+            paths = []
+            for name in rank_data_paths(rank, self.vision_rank):
+                base = self.root/'data'/name
+                paths.extend([base/'atlas.json', base/'atlas.bin'] if name.endswith('/') else [base])
             self.run(['python3', '-c', 'from pathlib import Path; import sys; '
                       'missing=[p for p in sys.argv[1:] if not Path(p).is_file()]; '
                       'assert not missing, missing', *paths], rank)
@@ -172,7 +271,8 @@ class Fleet:
     def launch(self):
         self.stop(self.state())
         image = self.preflight()
-        generation = secrets.token_hex(12)
+        host_policy = self.prepare_host_policy()
+        generation = secrets.token_hex(16)
         run_dir = self.state_dir/generation
         run_dir.mkdir(mode=0o700)
         keys = self.state_dir/'keys'
@@ -189,10 +289,12 @@ class Fleet:
         (run_dir/'rendezvous.ticket').chmod(0o600)
         containers = [f'titanic-{generation}-r{r}' for r in range(4)]
         state = dict(generation=generation, inventory_sha256=self.digest, image=image,
-                     containers=containers, started_epoch=time.time(), stopped=False)
+                     containers=containers, started_epoch=time.time(), stopped=False,
+                     host_policy=host_policy)
         atomic(self.state_file, state)
-        profile = json.loads((SOURCE/'deploy/profile.json').read_text())
+        profile = self.profile
         try:
+            self.host_policies('arm', state)
             for rank, node in enumerate(self.cfg['nodes']):
                 config = run_dir/f'rank{rank}.json'; atomic(config, self.config(rank))
                 if rank:
@@ -219,6 +321,7 @@ class Fleet:
             while time.monotonic() < until:
                 if self.stop_file.exists():
                     raise InterruptedError('stop requested during startup')
+                self.maintain_host_policy(state)
                 for rank, name in enumerate(containers):
                     c = self.inspect(rank, name)
                     assert c and c['State']['Running'], f'rank {rank} exited during loading'
@@ -246,6 +349,7 @@ class Fleet:
                 print(json.dumps(dict(status='ready', generation=state['generation'])), flush=True)
                 failures = 0
                 while not self.stop_file.exists():
+                    self.maintain_host_policy(state)
                     h = self.health(state)
                     failures = 0 if h and h.get('status') == 'ready' else failures+1
                     assert failures < 3, 'head health failed repeatedly'

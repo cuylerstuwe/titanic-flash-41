@@ -1,0 +1,289 @@
+{
+  "entries": [
+    {
+      "name": "hc_post_b128_w1",
+      "symbol": "hc_post_tiles",
+      "architecture": 121,
+      "physical_sms": 48,
+      "arguments": [
+        {
+          "name": "X",
+          "kind": "*bf16"
+        },
+        {
+          "name": "R",
+          "kind": "*bf16"
+        },
+        {
+          "name": "P",
+          "kind": "*fp32"
+        },
+        {
+          "name": "C",
+          "kind": "*fp32"
+        },
+        {
+          "name": "Y",
+          "kind": "*bf16"
+        }
+      ],
+      "constexprs": {
+        "B": 128
+      },
+      "metadata": {
+        "allowed_dot_input_precisions": [
+          "tf32",
+          "tf32x3",
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "sm121",
+        "backend_name": "cuda",
+        "debug": false,
+        "default_dot_input_precision": "tf32",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b15"
+        ],
+        "enable_fp_fusion": false,
+        "enable_reflect_ftz": true,
+        "extern_libs": [
+          [
+            "libdevice",
+            "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+          ]
+        ],
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "566e16b7016dc4925d912299a73b12b91ea7c479a0883b0076173ed140d5ed08",
+        "instrumentation_mode": "",
+        "ir_override": null,
+        "launch_cooperative_grid": false,
+        "launch_pdl": false,
+        "max_num_imprecise_acc_default": 0,
+        "maxnreg": null,
+        "name": "hc_post_tiles",
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 1,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "ptx_options": null,
+        "ptx_version": null,
+        "sanitize_overflow": true,
+        "shared": 0,
+        "supported_fp8_dtypes": [
+          "fp8e4b15",
+          "fp8e4nv",
+          "fp8e5"
+        ],
+        "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+        "tensordesc_meta": [],
+        "tmem_size": 0,
+        "triton_version": "3.7.1",
+        "warp_size": 32
+      },
+      "grid": {
+        "rows_div": 1,
+        "y": 40,
+        "z": 1
+      },
+      "ptx_parameters": [
+        [
+          "u64",
+          "hc_post_tiles_param_0"
+        ],
+        [
+          "u64",
+          "hc_post_tiles_param_1"
+        ],
+        [
+          "u64",
+          "hc_post_tiles_param_2"
+        ],
+        [
+          "u64",
+          "hc_post_tiles_param_3"
+        ],
+        [
+          "u64",
+          "hc_post_tiles_param_4"
+        ],
+        [
+          "u64",
+          "hc_post_tiles_param_5"
+        ],
+        [
+          "u64",
+          "hc_post_tiles_param_6"
+        ]
+      ],
+      "source_sha256": "070e231216e95ed8ddfecb73d25597ea2e677513cf0cf9bc8673ff4645f9695c",
+      "artifact_sha256": "3775026ae6594a4dcc62eebe298a7baeba8fa48afc5fcf093b100e4d68241d63",
+      "programmatic_stream_serialization": true
+    },
+    {
+      "name": "hc_norm_quant_p2",
+      "symbol": "hc_combine_norm_quant",
+      "architecture": 121,
+      "physical_sms": 48,
+      "arguments": [
+        {
+          "name": "X",
+          "kind": "*bf16"
+        },
+        {
+          "name": "P",
+          "kind": "*fp32"
+        },
+        {
+          "name": "W",
+          "kind": "*bf16"
+        },
+        {
+          "name": "Y",
+          "kind": "*bf16"
+        },
+        {
+          "name": "Q",
+          "kind": "*fp8e4nv"
+        },
+        {
+          "name": "SR",
+          "kind": "*u8"
+        },
+        {
+          "name": "SM",
+          "kind": "*u8"
+        }
+      ],
+      "metadata": {
+        "allowed_dot_input_precisions": [
+          "tf32",
+          "tf32x3",
+          "ieee",
+          "bf16x3",
+          "bf16x6"
+        ],
+        "arch": "sm121",
+        "backend_name": "cuda",
+        "debug": false,
+        "default_dot_input_precision": "tf32",
+        "deprecated_fp8_dot_operand_dtypes": [
+          "fp8e4b15"
+        ],
+        "enable_fp_fusion": true,
+        "enable_reflect_ftz": true,
+        "extern_libs": [
+          [
+            "libdevice",
+            "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+          ]
+        ],
+        "global_scratch_align": 1,
+        "global_scratch_size": 0,
+        "hash": "5c104ba9361a8855529c1e441a2471ac1933c1110c92501a7b9937034b5d16a7",
+        "instrumentation_mode": "",
+        "ir_override": null,
+        "launch_cooperative_grid": false,
+        "launch_pdl": false,
+        "max_num_imprecise_acc_default": 0,
+        "maxnreg": null,
+        "name": "hc_combine_norm_quant",
+        "num_ctas": 1,
+        "num_stages": 3,
+        "num_warps": 8,
+        "profile_scratch_align": 1,
+        "profile_scratch_size": 0,
+        "ptx_options": null,
+        "ptx_version": null,
+        "sanitize_overflow": true,
+        "shared": 256,
+        "supported_fp8_dtypes": [
+          "fp8e4b15",
+          "fp8e4nv",
+          "fp8e5"
+        ],
+        "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+        "tensordesc_meta": [],
+        "tmem_size": 0,
+        "triton_version": "3.7.1",
+        "warp_size": 32
+      },
+      "grid": {
+        "rows_div": 1,
+        "y": 2,
+        "z": 1
+      },
+      "ptx_parameters": [
+        [
+          "u64",
+          "hc_combine_norm_quant_param_0"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_1"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_2"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_3"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_4"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_5"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_6"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_7"
+        ],
+        [
+          "u64",
+          "hc_combine_norm_quant_param_8"
+        ]
+      ],
+      "artifact_sha256": "dadddf516464b8ad45ecf462a734399e142d4977d2e543d354d287c0ea8b7a7e",
+      "source_sha256": "38991fb0e8cd9cb98bdf44720c3a842bee03039ed604e2a52439b1d930f815a2",
+      "constexprs": {
+        "PARTS": 2,
+        "CONTIG": 8
+      },
+      "programmatic_stream_serialization": true
+    }
+  ],
+  "parents": [
+    {
+      "bundle": "mhc-post-tiles-v1",
+      "manifest_sha256": "b6e6dc4d603745c26fec10ee61037e2342c1d5206c0dcfd6609976260a212d1e",
+      "manifest": {
+        "source": "https://github.com/sgl-project/sglang",
+        "source_commit": "f80c91a4b97e52e17fbcff088aa6b47b6270f6b9",
+        "license": "Apache-2.0",
+        "contract": "M3/M6 exact residual post-update against pinned native cubin; FP32 explicit FMA order and BF16 output retained. Candidate integration selects target capacity6 only. Component performance, not full-model speed qualification."
+      }
+    },
+    {
+      "bundle": "mhc-norm-quant-layout8-v1",
+      "manifest_sha256": "4e84076b85df1737efbb3d56cf53a8fc0823a2ae119e1ee1495c6b23233dc997",
+      "manifest": {
+        "attribution": "SGLang f80c91a4b97e52e17fbcff088aa6b47b6270f6b9 _hc_combine_norm; b12x a7d7d29b2ef8869086e0ceaa787321f17544e3c9 quant/mxfp8_rows.py and intrinsics.py; Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0",
+        "contract": "HC4 H5120 small rows; BF16 combine and normalized boundaries, four ordered FP32 FMAs, native minimum amax1e-4 and UE8M0 exponent ceiling; preserves BF16 output and exact FP8/scale bytes. Contiguous8 compiler layout hint;15 component cases including captured first differing real boundary. Full-model equivalence remains to be checked."
+      }
+    }
+  ],
+  "attribution": "SGLang and b12x canonical arithmetic; full original attribution is retained in parents. Apache-2.0.",
+  "contract": "M6 target residual post and layout8 norm/FP8 quant only. Arithmetic unchanged. Each kernel waits at entry before dependent global reads. Post triggers at return; norm triggers at entry after its wait. All CTAs execute the trigger. Requires programmatic stream serialization launch attribute; no assumption of concurrent residency. Normal CUDA events preserve auxiliary joins.",
+  "compiler": "ptxas: NVIDIA (R) Ptx optimizing assembler\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Wed_Aug_20_01:53:56_PM_PDT_2025\nCuda compilation tools, release 13.0, V13.0.88\nBuild cuda_13.0.r13.0/compiler.36424714_0\n",
+  "component_sha256": "6f768b44c23dc90f07ace7198227c122f90aebf47fa2bf1b874d04eb43599f60"
+}

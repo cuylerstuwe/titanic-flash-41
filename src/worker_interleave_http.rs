@@ -5,19 +5,32 @@
 //! Background prefill can yield at encoder chunks under an explicit policy;
 //! router holds drain all ranks and retain active state in place until needed.
 use super::*;
-use super::request_checkpoint::{RequestCheckpoint,try_checkpoint,suspend,restore};
+use super::request_checkpoint::{try_checkpoint,try_checkpoint_protected,suspend,restore,try_exchange,exchange_enabled};
 use crate::{http_server::{Job,Queue},protocol::BackendEvent};
 use deepseek_recipe::stream::InferenceFinishReason;
 use std::collections::VecDeque;
 use crate::router_priority::Snapshot as PrioritySnapshot;
 
 const QUANTUM: usize=64;
+#[path = "two_stream_admission.rs"]
+mod two_stream_admission;
+#[path = "two_stream_work.rs"]
+mod two_stream_work;
+use two_stream_work::Turns;
+#[path = "parking_protection.rs"]
+mod parking_protection;
+use parking_protection::Protection;
+#[path = "parked_request.rs"]
+mod parked_request;
+use parked_request::{ParkedRequest,Storage};
 enum Scheduled {
     Native(Command),
-    Park,
+    Park(Option<u8>),
     BeginBackground(Command),
     Prefill,
     Resume(u64),
+    Exchange(u64),
+    PairStep(u64),
     Discard(u64),
     Priority(PrioritySnapshot),
     Hold,
@@ -28,8 +41,10 @@ impl Scheduled {
         match self {
             Self::Native(Command::Step|Command::Finish(_)|Command::ReclaimInputs{..})=>true,
             Self::Priority(_)|Self::Hold|Self::OutputWait=>true,
-            Self::Park=>paused_ids.len()<2 && remaining>0,
+            Self::Park(_)=>paused_ids.len()<2 && remaining>0,
             Self::Discard(id)=>paused_ids.contains(id),
+            Self::Exchange(id)=>paused_ids.contains(id)&&remaining>0,
+            Self::PairStep(id)=>paused_ids.len()==1&&paused_ids.contains(id)&&remaining>=6,
             _=>false,
         }
     }
@@ -46,7 +61,10 @@ impl Scheduled {
             }
             Self::Hold=>Ok(vec![15]),
             Self::OutputWait=>Ok(vec![16]),
-            Self::Park=>Ok(vec![7]),
+            Self::Park(None)=>Ok(vec![7]),
+            Self::Park(Some(mask))=>{ensure!(*mask<16,"park protection mask");Ok(vec![7,*mask])},
+            Self::Exchange(id)=>{ensure!(*id>0,"invalid exchange request identity");let mut bytes=vec![17];bytes.extend(id.to_le_bytes());Ok(bytes)},
+            Self::PairStep(id)=>{ensure!(*id>0,"invalid paired request identity");let mut bytes=vec![18];bytes.extend(id.to_le_bytes());Ok(bytes)},
             Self::Resume(id)|Self::Discard(id)=>{
                 let mut bytes=vec![if matches!(self,Self::Resume(_)){8}else{9}];
                 bytes.extend_from_slice(&id.to_le_bytes());Ok(bytes)
@@ -55,12 +73,19 @@ impl Scheduled {
     }
     fn decode(bytes:&[u8])->Result<Self> {
         match bytes {
-            [7]=>Ok(Self::Park),
+            [7]=>Ok(Self::Park(None)),
+            [7,mask] if *mask<16=>Ok(Self::Park(Some(*mask))),
             [11]=>Ok(Self::Prefill),
             [14,..] if bytes.len()==10 && bytes[9]<=1=>Ok(Self::Priority(PrioritySnapshot{
                 revision:u64::from_le_bytes(bytes[1..9].try_into().unwrap()),hold:bytes[9]!=0})),
             [15]=>Ok(Self::Hold),
             [16]=>Ok(Self::OutputWait),
+            [17,..]if bytes.len()==9=>{
+                let id=u64::from_le_bytes(bytes[1..].try_into().unwrap());ensure!(id>0,"invalid exchange request identity");Ok(Self::Exchange(id))
+            },
+            [18,..]if bytes.len()==9=>{
+                let id=u64::from_le_bytes(bytes[1..].try_into().unwrap());ensure!(id>0,"invalid paired request identity");Ok(Self::PairStep(id))
+            },
             [10,rest @ ..]=>{
                 let command=Command::decode(rest)?;
                 ensure!(matches!(command,Command::Begin{..}),"invalid background start frame");
@@ -76,9 +101,10 @@ impl Scheduled {
     }
 }
 
-fn execute(w:&mut Worker,images:&mut Vec<RequestCheckpoint>,command:Scheduled,
+fn execute(w:&mut Worker,images:&mut Vec<ParkedRequest>,command:Scheduled,
     queue:Option<&Queue>,job:Option<&Job>,priority:&mut PrioritySnapshot)->Result<Value> {
     update_reservations(w,images)?;
+    if let Scheduled::Native(c)|Scheduled::BeginBackground(c)=&command {w.select_resident_bank(c)?;}
     w.loaded_request_is_suspended=matches!(command,Scheduled::Native(Command::Begin{..})|Scheduled::BeginBackground(_))
         && images.iter().any(|p|p.matches_history(&w.history));
     let result=match command {
@@ -110,34 +136,67 @@ fn execute(w:&mut Worker,images:&mut Vec<RequestCheckpoint>,command:Scheduled,
                 "shutdown cannot strand suspended requests");
             w.execute_http(command,queue,job)
         }
-        Scheduled::Park=>{
+        Scheduled::Park(protected)=>{
+            if w.peer_bank.is_some(){parked_request::park(w,images)}else{
             ensure!(images.len()<2 && !images.iter().any(|p|Some(p.id)==w.current),
                 "bounded scheduler image ownership");
             let id=w.current.ok_or_else(||anyhow::anyhow!("park without active request"))?;
             let began=Instant::now();
-            let saved=try_checkpoint(w,images.iter().map(|p|p.charge).sum(),images.len())?;
+            let other_charge=images.iter().map(|p|p.charge).sum();
+            let saved=if let Some(mask)=protected {
+                try_checkpoint_protected(w,other_charge,images.len(),mask)?
+            }else{try_checkpoint(w,other_charge,images.len())?};
             let admitted=saved.is_some();
             let mut charge=0;
             let mut evicted=0;
+            let mut protected_reclaimed=0;
+            let mut prefill_working_allowance=None;
             if let Some((saved,receipt))=saved {
                 evicted=receipt["evicted_cache_entries"].as_u64().unwrap();
-                charge=saved.charge;images.push(saved);suspend(w)?;
+                protected_reclaimed=receipt["protected_entries_reclaimed_for_admitted_owner"].as_u64().unwrap();
+                prefill_working_allowance=receipt["prefill_working_allowance_bytes"].as_u64();
+                charge=saved.charge;images.push(ParkedRequest::image(saved));suspend(w)?;
             }
             Ok(json!({"type":"park","request_id":id,"parked":admitted,
                 "charge_bytes":charge,"held_bytes":images.iter().map(|p|p.charge).sum::<usize>(),
-                "evicted_cache_entries":evicted,
-                "seconds":began.elapsed().as_secs_f64()}))
+                "evicted_cache_entries":evicted,"protected_cache_mask":protected,
+                "protected_entries_reclaimed_for_admitted_owner":protected_reclaimed,
+                "host_allocator_trim":w.state_pressure_trim.take(),
+                "prefill_working_allowance_bytes":prefill_working_allowance,
+                "protected_cache_entries":protected.map_or(0,u8::count_ones),
+                "seconds":began.elapsed().as_secs_f64()}))}
         }
         Scheduled::Resume(id)|Scheduled::Discard(id)=>{
             let index=images.iter().position(|p|p.id==id)
                 .ok_or_else(||anyhow::anyhow!("unknown suspended request"))?;
             let saved=images.remove(index);
-            if matches!(command,Scheduled::Resume(_)) {
-                let mut event=restore(w,&saved)?;
-                event["type"]=json!("resume");Ok(event)
+            if matches!(saved.storage,Storage::Resident(_)) {
+                if matches!(command,Scheduled::Resume(_)){parked_request::resume(w,&saved)}
+                else{parked_request::discard(w,&saved)}
             }else{
-                w.agree(&[])?;
-                Ok(json!({"type":"discard","request_id":id}))
+                let Storage::Image(saved)=saved.storage else{unreachable!()};
+                if matches!(command,Scheduled::Resume(_)) {
+                    let mut event=restore(w,&saved)?;
+                    event["type"]=json!("resume");Ok(event)
+                }else{w.agree(&[])?;Ok(json!({"type":"discard","request_id":id}))}
+            }
+        }
+        Scheduled::PairStep(id)=>{
+            ensure!(images.len()==1&&images[0].id==id&&!images[0].is_image(),
+                "paired step requires exactly one physical peer");
+            images[0].resident_bank(w)?;
+            w.execute_resident_pair(id)
+        }
+        Scheduled::Exchange(id)=>{
+            ensure!(images.len()==1,"two-owner exchange requires one inactive image");
+            let saved=images.iter_mut().find(|p|p.id==id).ok_or_else(||anyhow::anyhow!("unknown exchange request"))?;
+            if matches!(saved.storage,Storage::Resident(_)){parked_request::exchange(w,saved)}else{
+                let Storage::Image(image)=&mut saved.storage else{unreachable!()};
+                let event=try_exchange(w,image)?;
+                saved.id=image.id;saved.charge=image.charge;
+                if let Some(mut event)=event{event["exchanged"]=json!(true);Ok(event)}
+                else{Ok(json!({"type":"exchange","request_id":w.current,"requested_request_id":id,"exchanged":false,
+                    "host_allocator_trim":w.state_pressure_trim.take()}))}
             }
         }
     };
@@ -146,16 +205,22 @@ fn execute(w:&mut Worker,images:&mut Vec<RequestCheckpoint>,command:Scheduled,
     event["suspended_image_bytes"]=json!(w.suspended_image_bytes);
     event["cached_image_bytes"]=json!(w.cached_sessions.iter().map(|p|p.charge).sum::<usize>());
     event["shared_image_bytes"]=json!(w.suspended_image_bytes+w.cached_sessions.iter().map(|p|p.charge).sum::<usize>());
-    event["shared_image_count"]=json!(images.len()+w.cached_sessions.len());
+    event["shared_image_count"]=json!(w.suspended_image_count+w.cached_sessions.len());
+    event["parked_resident_owners"]=json!(images.iter().filter(|p|!p.is_image()).count());
     event["shared_image_budget_bytes"]=json!(w.shared_image_budget);
     Ok(event)
 }
 
-fn update_reservations(w:&mut Worker,images:&[RequestCheckpoint])->Result<()> {
+fn update_reservations(w:&mut Worker,images:&[ParkedRequest])->Result<()> {
     w.suspended_image_bytes=images.iter().map(|p|p.charge).sum();
-    w.suspended_image_count=images.len();
+    w.suspended_image_count=images.iter().filter(|p|p.is_image()).count();
+    if w.peer_bank.is_some() {
+        ensure!(images.len()<=1&&w.suspended_image_count==0,"physical and snapshot owners cannot mix");
+        for saved in images {saved.resident_bank(w)?;}
+    }else{ensure!(images.iter().all(ParkedRequest::is_image),"physical marker without resident banks");}
     ensure!(w.suspended_image_bytes+w.cached_sessions.iter().map(|p|p.charge).sum::<usize>()<=w.shared_image_budget
-        && w.suspended_image_count+w.cached_sessions.len()<=4,"shared image budget exceeded");
+        && w.suspended_image_count<=2
+        && w.suspended_image_count+w.cached_sessions.len()<=w.image_entry_limit(),"shared image budget exceeded");
     Ok(())
 }
 
@@ -167,7 +232,9 @@ fn runnable_peer(active_background:bool,peer_background:bool)->bool {
 }
 
 fn choose(w:&mut Worker,queue:&Queue,active:&mut Option<Job>,ready:&mut VecDeque<(Option<u64>,Job)>,
-    next_id:&mut u64,quantum_start:usize,refused:bool,paused_count:usize)->Result<Scheduled> {
+    next_id:&mut u64,quantum_start:usize,_prefill_turn_done:bool,refused:bool,images:&[ParkedRequest],
+    _protection:&mut Protection,_turns:&mut Turns)->Result<Scheduled> {
+    let paused_count=images.len();
     loop {
         // Paused clients retain their bounded output queue. Advance the stall
         // deadline even while another request owns the GPU.
@@ -214,7 +281,7 @@ fn choose(w:&mut Worker,queue:&Queue,active:&mut Option<Job>,ready:&mut VecDeque
                 }
                 if ready.iter().any(|(_,peer)|runnable_peer(job.background,peer.background)
                     && (!held||!peer.background) && !peer.output_backpressured()) {
-                    return Ok(Scheduled::Park);
+                    return Ok(Scheduled::Park(None));
                 }
             }
             if can_work && (held||output_blocked) {
@@ -270,19 +337,53 @@ fn choose(w:&mut Worker,queue:&Queue,active:&mut Option<Job>,ready:&mut VecDeque
     }
 }
 
+pub(super) fn two_stream_enabled()->Result<bool> {
+    Ok(match std::env::var("CANADA_SCRATCH_TWO_STREAM_ADMISSION") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","two-stream admission flag");v=="1"},
+        Err(std::env::VarError::NotPresent)=>false,
+        Err(e)=>return Err(e.into()),
+    })
+}
+
+/// Reject inconsistent scheduler settings before HTTP readiness or model I/O.
+/// The live scheduler still constructs its own turn state with the actual
+/// slice; this validation owns no requests and performs no device work.
+pub(super) fn validate_startup()->Result<()> {
+    let two_stream=two_stream_enabled()?;
+    ensure!(!exchange_enabled()?||two_stream,"HTTP state exchange requires two-owner admission");
+    let turns=Turns::new(Duration::ZERO)?;
+    let peer_prefill=match std::env::var("CANADA_SCRATCH_PEER_PREFILL") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid peer prefill policy");v=="1"},
+        Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
+    };
+    ensure!(!turns.enabled||(two_stream&&peer_prefill),
+        "work-aware scheduling needs two owners and resumable peer prefill");
+    Ok(())
+}
+
 pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_log::EventLog)->Result<()> {
+    let two_stream=two_stream_enabled()?;
+    ensure!(!exchange_enabled()?||two_stream,"HTTP state exchange requires two-owner admission");
+    if two_stream {if let Some(queue)=queue {queue.enable_two_stream_admission();}}
+    if exchange_enabled()? {if let Some(queue)=queue {queue.reserve_waiting_image_capacity(w.shared_image_budget)?;}}
+    let select=if two_stream{two_stream_admission::choose}else{choose};
     let mut images=Vec::new();
+    let mut protection=Protection::default();
+    let mut turns=Turns::new(w.peer_prefill_slice)?;
+    ensure!(!turns.enabled||(two_stream&&w.peer_prefill_enabled),"work-aware scheduling needs two owners and resumable peer prefill");
+    if let Some(queue)=queue {queue.set_decode_prefill_slice(turns.decode_prefill_slice);}
+    w.control.agree(&[0x62,u8::from(turns.enabled)])?;
     let mut active:Option<Job>=None;
     // None is a newly admitted HTTP job; Some(id) owns a saved unfinished one.
     let mut ready:VecDeque<(Option<u64>,Job)>=VecDeque::new();
-    let mut next_id=1u64;let mut quantum_start=0;let mut refused=false;
+    let mut next_id=1u64;let mut quantum_start=0;let mut prefill_turn_done=false;let mut refused=false;
     let mut authorized_next=None;
     let mut priority=PrioritySnapshot::default();
     let result=(||->Result<()>{
         loop {
             let began=Instant::now();
             let bytes=if authorized_next.is_some(){None}else if let Some(queue)=queue {
-                Some(choose(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,refused,images.len())?.encode()?)
+                Some(select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns)?.encode()?)
             }else{None};
             let wire=if let Some(next)=authorized_next.take(){next}else{w.control.command(bytes.as_deref())?};
             let command=Scheduled::decode(&wire)?;
@@ -293,27 +394,58 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
             let shutdown=matches!(command,Scheduled::Native(Command::Shutdown));
             let discarded=matches!(command,Scheduled::Discard(_));
             let mut event=execute(w,&mut images,command,queue,active.as_ref(),&mut priority)?;
+            let exchanged=event["type"]=="exchange"&&event["exchanged"]==true;
+            if event["type"]=="exchange" {
+                if exchanged {
+                    if queue.is_some(){
+                        let incoming=event["request_id"].as_u64().unwrap();let outgoing=event["outgoing_request_id"].as_u64().unwrap();
+                        let index=ready.iter().position(|(id,_)|*id==Some(incoming)).ok_or_else(||anyhow::anyhow!("exchanged HTTP peer lost"))?;
+                        let(_,peer)=ready.remove(index).unwrap();let previous=active.take().ok_or_else(||anyhow::anyhow!("exchanged HTTP owner lost"))?;
+                        previous.set_executing(false);ready.push_back((Some(outgoing),previous));peer.set_executing(true);active=Some(peer);
+                    }
+                }else{refused=true;}
+            }
             if started {event["request_started"]=json!(true);}
             let input_refused=event["type"]=="input_refused";
             if started && !input_refused {event["vision"]=w.media_receipt.clone();}
-            if started||resumed {quantum_start=if started {0}else{w.emitted};refused=false;}
-            if w.progress_next && event["type"]=="tokens" {
+            if resumed||exchanged {if let (Some(id),Some(job))=(w.current,active.as_ref()) {turns.activate(id,&job.id,false,None);}}
+            if started||resumed||exchanged {
+                quantum_start=if started {0}else{w.emitted};prefill_turn_done=false;refused=false;
+            }
+            // Two partial prompts must each advance before yielding again.
+            // Restoration alone must not make them exchange forever.
+            if event["type"]=="prefill_progress" {prefill_turn_done=true;}
+            if w.progress_next && event["type"]=="tokens" && event.get("paired_peer").is_none() {
                 // Exactly the normal fast path for an uncontended stream.
                 // The bounded next frame may also authorize a park or release
-                // an already paused request, never a new prompt or restoration.
+                // an already paused request, or exchange two existing owners.
+                // It cannot admit a new prompt or a standalone restoration.
                 let agreement_began=Instant::now();
-                let next=queue.map(|queue|choose(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,refused,images.len())
+                let next=queue.map(|queue|select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns)
                     .and_then(|command|command.encode())).transpose()?;
                 let tokens:Vec<u32>=serde_json::from_value(event["output_ids"].clone())?;
                 let wire=w.control.agree_and_next(&w.agreement_state(&tokens),next.as_deref())?;
                 let paused_ids=images.iter().map(|image|image.id).collect::<Vec<_>>();
                 ensure!(Scheduled::decode(&wire)?.follows_progress(&paused_ids,w.history.step_limit()?),
-                    "progress agreement cannot admit a new prompt or restore an image");
+                    "progress agreement cannot admit a new prompt or standalone restoration");
                 authorized_next=Some(wire);
                 event["progress_agreement_seconds"]=json!(agreement_began.elapsed().as_secs_f64());
             }
+            if let Some(peer_event)=event.get_mut("paired_peer") {
+                // Both requests already passed all-rank commit agreement.
+                // Keep this publication before any following selection can
+                // remove a cancelled peer from the ready queue.
+                if queue.is_some() {
+                    let id=peer_event["request_id"].as_u64().context("paired peer identity")?;
+                    let(_,job)=ready.iter().find(|(saved,_)|*saved==Some(id)).context("paired HTTP peer lost")?;
+                    job.emit(BackendEvent::Tokens(serde_json::from_value(peer_event["output_ids"].clone())?));
+                    job.set_executing(false);
+                    peer_event["http_request_id"]=json!(job.id);
+                    peer_event["request_mode"]=json!(if job.background{"background"}else{"foreground"});
+                }
+            }
             if let Some(job)=active.as_ref().filter(|_|!discarded) {
-                if !input_refused && (started || (job.background && event["background_prefill"]==true)) {
+                if !input_refused && (started || event["resumed_prefill"]==true) {
                     job.record_prefill_timing(&event);
                 }
                 if started && !input_refused {
@@ -329,6 +461,9 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                 }else if event["type"]=="tokens" {
                     job.emit(BackendEvent::Tokens(serde_json::from_value(event["output_ids"].clone())?));
                 }else if finished {
+                    if two_stream && !job.background && matches!(event["reason"].as_str(),Some("stop"|"length")) {
+                        protection.remember_foreground(w.history.committed(),w.history.media());
+                    }
                     job.emit(match event["reason"].as_str(){
                         Some("stop")=>BackendEvent::Finish(InferenceFinishReason::Stop),
                         Some("length")=>BackendEvent::Finish(InferenceFinishReason::Length),
@@ -341,10 +476,13 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
             }
             if event["type"]=="park" {
                 if event["parked"]==true {
-                    if let Some(job)=active.take(){ready.push_back((event["request_id"].as_u64(),job));}
+                    if let Some(job)=active.take(){
+                        job.set_executing(false);
+                        ready.push_back((event["request_id"].as_u64(),job));
+                    }
                 }else{
                     refused=true;
-                    if active.as_ref().is_some_and(|job|job.background) {
+                    if !two_stream&&active.as_ref().is_some_and(|job|job.background) {
                         // Serial fallback is fine for equal peers. It is not a
                         // successful priority handoff: reject new foreground
                         // work rather than cancel/replay the background owner.
@@ -359,10 +497,14 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                     }
                 }
             }
-            if finished || input_refused {active=None;}
+            if finished || input_refused {active=None;turns.retired();}
             if !idle {
                 redact_http_event(&mut event);
                 event["http_interleave"]=json!(true);event["quantum_tokens"]=json!(QUANTUM);
+                if two_stream {
+                    event["two_stream_admission"]=json!(true);
+                    event["execution_owners"]=json!(usize::from(active.is_some())+ready.len());
+                }
                 event["progress_next"]=json!(w.progress_next);
                 event["control_and_execution_seconds"]=json!(began.elapsed().as_secs_f64());
                 events.record(&event)?;
@@ -399,26 +541,37 @@ mod tests {
         assert!(Scheduled::decode(&[16,0]).is_err());
         assert!(Scheduled::OutputWait.follows_progress(&[],6));
         for id in [1,1u64<<40,u64::MAX] {
-            for command in [Scheduled::Resume(id),Scheduled::Discard(id)] {
+            for command in [Scheduled::Resume(id),Scheduled::Discard(id),Scheduled::Exchange(id),Scheduled::PairStep(id)] {
                 let wire=command.encode().unwrap();
                 assert_eq!(Scheduled::decode(&wire).unwrap().encode().unwrap(),wire);
                 assert!(Scheduled::decode(&wire[..8]).is_err());
             }
         }
         assert!(Scheduled::decode(&[8,0,0,0,0,0,0,0,0]).is_err());
+        assert!(Scheduled::decode(&[18,0,0,0,0,0,0,0,0]).is_err());
         assert_eq!(Scheduled::decode(&[7]).unwrap().encode().unwrap(),[7]);
+        for mask in 0..16 {assert_eq!(Scheduled::decode(&[7,mask]).unwrap().encode().unwrap(),[7,mask]);}
+        assert!(Scheduled::decode(&[7,16]).is_err());
+        assert!(Scheduled::decode(&[7,0,0]).is_err());
     }
     #[test]
     fn progress_cannot_start_or_restore_a_request_or_discard_an_unknown_owner() {
         let reclaim=Scheduled::Native(Command::ReclaimInputs{headroom:9usize<<30});
         assert!(reclaim.follows_progress(&[2,3],0));
         assert_eq!(Scheduled::decode(&reclaim.encode().unwrap()).unwrap().encode().unwrap(),reclaim.encode().unwrap());
-        assert!(Scheduled::Park.follows_progress(&[2],6));
-        assert!(!Scheduled::Park.follows_progress(&[2],0));
-        assert!(!Scheduled::Park.follows_progress(&[2,3],6));
+        assert!(Scheduled::Park(None).follows_progress(&[2],6));
+        assert!(!Scheduled::Park(None).follows_progress(&[2],0));
+        assert!(!Scheduled::Park(None).follows_progress(&[2,3],6));
         assert!(Scheduled::Discard(2).follows_progress(&[2],6));
         assert!(!Scheduled::Discard(3).follows_progress(&[2],6));
         assert!(!Scheduled::Resume(2).follows_progress(&[2],6));
+        assert!(Scheduled::Exchange(2).follows_progress(&[2],6));
+        assert!(!Scheduled::Exchange(3).follows_progress(&[2],6));
+        assert!(!Scheduled::Exchange(2).follows_progress(&[2],0));
+        assert!(Scheduled::PairStep(2).follows_progress(&[2],6));
+        assert!(!Scheduled::PairStep(3).follows_progress(&[2],6));
+        assert!(!Scheduled::PairStep(2).follows_progress(&[2,3],6));
+        assert!(!Scheduled::PairStep(2).follows_progress(&[2],5));
         assert!(!Scheduled::Native(Command::Shutdown).follows_progress(&[2],6));
         assert!(!Scheduled::Native(Command::Begin{images: Vec::new(),id:3,seed:7,greedy:false,limit:1,tokens:vec![42]})
             .follows_progress(&[2],6));

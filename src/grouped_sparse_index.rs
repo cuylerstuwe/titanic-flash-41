@@ -47,6 +47,9 @@ impl Grouped {
             ("selection-lengths",self.windows.lengths().ptr(),self.windows.lengths().bytes()),
             ("selection-error",self.error.ptr(),self.error.bytes())]
     }
+    pub(crate) fn share_score_scratch(&mut self, storage: Rc<Buffer<f32>>) -> Result<usize> {
+        self.scorer.share_score_scratch(storage)
+    }
     pub(crate) fn cached_ballots(&self) -> bool { self.cached_ballots }
     pub(crate) fn columns(&self) -> usize { self.columns }
     // The native selector sees the union length, not each original causal
@@ -57,7 +60,7 @@ impl Grouped {
         topk: Rc<topk::Native>, queries: Rc<QueryRows>, keys: Rc<KeyMatrix>,
         columns: usize, budget: usize) -> Result<Self> {
         let rows=queries.rows();let group=if rows==16 {16}else{GROUP};
-        ensure!([16,ROWS].contains(&rows) && columns == 1048576
+        ensure!([16,32,ROWS].contains(&rows) && columns == 1048576
             && keys.rows() == columns.min(group*WINDOW), "grouped sparse geometry");
         let cached_ballots = match std::env::var("CANADA_SCRATCH_GROUPED_UNION_CACHE") {
             Ok(value) => { ensure!(value == "0" || value == "1", "invalid grouped union cache policy"); value == "1" },
@@ -81,9 +84,9 @@ impl Grouped {
             keys, scorer,
         })
     }
-    pub(crate) fn configure_packed_gather16(&mut self,kernels:&std::path::Path)->Result<()> {
+    pub(crate) fn configure_packed_gather(&mut self,kernels:&std::path::Path)->Result<()> {
         use sha2::{Digest,Sha256};
-        ensure!(self.rows==16,"packed grouped gather currently qualified at16rows only");
+        ensure!([16,32].contains(&self.rows),"packed grouped verifier gather shape");
         let root=kernels.join("sparse-gather-packed-v1");
         let manifest:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
         let raw=std::fs::read(root.join("gather.cubin"))?;

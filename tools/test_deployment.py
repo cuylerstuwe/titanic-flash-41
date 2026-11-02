@@ -5,9 +5,11 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT/'deploy'))
 def module(name, path):
     s = importlib.util.spec_from_file_location(name, path)
     m = importlib.util.module_from_spec(s); s.loader.exec_module(m); return m
@@ -16,6 +18,21 @@ pack = module('pack_engram', ROOT/'tools/pack_engram.py')
 download = module('download_model', ROOT/'tools/download_model.py')
 
 class DeploymentChecks(unittest.TestCase):
+    def test_vision_distribution_uses_selected_host_and_unchanged_canonical_atlas(self):
+        profile = json.loads((ROOT/'deploy/profile.json').read_text())
+        self.assertEqual(fleet.vision_encoder_rank(profile), 3)
+        for owner in range(4):
+            for rank in range(4):
+                paths = fleet.rank_data_paths(rank, owner)
+                vision = [p for p in paths if '/vision-' in p]
+                self.assertEqual(vision, ['staged/vision-v1/r0/'] if rank == owner else [])
+                self.assertIn(f'staged/model-io-v1/r{rank}/', paths)
+                self.assertIn(f'staged/dspark-mtp-v1/r{rank}/', paths)
+                self.assertEqual(sum(p.startswith('staged/layer') for p in paths), 40)
+        for invalid in ('-1', '4', '3.0', '', 3, True):
+            with self.assertRaises(AssertionError):
+                fleet.vision_encoder_rank(dict(CANADA_SCRATCH_VISION_ENCODER_RANK=invalid))
+
     def test_inventory_rejects_wrong_rank_count_or_ambiguous_rails(self):
         original = json.loads((ROOT/'deploy/fleet.example.json').read_text())
         fleet.validate(original)
@@ -24,6 +41,9 @@ class DeploymentChecks(unittest.TestCase):
                       lambda x: x['nodes'][1].update(fabric_ipv4=x['nodes'][0]['fabric_ipv4']),
                       lambda x: x.update(root='/'),
                       lambda x: x.update(root='/srv/path with spaces'),
+                      lambda x: x.update(gpu_clock_cap_mhz=2000),
+                      lambda x: x.update(gpu_clock_cap_mhz=True),
+                      lambda x: x['nodes'][1].update(disable_nvme0_apst='true'),
                       lambda x: x.update(http_bind='0.0.0.0:8000', allow_remote=True),
                       lambda x: x.update(http_bind='127.0.0.1:18043'),
                       lambda x: x['nodes'][2].update(hcas=['same', 'same'])]:

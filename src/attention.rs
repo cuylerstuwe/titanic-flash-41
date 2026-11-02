@@ -296,7 +296,8 @@ impl Decode {
         ensure!(unsafe { abi() } == 1, "attention library ABI mismatch");
         let launch = *unsafe { lib.get(b"ca_sparse_attention_decode\0") }?;
         let splits = topk.div_ceil(64) + extra_topk.div_ceil(64);
-        // Exact upstream 48-SM heuristic. This is launch scheduling, not numeric execution.
+        // Upstream 48-SM heuristic. Grouping also changes intermediate rounding:
+        // partial attention outputs are BF16, so this is not numerically invariant.
         let mut cpb = 1;
         let mut best_gap = 2f32;
         for candidate in 1..=splits {
@@ -310,6 +311,18 @@ impl Decode {
                 best_gap = gap;
                 cpb = candidate;
             }
+        }
+        let match_grouping = match std::env::var("CANADA_SCRATCH_HISTORY32_MATCH_GROUPING").as_deref() {
+            Ok("1") => true,
+            Ok("0") | Err(_) => false,
+            _ => anyhow::bail!("history32 attention grouping must be 0 or 1"),
+        };
+        ensure!(!match_grouping || crate::config::history32_enabled(),
+            "history32 grouping requires its admitted capability");
+        // Isolate width from grouping in the first two SWA layers. All other
+        // geometries retain their existing algorithm and arithmetic boundaries.
+        if match_grouping && rows == 32 && topk == 128 && extra_topk == 0 {
+            cpb = 1;
         }
         let mut mid_output = cuda.allocate::<bf16>(rows * HEADS * splits * WIDTH)?;
         mid_output.zero()?;
@@ -516,14 +529,17 @@ impl Prefill {
         Self::new_admitted(cuda,root,rows,topk,extra_topk,65)
     }
     pub(crate) fn new_small_bf16(cuda:&Cuda,root:&Path,rows:usize,topk:usize,extra_topk:usize)->Result<Self> {
-        ensure!([1,6,16].contains(&rows),"small BF16 attention geometry");
+        ensure!([1,6,16].contains(&rows)||(rows==32&&crate::config::history32_enabled()),"small BF16 attention geometry");
         Self::new_admitted(cuda,root,rows,topk,extra_topk,1)
     }
     pub(crate) fn new_split_bf16(cuda:&Cuda,kernels:&Path,rows:usize,extra_topk:usize,parts:usize,fp32:bool,vector:bool)->Result<Self> {
-        ensure!([6,16].contains(&rows) && ([2,8].contains(&parts)||(fp32&&parts==3))
+        ensure!(([6,16].contains(&rows)
+                ||(rows==32&&crate::config::history32_enabled()&&fp32&&vector&&parts==3))
+            && ([2,8].contains(&parts)||(fp32&&parts==3))
             && extra_topk==512&&(!vector||fp32),"split attention native geometry");
         let mut this=Self::new_small_bf16(cuda,&kernels.join("attention-small-bf16-s729"),rows,128,extra_topk)?;
-        let root=kernels.join(if vector{"attention-direct-fp32-vector-s799"}else if fp32{"attention-direct-fp32-s795"}else{"attention-direct-split-s782"});
+        let root=kernels.join(if rows==32{"attention-direct-fp32-wide-v1"}
+            else if vector{"attention-direct-fp32-vector-s799"}else if fp32{"attention-direct-fp32-s795"}else{"attention-direct-split-s782"});
         let m:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
         ensure!(m["abi"]==(if fp32{3}else{2}) && (!fp32||m["partial_dtype"]=="float32")
             &&(!vector||m["partial_store_type"]=="float2")

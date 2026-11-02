@@ -5,11 +5,15 @@
 use crate::protocol::{BackendEvent, Frontend, MODEL_NAME};
 #[path = "http_timing.rs"]
 mod timing;
+#[path = "http_admission.rs"]
+mod admission;
+#[path = "http_raw_input.rs"]
+mod raw_input;
 use timing::{PrefillTiming, WithTimings};
 use anyhow::{Result, ensure};
 use axum::{
     Json, Router,
-    body::{Body, to_bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{Path as RoutePath, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{
@@ -138,6 +142,11 @@ struct Shared {
     background_admission: Arc<Semaphore>,
     decode_priority: AtomicBool,
     background_prefill: AtomicBool,
+    execution_activity: AtomicBool,
+    execution_admission: Arc<Semaphore>,
+    waiting_inputs: AtomicUsize,
+    waiting_image_budget: AtomicUsize,
+    waiting_raw_pool: Mutex<Option<Arc<raw_input::Pool>>>,
     health: AtomicU8,
     progress: Arc<AtomicU64>,
     progress_gap_ms: AtomicU64,
@@ -165,6 +174,7 @@ impl Shared {
     fn fail(&self) {
         self.health.store(FAILED, Ordering::Release);
         self.shutdown.store(true, Ordering::Release);
+        self.execution_admission.close();
         // Wake streams even when the sole model owner is stuck in CUDA/NCCL
         // and cannot drop their backend senders. Keep HTTP health available
         // until the external supervisor retires this complete worker group.
@@ -197,6 +207,43 @@ fn fail_on_worker_failure<T: Send + 'static>(
     }
 }
 
+/// SSE comments are transport metadata, separate from model deltas and PP.
+/// Native admission/pause transitions let a router exclude waiting time from
+/// its request budget. Closing the watch must not discard buffered final data.
+fn with_execution_activity(
+    source: impl Stream<Item = std::io::Result<Event>> + Send + 'static,
+    activity: Option<tokio::sync::watch::Receiver<bool>>,
+) -> impl Stream<Item = std::io::Result<Event>> + Send + 'static {
+    async_stream::stream! {
+        let mut source = std::pin::pin!(source);
+        let Some(mut activity) = activity else {
+            while let Some(event) = source.next().await { yield event; }
+            return;
+        };
+        let comment = |running| Event::default().comment(if running {
+            "native-execution running"
+        } else { "native-execution waiting" });
+        let initial = *activity.borrow_and_update();
+        yield Ok(comment(initial));
+        let mut open = true;
+        loop {
+            tokio::select! {
+                biased;
+                changed = activity.changed(), if open => {
+                    if changed.is_ok() {
+                        let running = *activity.borrow_and_update();
+                        yield Ok(comment(running));
+                    } else { open = false; }
+                }
+                event = source.next() => match event {
+                    Some(event) => yield event,
+                    None => return,
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct Job {
     pub id: String,
     pub tokens: Vec<u32>,
@@ -212,11 +259,30 @@ pub(crate) struct Job {
     prompt_tokens: usize,
     prefill_timing: Arc<OnceLock<PrefillTiming>>,
     output_stalled_since: Cell<Option<Instant>>,
+    activity: Option<tokio::sync::watch::Sender<bool>>,
+    executing: Cell<bool>,
     shared: Arc<Shared>,
     _permit: OwnedSemaphorePermit,
     _background_permit: Option<OwnedSemaphorePermit>,
+    _execution_permit: Option<OwnedSemaphorePermit>,
 }
 impl Job {
+    /// Transitions only: no timer, lock or notification on an unchanged step.
+    pub(crate) fn set_executing(&self, executing: bool) {
+        if self.executing.replace(executing) != executing {
+            if let Some(activity) = &self.activity { activity.send_replace(executing); }
+        }
+    }
+
+    pub(crate) fn needs_cached_prefix(&self, prefix: &[u32], media: &crate::prompt_media::Identity) -> bool {
+        // Every entry belongs to this worker's one immutable encoder identity.
+        // Encoded input identity and full span geometry must still match; equal
+        // placeholder tokens alone cannot identify an image-bearing prefix.
+        self.tokens.starts_with(prefix) && self.images.iter().take_while(|image| image.start < prefix.len())
+            .map(|image| (image.start, image.geometry.tokens(), image.input))
+            .eq(media.placements().iter().take_while(|image| image.start < prefix.len())
+                .map(|image| (image.start, image.tokens, image.key.input)))
+    }
     /// Publish only a completed measured phase, once per request. The slot
     /// travels with a parked Job; another request cannot overwrite its timing.
     pub fn record_prefill_timing(&self, event: &serde_json::Value) {
@@ -265,29 +331,96 @@ impl Job {
 }
 impl Drop for Job {
     fn drop(&mut self) {
+        self.set_executing(false);
         self.shared.requests.lock().unwrap().remove(&self.id);
     }
 }
 
+#[derive(Clone,Copy)]
+pub(crate) enum PrefillPeer { Decode, Prompt(usize) }
+fn prefill_work_yield(remaining:usize,peer:PrefillPeer,slice_due:bool)->bool {
+    match peer {
+        PrefillPeer::Decode=>slice_due,
+        // Hysteresis prevents two comparable prefills exchanging repeatedly.
+        // The current owner keeps equal work; initial selection is FIFO on ties.
+        PrefillPeer::Prompt(other)=>other.checked_mul(2).is_some_and(|n|n<remaining),
+    }
+}
+fn prefill_turn_due(elapsed:Duration,normal:Duration,peer:Option<PrefillPeer>,short:Option<Duration>)->bool {
+    // Shorten only a prefill delaying a ready decoder. Prompt/prompt ordering,
+    // the newcomer's first turn and repayment protection are separate rules.
+    let limit=if matches!(peer,Some(PrefillPeer::Decode)){short.unwrap_or(normal).min(normal)}else{normal};
+    elapsed>=limit
+}
 pub(crate) struct Queue {
     receiver: mpsc::Receiver<Job>,
     pending: RefCell<VecDeque<Job>>,
+    execution_owners: Cell<Option<usize>>,
+    // Set by the two-owner scheduler, not inferred from raw third requests.
+    prefill_peer_ready: Cell<bool>,
+    work_aware_prefill: Cell<bool>,
+    prefill_peer_work: Cell<Option<PrefillPeer>>,
+    prefill_protected_until: Cell<Option<Instant>>,
+    decode_prefill_slice: Cell<Option<Duration>>,
     shared: Arc<Shared>,
 }
 impl Queue {
     pub fn try_next(&self) -> Result<Option<Job>> {
-        self.try_selected(false)
+        self.try_selected(false, false)
     }
-    pub fn foreground_waiting(&self) -> Result<bool> {
-        if let Some(job)=self.try_foreground()? {
-            self.pending.borrow_mut().push_front(job);
-            Ok(true)
-        }else{Ok(false)}
+    /// Admission order is independent of execution priority. In particular a
+    /// third foreground request cannot acquire a third execution slot.
+    pub(crate) fn try_fifo(&self) -> Result<Option<Job>> {
+        self.try_selected(false, true)
+    }
+    pub fn foreground_can_join(&self) -> Result<bool> {
+        // A third foreground cannot interrupt an already admitted pair's
+        // prefill. Peeking must never move it ahead of earlier FIFO requests.
+        if self.execution_owners.get().is_some_and(|n| n >= 2) { return Ok(false); }
+        self.buffer_pending()?;
+        Ok(self.pending.borrow().iter().any(|job| !job.background))
+    }
+    pub(crate) fn set_execution_owners(&self, owners: usize) -> Result<()> {
+        ensure!(self.execution_owners.get().is_some() && owners <= 2, "two-stream admission accounting");
+        self.execution_owners.set(Some(owners)); Ok(())
+    }
+    pub(crate) fn set_prefill_peer_ready(&self, ready: bool) {
+        self.prefill_peer_ready.set(ready);
+    }
+    pub(crate) fn set_prefill_work(&self,enabled:bool,peer:Option<PrefillPeer>,protected:Option<Instant>) {
+        self.work_aware_prefill.set(enabled);self.prefill_peer_work.set(peer);
+        self.prefill_protected_until.set(protected);
+    }
+    pub(crate) fn set_decode_prefill_slice(&self,slice:Option<Duration>) {self.decode_prefill_slice.set(slice);}
+    pub(crate) fn prefill_slice_due(&self,elapsed:Duration,normal:Duration)->bool {
+        prefill_turn_due(elapsed,normal,self.prefill_peer_work.get(),
+            if self.work_aware_prefill.get(){self.decode_prefill_slice.get()}else{None})
+    }
+    pub(crate) fn prefill_peer_should_yield(&self,background:bool,remaining:usize,slice_due:bool,
+        mut estimate:impl FnMut(&Job)->usize)->Result<bool> {
+        if !self.work_aware_prefill.get(){return Ok(slice_due&&self.prefill_peer_can_run(background)?);}
+        if self.prefill_protected_until.get().is_some_and(|end|Instant::now()<end){return Ok(false);}
+        if let Some(peer)=self.prefill_peer_work.get(){return Ok(prefill_work_yield(remaining,peer,slice_due));}
+        let Some(owners)=self.execution_owners.get()else{return Ok(false);};
+        if owners>=2{return Ok(false);}
+        self.buffer_pending()?;
+        Ok(self.pending.borrow().front().filter(|peer|(background||!peer.background)
+            &&!peer.cancelled()&&!peer.output_backpressured())
+            .is_some_and(|peer|prefill_work_yield(remaining,PrefillPeer::Prompt(estimate(peer)),slice_due)))
+    }
+    pub(crate) fn prefill_peer_can_run(&self, background: bool) -> Result<bool> {
+        if self.prefill_peer_ready.get() { return Ok(true); }
+        let Some(owners)=self.execution_owners.get() else { return Ok(false); };
+        if owners>=2 { return Ok(false); }
+        self.buffer_pending()?;
+        // Only the first FIFO entrant can own the vacant second slot. A
+        // foreground owner does not yield solely for a background entrant.
+        Ok(self.pending.borrow().front().is_some_and(|peer|background||!peer.background))
     }
     pub fn try_foreground(&self) -> Result<Option<Job>> {
-        self.try_selected(true)
+        self.try_selected(true, false)
     }
-    fn try_selected(&self, foreground_only: bool) -> Result<Option<Job>> {
+    fn buffer_pending(&self) -> Result<()> {
         let mut pending = self.pending.borrow_mut();
         pending.retain(|job| !job.cancelled());
         loop {
@@ -299,14 +432,34 @@ impl Queue {
             }
         }
         ensure!(pending.len() <= QUEUE_DEPTH + 1, "HTTP admission ownership bound");
-        let selected = pending.iter().position(|job| !job.background)
-            .or_else(|| (!foreground_only && !pending.is_empty()).then_some(0));
+        Ok(())
+    }
+    fn try_selected(&self, foreground_only: bool, fifo: bool) -> Result<Option<Job>> {
+        self.buffer_pending()?;
+        let mut pending = self.pending.borrow_mut();
+        let selected = if fifo { (!pending.is_empty()).then_some(0) } else {
+            pending.iter().position(|job| !job.background)
+                .or_else(|| (!foreground_only && !pending.is_empty()).then_some(0))
+        };
         Ok(selected.and_then(|i| pending.remove(i)))
     }
+    pub(crate) fn pending_needs_prefix(&self, prefix: &[u32], media: &crate::prompt_media::Identity) -> Result<bool> {
+        // Raw queued inputs have not been tokenized yet. Protect every cache
+        // entry until their exact prefix identity is available at admission.
+        if self.shared.waiting_inputs.load(Ordering::Acquire) > 0 { return Ok(true); }
+        self.buffer_pending()?;
+        Ok(self.pending.borrow().iter().any(|job| job.needs_cached_prefix(prefix, media)))
+    }
     pub fn next(&self, wait: Duration) -> Result<Option<Job>> {
+        self.next_selected(wait, false)
+    }
+    pub(crate) fn next_fifo(&self, wait: Duration) -> Result<Option<Job>> {
+        self.next_selected(wait, true)
+    }
+    fn next_selected(&self, wait: Duration, fifo: bool) -> Result<Option<Job>> {
         let deadline = Instant::now() + wait;
         loop {
-            if let Some(job) = self.try_next()? { return Ok(Some(job)); }
+            if let Some(job) = self.try_selected(false, fifo)? { return Ok(Some(job)); }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
@@ -324,6 +477,21 @@ impl Queue {
         *self.shared.identity.lock().unwrap() = Some(identity.into());
         self.shared.health.store(READY, Ordering::Release);
     }
+    pub(crate) fn enable_two_stream_admission(&self) {
+        self.execution_owners.set(Some(0));
+        self.shared.execution_activity.store(true, Ordering::Release);
+    }
+    pub(crate) fn reserve_waiting_image_capacity(&self, bytes: usize) -> Result<()> {
+        assert!(bytes <= 2usize << 30);
+        let mut pool = self.shared.waiting_raw_pool.lock().unwrap();
+        if pool.is_none() {
+            // Four ordinary text uploads, physically backed before readiness.
+            // Larger or additional bodies retain the future-growth guard.
+            *pool = Some(raw_input::Pool::new(4, 8 << 20)?);
+        }
+        self.shared.waiting_image_budget.store(bytes, Ordering::Release);
+        Ok(())
+    }
     pub fn enable_background_prefill(&self) {
         self.shared.background_prefill.store(true,Ordering::Release);
     }
@@ -332,6 +500,17 @@ impl Queue {
     }
     pub fn stopping(&self) -> bool {
         self.shared.shutdown.load(Ordering::Acquire)
+    }
+    pub(crate) fn has_outstanding_requests(&self) -> bool {
+        self.shared.admission.available_permits() != QUEUE_DEPTH + 1
+    }
+    pub(crate) fn input_pending_for_vacancy(&self) -> bool {
+        let Some(owners)=self.execution_owners.get().filter(|n|*n<2)else{return false;};
+        // The FIFO waiter can be waking up, or already hold the newly freed
+        // lifetime permit while uploading/converting. Neither is a model Job
+        // yet. An idle/uncontended stream must never wait for imaginary work.
+        self.shared.waiting_inputs.load(Ordering::Acquire)>0
+            ||self.shared.execution_admission.available_permits()<2-owners
     }
     pub fn input_reclaim_target(&self) -> usize {
         self.shared.input_reclaim_target.load(Ordering::Acquire)
@@ -438,6 +617,7 @@ async fn health(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
                 "maximum_observed_gap_ms":shared.progress_maximum_gap_ms.load(Ordering::Relaxed),
                 "timed_out":shared.progress_timed_out.load(Ordering::Acquire)},
             "active_or_queued":QUEUE_DEPTH+1-shared.admission.available_permits(),
+            "waiting_for_execution_slot":shared.waiting_inputs.load(Ordering::Acquire),
             "output_flow":{"pause_enabled":shared.decode_priority.load(Ordering::Acquire),
                 "stall_timeout_seconds":shared.output_stall_timeout.as_secs(),
                 "backpressure_events":shared.output_backpressure_events.load(Ordering::Relaxed),
@@ -499,6 +679,7 @@ async fn shutdown(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Resp
     }
     shared.health.store(LOADING, Ordering::Release);
     shared.shutdown.store(true, Ordering::Release);
+    shared.execution_admission.close();
     Json(json!({"shutdown_requested":true})).into_response()
 }
 
@@ -661,18 +842,41 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
             "application/json is required",
         );
     }
-    let upload_workspace = if shared.body_limit == MAX_BODY {
+    // An available lifetime slot may be claimed before upload, preserving
+    // solo recovery from low headroom. A waiting upload cannot ask the model
+    // to reclaim cache; its bounded CPU body must fit without GPU work.
+    let upload_execution = if shared.execution_activity.load(Ordering::Acquire) {
+        shared.execution_admission.clone().try_acquire_owned().ok()
+    } else { None };
+    let waiting_upload = shared.execution_activity.load(Ordering::Acquire) && upload_execution.is_none();
+    let declared = request.headers().get("content-length").and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let pooled_upload = if waiting_upload {
+        declared.and_then(|bytes| shared.waiting_raw_pool.lock().unwrap().as_ref()
+            .and_then(|pool| pool.take(bytes)))
+    } else { None };
+    let upload_workspace = if shared.body_limit == MAX_BODY && pooled_upload.is_none() {
         let bytes = request.headers().get("content-length").and_then(|v|v.to_str().ok())
             .and_then(|v|v.parse::<usize>().ok()).unwrap_or(shared.body_limit);
         if bytes > shared.body_limit { return error(StatusCode::PAYLOAD_TOO_LARGE, "body_limit", "request body exceeds its bound"); }
-        match reserve_input_workspace(&shared, bytes.max(1)*2).await {
+        match if waiting_upload {
+            // A waiting upload may reserve bounded CPU memory, but cannot
+            // trigger GPU cache reclamation before it owns a lifetime slot.
+            crate::memory::reserve_waiting_host_workspace(bytes.max(1)*2,
+                shared.waiting_image_budget.load(Ordering::Acquire))
+        } else { reserve_input_workspace(&shared, bytes.max(1)*2).await } {
             Ok(reservation) => Some(reservation),
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "input_capacity", "input upload cannot retain the memory reserve"),
         }
     } else { None };
     let body = match tokio::time::timeout(
         Duration::from_secs(15),
-        to_bytes(request.into_body(), shared.body_limit),
+        async {
+            match pooled_upload {
+                Some(input) => input.read(request.into_body()).await,
+                None => to_bytes(request.into_body(), shared.body_limit).await.map_err(anyhow::Error::from),
+            }
+        },
     )
     .await
     {
@@ -692,6 +896,17 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
             );
         }
     };
+    admission::dispatch(shared,body,permit,background_permit,upload_workspace,background,upload_execution).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_chat(shared: Arc<Shared>, body: Bytes, permit: OwnedSemaphorePermit,
+    background_permit: Option<OwnedSemaphorePermit>,
+    upload_workspace: Option<crate::memory::HostWorkspaceReservation>, background: bool,
+    execution_permit: Option<OwnedSemaphorePermit>, mut registration: admission::Registered) -> Response {
+    if shared.health.load(Ordering::Acquire) != READY || shared.shutdown.load(Ordering::Acquire) {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready", "native worker is stopping");
+    }
     // Conversion can simultaneously own the raw body, parsed/normalized
     // request, canonical conversation, rendering and tokenizer buffers. Hold
     // this conservative size-based allowance through the blocking task, even
@@ -705,13 +920,13 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
     drop(upload_workspace);
     let frontend = shared.frontend.clone();
     let capacity = shared.capacity;
-    let cancellation = Arc::new(AtomicBool::new(false));
+    let cancellation = registration.cancellation.clone();
     let guard = CancelOnDrop(cancellation.clone());
     let preprocessing_cancel = cancellation.clone();
     let preprocessing_shared = shared.clone();
     // A disconnected caller cannot release admission while its blocking
     // conversion still owns a potentially large body/decoder workspace.
-    let (mut prepared, permit, background_permit) =
+    let (mut prepared, permit, background_permit, execution_permit) =
         match tokio::task::spawn_blocking(move || {
             let _workspace = conversion_workspace;
             let cancelled = || preprocessing_cancel.load(Ordering::Acquire)
@@ -738,10 +953,10 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
                     prepared = frontend.prepare_chat_cancellable(&body, capacity, &cancelled);
                 }
             }
-            (prepared, permit, background_permit)
+            (prepared, permit, background_permit, execution_permit)
         }).await {
-            Ok((Ok(prepared), permit, background_permit)) => (prepared, permit, background_permit),
-            Ok((Err(reason), _, _)) => {
+            Ok((Ok(prepared), permit, background_permit, execution_permit)) => (prepared, permit, background_permit, execution_permit),
+            Ok((Err(reason), _, _, _)) => {
                 if reason.downcast_ref::<crate::memory::InputCapacityError>().is_some() {
                     return error(StatusCode::SERVICE_UNAVAILABLE, "input_capacity", &reason.to_string());
                 }
@@ -779,20 +994,16 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
             }
         },
     };
-    let id = format!(
-        "chatcmpl-{}-{}",
-        shared.nonce,
-        shared.sequence.fetch_add(1, Ordering::Relaxed)
-    );
+    let id = registration.id.clone();
     let (output, incoming) = tokio::sync::mpsc::channel(OUTPUT_CHUNKS);
     let prefill_timing = Arc::new(OnceLock::new());
+    let activity_enabled = shared.execution_activity.load(Ordering::Acquire);
+    let (activity, activity_rx) = if activity_enabled {
+        let (tx, rx) = tokio::sync::watch::channel(false); (Some(tx), Some(rx))
+    } else { (None, None) };
     let stream = prepared.converted.stream;
     let prompt_tokens = prepared.tokens.len();
-    shared
-        .requests
-        .lock()
-        .unwrap()
-        .insert(id.clone(), Arc::downgrade(&cancellation));
+
     let job = Job {
         id: id.clone(),
         tokens: prepared.tokens.clone(),
@@ -801,17 +1012,20 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
         seed,
         greedy: prepared.converted.inference_options.temperature == Some(0.),
         limit: prepared.max_new_tokens as usize,
-        enqueued: Instant::now(),
+        enqueued: registration.enqueued,
         background,
         cancelled: cancellation,
         output,
         prompt_tokens,
         prefill_timing: prefill_timing.clone(),
         output_stalled_since: Cell::new(None),
+        activity, executing: Cell::new(false),
         shared: shared.clone(),
         _permit: permit,
         _background_permit: background_permit,
+        _execution_permit: execution_permit,
     };
+    registration.transferred = true;
     match shared.sender.try_send(job) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(_)) => {
@@ -859,7 +1073,7 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
             yield Ok(Event::default().data("[DONE]"));
         };
         Sse::new(GuardedStream {
-            inner: Box::pin(events),
+            inner: Box::pin(with_execution_activity(events, activity_rx)),
             _cancel: guard,
         })
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(5)))
@@ -893,6 +1107,9 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
             Json(WithTimings {response:complete,timings:timing}).into_response()
         }else{Json(complete).into_response()}
     };
+    if activity_enabled {
+        response.headers_mut().insert("x-native-execution-timing", HeaderValue::from_static("v1"));
+    }
     response
         .headers_mut()
         .insert("x-request-id", HeaderValue::from_str(&id).unwrap());
@@ -932,6 +1149,11 @@ pub(crate) fn start(config: &ServerConfig, capacity: usize, images: bool) -> Res
         background_admission: Arc::new(Semaphore::new(QUEUE_DEPTH)),
         decode_priority: AtomicBool::new(false),
         background_prefill: AtomicBool::new(false),
+        execution_activity: AtomicBool::new(false),
+        execution_admission: Arc::new(Semaphore::new(2)),
+        waiting_inputs: AtomicUsize::new(0),
+        waiting_image_budget: AtomicUsize::new(0),
+        waiting_raw_pool: Mutex::new(None),
         health: AtomicU8::new(LOADING),
         progress: Arc::new(AtomicU64::new(0)),
         progress_gap_ms: AtomicU64::new(0),
@@ -1011,12 +1233,35 @@ pub(crate) fn start(config: &ServerConfig, capacity: usize, images: bool) -> Res
                 eprintln!("native HTTP listener failed");
             }
         })?;
-    Ok(Queue { receiver, pending: RefCell::new(VecDeque::new()), shared })
+    Ok(Queue { receiver, pending: RefCell::new(VecDeque::new()), execution_owners: Cell::new(None), prefill_peer_ready:Cell::new(false),
+            work_aware_prefill: Cell::new(false),
+            prefill_peer_work: Cell::new(None),
+            prefill_protected_until: Cell::new(None), decode_prefill_slice: Cell::new(None), shared })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn work_aware_prefill_preserves_hysteresis_and_decoder_slices() {
+        assert!(!prefill_work_yield(100,PrefillPeer::Prompt(100),true));
+        assert!(!prefill_work_yield(100,PrefillPeer::Prompt(50),true));
+        assert!(prefill_work_yield(100,PrefillPeer::Prompt(49),false));
+        assert!(!prefill_work_yield(0,PrefillPeer::Prompt(0),true));
+        assert!(!prefill_work_yield(usize::MAX,PrefillPeer::Prompt(usize::MAX),true));
+        assert!(!prefill_work_yield(100,PrefillPeer::Decode,false));
+        assert!(prefill_work_yield(100,PrefillPeer::Decode,true));
+    }
+    #[test]
+    fn shorter_prefill_turns_apply_only_to_a_waiting_decoder() {
+        let normal=Duration::from_secs(12);let short=Duration::from_secs(2);
+        assert!(prefill_turn_due(short,normal,Some(PrefillPeer::Decode),Some(short)));
+        assert!(!prefill_turn_due(short-Duration::from_millis(1),normal,Some(PrefillPeer::Decode),Some(short)));
+        assert!(!prefill_turn_due(short,normal,Some(PrefillPeer::Prompt(1)),Some(short)));
+        assert!(!prefill_turn_due(short,normal,None,Some(short)));
+        assert!(!prefill_turn_due(short,normal,Some(PrefillPeer::Decode),None));
+        assert!(prefill_turn_due(normal,normal,Some(PrefillPeer::Decode),Some(normal*2)));
+    }
     use std::io::Write;
     #[test]
     fn progress_watch_ignores_loading_and_requires_completed_work() {
@@ -1056,6 +1301,34 @@ mod tests {
             assert_eq!(stream.next().await.unwrap().unwrap(), 7);
             assert_eq!(stream.next().await.unwrap().unwrap(), 9);
             assert!(stream.next().await.is_none());
+        });
+    }
+    #[test]
+    fn execution_activity_comments_preserve_transitions_and_final_data() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            async fn text(event: Event) -> String {
+                let body = Sse::new(tokio_stream::iter([Ok::<_, std::io::Error>(event)]))
+                    .into_response().into_body();
+                String::from_utf8(to_bytes(body, 1024).await.unwrap().to_vec()).unwrap()
+            }
+            let (activity, rx) = tokio::sync::watch::channel(false);
+            let (output, incoming) = tokio::sync::mpsc::channel(2);
+            let source = tokio_stream::wrappers::ReceiverStream::new(incoming);
+            let mut stream = std::pin::pin!(with_execution_activity(source, Some(rx)));
+            assert!(text(stream.next().await.unwrap().unwrap()).await.contains("native-execution waiting"));
+            activity.send_replace(true);
+            assert!(text(stream.next().await.unwrap().unwrap()).await.contains("native-execution running"));
+            activity.send_replace(false);
+            assert!(text(stream.next().await.unwrap().unwrap()).await.contains("native-execution waiting"));
+            output.send(Ok(Event::default().data("[DONE]"))).await.unwrap();
+            drop(activity); drop(output);
+            assert!(text(stream.next().await.unwrap().unwrap()).await.contains("data: [DONE]"));
+            assert!(stream.next().await.is_none());
+            let source = tokio_stream::iter([Ok(Event::default().data("unchanged"))]);
+            let mut legacy = std::pin::pin!(with_execution_activity(source, None));
+            assert_eq!(text(legacy.next().await.unwrap().unwrap()).await, "data: unchanged\n\n");
+            assert!(legacy.next().await.is_none());
         });
     }
     #[test]
@@ -1124,9 +1397,7 @@ mod tests {
         drop(stream);
         assert!(flag.load(Ordering::Acquire));
     }
-    #[test]
-    #[ignore = "requires CANADA_TEST_TOKENIZER pointing to the pinned public1017 tokenizer"]
-    fn admission_cancel_backpressure_and_bare_eof_are_bounded() {
+    fn test_http_fixture() -> (Queue, Arc<Shared>, tokio::runtime::Runtime) {
         let frontend = Arc::new(
             Frontend::load(Path::new(&std::env::var("CANADA_TEST_TOKENIZER").unwrap())).unwrap(),
         );
@@ -1139,7 +1410,12 @@ mod tests {
             admission: Arc::new(Semaphore::new(QUEUE_DEPTH + 1)),
             background_admission: Arc::new(Semaphore::new(QUEUE_DEPTH)),
             decode_priority: AtomicBool::new(false),
-        background_prefill: AtomicBool::new(false),
+            background_prefill: AtomicBool::new(false),
+            execution_activity: AtomicBool::new(false),
+            execution_admission: Arc::new(Semaphore::new(2)),
+            waiting_inputs: AtomicUsize::new(0),
+            waiting_image_budget: AtomicUsize::new(0),
+            waiting_raw_pool: Mutex::new(None),
             health: AtomicU8::new(READY),
             progress: Arc::new(AtomicU64::new(0)),
             progress_gap_ms: AtomicU64::new(0),
@@ -1165,12 +1441,24 @@ mod tests {
         let queue = Queue {
             receiver,
             pending: RefCell::new(VecDeque::new()),
+            execution_owners: Cell::new(None),
+            prefill_peer_ready: Cell::new(false),
+            work_aware_prefill: Cell::new(false),
+            prefill_peer_work: Cell::new(None),
+            prefill_protected_until: Cell::new(None),
+            decode_prefill_slice: Cell::new(None),
             shared: shared.clone(),
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        (queue,shared,rt)
+    }
+    #[test]
+    #[ignore = "requires CANADA_TEST_TOKENIZER pointing to the pinned public1017 tokenizer"]
+    fn admission_cancel_backpressure_and_bare_eof_are_bounded() {
+        let (queue,shared,rt)=test_http_fixture();
         let request = || {
             Request::builder().method("POST").uri("/v1/chat/completions")
             .header("authorization","Bearer test-token").header("content-type","application/json")
@@ -1274,6 +1562,201 @@ mod tests {
         assert!(queue.try_next().unwrap().is_none());
         assert_eq!(shared.admission.available_permits(),QUEUE_DEPTH + 1);
         assert_eq!(shared.background_admission.available_permits(),QUEUE_DEPTH);
+        assert!(shared.requests.lock().unwrap().is_empty());
+
+        // FIFO execution admission is deliberately different from the
+        // legacy foreground-priority dequeue above. A later foreground may
+        // win execution only after it owns one of the two slots.
+        let bg1=rt.block_on(chat(State(shared.clone()),background_request()));
+        let bg2=rt.block_on(chat(State(shared.clone()),background_request()));
+        let fg=rt.block_on(chat(State(shared.clone()),request()));
+        queue.enable_two_stream_admission();
+        queue.set_execution_owners(2).unwrap();
+        assert!(!queue.foreground_can_join().unwrap(), "queued foreground cannot interrupt two owners");
+        assert!(!queue.prefill_peer_can_run(false).unwrap(),"third request cannot interrupt foreground prefill");
+        assert!(!queue.prefill_peer_can_run(true).unwrap(),"third foreground cannot interrupt two background owners");
+        queue.set_prefill_work(true,None,None);
+        assert!(!queue.prefill_peer_should_yield(true,100,true,|_|1).unwrap(),"work estimates cannot admit a third owner");
+        queue.set_prefill_work(true,Some(PrefillPeer::Prompt(49)),None);
+        assert!(queue.prefill_peer_should_yield(false,100,false,|_|100).unwrap());
+        queue.set_prefill_work(true,Some(PrefillPeer::Prompt(49)),Some(Instant::now()+Duration::from_secs(12)));
+        assert!(!queue.prefill_peer_should_yield(false,100,true,|_|1).unwrap(),"repay an interrupted owner's turn");
+        queue.set_prefill_work(false,None,None);
+        queue.set_prefill_peer_ready(true);
+        assert!(queue.prefill_peer_can_run(false).unwrap(),"admitted runnable peer can receive an encoder boundary");
+        queue.set_prefill_peer_ready(false);
+        queue.set_execution_owners(1).unwrap();
+        assert!(queue.foreground_can_join().unwrap());
+        assert!(!queue.prefill_peer_can_run(false).unwrap(),"foreground must not yield for a background FIFO head");
+        assert!(queue.prefill_peer_can_run(true).unwrap(),"background peer can fill the vacant slot");
+        queue.set_prefill_work(true,None,None);
+        assert!(!queue.prefill_peer_should_yield(false,100,true,|_|1).unwrap(),"background FIFO head cannot interrupt foreground");
+        assert!(queue.prefill_peer_should_yield(true,100,false,|_|1).unwrap());
+        queue.set_prefill_work(false,None,None);
+        let cached=queue.pending.borrow().front().unwrap().tokens.clone();
+        assert!(queue.pending_needs_prefix(&cached,&crate::prompt_media::Identity::default()).unwrap());
+        let mut different=cached.clone();different.push(129279);
+        assert!(!queue.pending_needs_prefix(&different,&crate::prompt_media::Identity::default()).unwrap());
+        let first=queue.try_fifo().unwrap().unwrap();
+        let second=queue.try_fifo().unwrap().unwrap();
+        let third=queue.try_fifo().unwrap().unwrap();
+        assert!(first.background&&second.background&&!third.background);
+        assert!(first.enqueued<=second.enqueued&&second.enqueued<=third.enqueued);
+        drop((first,second,third,bg1,bg2,fg));
+        let cancelled=rt.block_on(chat(State(shared.clone()),background_request()));
+        let live=rt.block_on(chat(State(shared.clone()),request()));
+        drop(cancelled);
+        let job=queue.try_fifo().unwrap().unwrap();assert!(!job.background);
+        assert!(queue.try_fifo().unwrap().is_none());drop((job,live));
+        assert!(shared.requests.lock().unwrap().is_empty());
+        queue.enable_two_stream_admission();
+        let response=rt.block_on(chat(State(shared.clone()),request()));
+        assert_eq!(response.headers()["x-native-execution-timing"], "v1");
+        let job=queue.try_fifo().unwrap().unwrap();
+        job.set_executing(true);
+        job.emit(BackendEvent::Ready{fingerprint:"test".into(),cached_tokens:0});
+        job.emit(BackendEvent::Tokens(vec![42,1]));
+        job.emit(BackendEvent::Finish(deepseek_recipe::stream::InferenceFinishReason::Stop));
+        drop(job);
+        let body=String::from_utf8(rt.block_on(to_bytes(response.into_body(),1024*1024)).unwrap().to_vec()).unwrap();
+        assert!(body.contains("native-execution waiting"));
+        assert!(body.contains("[DONE]"), "{body}");
+        assert!(body.contains("\"finish_reason\":\"stop\""));
+        assert!(shared.requests.lock().unwrap().is_empty());
+    }
+    #[test]
+    #[ignore = "requires CANADA_TEST_TOKENIZER pointing to the pinned public1017 tokenizer"]
+    fn raw_fifo_waits_without_conversion_and_releases_only_terminal_slots() {
+        let (queue,shared,rt)=test_http_fixture();
+        queue.enable_decode_priority();queue.enable_two_stream_admission();
+        assert!(!queue.input_pending_for_vacancy(),"idle serving does not wait for work");
+        let request=|stream:bool,valid:bool,background:bool| {
+            let messages=if valid {json!([{"role":"user","content":"hi"}])} else {json!(42)};
+            Request::builder().method("POST").uri("/v1/chat/completions")
+                .header("authorization","Bearer test-token").header("content-type","application/json")
+                .header("x-localai-mode",if background {"background"}else{"foreground"})
+                .body(Body::from(json!({"messages":messages,"max_tokens":16,"stream":stream}).to_string())).unwrap()
+        };
+        let finish=|job:Job| {
+            job.emit(BackendEvent::Ready{fingerprint:"test".into(),cached_tokens:0});
+            job.emit(BackendEvent::Tokens(vec![42,1]));
+            job.emit(BackendEvent::Finish(deepseek_recipe::stream::InferenceFinishReason::Stop));
+            drop(job);
+        };
+        let text=|response:Response|String::from_utf8(rt.block_on(to_bytes(response.into_body(),1<<20)).unwrap().to_vec()).unwrap();
+        let a=rt.block_on(chat(State(shared.clone()),request(true,true,true)));
+        let b=rt.block_on(chat(State(shared.clone()),request(true,true,true)));
+        let first=queue.try_fifo().unwrap().unwrap();let second=queue.try_fifo().unwrap().unwrap();
+        assert!(first.background&&second.background);
+        assert_eq!(shared.execution_admission.available_permits(),0);
+        queue.set_execution_owners(2).unwrap();
+
+        // A third foreground request is acknowledged but not converted or
+        // dispatched. It cannot borrow either paused owner's permit.
+        let third=rt.block_on(chat(State(shared.clone()),request(true,true,false)));
+        let third_id=third.headers()["x-request-id"].to_str().unwrap().to_owned();
+        assert_eq!(shared.waiting_inputs.load(Ordering::Acquire),1);
+        assert!(!queue.input_pending_for_vacancy(),"a full pair has no vacancy to wait for");
+        assert!(queue.try_fifo().unwrap().is_none());
+        assert!(queue.has_outstanding_requests());
+        assert!(queue.pending_needs_prefix(&[129279],&crate::prompt_media::Identity::default()).unwrap(),
+            "unknown queued prefixes conservatively protect cache");
+        first.set_executing(false);second.set_executing(false);
+        assert_eq!(shared.execution_admission.available_permits(),0);
+        assert_eq!(shared.input_reclaim_target.load(Ordering::Acquire),0);
+        let mut body=third.into_body().into_data_stream();
+        let first_chunk=rt.block_on(body.next()).unwrap().unwrap();
+        assert!(std::str::from_utf8(&first_chunk).unwrap().contains("native-execution waiting"));
+        assert!(queue.try_fifo().unwrap().is_none());
+        finish(first);
+        queue.set_execution_owners(1).unwrap();
+        assert!(queue.input_pending_for_vacancy(),"terminal release exposes the queued FIFO entrant");
+        rt.block_on(async {tokio::time::timeout(Duration::from_secs(2),body.next()).await}).unwrap().unwrap().unwrap();
+        let admitted=queue.try_fifo().unwrap().unwrap();assert_eq!(admitted.id,third_id);
+        assert!(!admitted.background);assert_eq!(shared.waiting_inputs.load(Ordering::Acquire),0);
+        assert_eq!(shared.execution_admission.available_permits(),0);
+        assert!(queue.input_pending_for_vacancy(),"claimed lifetime permit bridges conversion and model admission");
+        queue.set_execution_owners(2).unwrap();assert!(!queue.input_pending_for_vacancy());
+        finish(second);finish(admitted);
+        let remaining=rt.block_on(async {let mut out=Vec::new();while let Some(c)=body.next().await{out.extend_from_slice(&c.unwrap());}out});
+        assert!(std::str::from_utf8(&remaining).unwrap().contains("[DONE]"));
+        assert!(text(a).contains("[DONE]")&&text(b).contains("[DONE]"));
+        assert_eq!(shared.execution_admission.available_permits(),2);
+        queue.set_execution_owners(0).unwrap();assert!(!queue.input_pending_for_vacancy());
+
+        // Queued cancellation works by request ID, even before tokenization.
+        let a=rt.block_on(chat(State(shared.clone()),request(true,true,false)));
+        let b=rt.block_on(chat(State(shared.clone()),request(true,true,false)));
+        let first=queue.try_fifo().unwrap().unwrap();let second=queue.try_fifo().unwrap().unwrap();
+        let cancelled=rt.block_on(chat(State(shared.clone()),request(true,true,false)));
+        let id=cancelled.headers()["x-request-id"].to_str().unwrap().to_owned();
+        let mut headers=HeaderMap::new();headers.insert("authorization",HeaderValue::from_static("Bearer test-token"));
+        assert_eq!(rt.block_on(cancel(State(shared.clone()),RoutePath(id.clone()),headers)).status(),StatusCode::OK);
+        let cancelled=text(cancelled);
+        assert!(cancelled.contains("request_cancelled")&&!cancelled.contains("[DONE]"));
+        assert_eq!(shared.waiting_inputs.load(Ordering::Acquire),0);
+        assert!(!shared.requests.lock().unwrap().contains_key(&id));
+        assert!(queue.try_fifo().unwrap().is_none());
+        assert_eq!(shared.execution_admission.available_permits(),0);
+        let abandoned=rt.block_on(chat(State(shared.clone()),request(true,true,false)));
+        drop(abandoned);
+        assert_eq!(shared.waiting_inputs.load(Ordering::Acquire),0,"unpolled queued body releases its ticket");
+        assert_eq!(shared.requests.lock().unwrap().len(),2);
+
+        // Invalid message conversion happens only after admission. A late
+        // error is explicit SSE and cannot masquerade as successful output.
+        let invalid=rt.block_on(chat(State(shared.clone()),request(true,false,false)));
+        assert_eq!(invalid.status(),StatusCode::OK);
+        assert_eq!(shared.waiting_inputs.load(Ordering::Acquire),1);
+        assert!(queue.try_fifo().unwrap().is_none());
+        finish(first);
+        let invalid=text(invalid);assert!(invalid.contains("event: error")&&invalid.contains("invalid_request"));
+        assert!(!invalid.contains("[DONE]"));
+        assert!(queue.try_fifo().unwrap().is_none());
+        assert_eq!(shared.execution_admission.available_permits(),1);
+        let invalid=rt.block_on(chat(State(shared.clone()),request(true,false,false)));
+        assert_eq!(invalid.status(),StatusCode::BAD_REQUEST,"uncontended validation preserves HTTP status");
+        finish(second);drop((a,b));
+        assert!(shared.requests.lock().unwrap().is_empty());
+        assert_eq!(shared.admission.available_permits(),QUEUE_DEPTH+1);
+        assert_eq!(shared.execution_admission.available_permits(),2);
+
+        // Direct nonstream calls wait too, while preserving their final HTTP
+        // status and ordinary JSON response. No cancellation/replay is used.
+        let a=rt.block_on(chat(State(shared.clone()),request(true,true,false)));
+        let b=rt.block_on(chat(State(shared.clone()),request(true,true,false)));
+        let first=queue.try_fifo().unwrap().unwrap();let second=queue.try_fifo().unwrap().unwrap();
+        rt.block_on(async {
+            let pending=chat(State(shared.clone()),request(false,true,false));tokio::pin!(pending);
+            assert!(tokio::time::timeout(Duration::from_millis(20),&mut pending).await.is_err());
+            assert_eq!(shared.waiting_inputs.load(Ordering::Acquire),1);
+            assert!(queue.try_fifo().unwrap().is_none());finish(first);
+            let worker=async {
+                let until=Instant::now()+Duration::from_secs(2);
+                loop {
+                    if let Some(job)=queue.try_fifo().unwrap(){finish(job);break;}
+                    assert!(Instant::now()<until);tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            };
+            let (response,())=tokio::join!(pending,worker);assert_eq!(response.status(),StatusCode::OK);
+            let value:serde_json::Value=serde_json::from_slice(&to_bytes(response.into_body(),1<<20).await.unwrap()).unwrap();
+            assert_eq!(value["choices"][0]["finish_reason"],"stop");
+        });
+        finish(second);drop((a,b));
+        assert_eq!(shared.waiting_inputs.load(Ordering::Acquire),0);
+        assert_eq!(shared.execution_admission.available_permits(),2);
+        assert!(shared.requests.lock().unwrap().is_empty());
+        assert!(!queue.has_outstanding_requests());
+        // Worker failure closes raw waiters as well as already prepared jobs.
+        let a=rt.block_on(chat(State(shared.clone()),request(true,true,false)));
+        let b=rt.block_on(chat(State(shared.clone()),request(true,true,false)));
+        let first=queue.try_fifo().unwrap().unwrap();let second=queue.try_fifo().unwrap().unwrap();
+        let waiting=rt.block_on(chat(State(shared.clone()),request(true,true,false)));
+        shared.fail();
+        let failed=text(waiting);assert!(failed.contains("worker_not_ready")&&!failed.contains("[DONE]"));
+        drop((first,second,a,b));
+        assert_eq!(shared.waiting_inputs.load(Ordering::Acquire),0);
+        assert_eq!(shared.execution_admission.available_permits(),2);
         assert!(shared.requests.lock().unwrap().is_empty());
     }
     #[test]

@@ -82,6 +82,9 @@ pub struct Expert {
 }
 impl Expert {
     pub(crate) fn layout_layer(&self) -> usize { self.layout.layer }
+    pub(crate) fn same_layer_weights(&self,other:&Self)->bool {
+        self.layout.layer==other.layout.layer && Rc::ptr_eq(&self.weights,&other.weights)
+    }
     pub fn new(weights: Rc<Weights>, layout: Prepared) -> Result<Self> {
         ensure!(
             weights.expert_ready(layout.layer),
@@ -116,7 +119,8 @@ pub struct Workspace {
     cuda: Cuda,
     primitives: Primitives,
     contract: Contract,
-    scratch: Buffer<u8>,
+    scratch: Rc<Buffer<u8>>,
+    sequential_scratch: Option<Rc<SequentialScratch>>,
     ones: Buffer<f32>,
     output: Rc<Buffer<bf16>>,
     live_bounds: bool,
@@ -125,10 +129,32 @@ pub struct Workspace {
     packed: Option<PackedInput>,
     input_address: Option<PackedInput>,
     input_address_enabled: Cell<bool>,
+    scale_codes: Option<PackedInput>,
+    scale_codes_enabled: Cell<bool>,
+    fc_pdl: Option<PackedInput>,
+    // 0: ordinary input addressing; 1: all live rows (finite screen);
+    // 3: the measured three-row-only policy.
+    fc_pdl_mode: Cell<u8>,
     stream: Cell<Option<usize>>,
+}
+/// Only the complete, sequential wide-prefill bank may lend this storage.
+/// Different widths have different counter offsets. A width handoff clears
+/// the destination layout before capture/replay; same-width layer reuse keeps
+/// the already qualified kernel initialization behavior.
+struct SequentialScratch {
+    rows: Cell<usize>,
+    stream: Cell<usize>,
 }
 impl Workspace {
     pub fn new(cuda: &Cuda, root: &Path) -> Result<Self> {
+        Self::new_in(cuda,root,None,false)
+    }
+    pub(crate) fn new_sequential(cuda:&Cuda,root:&Path,donor:Option<&Self>)->Result<Self> {
+        ensure!(std::env::var("CANADA_SCRATCH_WIDE_MOE_ARENA_SCREEN").as_deref()==Ok("1"),
+            "sequential MoE scratch experiment admission");
+        Self::new_in(cuda,root,donor,true)
+    }
+    fn new_in(cuda:&Cuda,root:&Path,donor:Option<&Self>,sequential:bool)->Result<Self> {
         let c: Contract =
             serde_json::from_slice(&std::fs::read(root.join("runtime-contract.json"))?)?;
         ensure!(c.input_format.is_none(), "BF16 MoE workspace cannot consume a packed-input contract");
@@ -222,8 +248,17 @@ impl Workspace {
                 ensure!(node.scalars.contains_key(name), "unknown MoE scalar");
             }
         }
-        let mut scratch = cuda.allocate::<u8>(c.scratch_bytes)?;
-        scratch.zero()?;
+        ensure!(!sequential||crate::config::wide_rows(c.rows),"only wide MoE layouts may share scratch");
+        let (scratch,sequential_scratch)=if let Some(prior)=donor {
+            ensure!(sequential&&prior.contract.rows>=c.rows&&prior.scratch.len()>=c.scratch_bytes
+                &&cuda.owns_buffer(&prior.scratch)&&prior.sequential_scratch.is_some(),
+                "wide MoE scratch donor capacity/context");
+            (prior.scratch.clone(),prior.sequential_scratch.clone())
+        }else{
+            let mut scratch=cuda.allocate::<u8>(c.scratch_bytes)?;scratch.zero()?;
+            (Rc::new(scratch),sequential.then(||Rc::new(SequentialScratch{
+                rows:Cell::new(c.rows),stream:Cell::new(0)})))
+        };
         let mut ones = cuda.allocate::<f32>(c.experts)?;
         ones.upload(&vec![1.; c.experts])?;
         let mut output = cuda.allocate::<bf16>(c.rows * c.hidden)?;
@@ -233,6 +268,7 @@ impl Workspace {
             primitives,
             contract: c,
             scratch,
+            sequential_scratch,
             ones,
             output: Rc::new(output),
             live_bounds: false,
@@ -241,8 +277,28 @@ impl Workspace {
             packed: None,
             input_address: None,
             input_address_enabled: Cell::new(false),
+            scale_codes: None,
+            scale_codes_enabled: Cell::new(false),
+            fc_pdl: None,
+            fc_pdl_mode: Cell::new(0),
             stream: Cell::new(None),
         })
+    }
+    /// Must run outside the encoder CUDA graph before every wide chunk. The
+    /// clear is ordered with both previous users and the next graph on the
+    /// single shared stream, and is needed only when the row geometry changes.
+    pub(crate) fn prepare_sequential_scratch(&self,stream:&Stream)->Result<()> {
+        if let Some(shared)=&self.sequential_scratch {
+            self.guard_stream(stream)?;
+            if shared.rows.get()!=self.contract.rows {
+                unsafe{self.cuda.zero_device(self.scratch.ptr(),self.contract.scratch_bytes,stream)?;}
+                shared.rows.set(self.contract.rows);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn sequential_scratch_bytes(&self)->usize {
+        if self.sequential_scratch.is_some(){self.scratch.len()}else{0}
     }
     pub fn output(&self) -> &Buffer<bf16> {
         &self.output
@@ -255,7 +311,8 @@ impl Workspace {
         ensure!(self.packed.is_none() && [8192,16384].contains(&self.contract.rows)
             && c.abi == 1 && (c.rows,c.hidden,c.intermediate,c.experts,c.topk) == (self.contract.rows,5120,576,384,6)
             && c.deterministic && c.swiglu_limit == 10. && c.scratch_initializer == "zero"
-            && c.scratch_bytes == self.scratch.len() && c.input_format.as_deref() == Some("dual_quant_rows_v1")
+            && c.scratch_bytes == self.contract.scratch_bytes && c.scratch_bytes<=self.scratch.len()
+            && c.input_format.as_deref() == Some("dual_quant_rows_v1")
             && c.input_bytes == c.rows * c.hidden * 37 / 32 && c.routed_quantizer_entry == Some(2)
             && c.kernel_library_sha256 == "d9450a096168c6f6a6d7824e3d5d86c9554cc1fc9476d3af3821cbb9fbfbeb5b"
             && patch["base_commit"] == "a7d7d29b2ef8869086e0ceaa787321f17544e3c9"
@@ -306,6 +363,11 @@ impl Workspace {
         ensure!(self.cuda.owns_stream(stream) && self.stream.get().is_none_or(|s|s == id),
             "shared MoE workspace requires one ordered stream");
         self.stream.set(Some(id));
+        if let Some(shared)=&self.sequential_scratch {
+            ensure!(shared.stream.get()==0||shared.stream.get()==id,
+                "sequential MoE scratch requires one ordered stream across widths");
+            shared.stream.set(id);
+        }
         Ok(())
     }
     pub(crate) fn micro_fp32(&self) -> bool {
@@ -373,6 +435,21 @@ impl Workspace {
             grouped.enable_input_address(&kernels.join("moe-runtime-m6-input-address-v1"))?;
             grouped.input_address_enabled.set(input_address);
         }
+        if std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE_SCREEN").as_deref()==Ok("1") {
+            ensure!(input_address&&!task_order&&!task_order_m3&&!scale,
+                "scale-code screen requires the current input-address control");
+            grouped.enable_scale_codes(&kernels.join("moe-runtime-m6-scale-codes-v5"))?;
+        }
+        let pdl_m3=match std::env::var("CANADA_SCRATCH_MOE_FC_PDL_M3") {
+            Ok(v)=>{ensure!(v=="0"||v=="1","invalid M3 expert PDL policy");v=="1"},
+            Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
+        };
+        if pdl_m3 || std::env::var("CANADA_SCRATCH_MOE_FC_PDL_SCREEN").as_deref()==Ok("1") {
+            ensure!(input_address&&!task_order&&!task_order_m3&&!scale&&grouped.scale_codes.is_none(),
+                "FC PDL screen requires the ordinary input-address control");
+            grouped.enable_fc_pdl(&kernels.join("moe-runtime-m6-fc-pdl-v1"))?;
+            grouped.fc_pdl_mode.set(if pdl_m3 {3}else{0});
+        }
         Ok(grouped)
     }
     pub(crate) fn live_bounds(&self) -> bool { self.live_bounds }
@@ -405,6 +482,58 @@ impl Workspace {
         self.guard_stream(stream)?;
         self.input_address_enabled.set(enabled);
         Ok(())
+    }
+    fn enable_scale_codes(&mut self,root:&Path)->Result<()> {
+        let alternate=Self::new(&self.cuda,root)?;
+        let c=&alternate.contract;
+        let patch=c.fc1_input_address_overlay.as_ref().context("scale-code provenance absent")?;
+        ensure!(self.scale_codes.is_none()&&self.live_bounds&&self.input_address_enabled.get()
+            &&(c.rows,c.experts,c.topk,c.scratch_bytes)==(6,384,6,4118728)
+            &&c.kernel_library_sha256=="db4df4136bb446dfe5167a908d1fa336a2240c947af931125da37dc6a5b339ca"
+            &&patch["base_commit"]=="a7d7d29b2ef8869086e0ceaa787321f17544e3c9"
+            &&patch["files"]["w4a8_phase1.py"]["patched_sha256"]=="d8667d3042b024d413ca08dbad62f79784daa9240a7d21a90dfb6afb2b3af3d2"
+            &&patch["files"]["w4a8_phase2.py"]["patched_sha256"]=="0c9fce39b243676e6754ea1fe111f765b5a993b6d6946ac410301a4663d1c5c3"
+            &&c.nodes.len()==self.contract.nodes.len()
+            &&c.nodes.iter().zip(&self.contract.nodes).all(|(a,b)|
+                a.kernel_id==b.kernel_id&&a.scalars==b.scalars&&a.pointers==b.pointers),
+            "unqualified lossless scale-code kernel/ABI");
+        self.scale_codes=Some(PackedInput{primitives:alternate.primitives,contract:alternate.contract});
+        Ok(())
+    }
+    pub(crate) fn set_scale_codes_for_probe(&self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE_SCREEN").as_deref()==Ok("1")
+            &&self.scale_codes.is_some()&&self.input_address_enabled.get()&&self.live_bounds,
+            "scale-code probe admission");
+        self.guard_stream(stream)?;self.scale_codes_enabled.set(enabled);Ok(())
+    }
+    fn enable_fc_pdl(&mut self,root:&Path)->Result<()> {
+        let alternate=Self::new(&self.cuda,root)?;
+        let c=&alternate.contract;
+        let patch=c.fc1_input_address_overlay.as_ref().context("FC PDL provenance absent")?;
+        ensure!(self.fc_pdl.is_none()&&self.live_bounds&&self.input_address_enabled.get()
+            &&(c.rows,c.experts,c.topk,c.scratch_bytes)==(6,384,6,4118728)
+            &&c.kernel_library_sha256=="0ed9ef3842268d289419c63b26ab09ae8049a0f98956ebf581f243b4b0eafcaf"
+            &&c.task_order_overlay.is_none()&&c.fc1_scale_reuse_overlay.is_none()
+            &&patch["base_commit"]=="a7d7d29b2ef8869086e0ceaa787321f17544e3c9"
+            &&patch["fc_pdl"]==true&&patch["hoisted_input"]==true
+            &&patch["output_major_tasks"]==false&&patch["reuse_fc1_weight_scales"]==false
+            &&patch["stages"]==serde_json::json!([2,2])
+            &&patch["files"]["w4a8_phase1.py"]["patched_sha256"]=="b8e8c848bb1462aecfd549de98373739a8c4a43e5ff79b23f8a10d62e9f7d592"
+            &&patch["files"]["w4a8_phase2.py"]["patched_sha256"]=="3aff59cbaee697abc3ef33177beb3cc996b11d52d31c928edc2bbba89dedc54f"
+            &&c.scratch_bytes==self.contract.scratch_bytes&&c.nodes.len()==self.contract.nodes.len()
+            &&c.nodes.iter().zip(&self.contract.nodes).all(|(a,b)|
+                a.kernel_id==b.kernel_id&&a.scalars==b.scalars&&a.pointers==b.pointers),
+            "unqualified FC PDL kernel/ABI");
+        self.fc_pdl=Some(PackedInput{primitives:alternate.primitives,contract:alternate.contract});
+        Ok(())
+    }
+    pub(crate) fn set_fc_pdl_for_probe(&self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_FC_PDL_SCREEN").as_deref()==Ok("1")
+            &&self.fc_pdl.is_some()&&self.input_address_enabled.get()&&self.live_bounds
+            &&!self.scale_codes_enabled.get(),"FC PDL probe admission");
+        self.guard_stream(stream)?;
+        self.fc_pdl_mode.set(if !enabled {0}
+            else if std::env::var("CANADA_SCRATCH_MOE_FC_PDL_M3").as_deref()==Ok("1") {3}else{1});Ok(())
     }
     /// s581 qualified the existing M16 library at live widths8/10/12/16.
     /// Only launch bounds change; scratch capacities and arithmetic stay fixed.
@@ -462,6 +591,14 @@ impl Workspace {
         }
         ensure!(input.len() == self.contract.rows * self.contract.hidden && self.cuda.owns_buffer(input),
             "BF16 MoE operand");
+        if self.fc_pdl_mode.get()==1 || (self.fc_pdl_mode.get()==3 && live==3) {
+            let p=self.fc_pdl.as_ref().context("expert FC PDL plan absent")?;
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
+        }
+        if self.scale_codes_enabled.get() {
+            let p=self.scale_codes.as_ref().context("expert scale-code plan absent")?;
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
+        }
         if self.input_address_enabled.get() {
             let p=self.input_address.as_ref().context("expert input-address plan absent")?;
             return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
@@ -472,6 +609,8 @@ impl Workspace {
     fn launch_plan(&self, c: &Contract, primitives: &Primitives, expert: &Expert,
         input: u64, input_bytes: usize, ids: &Buffer<i32>, routing_weights: &Buffer<f32>,
         live: usize, stream: &Stream) -> Result<()> {
+        ensure!(self.sequential_scratch.as_ref().is_none_or(|s|s.rows.get()==c.rows),
+            "wide MoE scratch layout was not prepared before enqueue/capture");
         ensure!(
             expert.layout.experts == c.experts
                 && expert.layout.hidden == c.hidden
@@ -542,12 +681,19 @@ impl Workspace {
                 "routing_weights",
                 (routing_weights.ptr(), routing_weights.len() * 4),
             ),
-            ("scratch", (self.scratch.ptr(), self.scratch.len())),
+            ("scratch", (self.scratch.ptr(), c.scratch_bytes)),
             ("ones", (self.ones.ptr(), self.ones.len() * 4)),
             ("output", (self.output.ptr(), self.output.len() * 2)),
         ]);
         for role in ["w13", "s13", "w2", "s2"] {
             roles.insert(role, expert.region(role)?);
+        }
+        if c.kernel_library_sha256=="db4df4136bb446dfe5167a908d1fa336a2240c947af931125da37dc6a5b339ca" {
+            let codes=expert.weights.expert_scale_codes(expert.layout.layer)
+                .context("scale-code kernel requires prepared exact scale bytes")?;
+            ensure!(self.cuda.owns_buffer(codes)&&codes.len()==2*c.experts*576*160,
+                "scale-code operand ownership/size");
+            roles.insert("s13",(codes.ptr(),codes.len()));
         }
         for node in &c.nodes {
             let entry = &primitives.bindings.entries[node.entry as usize];

@@ -15,7 +15,7 @@ pub(super) struct PrefillTiming {
 
 impl PrefillTiming {
     pub fn from_worker(event: &Value, prompt_tokens: usize) -> Option<Self> {
-        // A partial background prefill has not measured the whole suffix yet.
+        // A partial prefill has not measured the whole suffix yet.
         if event["type"] != "tokens" || event["prompt_tokens"].as_u64()? != prompt_tokens as u64 {
             return None;
         }
@@ -32,7 +32,7 @@ impl PrefillTiming {
         }
         Some(Self {
             prompt_n, cache_n, prompt_ms, prompt_per_second,
-            scope: if event["background_prefill"] == true {
+            scope: if event["background_prefill"] == true || event["resumed_prefill"] == true {
                 "server_prefill_active"
             } else {
                 "server_prefill_phase"
@@ -80,6 +80,9 @@ mod tests {
         let timing = PrefillTiming::from_worker(&input, 10000).unwrap();
         assert_eq!(timing.scope, "server_prefill_active");
         assert_eq!(timing.prompt_per_second, Some(400.));
+        input["background_prefill"] = json!(false);
+        input["resumed_prefill"] = json!(true);
+        assert_eq!(PrefillTiming::from_worker(&input,10000).unwrap(),timing);
         input["type"] = json!("prefill_progress");
         assert!(PrefillTiming::from_worker(&input, 10000).is_none());
     }

@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "cases": [
+    {
+      "name": "s440-65520-seed1018",
+      "kind": "repository",
+      "frontier_index": 0,
+      "source_end": 32235,
+      "anchor": 28,
+      "prefix_tokens": 65705
+    },
+    {
+      "name": "s440-131072-seed1118",
+      "kind": "repository",
+      "frontier_index": 1,
+      "source_end": 105887,
+      "anchor": 16,
+      "prefix_tokens": 131251
+    },
+    {
+      "name": "s314-r0-turn4-offset599",
+      "kind": "tool",
+      "frontier_index": 7,
+      "source_end": 5595,
+      "anchor": 2606,
+      "prefix_tokens": 11574
+    }
+  ],
+  "source_sha256": "92e97f17bef2c55dfb3b20a07a7f0bb04626cf572df65e5ca0e21b31e079e7ae",
+  "scope": "Three public committed-history copy candidates for fixed-token component capture. Two repository frontiers and one saved public tool-call frontier; no future acceptance used for selection.32candidate inputs are anchor followed by31alreadycommitted source tokens."
+}

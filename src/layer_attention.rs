@@ -25,6 +25,33 @@ pub(crate) fn generation_fp32_attention_enabled()->Result<bool> {
     }
 }
 
+pub(crate) fn generation_swa_bf16_enabled()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_GENERATION_SWA_BF16") {
+        Err(std::env::VarError::NotPresent)=>Ok(false),
+        Ok(v)if v=="0"=>Ok(false),Ok(v)if v=="1"=>Ok(true),
+        _=>anyhow::bail!("generation SWA BF16 attention must be0or1"),
+    }
+}
+
+pub(crate) fn generation_fp32_attention16_enabled()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_GENERATION_FP32_ATTENTION16") {
+        Err(std::env::VarError::NotPresent)=>Ok(false),
+        Ok(v)if v=="0"=>Ok(false),Ok(v)if v=="1"=>Ok(true),
+        _=>anyhow::bail!("generation M16 FP32 attention must be0or1"),
+    }
+}
+
+fn history32_fp32_attention_enabled()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_HISTORY32_FP32_ATTENTION") {
+        Err(std::env::VarError::NotPresent)=>Ok(false),Ok(v)if v=="0"=>Ok(false),
+        Ok(v)if v=="1"=>{
+            ensure!(crate::config::history32_enabled(),"M32 precision requires its admitted capability");
+            Ok(true)
+        },
+        _=>anyhow::bail!("M32 FP32 attention must be0or1"),
+    }
+}
+
 fn query_overlap16_enabled() -> Result<bool> {
     if !crate::mhc::attention16_overlap_enabled()?
         || std::env::var("CANADA_SCRATCH_ENGRAM_URING").as_deref() != Ok("1") {
@@ -369,8 +396,18 @@ impl Layer {
             && std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1")))
             && std::env::var("CANADA_SCRATCH_APPEND_BF16_ONLY").as_deref()==Ok("1");
         ensure!(!(small_bf16 && append_bf16),"choose one small BF16 attention experiment");
-        let generation_fp32=!draft&&rows==6&&layer>=2&&generation_fp32_attention_enabled()?;
-        ensure!(!generation_fp32||(append_bf16&&!small_bf16
+        let precision32=!draft&&rows==32&&history32_fp32_attention_enabled()?;
+        let generation_fp32=!draft&&layer>=2&&((rows==6&&generation_fp32_attention_enabled()?)
+            ||(rows==16&&generation_fp32_attention16_enabled()?)||precision32);
+        let sparse16_screen=!draft&&rows==16&&layer>=2
+            &&std::env::var("CANADA_SCRATCH_SPARSE_PRECISION_WIDE_SCREEN").as_deref()==Ok("1");
+        ensure!(!sparse16_screen||!generation_fp32,"M16 precision screen needs the FP8 control constructor");
+        let generation_swa_bf16=!draft&&layer<2
+            &&(([6,16].contains(&rows)&&generation_swa_bf16_enabled()?)||precision32);
+        ensure!(!generation_swa_bf16||precision32||(append_bf16&&!small_bf16
+            &&std::env::var("CANADA_SCRATCH_TINY_APPEND_RETAIN_GRAPHS").as_deref()==Ok("1")),
+            "generation SWA BF16 requires the separate BF16 append graph bank");
+        ensure!(!generation_fp32||precision32||(append_bf16&&!small_bf16
             &&std::env::var("CANADA_SCRATCH_TINY_APPEND_RETAIN_GRAPHS").as_deref()==Ok("1")
             &&std::env::var("CANADA_SCRATCH_SPLIT_ATTENTION_SCREEN").as_deref()!=Ok("1")
             &&std::env::var("CANADA_SCRATCH_APPEND_SPLIT_ATTENTION_SCREEN").as_deref()!=Ok("1")),
@@ -378,8 +415,15 @@ impl Layer {
         // s797 native verification and s798 completed-task checks support the
         // higher-precision generation candidate. s799 changes only stores and
         // preserves FP32 intermediates exactly. Append keeps its existing bank.
-        let decode = if generation_fp32 {
-            Execution::Prefill(crate::attention::Prefill::new_split_bf16(cuda,kernels,rows,512,8,true,true)?)
+        let decode = if generation_swa_bf16 {
+            // First-two-layer SWA: canonical BF16 Q/K, FP32 accumulation and
+            // BF16 output, using the already qualified append primitive. Its
+            // separate append workspace keeps both graph banks independent.
+            Execution::Prefill(crate::attention::Prefill::new_small_bf16(cuda,
+                &kernels.join("attention-small-bf16-s729"),rows,128,0)?)
+        }else if generation_fp32 {
+            Execution::Prefill(crate::attention::Prefill::new_split_bf16(cuda,kernels,rows,512,
+                if rows==6 {8}else{3},true,true)?)
         }else if small_bf16 {
             Execution::Prefill(crate::attention::Prefill::new_small_bf16(cuda,
                 &kernels.join("attention-small-bf16-s729"),rows,128,if layer>=2 {512}else{0})?)
@@ -403,10 +447,11 @@ impl Layer {
                 &kernels.join("attention-small-bf16-s729"),rows,128,if layer>=2 {512}else{0})?))
         }else{None};
         let fp32_partials=std::env::var("CANADA_SCRATCH_SPLIT_ATTENTION_FP32").as_deref()==Ok("1");
-        let split_decode=if !draft && rows==6 && layer>=2
-            && std::env::var("CANADA_SCRATCH_SPLIT_ATTENTION_SCREEN").as_deref()==Ok("1") {
+        let split_decode=if sparse16_screen||(!draft && rows==6 && layer>=2
+            && std::env::var("CANADA_SCRATCH_SPLIT_ATTENTION_SCREEN").as_deref()==Ok("1")) {
             ensure!(append_decode.is_some(),"split attention screen needs unsplit BF16 control");
-            Some(Execution::Prefill(crate::attention::Prefill::new_split_bf16(cuda,kernels,rows,512,8,fp32_partials,false)?))
+            Some(Execution::Prefill(crate::attention::Prefill::new_split_bf16(cuda,kernels,rows,512,
+                if sparse16_screen {3}else{8},sparse16_screen||fp32_partials,sparse16_screen)?))
         }else{None};
         let append_split=if append_bf16&&layer>=2
             &&std::env::var("CANADA_SCRATCH_APPEND_SPLIT_ATTENTION_SCREEN").as_deref()==Ok("1") {
@@ -561,7 +606,7 @@ impl Layer {
     pub(crate) fn project_distributed_quantized(&mut self,input:&Buffer<bf16>,
         quantized:Option<(&Buffer<u8>,&Buffer<u8>)>,positions:&Positions,locations:&RowLocations,
         cache:&mut PagedKv,comm:Option<&Roce>,stream:&Stream)->Result<()> {
-        self.project_input(input, positions, locations, cache, comm, None, quantized, stream)
+        self.project_input(input, positions, locations, cache, comm, None, quantized, false, stream)
     }
     pub(crate) fn prepare_row_shard(&self, projection_root: Option<&Path>) -> Result<crate::fp8_linear::RowShard> {
         ensure!(matches!(self.mode, InputMode::Fused) && self.kv.is_none()
@@ -573,12 +618,30 @@ impl Layer {
         comm: &Roce, shard: &mut crate::fp8_linear::RowShard, project_local: bool, stream: &Stream) -> Result<()> {
         ensure!(matches!(self.mode, InputMode::Fused) && self.kv.is_none()
             && self.gathered_qkv.is_none(), "row gather requires fused QKV");
-        self.project_input(input, positions, locations, cache, Some(comm), Some((shard,project_local)), None, stream)
+        self.project_input(input, positions, locations, cache, Some(comm), Some((shard,project_local)), None, false, stream)
+    }
+    /// Only the admitted paired executor may supply this owner's already
+    /// computed QKV projection. All subsequent query/key/attention work is the
+    /// same private path used by ordinary execution.
+    pub(crate) fn project_precomputed(&mut self,input:&Buffer<bf16>,positions:&Positions,
+        locations:&RowLocations,cache:&mut PagedKv,comm:&Roce,stream:&Stream)->Result<()> {
+        self.project_input(input,positions,locations,cache,Some(comm),None,None,true,stream)
+    }
+    pub(crate) fn paired_input_projection(&self)->Result<&Linear> {
+        ensure!(self.rows==6&&matches!(self.mode,InputMode::Split(_))
+            &&self.kv.is_none()&&self.gathered_qkv.is_some()&&!self.qa.narrow_projection()
+            &&self.query_overlap.as_ref().is_none_or(|q|!q.pending.get()),
+            "paired QKV requires an idle split M6 projection");
+        Ok(&self.qa)
     }
     fn project_input(&mut self, input: &Buffer<bf16>, positions: &Positions,
         locations: &RowLocations, cache: &mut PagedKv, comm: Option<&Roce>,
         shard: Option<(&mut crate::fp8_linear::RowShard,bool)>,
-        quantized:Option<(&Buffer<u8>,&Buffer<u8>)>, stream: &Stream) -> Result<()> {
+        quantized:Option<(&Buffer<u8>,&Buffer<u8>)>, precomputed:bool, stream: &Stream) -> Result<()> {
+        if precomputed {
+            self.paired_input_projection()?;
+            ensure!(shard.is_none()&&quantized.is_none()&&comm.is_some(),"precomputed QKV input path");
+        }
         ensure!(quantized.is_none() || (shard.is_none() && self.rows == 6
             && matches!(self.mode,InputMode::Split(_)) && !self.qa.narrow_projection()),
             "prequantized normalized attention requires the checked legacy QKV quantizer");
@@ -590,7 +653,9 @@ impl Layer {
             self.gathered_qkv.is_none() || comm.is_some(),
             "split QKV requires TP4 communicator"
         );
-        if let Some((shard,project_local)) = shard {
+        if precomputed {
+            // The paired normalizer/projector already wrote this private output.
+        } else if let Some((shard,project_local)) = shard {
             self.qa.run_row_shard(input, shard, project_local,
                 comm.ok_or_else(|| anyhow::anyhow!("row gather communicator absent"))?, stream)?;
         } else if let Some((values,scales)) = quantized {
@@ -702,9 +767,10 @@ impl Layer {
         Ok(())
     }
     pub(crate) fn set_split_attention_for_probe(&mut self,path:u8,stream:&Stream)->Result<()> {
-        ensure!(path<=2 && self.rows==6 && self.cuda.owns_stream(stream)
+        ensure!(path<=2 && self.cuda.owns_stream(stream)
             && self.query_overlap.as_ref().is_none_or(|q|!q.pending.get())
-            && std::env::var("CANADA_SCRATCH_SPLIT_ATTENTION_SCREEN").as_deref()==Ok("1"),
+            && ((self.rows==6&&std::env::var("CANADA_SCRATCH_SPLIT_ATTENTION_SCREEN").as_deref()==Ok("1"))
+                ||(self.rows==16&&std::env::var("CANADA_SCRATCH_SPARSE_PRECISION_WIDE_SCREEN").as_deref()==Ok("1"))),
             "split attention switch admission");
         // SWA-only layers remain identical in all three arms.
         if self.split_decode.is_none(){return Ok(())}

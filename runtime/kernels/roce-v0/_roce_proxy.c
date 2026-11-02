@@ -302,7 +302,7 @@ static int connect_qp(roce_ctx_t *c, int h, int p, const roce_blob_t *peer) {
     memcpy(rtr.ah_attr.grh.dgid.raw, peer->gid[h], 16);
     rtr.ah_attr.grh.sgid_index = (uint8_t)c->gid_index;
     rtr.ah_attr.grh.hop_limit = 64;
-    rtr.ah_attr.grh.traffic_class = 0;
+    rtr.ah_attr.grh.traffic_class = 106;
     rtr.ah_attr.grh.flow_label = 0;
     int rc = ibv_modify_qp(hca->qp[p], &rtr,
                            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |

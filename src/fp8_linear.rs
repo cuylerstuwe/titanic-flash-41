@@ -9,6 +9,14 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use serde::Deserialize;
 use std::{cell::Cell, collections::BTreeMap, path::Path, rc::Rc};
+#[path = "fp8_paired.rs"]
+mod paired;
+pub(crate) use paired::PairedSharedUp;
+pub use paired::native_probe as paired_shared_up_probe;
+#[path = "fp8_paired_qkv.rs"]
+mod paired_qkv;
+pub(crate) use paired_qkv::PairedQkv;
+pub use paired_qkv::native_probe as paired_qkv_probe;
 #[derive(Clone,Copy)]
 struct PrefillRows { live:usize, capacity:usize, stream:usize, dense:bool, experts:bool }
 thread_local! {
@@ -195,11 +203,12 @@ impl Linear {
         }else{None};
         if std::env::var("CANADA_SCRATCH_VERIFY16_LEGACY_QKV").as_deref()==Ok("1") {
             let serving=std::env::var("CANADA_SCRATCH_GROUPED_SPARSE16").as_deref()==Ok("1")
-                && std::env::var("CANADA_SCRATCH_ATTENTION16_OVERLAP").as_deref()==Ok("0")
+                && (std::env::var("CANADA_SCRATCH_ATTENTION16_OVERLAP").as_deref()==Ok("0")
+                    || crate::mhc::compact16_overlap_enabled()?)
                 && std::env::var("CANADA_SCRATCH_VERIFY16_COMPACT_DENSE").as_deref()==Ok("1");
             ensure!((std::env::var("CANADA_SCRATCH_GROUPED_SPARSE16_SCREEN").as_deref()==Ok("1") || serving)
                 && std::env::var_os("CANADA_SCRATCH_VERIFY16_QKV_NO_PDL").is_none(),
-                "legacy QKV requires its isolated probe or the compact/serial serving candidate");
+                "legacy QKV requires its isolated probe or the guarded compact serving candidate");
         }
         let root=compact_root.as_deref().unwrap_or(root);
         Self::load_shared(cuda,root,matrix)
@@ -371,7 +380,11 @@ impl Linear {
         } else {
             None
         };
-        let mut scale_mma = input_storage(scale_bytes(g.rows, matrix.padded_k)?)?;
+        // Narrow profiles leave padded MMA row lanes initialized. Preserve
+        // them even when the active rows borrow a prefill transient arena.
+        let mut scale_mma = if g.rows<=128 {
+            cuda.allocate(scale_bytes(g.rows, matrix.padded_k)?)?
+        }else{input_storage(scale_bytes(g.rows, matrix.padded_k)?)?};
         scale_mma.zero()?;
         let mut alpha = cuda.allocate::<f32>(1)?;
         alpha.upload(&[1.])?;

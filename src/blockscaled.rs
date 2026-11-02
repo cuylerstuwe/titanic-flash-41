@@ -7,7 +7,16 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use std::ffi::c_void;
-use std::rc::Rc;
+use std::{rc::{Rc,Weak},cell::RefCell,collections::BTreeMap};
+type EncodedKey=(usize,u64,u64,usize,usize);
+struct Encoded {
+    source:Weak<Weights>,
+    values:Option<Weak<Buffer<u8>>>,
+    scales:Weak<Buffer<u8>>,
+}
+thread_local! {
+    static ENCODED: RefCell<BTreeMap<EncodedKey,Encoded>> = const {RefCell::new(BTreeMap::new())};
+}
 pub fn physical_k(k: usize) -> Result<usize> {
     ensure!(k > 0 && k % 32 == 0, "K must be a positive multiple of 32");
     Ok(k.checked_add(127).context("K overflow")? & !127)
@@ -75,14 +84,21 @@ pub fn pack_scales_gpu(
 }
 pub struct Matrix {
     _source_owner: Rc<Weights>,
-    values: Option<Buffer<u8>>,
-    scales: Buffer<u8>,
+    values: Option<Rc<Buffer<u8>>>,
+    scales: Rc<Buffer<u8>>,
     source_pointer: u64,
+    source_scales: u64,
     pub n: usize,
     pub k: usize,
     pub padded_k: usize,
 }
 impl Matrix {
+    /// Canonical identity is independent of separately prepared MMA scale buffers.
+    pub(crate) fn same_canonical_source(&self,other:&Self)->bool {
+        Rc::ptr_eq(&self._source_owner,&other._source_owner)
+            && (self.source_pointer,self.source_scales,self.n,self.k,self.padded_k)
+                ==(other.source_pointer,other.source_scales,other.n,other.k,other.padded_k)
+    }
     pub(crate) fn in_context(&self, cuda: &Cuda) -> bool {
         self._source_owner.in_context(cuda)
             && cuda.owns_buffer(&self.scales)
@@ -152,14 +168,15 @@ impl Matrix {
             _source_owner: weights.clone(),
             values: None,
             source_pointer: weights.ptr(&format!("{p}.w1.weight"))?,
-            scales: launch_scales(
+            source_scales: weights.ptr(&format!("{p}.w1.scale"))?,
+            scales: Rc::new(launch_scales(
                 cuda,
                 module,
                 stream,
                 weights.ptr(&format!("{p}.w1.scale"))?,
                 1152,
                 5120,
-            )?,
+            )?),
             n: 1152,
             k: 5120,
             padded_k: 5120,
@@ -216,19 +233,21 @@ impl Matrix {
         let n = if rank.is_some() { 448 } else { 1792 };
         let first = rank.unwrap_or(0) * n;
         let source_pointer = weights.ptr(&format!("{p}.wq_a.weight"))? + (first * 5120) as u64;
+        let source_scales=weights.ptr(&format!("{p}.wq_a.scale"))? + (first / 32 * 160) as u64;
         let scales = launch_scales(
             cuda,
             module,
             stream,
-            weights.ptr(&format!("{p}.wq_a.scale"))? + (first / 32 * 160) as u64,
+            source_scales,
             n,
             5120,
         )?;
         Ok(Self {
             _source_owner: weights.clone(),
             values: None,
-            scales,
+            scales:Rc::new(scales),
             source_pointer,
+            source_scales,
             n,
             k: 5120,
             padded_k: 5120,
@@ -246,8 +265,9 @@ impl Matrix {
         Ok(Self {
             _source_owner: weights.clone(), values: None,
             source_pointer: weights.ptr("mtp.0.main_proj.weight")? + (first * 15360) as u64,
-            scales: launch_scales(cuda, module, stream,
-                weights.ptr("mtp.0.main_proj.scale")? + (first / 32 * 480) as u64,1280,15360)?,
+            source_scales: weights.ptr("mtp.0.main_proj.scale")? + (first / 32 * 480) as u64,
+            scales: Rc::new(launch_scales(cuda, module, stream,
+                weights.ptr("mtp.0.main_proj.scale")? + (first / 32 * 480) as u64,1280,15360)?),
             n:1280,k:15360,padded_k:15360,
         })
     }
@@ -275,7 +295,24 @@ impl Matrix {
         );
         let padded_k = physical_k(k)?;
         let source_pointer = weights.ptr(&wn)?;
-        let scales = launch_scales(cuda, module, stream, weights.ptr(&sn)?, n, k)?;
+        let source_scales=weights.ptr(&sn)?;
+        let key=(cuda.context_key(),source_pointer,source_scales,n,k);
+        let shared=std::env::var("CANADA_SCRATCH_SHARED_MATRIX_ENCODING_SCREEN").as_deref()==Ok("1");
+        if shared {
+            let cached=ENCODED.with(|cache| {
+                let cache=cache.borrow();let entry=cache.get(&key)?;
+                if !Rc::ptr_eq(&entry.source.upgrade()?,weights){return None;}
+                let scales=entry.scales.upgrade()?;
+                let values=match &entry.values{Some(v)=>Some(v.upgrade()?),None=>None};
+                Some((values,scales))
+            });
+            if let Some((values,scales))=cached {
+                ensure!(values.is_some()==(padded_k!=k)&&cuda.owns_buffer(&scales)
+                    &&values.as_ref().is_none_or(|v|cuda.owns_buffer(v)),"encoded matrix cache identity");
+                return Ok(Self{_source_owner:weights.clone(),values,scales,source_pointer,source_scales,n,k,padded_k});
+            }
+        }
+        let scales = Rc::new(launch_scales(cuda, module, stream, source_scales, n, k)?);
         let mut nr = n as i32;
         let mut kr = k as i32;
         let mut pk = padded_k as i32;
@@ -304,13 +341,26 @@ impl Matrix {
                     &mut args,
                 )
             }?;
-            Some(values)
+            Some(Rc::new(values))
         };
+        if shared {
+            // Publish only finished, byte-identical encodings. The cache owns
+            // no weights or allocations; live matrices retain both, avoiding
+            // address-reuse aliasing and extending no model lifetime.
+            stream.synchronize()?;
+            ENCODED.with(|cache| {
+                let mut cache=cache.borrow_mut();
+                cache.retain(|_,v|v.scales.strong_count()>0&&v.source.strong_count()>0);
+                cache.insert(key,Encoded{source:Rc::downgrade(weights),
+                    values:values.as_ref().map(Rc::downgrade),scales:Rc::downgrade(&scales)});
+            });
+        }
         Ok(Self {
             _source_owner: weights.clone(),
             values,
             scales,
             source_pointer,
+            source_scales,
             n,
             k,
             padded_k,

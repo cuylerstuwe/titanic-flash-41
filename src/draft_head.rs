@@ -14,6 +14,10 @@ const N: usize = 32320;
 const K: usize = 5120;
 const M: usize = 5;
 
+#[path = "draft_head_pair.rs"]
+mod pair;
+pub(crate) use pair::Pair;
+
 pub(crate) struct DraftHead {
     cuda: Cuda,
     canonical: Rc<Weights>,
@@ -24,8 +28,11 @@ pub(crate) struct DraftHead {
     integer_active: Cell<bool>,
     lossless: Option<crate::lossless_head::Head>,
     lossless_active: Cell<bool>,
-    weights: Buffer<u8>,
-    scales: Buffer<u8>,
+    // Immutable after construction. Request owners may share these bytes,
+    // while precision switches, operators and every activation stay private.
+    weights: Rc<Buffer<u8>>,
+    scales: Rc<Buffer<u8>>,
+    quantizer_sha256: String,
     stream: usize,
 }
 struct IntegerHead { projection:Operator, weights:Buffer<u8>, scales:Buffer<f32> }
@@ -158,6 +165,36 @@ pub fn qualify(path: &Path) -> Result<serde_json::Value> {
     )
 }
 impl DraftHead {
+    pub(crate) fn share_encoding_from(&mut self,source:&Self,stream:&Stream)->Result<usize> {
+        ensure!(std::env::var("CANADA_SCRATCH_SHARED_DRAFT_HEAD").as_deref()==Ok("1")
+            &&Rc::ptr_eq(&self.canonical,&source.canonical)&&self.cuda.owns_stream(stream)
+            &&self.stream==stream.raw()as usize&&self.stream==source.stream
+            &&self.projection.entry.artifact_sha256==source.projection.entry.artifact_sha256
+            &&self.quantizer_sha256==source.quantizer_sha256
+            &&self.weights.len()==source.weights.len()&&self.scales.len()==source.scales.len()
+            &&self.cuda.owns_buffer(&source.weights)&&self.cuda.owns_buffer(&source.scales),
+            "immutable draft-head sharing requires the same canonical source/encoding/stream");
+        // Only a fresh QueryNetwork may invoke this: no captured peer head
+        // can still reference the old buffers when they are released.
+        stream.synchronize()?;
+        if std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1") {
+            use sha2::{Digest,Sha256};
+            // Finite proof only: hash GPU-produced bytes before dropping the
+            // redundant copy. Serving pays no download or hashing cost.
+            let digest=|head:&Self|->Result<String>{
+                let mut hash=Sha256::new();
+                hash.update(head.weights.download()?);hash.update(head.scales.download()?);
+                Ok(format!("{:x}",hash.finalize()))
+            };
+            let own=digest(self)?;let shared=digest(source)?;
+            ensure!(own==shared,"independently encoded draft-head bytes differ");
+            eprintln!("draft_head_shared_encoding_proof {}",serde_json::json!({
+                "exact":true,"sha256":shared,"bytes":self.weights.bytes()+self.scales.bytes()}));
+        }
+        let reclaimed=if Rc::ptr_eq(&self.weights,&source.weights){0}else{self.weights.bytes()+self.scales.bytes()};
+        self.weights=source.weights.clone();self.scales=source.scales.clone();
+        Ok(reclaimed)
+    }
     pub(crate) fn with_lossless(mut self,root:&Path,stream:&Stream)->Result<Self> {
         ensure!(self.stream==stream.raw()as usize&&self.lossless.is_none(),"private lossless stream/profile");
         self.lossless=Some(crate::lossless_head::Head::new_draft(&self.cuda,self.canonical.ptr("head.weight")?,root,stream)?);Ok(self)
@@ -252,8 +289,8 @@ impl DraftHead {
                     ],
             "private draft-head operator ABI"
         );
-        let weights = cuda.allocate::<u8>(N * K)?;
-        let scales = cuda.allocate::<u8>((N / 32) * (K / 32))?;
+        let weights = Rc::new(cuda.allocate::<u8>(N * K)?);
+        let scales = Rc::new(cuda.allocate::<u8>((N / 32) * (K / 32))?);
         unsafe {
             // These operators use vocabulary rows for their launch grid. M5
             // and K5120 are immutable compile-time geometry, not runtime rows.
@@ -277,6 +314,7 @@ impl DraftHead {
             lossless_active:Cell::new(false),
             weights,
             scales,
+            quantizer_sha256: quantizer.entry.artifact_sha256.clone(),
             stream: stream.raw() as usize,
         })
     }

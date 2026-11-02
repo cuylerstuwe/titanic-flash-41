@@ -56,3 +56,7 @@ storage-fault-injection = []
 name = "vision-input"
 required-features = ["vision-input"]
 
+[[example]]
+name = "host-input-pressure"
+required-features = ["protocol"]
+

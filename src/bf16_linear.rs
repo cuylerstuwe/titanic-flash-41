@@ -9,7 +9,8 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use half::bf16;
-use std::{cell::Cell, path::Path, rc::Rc};
+use std::{cell::{Cell,RefCell}, path::Path, rc::Rc};
+pub(crate) type LosslessHeadAtlas=Rc<RefCell<Option<Rc<crate::lossless_head::Head>>>>;
 mod sealed {
     pub trait Sealed {}
     impl Sealed for half::bf16 {}
@@ -36,7 +37,7 @@ pub struct Projection<T: Output> {
     stream: Cell<usize>,
     head_gemv: Option<Operator>,
     head_gemv_active: Cell<bool>,
-    lossless_head: Option<crate::lossless_head::Head>,
+    lossless_head: Option<Rc<crate::lossless_head::Head>>,
     lossless_active: Cell<bool>,
 }
 impl<T: Output> Projection<T> {
@@ -174,8 +175,32 @@ impl<T: Output> Projection<T> {
     pub(crate) fn with_lossless_head(mut self,root:&Path,stream:&Stream)->Result<Self> {
         ensure!(T::CUDA_TYPE==0 && self.rows==6 && self.n==32320 && self.k==5120
             && self.uses_head_gemv(),"lossless head requires canonical M6 BF16/FP32 GEMV");
-        self.lossless_head=Some(crate::lossless_head::Head::new(&self.cuda,self.pointer,root,stream)?);
+        self.lossless_head=Some(Rc::new(crate::lossless_head::Head::new(&self.cuda,self.pointer,root,stream)?));
         self.lossless_active.set(true);Ok(self)
+    }
+    pub(crate) fn with_shared_lossless_head(mut self,root:&Path,stream:&Stream,atlas:&LosslessHeadAtlas)->Result<Self> {
+        ensure!(T::CUDA_TYPE==0&&self.rows==6&&self.n==32320&&self.k==5120&&self.uses_head_gemv(),
+            "shared lossless head requires canonical M6 BF16/FP32 GEMV");
+        let previous=atlas.borrow().clone();
+        if let Some(head)=previous {
+            ensure!(head.matches_canonical(&self.cuda,self.pointer,stream),"shared head atlas has a different canonical operand/context");
+            self.lossless_head=Some(head);self.lossless_active.set(true);
+        }else{
+            self=self.with_lossless_head(root,stream)?;
+            *atlas.borrow_mut()=self.lossless_head.clone();
+        }
+        Ok(self)
+    }
+    pub(crate) fn shares_lossless_head(&self,other:&Self)->bool {
+        self.lossless_active.get()&&other.lossless_active.get()
+            &&self.lossless_head.as_ref().zip(other.lossless_head.as_ref()).is_some_and(|(a,b)|Rc::ptr_eq(a,b))
+    }
+    pub(crate) fn run_pooled_lossless(&self,input:&Buffer<bf16>,output:&Buffer<f32>,rows:usize,stream:&Stream)->Result<()> {
+        ensure!(T::CUDA_TYPE==0&&self.rows==6&&self.n==32320&&self.k==5120&&self.lossless_active.get()
+            &&matches!(rows,6|9|12)&&input.len()==12*5120&&output.len()==12*32320
+            &&self.cuda.owns_buffer(input)&&self.cuda.owns_buffer(output)&&self.cuda.owns_stream(stream),
+            "pooled lossless head geometry/context");
+        self.lossless_head.as_ref().unwrap().run_pooled(input.ptr(),output.ptr(),rows,stream)
     }
     pub(crate) fn set_lossless_for_probe(&self,active:bool)->Result<()> {
         ensure!(self.lossless_head.is_some() && self.rows==6

@@ -26,7 +26,7 @@ impl ReductionRows {
         ensure!(
             live > 0
                 && live <= capacity
-                && ([5, 6, 16, 128].contains(&capacity) || crate::config::wide_rows(capacity)),
+                && ([5, 6, 16, 32, 128].contains(&capacity) || crate::config::wide_rows(capacity)),
             "invalid reduction row geometry"
         );
         Ok(Self { live, capacity })
@@ -71,6 +71,7 @@ pub struct Roce {
     prefill_sum: Option<crate::collective::Communicator>,
     precise_prefill:Option<PrecisePrefill>,
     exchange_prefill:Option<crate::prefill_exchange::Exchange>,
+    native_prefill_rs:Option<crate::prefill_rs::ReduceScatter>,
     small_prefill_sum:bool,
     small_prefill_enqueues:Cell<usize>,
     native_sum_selected: Cell<bool>,
@@ -133,6 +134,8 @@ impl Roce {
             "mapped_region_bytes":self.layout.total_bytes,
             "maximum_enqueued_native_bytes":self.peak_native_bytes.get(),
             "small_prefill_sum":self.small_prefill_sum,
+            "native_prefill_rs":self.native_prefill_rs.is_some(),
+            "native_prefill_rs_enqueues":self.native_prefill_rs.as_ref().map_or(0,|p|p.calls()),
             "small_prefill_enqueues":self.small_prefill_enqueues.get()})
     }
     pub fn local(cuda: &Cuda, root: &Path, rank: usize) -> Result<Self> {
@@ -310,6 +313,7 @@ impl Roce {
             prefill_sum: None,
             precise_prefill:None,
             exchange_prefill:None,
+            native_prefill_rs:None,
             small_prefill_sum:false,
             small_prefill_enqueues:Cell::new(0),
             native_sum_selected: Cell::new(false),
@@ -386,6 +390,7 @@ impl Roce {
         Ok(())
     }
     pub fn health(&self) -> Result<()> {
+        if let Some(rs)=&self.native_prefill_rs {rs.health()?;}
         if let Some(pipeline)=&self.moe_pipeline {pipeline.health()?;}
         let failed = unsafe { (self.failed)(self.handle) };
         let sequence = self.region.status_word(self.layout.ctrl_off as usize + 8)?;
@@ -494,7 +499,10 @@ impl Roce {
             .filter(|_| !self.native_sum_selected.get())
             .ok_or_else(|| anyhow::anyhow!("sequence-parallel prefill needs NCCL prefill sums"))?;
         self.bind_prefill_stream(stream)?;
-        let result = if let Some(exchange)=&self.exchange_prefill {
+        let result = if let Some(rs)=self.native_prefill_rs.as_ref()
+            .filter(|_|crate::prefill_rs::ReduceScatter::handles(input.len())) {
+            unsafe{rs.run(input,output,stream)}
+        }else if let Some(exchange)=&self.exchange_prefill {
             unsafe{exchange.run(nccl,input,output,input.len(),true,stream)}
         }else if self.precise_prefill.is_some(){
             unsafe{self.precise_prefill_sum(input,output,input.len(),true,stream)}
@@ -698,8 +706,18 @@ impl Roce {
     /// Safety: all ranks agree on root, length and collective order and retain
     /// the span through stream completion. Used outside model graph captures.
     pub(crate) unsafe fn broadcast_image_span(&self, span: &Buffer<half::bf16>, root: usize, stream: &Stream) -> Result<()> {
+        ensure!(span.len() <= 1024 * 5120,"image span extent");
+        unsafe {self.broadcast_image_buffer(span,root,stream)}
+    }
+    /// The canonical patch processor bounds images to9198patches of588BF16
+    /// values. Placement on a peer copies those bits once before encoding.
+    pub(crate) unsafe fn broadcast_image_patches(&self, patches: &Buffer<half::bf16>, root: usize, stream: &Stream) -> Result<()> {
+        ensure!(!patches.is_empty() && patches.len() <= 9198 * 588,"image patch extent");
+        unsafe {self.broadcast_image_buffer(patches,root,stream)}
+    }
+    unsafe fn broadcast_image_buffer(&self, span: &Buffer<half::bf16>, root: usize, stream: &Stream) -> Result<()> {
         ensure!(self.cuda.owns_buffer(span) && self.cuda.owns_stream(stream)
-            && span.len() <= 1024 * 5120 && root < 4, "image broadcast context/extent");
+            && root < 4, "image broadcast context/root");
         self.health()?;
         let raw = stream.raw() as usize;
         ensure!(self.stream.get().is_none_or(|prior| prior == raw), "image broadcast stream changed");
@@ -880,11 +898,12 @@ impl Roce {
         let default_blocks=(bytes / 16).div_ceil(512).next_power_of_two().min(8);
         let blocks = if row_packs.is_some() {
             self.gather_grid_override.get().unwrap_or_else(|| {
-                // s641: same raw transport, changed grids qualified on all
-                // four peers. Keep M1 and unmeasured geometries unchanged.
+                // s641/s1054: same raw transport, changed grids qualified on
+                // all four peers, including mixed class/order changes. M32
+                // benefits from16 blocks; retain M1/unmeasured geometries.
                 if self.tuned_logit_gather && std::mem::size_of::<T>()==4
                     && row_packs==Some(32320/4) {
-                    match bytes {775680=>16,2068480=>32,_=>default_blocks}
+                    match bytes {775680|4136960=>16,2068480=>32,_=>default_blocks}
                 }else{default_blocks}
             })
         } else { self.sum_grid_override.get().unwrap_or_else(||{
@@ -1050,6 +1069,19 @@ impl Drop for Roce {
 }
 
 impl Roce {
+    pub(crate) fn attach_native_prefill_rs(&mut self,root:&Path,stream:&Stream)->Result<()> {
+        ensure!(self.native_prefill_rs.is_none()&&self.prefill_sum.is_some(),"prefill RS attach state");
+        let rs=crate::prefill_rs::ReduceScatter::new(&self.cuda,root,self.rank)?;
+        let bytes=rs.blob()?;
+        let mut local=self.cuda.allocate::<u8>(bytes.len())?;
+        let mut all=self.cuda.allocate::<u8>(4*bytes.len())?;
+        local.upload(&bytes)?;stream.join_default()?;
+        unsafe{self.gather_rows(&local,&mut all,stream)}?;stream.synchronize()?;
+        rs.connect(&all.download()?)?;
+        ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3),
+            "prefill RS consumed runtime reserve");
+        self.native_prefill_rs=Some(rs);Ok(())
+    }
     pub(crate) fn attach_moe_pipeline(&mut self,root:&Path,stream:&Stream)->Result<()> {
         ensure!(self.moe_pipeline.is_none()&&self.prefill_sum.is_some(),"pipeline attach state");
         let pipeline=crate::moe_transport::Pipeline::new(&self.cuda,root,self.rank)?;
@@ -1094,7 +1126,7 @@ mod tests {
     use super::ReductionRows;
     #[test]
     fn reduction_count_tracks_accepted_rows_and_rejects_invalid_storage() {
-        for capacity in [5usize, 6, 16, 128] {
+        for capacity in [5usize, 6, 16, 32, 128] {
             for live in 1..=capacity {
                 let rows = ReductionRows::new(live, capacity).unwrap();
                 for width in [1024usize, 5120, 6144] {

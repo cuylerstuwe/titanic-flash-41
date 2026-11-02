@@ -1,4 +1,4 @@
-//! One long accepted prefix, exact arithmetic, bounded ABBA kernel comparison.
+//! One long accepted prefix, exact arithmetic, bounded paired kernel comparison.
 use crate::{control_channel::ControlChannel,cuda::{Cuda,Stream},roce::Roce,target::Target};
 use anyhow::{ensure,Result};
 use serde_json::{json,Value};
@@ -10,7 +10,9 @@ fn logits(cuda:&Cuda,t:&Target)->Result<Vec<u8>>{let(y,rows)=t.pending_logits()?
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run(cuda:&Cuda,large:&mut Target,verify:&mut Target,wides:&mut[Target],
     comm:&Roce,stream:&Stream,control:&mut ControlChannel,out:&Path,rank:usize)->Result<()> {
-    ensure!(std::env::var("CANADA_SCRATCH_MOE_INPUT_ADDRESS_SCREEN").as_deref()==Ok("1")
+    let scale_codes=std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE_SCREEN").as_deref()==Ok("1");
+    let label=if scale_codes {"moe-scale-codes"}else{"moe-input-address"};
+    ensure!((scale_codes||std::env::var("CANADA_SCRATCH_MOE_INPUT_ADDRESS_SCREEN").as_deref()==Ok("1"))
         &&large.position()==0&&verify.physical_rows()==6,"expert address probe admission");
     let raw=include_bytes!("../tests/fixtures/long-context-continuation-v2.json");
     let fixture:Value=serde_json::from_slice(raw)?;
@@ -19,8 +21,25 @@ pub(crate) fn run(cuda:&Cuda,large:&mut Target,verify:&mut Target,wides:&mut[Tar
     ensure!(tokens.len()>=prefix+6,"long expert probe fixture");
     large.prefill_wide(wides,&tokens[..prefix],comm,stream)?;verify.handoff_from(large)?;
     let accepted=state(verify)?;let mut reference=BTreeMap::new();let mut records=Vec::new();
-    for (trial,enabled) in [false,true,true,false].into_iter().enumerate() {
-        verify.set_moe_input_address_for_probe(enabled,stream)?;
+    if scale_codes {
+        // The first screen's control sped up over time. Warm both paths before
+        // a reversed-order timing screen; don't attribute that trend to codes.
+        for enabled in [false,true] {
+            verify.set_moe_scale_codes_for_probe(enabled,stream)?;
+            for live in [3,6] {
+                for replay in 0..8u8 {
+                    control.agree(&[200+enabled as u8,live as u8,replay,0])?;
+                    verify.begin_verification(&tokens[prefix..prefix+live],comm,stream)?;
+                    verify.finish_verification(0,comm,stream)?;
+                }
+            }
+            ensure!(state(verify)?==accepted,"scale-code prewarm changed retained state");
+        }
+    }
+    let schedule=if scale_codes {[true,false,false,true]}else{[false,true,true,false]};
+    for (trial,enabled) in schedule.into_iter().enumerate() {
+        if scale_codes {verify.set_moe_scale_codes_for_probe(enabled,stream)?;}
+        else {verify.set_moe_input_address_for_probe(enabled,stream)?;}
         for live in [3,6] {
             control.agree(&[trial as u8,enabled as u8,live as u8,0])?;
             verify.begin_verification(&tokens[prefix..prefix+live],comm,stream)?;
@@ -39,13 +58,16 @@ pub(crate) fn run(cuda:&Cuda,large:&mut Target,verify:&mut Target,wides:&mut[Tar
             ensure!(state(verify)?==accepted,"expert address abort changed retained state");
             records.push(json!({"trial":trial,"enabled":enabled,"live":live,"seconds":seconds,
                 "metrics":metrics,"logits_sha256":hash(&warm),"exact":true,"state_exact":true}));
-            std::fs::write(out.join("moe-input-address-partial.json"),serde_json::to_vec(&records)?)?;
-            eprintln!("expert input-address rank{rank} trial{trial} enabled{enabled} M{live}: exact");
+            std::fs::write(out.join(format!("{label}-partial.json")),serde_json::to_vec(&records)?)?;
+            eprintln!("{label} rank{rank} trial{trial} enabled{enabled} M{live}: exact");
         }
     }
-    verify.set_moe_input_address_for_probe(false,stream)?;
-    std::fs::write(out.join("moe-input-address-summary.json"),serde_json::to_vec_pretty(&json!({"rank":rank,
+    if scale_codes {verify.set_moe_scale_codes_for_probe(false,stream)?;}
+    else {verify.set_moe_input_address_for_probe(false,stream)?;}
+    std::fs::write(out.join(format!("{label}-summary.json")),serde_json::to_vec_pretty(&json!({"rank":rank,
+        "variant":label,"extra_scale_bytes":if scale_codes {40usize*2*384*576*160}else{0},
+        "prewarm_steps":if scale_codes {32}else{0},"schedule":schedule,
         "prefix_tokens":prefix,"records":records,"fixture_sha256":hash(raw),"all_exact":true,
-        "scope":"One131K public repository-history prefix. Three/six-row target verification, ABBA paths with three warm replays each. Canonical precision and arithmetic unchanged; mapped sampler and candidate-error readout retained. Exact logits and rollback state. Target-only timing, not completed-task quality or generation TPS."}))?)?;
+        "scope":"One131K public repository-history prefix. Three/six-row target verification; explicit schedule and prewarm_steps fields describe the paired order and warmup. Canonical precision and arithmetic unchanged; mapped sampler and candidate-error readout retained. Exact logits and rollback state. Target-only timing, not completed-task quality or generation TPS."}))?)?;
     Ok(())
 }

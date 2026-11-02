@@ -2,6 +2,19 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include "state_exchange.cuh"
+#include "paired_dense.cuh"
+
+// Ordered metadata for a bounded accepted draft prefix. The caller validates
+// context/ring bounds; inactive lanes never name writable KV locations.
+extern "C" __global__ void ca_kv_ring_metadata(int32_t* positions,int32_t* locations,
+ uint32_t rows,uint32_t live,uint32_t start,uint32_t base,uint32_t ring) {
+ const uint32_t row=threadIdx.x;
+ if(row<rows) {
+  positions[row]=row<live?int32_t(start+row):0;
+  locations[row]=row<live?int32_t(base+(start+row)%ring):-1;
+ }
+}
 
 // Independent implementation of NVIDIA's PTX cache-hint primitive. Rust
 // validates immutable allocation bounds/alignment and retains source ownership.
@@ -274,6 +287,8 @@ extern "C" __global__ void ca_expert_compact_scales(const uint8_t* source,uint8_
     int dst=rg*group*columns+nt*128*columns+kt*nr*4+(r%128)*width+column%4;
     out[dst]=source[i];
 }
+
+#include "expert_scale_codes.cuh"
 
 extern "C" __global__ void ca_block_scales_mma(const uint8_t* source,uint8_t* out,int n,int k,int padded_k){
     int index=blockIdx.x*blockDim.x+threadIdx.x;
@@ -621,6 +636,7 @@ extern "C" __global__ void ca_dspark_confidence_readout(
 
 // s594: isolated parallel FP64 categorical finish.
 #include "categorical_parallel.cuh"
+#include "categorical_sharded.cuh"
 
 // s598: isolated FP64 probability normalization.
 #include "categorical_normalize.cuh"
@@ -652,3 +668,7 @@ extern "C" __global__ void ca_trace_copy_first(const uint32_t* current,
  if(*first!=index)return;
  for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<words;i+=gridDim.x*blockDim.x)saved[i]=current[i];
 }
+#include "sampler_law_probe.cuh"
+#include "key_sharded_index.cuh"
+#include "key_sharded_publisher.cuh"
+#include "allocation_placement_probe.cuh"

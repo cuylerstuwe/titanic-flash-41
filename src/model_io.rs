@@ -22,6 +22,9 @@ pub struct ModelIo {
     cuda: Cuda,
     module: Module,
     weights: Rc<Weights>,
+    // Immutable encoding follows the canonical atlas across profiles/owners.
+    // Normalization, logits, sampler inputs and media remain private.
+    lossless_atlas: crate::bf16_linear::LosslessHeadAtlas,
     media: Rc<RefCell<Option<Rc<crate::prompt_media::Bindings>>>>,
     rows: usize,
     // The wide encoder profile embeds tokens only; its prompt logits come from
@@ -42,7 +45,45 @@ pub struct ModelIo {
     logits: Buffer<f32>,
     stream: Cell<usize>,
 }
+/// Only immutable head weights/encoding are shared. Pack/scatter storage is
+/// private to the pair executor and outlives every graph using its addresses.
+pub(crate) struct PairedHead {
+    cuda:Cuda,
+    input:Buffer<bf16>,
+    output:Buffer<f32>,
+    owners:[[u64;2];2],
+    stream:usize,
+}
+impl PairedHead {
+    pub(crate) fn new(a:&ModelIo,b:&ModelIo,stream:&Stream)->Result<Self> {
+        ensure!(a.rows==6&&b.rows==6&&!a.input_only&&!b.input_only&&a.rank==b.rank
+            &&a.shares_lossless_head(b)&&a.cuda.owns_stream(stream),
+            "paired head requires independent M6 outputs and one immutable encoding");
+        ensure!(a.head.output().ptr()!=b.head.output().ptr()&&a.normalized.ptr()!=b.normalized.ptr(),
+            "paired head must not alias mutable owner buffers");
+        Ok(Self{cuda:a.cuda.clone(),input:a.cuda.allocate(12*5120)?,output:a.cuda.allocate(12*32320)?,
+            owners:[[a.normalized.ptr(),a.head.output().ptr()],[b.normalized.ptr(),b.head.output().ptr()]],
+            stream:stream.raw()as usize})
+    }
+    pub(crate) fn run_normalized(&self,a:&ModelIo,a_live:usize,b:&ModelIo,b_live:usize,stream:&Stream)->Result<()> {
+        ensure!(stream.raw()as usize==self.stream&&self.cuda.owns_stream(stream)
+            &&self.owners==[[a.normalized.ptr(),a.head.output().ptr()],[b.normalized.ptr(),b.head.output().ptr()]]
+            &&a.shares_lossless_head(b)&&matches!(a_live,3|6)&&matches!(b_live,3|6),
+            "paired head changed owner/storage/context/live rows");
+        unsafe{
+            self.cuda.copy_device(self.input.ptr(),a.normalized.ptr(),a_live*5120*2,stream)?;
+            self.cuda.copy_device(self.input.ptr()+(a_live*5120*2)as u64,b.normalized.ptr(),b_live*5120*2,stream)?;
+        }
+        a.head.run_pooled_lossless(&self.input,&self.output,a_live+b_live,stream)?;
+        unsafe{
+            self.cuda.copy_device(a.head.output().ptr(),self.output.ptr(),a_live*32320*4,stream)?;
+            self.cuda.copy_device(b.head.output().ptr(),self.output.ptr()+(a_live*32320*4)as u64,b_live*32320*4,stream)?;
+        }
+        Ok(())
+    }
+}
 impl ModelIo {
+    pub(crate) fn core_module(&self)->&Module {&self.module}
     pub(crate) fn matches_profile(&self, rank: usize, rows: usize, cuda: &Cuda) -> bool {
         self.rank == rank && self.rows == rows && self.weights.in_context(cuda)
     }
@@ -70,7 +111,7 @@ impl ModelIo {
             &["embed.", "head.", "norm."],
             stage,
         )?);
-        Self::from_weights(cuda, core, stream, weights, plan.rank, kernels, rows)
+        Self::from_weights(cuda, core, stream, weights, plan.rank, kernels, rows,Rc::new(RefCell::new(None)))
     }
     pub(crate) fn fork_profile(
         &self,
@@ -88,13 +129,25 @@ impl ModelIo {
             self.rank,
             kernels,
             rows,
+            self.lossless_atlas.clone(),
         )?;
         profile.media = self.media.clone();
         Ok(profile)
     }
+    pub(crate) fn fork_owner(&self,cuda:&Cuda,core:&[u8],stream:&Stream,
+        kernels:&Path,rows:usize)->Result<Self> {
+        Self::from_weights(cuda,core,stream,self.weights.clone(),self.rank,kernels,rows,self.lossless_atlas.clone())
+    }
+    pub(crate) fn shares_media_owner(&self,other:&Self)->bool {
+        Rc::ptr_eq(&self.media,&other.media)
+    }
     pub(crate) fn shares_atlas(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.weights, &other.weights)
     }
+    pub(crate) fn shares_lossless_head(&self,other:&Self)->bool {
+        self.shares_atlas(other)&&self.head.shares_lossless_head(&other.head)
+    }
+    #[allow(clippy::too_many_arguments)]
     fn from_weights(
         cuda: &Cuda,
         core: &[u8],
@@ -103,6 +156,7 @@ impl ModelIo {
         rank: usize,
         kernels: &Path,
         rows: usize,
+        lossless_atlas: crate::bf16_linear::LosslessHeadAtlas,
     ) -> Result<Self> {
         ensure!(
             ((1..=8).contains(&rows) || crate::config::target_rows(rows))
@@ -138,9 +192,13 @@ impl ModelIo {
                 stream,
             )?;
         }
-        let blas = Rc::new(Blas::new(cuda)?);
-        let mut head = Projection::new(cuda, weights.clone(), blas.clone(), "head", head_rows)?;
-        let mut last_head = Projection::new(cuda, weights.clone(), blas, "head", 1)?;
+        let blas = Rc::new(Blas::new_on(cuda,stream)?);
+        // Vocabulary output remains private even when a sequential wide
+        // profile borrows an embedding arena. A later prefill cannot clobber
+        // an earlier request's terminal logits or pending sampling input.
+        let (mut head,mut last_head)=cuda.without_row_arena(||->Result<_>{Ok((
+            Projection::new(cuda, weights.clone(), blas.clone(), "head", head_rows)?,
+            Projection::new(cuda, weights.clone(), blas, "head", 1)?))})?;
         if std::env::var("CANADA_SCRATCH_HEAD_GEMV").as_deref() == Ok("1") {
             let root = kernels.join("target-head-gemv-v1");
             head = head.with_head_gemv(&root)?;
@@ -150,19 +208,23 @@ impl ModelIo {
             head=head.with_head_tiled16(&kernels.join("target-head-tiled-m16-v1"))?;
         }
         if head_rows==6 && std::env::var("CANADA_SCRATCH_LOSSLESS_HEAD").as_deref()==Ok("1") {
-            head=head.with_lossless_head(&kernels.join("target-head-lossless-v1"),stream)?;
+            let root=kernels.join("target-head-lossless-v1");
+            head=if std::env::var("CANADA_SCRATCH_SHARED_TARGET_HEAD").as_deref()==Ok("1") {
+                head.with_shared_lossless_head(&root,stream,&lossless_atlas)?
+            }else{head.with_lossless_head(&root,stream)?};
         }
         Ok(Self {
             cuda: cuda.clone(),
             module: cuda.module(core)?,
             weights,
+            lossless_atlas,
             media: Rc::new(RefCell::new(None)),
             rows,
             input_only,
             rank,
-            local_embedding: cuda.allocate(rows * 5120)?,
-            embedding: cuda.allocate(rows * 5120)?,
-            expanded: cuda.allocate(rows * 20480)?,
+            local_embedding: cuda.allocate_rows(rows * 5120)?,
+            embedding: cuda.allocate_rows(rows * 5120)?,
+            expanded: cuda.allocate_rows(rows * 20480)?,
             combined: cuda.allocate(head_rows * 5120)?,
             norm,
             norm_weight,
@@ -386,7 +448,7 @@ impl ModelIo {
         }
         self.last_head.run(&self.last_input, stream)
     }
-    fn prepare_head(
+    pub(crate) fn prepare_head(
         &mut self,
         residual: &Buffer<bf16>,
         pre: &Buffer<f32>,
