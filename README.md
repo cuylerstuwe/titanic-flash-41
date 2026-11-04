@@ -8,34 +8,34 @@ The engine includes GPU model execution, speculative decoding, SSD-backed Engram
 
 This checkout carries the **November 4 engine update (s1291)**: safer image-memory admission, reduced sampling/transport overhead, wider verification overlap, faster verified weight loading, and a fix for stale full-logit rows when verification width changes. Target precision and recommended sampling settings are preserved. See [release validation](docs/VALIDATION.md) for the native deployment checks and portable-package scope.
 
-The benchmark table below remains the **November 1 s1173 measurement**. It has not been relabeled as a measurement of s1291.
+The benchmark table below is a fresh **November 4 measurement of the installed native s1291 release**.
 
 ## Performance
 
-Single-stream measurements from **November 1, 2026, after a four-device reboot (s1173)**, using the published comparison's prompts, context file, request settings and timing function. The benchmark ran **on the head GB10 against its local HTTP endpoint**, verified to route through `lo`, bypassing any external router or physical network hop. All 24 requests completed in one pass on the first model load of that boot. Only Titanic was measured again; competitor results below are the author's existing published numbers.
+Single-stream measurements from **November 4, 2026 (s1291)**, using the published comparison's prompts, context file, request settings and timing function. The benchmark ran **on the head GB10 against its local HTTP endpoint**, verified to route through `lo`, bypassing any external router or physical network hop. All 24 requests completed in one full pass on the first model load after a four-device reboot. Only Titanic was measured again; competitor results below are the author's existing published numbers.
 
 Median generation speed in **tokens/second**, three repetitions with a 512-token output budget:
 
-| Starting context | Workload | SGLang stock, published | SGLang tuned, published | TensorFold, published | Titanic s1173 |
+| Starting context | Workload | SGLang stock, published | SGLang tuned, published | TensorFold, published | Titanic s1291 |
 |---|---|---:|---:|---:|---:|
-| Clean | Code | 71.6 | 103.1 | 110.9 | 117.3 |
-| Clean | Prose | 32.9 | 46.3 | 57.7 | 63.4 |
+| Clean | Code | 71.6 | 103.1 | 110.9 | 118.1 |
+| Clean | Prose | 32.9 | 46.3 | 57.7 | 63.7 |
 | Clean | Prose 2 | 26.8 | 43.7 | 56.3 | 60.4 |
-| ~131K tokens | Code | 57.4 | 86.0 | 94.7 | 108.7 |
-| ~131K tokens | Prose | 32.0 | 45.8 | 57.7 | 60.6 |
-| ~131K tokens | Prose 2 | 28.1 | 44.1 | 53.7 | 56.8 |
+| ~131K tokens | Code | 57.4 | 86.0 | 94.7 | 109.2 |
+| ~131K tokens | Prose | 32.0 | 45.8 | 57.7 | 61.0 |
+| ~131K tokens | Prose 2 | 28.1 | 44.1 | 53.7 | 57.1 |
 
-| Uncached ~131K prompt, time to first generated content | SGLang tuned, published | TensorFold, published | Titanic s1173 |
+| Uncached ~131K prompt, time to first generated content | SGLang tuned, published | TensorFold, published | Titanic s1291 |
 |---|---:|---:|---:|
-| First long-context request | 32.45 s | 56.02 s | 21.19 s |
+| First long-context request | 32.45 s | 56.02 s | 21.27 s |
 
 The comparison uses **temperature 0, top-p 1, thinking disabled**. These are benchmark settings, not the server's recommended-use defaults. “Prose 2” is the published fishing-village story workload, not the separate sampled-chat workload. Uncached timing means no reusable prompt state; it does not mean an empty operating-system file cache. Generation trials follow warmups and can reuse prompt state.
 
 These are **cross-system comparisons**: Titanic ran on three ASUS GX10s and one DGX Spark, with two switched 100 Gb/s fabrics. The published runs used four DGX Sparks and a different network arrangement. These short throughput measurements do not establish completed-task quality or which system solves arbitrary agentic tasks fastest. Multi-stream results are deliberately omitted.
 
-Titanic used the approved 2350 MHz cap. All six generation medians in this complete pass were 2.3–6.7% higher than the [earlier s1173 portable-build pass](benchmarks/results-2026-11-01.json); first-long-prompt TTFT was essentially unchanged (21.19 versus 21.22 s). The earlier pass followed repeated model launches. Build hashes, continuations and allocation history differ, so the improvement cannot be attributed solely to reboot or memory bandwidth. [The previous s986 measurements](benchmarks/results-2026-10-30.json) also remain available; long-context code and prose 2 are still below those historical observations. See the [complete comparison and limits](docs/BENCHMARKS.md).
+Titanic used the 2350 MHz cap. The table reports the entire completed s1291 pass, including lower scores, rather than selecting each row's historical best. An earlier client-only interruption occurred during short-context tests; the complete pass restarted without reloading the model or warming the long prompt. [Historical comparisons and run accounting](docs/BENCHMARKS.md) distinguish this native measurement from the portable package's separate qualification.
 
-Source: [published comparison and benchmark client](https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa), pinned revision `7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2`. [Full results](benchmarks/results-2026-11-01-clean-boot.json) include ranges, timing details, hardware and measured-build identity; [individual samples](benchmarks/samples-2026-11-01-clean-boot.json) omit generated text. [Reproduction instructions](docs/BENCHMARKS.md) use the original external timing function.
+Source: [published comparison and benchmark client](https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa), pinned revision `7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2`. [Full results](benchmarks/results-2026-11-04.json) include ranges, timing details, hardware and measured-build identity; [individual samples](benchmarks/samples-2026-11-04.json) omit generated text. [Reproduction instructions](docs/BENCHMARKS.md) use the original external timing function.
 
 ## Model and quality
 

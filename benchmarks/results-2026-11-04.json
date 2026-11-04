@@ -1,0 +1,293 @@
+{
+  "date": "2026-11-04",
+  "date_timezone": "America/Los_Angeles",
+  "started_at": "2026-11-04T07:11:38.842932-08:00",
+  "finished_at": "2026-11-04T07:14:20.428336-08:00",
+  "engine_release": "s1291",
+  "build_variant": "installed native s1291",
+  "single_stream": true,
+  "client": "head GB10, local interface address routed by the kernel through lo",
+  "model_parallelism": "TP4",
+  "hardware": "3 ASUS GX10 + 1 NVIDIA DGX Spark, dual 100 Gb/s switched RoCE",
+  "compiler_source_sha256": "8394bfba7ba369edc643b85fa2be111b2ee841b294923231c3fa7f4e059f520f",
+  "runtime_sha256": {
+    "engine": "c5d33f5f6e842b690e7697d91470856fc4f52b29305d97995ad02070ab9d878d",
+    "core.cubin": "a6ea6656fcb020c4a248c01cf9d2e417118487aa40cb03b1efddb463c44bd0ee",
+    "vision.cubin": "6b9daa1fa6cf56901b1660b63eac1d7203cc1e00afe4abb3423387279eb70ec5",
+    "source-manifest.json": "6e3b83e88044a34ad09cb9aac94b39901b9978d1f7143793bbeb66e75dbfbea2",
+    "binary-provenance.json": "1e9679d6492f22445db58ed4367c9b72530a919b729db2bfe8de2a4b0d4c75a4"
+  },
+  "deployment_manifest_sha256": "c8cf0009b522d3d9c0318b50bb2b66c15f1518c98faf00345e34284525990101",
+  "source_url": "https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa",
+  "source_revision": "7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2",
+  "settings": {
+    "temperature": 0,
+    "top_p": 1,
+    "thinking": false,
+    "max_tokens": 512,
+    "repetitions": 3
+  },
+  "benchmark_wrapper_sha256": "27e5cba69e8142434f35dbac02f833e238725786353e772e33ad79c76f4071d8",
+  "external_client_sha256": "76a078842a0dd50b8345a6feb4455b890517eac51513f030701cd4a65d0a23ee",
+  "context_sha256": "6b4b21a0ed3ae0eefe2b0aab0b9555eb1332334347c8bda80a83a2eaee168457",
+  "host_profile": {
+    "gpu_clock_cap_mhz": 2350,
+    "driver": "580.178.04",
+    "kernel": "7.0.0-1019-nvidia",
+    "nvme_apst": "Temporarily disabled on the Spark; unchanged on the three GX10s."
+  },
+  "measurement_conditions": "First s1291 model load after rebooting all four devices. Built-in startup warmup, two short operational requests and the interrupted short-context attempt preceded the complete pass; no reusable long benchmark prompt. Same model generation throughout, no reloads. The head-local interface route was verified as type=local, dev=lo; no external router or physical network hop for HTTP. No other inference traffic.",
+  "run_accounting": {
+    "completed_passes": 1,
+    "requests_in_completed_pass": 24,
+    "interrupted_attempts": 1,
+    "completed_requests_in_interrupted_attempt": 4,
+    "interruption": "The first benchmark client ran under a non-lingering user service manager, which stopped after SSH logout. Four short-context requests completed before client shutdown; a further short request was cancelled. The complete replacement pass ran under a bounded system service with the same unprivileged account. No model reload or long-context request occurred in the interrupted attempt.",
+    "selection": "All six medians and uncached TTFT come from the single complete replacement pass; no per-row best-of selection."
+  },
+  "rows": [
+    {
+      "context": "clean",
+      "workload": "code",
+      "titanic_decode_tps": {
+        "median": 118.13818180673813,
+        "min": 116.36244777992131,
+        "max": 118.18582928607233,
+        "stdev": 0.8485426548078743,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.14471693199993751,
+        "min": 0.14327703300000394,
+        "max": 0.15456275099995764,
+        "stdev": 0.005015319771412011,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 114.28556142877363,
+        "min": 112.90643767520507,
+        "max": 114.58198188277673,
+        "stdev": 0.7300909992547653,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 71.57781042288849,
+        "sglang-tuned": 103.0501327003324,
+        "tensorfold": 110.8839365430241
+      }
+    },
+    {
+      "context": "clean",
+      "workload": "prose",
+      "titanic_decode_tps": {
+        "median": 63.73008165794503,
+        "min": 63.67710923082721,
+        "max": 63.95825799813066,
+        "stdev": 0.12198139640103202,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.1405585150000661,
+        "min": 0.13292908800008263,
+        "max": 0.14209066900002654,
+        "stdev": 0.004006802807534607,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 62.75471096887962,
+        "min": 62.691683748944776,
+        "max": 63.03466316780039,
+        "stdev": 0.14906394820561725,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 32.92104872709232,
+        "sglang-tuned": 46.315845996857675,
+        "tensorfold": 57.67837667994458
+      }
+    },
+    {
+      "context": "clean",
+      "workload": "prose2",
+      "titanic_decode_tps": {
+        "median": 60.438597134676186,
+        "min": 59.897652030982904,
+        "max": 60.91844796514129,
+        "stdev": 0.4169869121183644,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.12210453600005167,
+        "min": 0.11968720100003338,
+        "max": 0.12679511100009222,
+        "stdev": 0.002950845206645702,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 59.66213653695286,
+        "min": 59.1680162066817,
+        "max": 60.179003336355024,
+        "stdev": 0.41276858804320443,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 26.7517911172939,
+        "sglang-tuned": 43.72182796367915,
+        "tensorfold": 56.30457268437747
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "code",
+      "titanic_decode_tps": {
+        "median": 109.18918289090558,
+        "min": 107.32682130050387,
+        "max": 109.2672865447908,
+        "stdev": 0.8969018426685037,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.23290666600018994,
+        "min": 0.23207507000006444,
+        "max": 0.25216051500001413,
+        "stdev": 0.009278573609615383,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 103.80949879947075,
+        "min": 102.53876571163576,
+        "max": 104.2873459159446,
+        "stdev": 0.7379124592872143,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 57.358793189004516,
+        "sglang-tuned": 85.98516855760624,
+        "tensorfold": 94.67134822472953
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "prose",
+      "titanic_decode_tps": {
+        "median": 61.04266567501094,
+        "min": 60.026449192352075,
+        "max": 61.05130361795448,
+        "stdev": 0.4810979511449344,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.3319021999998313,
+        "min": 0.31170958799998516,
+        "max": 0.3427790240000377,
+        "stdev": 0.012872696053055497,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 58.83764501841894,
+        "min": 57.81591551596599,
+        "max": 58.96644959463186,
+        "stdev": 0.5147006099782307,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 31.99416760975024,
+        "sglang-tuned": 45.76539923068635,
+        "tensorfold": 57.66456969748044
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "prose2",
+      "titanic_decode_tps": {
+        "median": 57.14345330067915,
+        "min": 56.26295904955933,
+        "max": 57.28753669666729,
+        "stdev": 0.4528661202960311,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.3030776690000039,
+        "min": 0.3015427139998792,
+        "max": 0.32460901199988257,
+        "stdev": 0.01053042640086226,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 55.37838573222305,
+        "min": 54.56156684352623,
+        "max": 55.384134286205644,
+        "stdev": 0.38641419064133103,
+        "n": 3
+      },
+      "published_decode_tps": {
+        "sglang-stock": 28.12880041612874,
+        "sglang-tuned": 44.12675113346383,
+        "tensorfold": 53.74595055288519
+      }
+    }
+  ],
+  "cold_131k_first_token_seconds": {
+    "titanic": 21.27263853600016,
+    "sglang_tuned": 32.44752314499965,
+    "tensorfold": 56.01667726300366
+  },
+  "comparison_to_s1173": [
+    {
+      "context": "clean",
+      "workload": "code",
+      "s1173_decode_tps": 117.26048062088564,
+      "s1291_decode_tps": 118.13818180673813,
+      "change_percent": 0.7485055333264157,
+      "s986_decode_tps": 115.52188989739545,
+      "change_vs_s986_percent": 2.264758576635506
+    },
+    {
+      "context": "clean",
+      "workload": "prose",
+      "s1173_decode_tps": 63.354421061912014,
+      "s1291_decode_tps": 63.73008165794503,
+      "change_percent": 0.5929508781493009,
+      "s986_decode_tps": 59.92090899935372,
+      "change_vs_s986_percent": 6.357000790212308
+    },
+    {
+      "context": "clean",
+      "workload": "prose2",
+      "s1173_decode_tps": 60.39075231431855,
+      "s1291_decode_tps": 60.438597134676186,
+      "change_percent": 0.07922540873248618,
+      "s986_decode_tps": 54.800900868735134,
+      "change_vs_s986_percent": 10.287597788666014
+    },
+    {
+      "context": "131k",
+      "workload": "code",
+      "s1173_decode_tps": 108.66817966443733,
+      "s1291_decode_tps": 109.18918289090558,
+      "change_percent": 0.4794441464622823,
+      "s986_decode_tps": 113.88717638423863,
+      "change_vs_s986_percent": -4.125129485590817
+    },
+    {
+      "context": "131k",
+      "workload": "prose",
+      "s1173_decode_tps": 60.55363135950637,
+      "s1291_decode_tps": 61.04266567501094,
+      "change_percent": 0.8076052658199329,
+      "s986_decode_tps": 60.09518290757425,
+      "change_vs_s986_percent": 1.5766367978177431
+    },
+    {
+      "context": "131k",
+      "workload": "prose2",
+      "s1173_decode_tps": 56.799670731219734,
+      "s1291_decode_tps": 57.14345330067915,
+      "change_percent": 0.605254511221065,
+      "s986_decode_tps": 58.83932150104866,
+      "change_vs_s986_percent": -2.882202168730452
+    }
+  ],
+  "attribution_limit": "Unmatched historical runs with different code, generated continuations and host histories. Not an isolated causal estimate of optimization gains; no allocation-specific bandwidth probe.",
+  "scope": "Short capped throughput diagnostics. Competitor values are previously published measurements on a different four-Spark system. No task-quality or recommended-sampler claim."
+}

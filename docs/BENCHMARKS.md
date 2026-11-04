@@ -1,7 +1,7 @@
 # Reproducing the published single-stream comparison
 
-The current source release is s1291 (November 4). The published comparison below
-remains the historical s1173 pass; no s1291 benchmark is claimed here.
+The current source release and README benchmark are s1291 (November 4).
+Historical s1173 and s986 measurements remain separately labeled below.
 
 Run on the **head node**, against its direct loopback endpoint, with no other requests. Use a freshly started model process if measuring the first uncached long prompt. Do not route through a remote client or proxy.
 
@@ -21,11 +21,32 @@ For each context, it runs three 64-token warmups followed by three 512-token tri
 
 The original decode formula is `(completion_tokens - 1) / (last_content_delta_time - first_content_delta_time)`. Time to first token is measured from sending the request to its first nonempty content or reasoning delta. End-to-end throughput uses completion tokens divided by time from sending to the last content delta. Server token usage counts are used, not SSE event counts. A speculative step can emit several tokens in one delta.
 
-The README's first-long-prompt TTFT is the initial 131K prose warmup, not the median of later cached requests. In the November 1 post-reboot pass, the ordinary 131K trial TTFT medians were 0.233 s for code, 0.332 s for prose and 0.303 s for prose2; they benefit from prefix reuse. The 21.19 s uncached TTFT is not a pure GPU-prefill measurement.
+The README's first-long-prompt TTFT is the initial 131K prose warmup, not the median of later cached requests. The later trials benefit from prefix reuse. Uncached TTFT includes work outside GPU prefill; report it separately from server prefill timing.
 
-## Complete post-reboot pass
+## Current s1291 pass — November 4
 
-The current table was measured on November 1, 20:16–20:18 Pacific, using the installed native s1173 build on the first model load after all four GB10s rebooted. All 24 requests completed in one pass without a reload. Built-in startup warmup and two short operational requests preceded it, with no reusable long benchmark prompt. All four GPUs retained the 2350 MHz maximum-clock policy; the Spark's NVMe APST was temporarily disabled. The measured build hashes are recorded in [results-2026-11-01-clean-boot.json](../benchmarks/results-2026-11-01-clean-boot.json). This is a native-build observation; the portable build has a separate earlier measurement and qualification record.
+Measured 07:11–07:14 Pacific on the installed native s1291 release, using the first model load after all four GB10s rebooted. All 24 requests completed with no model restart, worker timeout, or concurrent inference traffic. The 2350 MHz maximum-clock policy and Spark APST policy stayed active. Startup warmup and two short operational requests preceded the benchmark.
+
+The first client attempt stopped after four completed short-context requests when its non-lingering user service manager exited after SSH logout. A subsequent short request was cancelled. The complete replacement pass ran in a bounded system service under the same unprivileged account; the inference service did not restart. This was a client-launch problem, not a score-based retry. No long-context request had started, so the first ~131K prompt remained uncached. [Interrupted sample metadata](../benchmarks/samples-2026-11-04-interrupted.json) is retained separately.
+
+| Context | Workload | Prior s1173 | Current s1291 | Change | Historical s986 | Change vs s986 |
+|---|---|---:|---:|---:|---:|---:|
+| Clean | Code | 117.3 | 118.1 | +0.7% | 115.5 | +2.3% |
+| Clean | Prose | 63.4 | 63.7 | +0.6% | 59.9 | +6.4% |
+| Clean | Prose 2 | 60.4 | 60.4 | +0.1% | 54.8 | +10.3% |
+| ~131K | Code | 108.7 | 109.2 | +0.5% | 113.9 | -4.1% |
+| ~131K | Prose | 60.6 | 61.0 | +0.8% | 60.1 | +1.6% |
+| ~131K | Prose 2 | 56.8 | 57.1 | +0.6% | 58.8 | -2.9% |
+
+All throughput values are medians in tokens/second, with three 512-token trials each. First-long-prompt TTFT was **21.27 s**, versus **21.19 s** in the prior s1173 pass. The ordinary cached ~131K TTFT medians were 0.233 s for code, 0.332 s for prose and 0.303 s for prose 2. Uncached TTFT includes all server work before first content and is not a pure GPU-prefill measurement.
+
+The generation differences from s1173 are small (0.1–0.8%); this pass does not establish a general speed improvement. Long-context code and prose 2 remain 4.1% and 2.9% below the historical s986 observations. Those historical gaps remain unresolved; this run does not isolate their cause.
+
+[Full results](../benchmarks/results-2026-11-04.json) record hashes, all ranges, settings and run accounting. [All 24 completed samples](../benchmarks/samples-2026-11-04.json) include token counts, timing and output hashes without generated text. README scores all come from this one complete pass; lower results are retained. Historical runs were not repeated, and differences in implementation, continuations and host state prevent treating these changes as isolated optimization effects. This benchmark exercised the installed native engine; it does not requalify the portable Arm64 build or deployment wrapper.
+
+## Historical s1173 post-reboot pass — November 1
+
+The earlier table was measured on November 1, 20:16–20:18 Pacific, using the installed native s1173 build on the first model load after all four GB10s rebooted. All 24 requests completed in one pass without a reload. Built-in startup warmup and two short operational requests preceded it, with no reusable long benchmark prompt. All four GPUs retained the 2350 MHz maximum-clock policy; the Spark's NVMe APST was temporarily disabled. The measured build hashes are recorded in [results-2026-11-01-clean-boot.json](../benchmarks/results-2026-11-01-clean-boot.json). This is a native-build observation; the portable build has a separate earlier measurement and qualification record.
 
 An initial client call to an unbound loopback port was refused before generating tokens. The wrapper was then adjusted to accept the server's verified local interface address (`type=local`, `dev=lo`); no proxy or physical network hop was added. That setup failure yielded no score and did not reload the model. The complete pass was not repeated to select better scores.
 
@@ -38,7 +59,7 @@ An initial client call to an unbound loopback port was refused before generating
 | ~131K | Prose | 57.9 | 60.6 | +4.6% | 60.1 | +0.8% |
 | ~131K | Prose 2 | 54.1 | 56.8 | +4.9% | 58.8 | -3.5% |
 
-All throughput cells are medians in tokens/second, with three measured trials each. The README uses the entire new pass, not a per-row selection of the best trials or runs. First-long-prompt TTFT was essentially unchanged: 21.19 s versus 21.22 s. Raw samples, ranges and standard deviations remain available for both s1173 passes in separate files. The [earlier s1173 results](../benchmarks/results-2026-11-01.json) and [October 30 s986 results](../benchmarks/results-2026-10-30.json) have not been overwritten.
+All throughput cells are medians in tokens/second, with three measured trials each. That update used the entire completed pass, not a per-row selection of the best trials or runs. First-long-prompt TTFT was essentially unchanged: 21.19 s versus 21.22 s. Raw samples, ranges and standard deviations remain available for both s1173 passes in separate files. The [earlier s1173 results](../benchmarks/results-2026-11-01.json) and [October 30 s986 results](../benchmarks/results-2026-10-30.json) have not been overwritten.
 
 The earlier s1173 pass used the portable build after two failed portable GPU startups in the same boot. The native and portable artifacts have different build hashes, and generated continuations and allocation history were not held fixed. These observations therefore do not isolate how much of the increase came from reboot or memory bandwidth. Against historical s986, long-context code and prose 2 still remain lower, while long-context prose is slightly higher. Target attention precision, drafting policy, host policy and continuations differ from s986; this is not a matched numerical-policy regression test or a recommended-sampler quality conclusion.
 

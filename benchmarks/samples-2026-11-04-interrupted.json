@@ -1,0 +1,63 @@
+[
+  {
+    "tag": "warmup",
+    "workload": "prose",
+    "max_tokens": 64,
+    "finish": "length",
+    "completion_tokens": 64,
+    "prompt_tokens": 52,
+    "ttft_s": 0.1627340479999475,
+    "total_s": 1.2284784519999903,
+    "error": null,
+    "text_sha": "44a429b09cace27a",
+    "decode_tps": 59.1204993529739,
+    "e2e_tps": 52.10223243444291,
+    "context": "clean"
+  },
+  {
+    "tag": "warmup",
+    "workload": "code",
+    "max_tokens": 64,
+    "finish": "length",
+    "completion_tokens": 64,
+    "prompt_tokens": 67,
+    "ttft_s": 0.17022426100015764,
+    "total_s": 0.6502654759999587,
+    "error": null,
+    "text_sha": "62033f30f56b43bd",
+    "decode_tps": 131.42286898736654,
+    "e2e_tps": 98.52324645071042,
+    "context": "clean"
+  },
+  {
+    "tag": "warmup",
+    "workload": "prose2",
+    "max_tokens": 64,
+    "finish": "length",
+    "completion_tokens": 64,
+    "prompt_tokens": 41,
+    "ttft_s": 0.1410207530000207,
+    "total_s": 1.3371527499998592,
+    "error": null,
+    "text_sha": "9171738d548a4369",
+    "decode_tps": 52.70565959195393,
+    "e2e_tps": 47.89206427783923,
+    "context": "clean"
+  },
+  {
+    "tag": "c1-prose",
+    "workload": "prose",
+    "max_tokens": 512,
+    "finish": "length",
+    "completion_tokens": 512,
+    "prompt_tokens": 52,
+    "ttft_s": 0.14320949700004348,
+    "total_s": 8.241590515000098,
+    "error": null,
+    "text_sha": "bdbb59887532acb6",
+    "decode_tps": 63.102627530530974,
+    "e2e_tps": 62.12740975154132,
+    "context": "clean",
+    "rep": 0
+  }
+]

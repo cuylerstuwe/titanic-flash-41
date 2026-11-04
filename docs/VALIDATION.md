@@ -65,8 +65,13 @@ by the runtime inventory.
 This update has **not** repeated the portable Arm64 build and four-node portable
 controller startup. Those were last exercised for s1173 below. The native s1291
 release has separate real-hardware qualification; CPU package checks do not
-establish a new portable GPU run or empty-fleet provisioning result. The README
-benchmark remains explicitly attributed to the November 1 s1173 pass.
+establish a new portable GPU run or empty-fleet provisioning result.
+
+The November 4 head-local published-client benchmark completed all 24 requests
+on this native s1291 generation, with six three-trial single-stream workloads
+and the first uncached ~131K prompt. The README now uses that complete pass.
+The engine stayed Ready without a reload; this performance run does not expand
+the portable-wrapper or quality qualification. See [benchmark details](BENCHMARKS.md).
 
 ## November 1 engine update (s1173)
 
@@ -133,8 +138,8 @@ remeasured. This greedy/no-thinking diagnostic is separate from the recommended
 sampling profile used in the serving checks.
 
 A later head-local pass completed all **24 requests** on the installed native
-s1173 build, on the first model load after rebooting all four devices. The README
-now reports that complete pass; summaries and text-free samples are in
+s1173 build, on the first model load after rebooting all four devices. That
+historical pass is retained; summaries and text-free samples are in
 `benchmarks/*2026-11-01-clean-boot.json`. This is a separate native-build
 measurement and does not extend the portable qualification above. See
 [benchmark conditions and comparisons](BENCHMARKS.md).
