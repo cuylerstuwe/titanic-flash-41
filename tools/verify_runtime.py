@@ -6,6 +6,7 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
+from prepare_runtime import validate_fenced_bundles
 
 ROOT = Path(__file__).resolve().parents[1]
 def sha(p):
@@ -16,7 +17,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('data', type=Path, default=Path('/data'), nargs='?')
     a = ap.parse_args()
-    expected = json.loads((ROOT/'runtime/artifacts.json').read_text())['files']
+    inventory = json.loads((ROOT/'runtime/artifacts.json').read_text())
+    validate_fenced_bundles(inventory)
+    expected = inventory['files']
     for name, digest in expected.items():
         assert sha(a.data/name) == digest, name
     external = a.data/'kernels/woa-v1'

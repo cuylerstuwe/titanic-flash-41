@@ -14,6 +14,56 @@ use std::{
 type Handle = *mut c_void;
 type CuResult = c_int;
 
+#[derive(Debug)]
+struct DriverError { code: CuResult, operation: String, message: String }
+impl std::fmt::Display for DriverError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {} ({})", self.operation, self.message, self.code)
+    }
+}
+impl std::error::Error for DriverError {}
+
+#[derive(Debug)]
+struct AllocationFloorError { bytes: usize, available: usize, required: usize }
+impl std::fmt::Display for AllocationFloorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "construction allocation of {} bytes would consume physical reserve; available={}",
+            self.bytes, self.available)
+    }
+}
+impl std::error::Error for AllocationFloorError {}
+
+/// Only allocation capacity is retryable. In particular, an asynchronous
+/// execution error reported by cuMemAlloc must still retire the worker group.
+fn input_allocation_error(error: anyhow::Error, required: usize) -> anyhow::Error {
+    if let Some(floor) = error.downcast_ref::<AllocationFloorError>() {
+        return crate::memory::InputCapacityError("image allocation cannot retain the UMA reserve", floor.required).into();
+    }
+    if error.downcast_ref::<DriverError>().is_some_and(|e|
+        e.code == 2 && e.operation == "allocate device memory") {
+        return crate::memory::InputCapacityError("image device allocation is temporarily unavailable", required).into();
+    }
+    error
+}
+
+#[cfg(test)]
+mod input_allocation_tests {
+    use super::*;
+    #[test]
+    fn image_allocation_refusal_does_not_mask_execution_or_identity_errors() {
+        let floor=input_allocation_error(AllocationFloorError {bytes:3,available:4,required:12}.into(),9);
+        assert_eq!(floor.downcast_ref::<crate::memory::InputCapacityError>().unwrap().1,12);
+        for (code,op,retryable) in [(2,"allocate device memory",true),(700,"allocate device memory",false),
+            (201,"allocate device memory",false),(2,"launch kernel",false)] {
+            let e=input_allocation_error(DriverError{code,operation:op.into(),message:"diagnostic".into()}.into(),9);
+            assert_eq!(e.downcast_ref::<crate::memory::InputCapacityError>().is_some(),retryable);
+            if !retryable {assert_eq!(e.downcast_ref::<DriverError>().unwrap().code,code);}
+        }
+        let e=input_allocation_error(anyhow::anyhow!("out of memory (2)"),9);
+        assert!(e.downcast_ref::<crate::memory::InputCapacityError>().is_none());
+    }
+}
+
 // CUDA 13.0 public VMM ABI. Used only for opt-in, individually owned,
 // losslessly compressible weight storage. The finite external-pool experiment
 // can import allocations from its direct parent in the same memory cgroup.
@@ -155,7 +205,7 @@ impl Api {
         } else {
             format!("CUDA error {code}")
         };
-        bail!("{op}: {s} ({code})")
+        Err(DriverError { code, operation: op.to_owned(), message: s }.into())
     }
 }
 struct ContextOwner {
@@ -202,8 +252,9 @@ impl Cuda {
         self.owner.current()?;
         self.owner.api.check(unsafe { (self.owner.api.context_sync)() }, "drain CUDA context")
     }
-    /// A local allocator for small integer scheduling buffers only. Do not
-    /// pass this clone to model-value or weight constructors.
+    /// A local allocator for small CPU-written scheduling and sampler controls
+    /// (IDs and RNG uniforms). Never pass it to model-value, probability or
+    /// weight constructors. GPU kernels must not write these buffers.
     /// Safety: all GPU readers must complete before each host upload, and
     /// uploads must finish before the next GPU reader is launched.
     pub(crate) unsafe fn mapped_metadata_allocator(&self) -> Result<Self> {
@@ -527,8 +578,7 @@ impl Cuda {
         // Keep the physical8GiB floor plus512MiB for untracked host/vendor
         // activity. This opt-in guard also applies to later dynamic allocations;
         // image/cache preflight must therefore include the same allowance.
-        ensure!(available>=required,
-            "construction allocation of {bytes} bytes would consume physical reserve; available={available}");
+        ensure!(available>=required, AllocationFloorError { bytes, available, required });
         Ok(())
     }
     pub(crate) fn report_allocation_sites(&self,label:&str)->Result<()> {
@@ -582,6 +632,15 @@ impl Cuda {
             storage: Storage::Owned,
             _element: PhantomData,
         })
+    }
+    /// Request-owned image buffers may refuse capacity without invalidating
+    /// model state. Distributed callers must agree on success before GPU IO.
+    #[track_caller]
+    pub(crate) fn allocate_input<T: DeviceElement>(&self, len: usize) -> Result<Buffer<T>> {
+        let required = len.checked_mul(size_of::<T>())
+            .and_then(|n| n.checked_add(self.allocation_reserve_bytes()))
+            .context("input allocation size overflow")?;
+        self.allocate(len).map_err(|e| input_allocation_error(e, required))
     }
     fn compressible_properties(&self) -> Result<MemAllocationProp> {
         self.owner.current()?;
@@ -932,19 +991,24 @@ impl Buffer<u8> {
         )
     }
     pub fn download_part(&self, offset: usize, bytes: usize) -> Result<Vec<u8>> {
+        ensure!(offset.checked_add(bytes).is_some_and(|n|n<=self.len),
+            "partial download outside buffer");
+        let mut data = vec![0u8; bytes];
+        self.download_part_into(offset, &mut data)?;
+        Ok(data)
+    }
+    pub(crate) fn download_part_into(&self, offset: usize, data: &mut[u8]) -> Result<()> {
         ensure!(
-            offset.checked_add(bytes).is_some_and(|n| n <= self.len),
+            offset.checked_add(data.len()).is_some_and(|n| n <= self.len),
             "partial download outside buffer"
         );
         self.owner.current()?;
-        let mut data = vec![0u8; bytes];
         self.owner.api.check(
             unsafe {
-                (self.owner.api.dtoh)(data.as_mut_ptr().cast(), self.ptr + offset as u64, bytes)
+                (self.owner.api.dtoh)(data.as_mut_ptr().cast(), self.ptr + offset as u64, data.len())
             },
             "partial download",
-        )?;
-        Ok(data)
+        )
     }
 }
 impl<T: DeviceElement> Buffer<T> {

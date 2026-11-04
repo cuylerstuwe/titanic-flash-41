@@ -122,8 +122,12 @@ impl GreedySession {
                 (target.verification_sample(proposal.seed,stream)?,None,None)
             }else{
                 let rejection=self.rejection.as_mut().ok_or_else(||anyhow::anyhow!("missing pair rejection sampler"))?;
-                let draw=rejection.sample_block(logits,self.draft.proposal_probabilities_prefix(live-1)?,
-                    &proposal.draft_tokens[..live-1],live,proposal.round_seed,proposal.start+1,stream)?;
+                let draw=if self.draft.hierarchical_active() {
+                    let(q,selected)=self.draft.sharded_probabilities(live-1)?;
+                    rejection.sample_block_sharded(logits,q,selected,&proposal.draft_tokens[..live-1],
+                        live,proposal.round_seed,proposal.start+1,false,comm,stream)?
+                }else{rejection.sample_block(logits,self.draft.proposal_probabilities_prefix(live-1)?,
+                    &proposal.draft_tokens[..live-1],live,proposal.round_seed,proposal.start+1,stream)?};
                 (draw.ids,draw.accepted_prefix,draw.acceptance_expected_lengths)
             };
             ensure!(predictions.len()==live,"paired prediction extent");
@@ -170,8 +174,10 @@ impl GreedySession {
         ensure!(self.poisoned&&other.poisoned&&Rc::ptr_eq(&self.image_owner,&a.owner)
             &&Rc::ptr_eq(&other.image_owner,&b.owner),"pair q ownership check");
         if a.lookup.is_some()||b.lookup.is_some(){return Ok(!Rc::ptr_eq(&self.image_owner,&other.image_owner));}
-        let x=self.draft.proposal_probabilities_prefix(a.live-1)?;
-        let y=other.draft.proposal_probabilities_prefix(b.live-1)?;
+        let x=if self.draft.hierarchical_active(){self.draft.sharded_probabilities(a.live-1)?.0}
+            else{self.draft.proposal_probabilities_prefix(a.live-1)?};
+        let y=if other.draft.hierarchical_active(){other.draft.sharded_probabilities(b.live-1)?.0}
+            else{other.draft.proposal_probabilities_prefix(b.live-1)?};
         Ok(!Rc::ptr_eq(&self.image_owner,&other.image_owner)
             &&(x.ptr()+x.bytes()as u64<=y.ptr()||y.ptr()+y.bytes()as u64<=x.ptr()))
     }

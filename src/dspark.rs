@@ -1007,6 +1007,13 @@ impl QueryNetwork {
     pub(crate) fn markov_cache_counters_for_probe(&self,stream:&Stream)->Result<[u64;2]>{
         self.guard(stream)?;self.markov.cache_counters_for_probe(stream)
     }
+    pub(crate) fn hierarchical_active(&self)->bool{self.markov.hierarchical_active()}
+    pub(crate) fn set_hierarchical_for_probe(&mut self,active:bool,stream:&Stream)->Result<()>{
+        self.guard(stream)?;self.markov.set_hierarchical_for_probe(active,stream)
+    }
+    pub(crate) fn sharded_probabilities(&self,requested:usize)->Result<(&Buffer<f64>,[u64;5])>{
+        self.markov.sharded_probabilities(requested)
+    }
     pub(crate) fn produced_proposals(&self)->Result<usize>{self.markov.produced()}
     pub(crate) fn proposal_probabilities_prefix(&self,requested:usize)->Result<&Buffer<f64>>{
         self.markov.probabilities_prefix(requested)

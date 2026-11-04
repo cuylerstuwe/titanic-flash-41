@@ -389,7 +389,30 @@ struct SharedBranch {
     input_ready: Event,
     output_ready: Event,
 }
+/// Carried wide-verification schedule. The caller admits this only on the
+/// Verify16/32 owners, including Verify16's tiny retained-append bank. Bulk prefill
+/// profiles retain their existing schedule.
+pub(crate) fn wide_overlap_enabled(rows:usize) -> Result<bool> {
+    ensure!([16,32].contains(&rows),"wide FFN overlap profile");
+    let fenced=std::env::var("CANADA_SCRATCH_DENSE_PIPELINE_FENCE").as_deref()==Ok("1");
+    let base=std::env::var("CANADA_SCRATCH_FFN_OVERLAP").as_deref()==Ok("1")
+        && crate::mhc::overlap_enabled();
+    let flag=if rows==16 {"CANADA_SCRATCH_FFN16_OVERLAP"}else{"CANADA_SCRATCH_FFN32_OVERLAP"};
+    let enabled=match std::env::var(flag) {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid wide FFN overlap policy");v=="1"},
+        Err(std::env::VarError::NotPresent)=>fenced&&base,Err(e)=>return Err(e.into()),
+    };
+    ensure!(!enabled||(fenced&&base),"wide FFN overlap requires fenced dense kernels and base overlap policies");
+    Ok(enabled)
+}
 impl LayerFfn {
+    pub(crate) fn enable_verify16_overlap_before_capture(&mut self,stream:&Stream)->Result<()> {
+        ensure!(wide_overlap_enabled(self.rows)?&&self.shared_branch.is_none()
+            &&self.cuda.owns_stream(stream),"uncaptured M16 shared-expert overlap admission");
+        self.shared_branch=Some(SharedBranch {stream:self.cuda.auxiliary_stream(stream)?,
+            input_ready:self.cuda.fence_event()?,output_ready:self.cuda.fence_event()?});
+        Ok(())
+    }
     pub fn new(
         cuda: &Cuda,
         module: &Module,
@@ -663,8 +686,12 @@ impl LayerFfn {
     }
     fn run_shared_quantized_input(&self,input:&Buffer<bf16>,
         quantized:Option<(&Buffer<u8>,&Buffer<u8>)>,stream:&Stream)->Result<()> {
+        // The compact M16 shared projection retains its own quantizer's
+        // minimum-amax semantics. Reuse the fused BF16 normalization here,
+        // but do not substitute legacy MXFP8 operands for that quantizer.
+        let quantized = quantized.filter(|_| !(self.rows == 16 && self.shared_up.narrow_projection()));
         if let Some((values,scales))=quantized {
-            ensure!(self.rows==6 && !self.shared_up.narrow_projection(),
+            ensure!(matches!(self.rows,6|16) && !self.shared_up.narrow_projection(),
                 "prequantized normalized shared input requires the checked legacy quantizer");
             self.shared_up.run_quantized(values,scales,stream)?;
             self.finish_shared(stream)
@@ -773,19 +800,25 @@ impl LayerFfn {
     }
 }
 
-// Isolated M16 schedule screen; ordinary constructors are unchanged.
+pub(crate) fn wide_overlap_probe(rows:usize)->bool {
+    (rows==16&&std::env::var("CANADA_SCRATCH_VERIFY16_OVERLAP_SCREEN").as_deref()==Ok("1"))
+        ||(rows==32&&(std::env::var("CANADA_SCRATCH_FFN32_REFRESH_SCREEN").as_deref()==Ok("1")
+                ||std::env::var("CANADA_SCRATCH_FFN32_GENERATION_SCREEN").as_deref()==Ok("1"))
+            &&std::env::var("CANADA_SCRATCH_DENSE_PIPELINE_FENCE").as_deref()==Ok("1"))
+}
+// Isolated same-load comparisons against the serial wide schedule.
 impl LayerFfn {
     pub(crate) fn enable_verify16_overlap_for_probe(&mut self, stream: &Stream) -> Result<()> {
-        ensure!(std::env::var("CANADA_SCRATCH_VERIFY16_OVERLAP_SCREEN").as_deref()==Ok("1")
-            && self.rows==16 && self.shared_branch.is_none() && self.cuda.owns_stream(stream),
-            "isolated M16 shared-expert overlap admission");
+        ensure!(wide_overlap_probe(self.rows)
+            && self.shared_branch.is_none() && self.cuda.owns_stream(stream),
+            "isolated wide shared-expert overlap admission");
         self.shared_branch=Some(SharedBranch { stream:self.cuda.auxiliary_stream(stream)?,
             input_ready:self.cuda.fence_event()?,output_ready:self.cuda.fence_event()? });
         Ok(())
     }
     pub(crate) fn set_verify16_overlap_for_probe(&mut self, enabled: bool, stream: &Stream) -> Result<()> {
-        ensure!(std::env::var("CANADA_SCRATCH_VERIFY16_OVERLAP_SCREEN").as_deref()==Ok("1")
-            && self.rows==16 && self.cuda.owns_stream(stream), "idle M16 FFN schedule screen");
+        ensure!(wide_overlap_probe(self.rows)
+            && self.cuda.owns_stream(stream), "idle wide FFN schedule screen");
         // Target::set_verify16_overlap_for_probe joins and destroys all of this
         // profile's old graphs before changing any layer's event schedule.
         unsafe {

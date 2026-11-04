@@ -637,6 +637,13 @@ extern "C" __global__ void ca_dspark_confidence_readout(
 // s594: isolated parallel FP64 categorical finish.
 #include "categorical_parallel.cuh"
 #include "categorical_sharded.cuh"
+#include "local_target_probabilities.cuh"
+#include "target_transport_fused.cuh"
+#include "target_selected_finish.cuh"
+#include "hierarchical_categorical.cuh"
+#include "hierarchy_local_fused.cuh"
+#include "sharded_block.cuh"
+#include "sharded_local_fused.cuh"
 
 // s598: isolated FP64 probability normalization.
 #include "categorical_normalize.cuh"
@@ -672,3 +679,7 @@ extern "C" __global__ void ca_trace_copy_first(const uint32_t* current,
 #include "key_sharded_index.cuh"
 #include "key_sharded_publisher.cuh"
 #include "allocation_placement_probe.cuh"
+
+#include "block_finish_parallel.cuh"
+
+#include "block_decide_finish_fused.cuh"

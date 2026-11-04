@@ -22,16 +22,16 @@ const RESERVE: usize = 8 * 1024 * 1024 * 1024;
 /// Opt-in startup diagnostics, never part of the generation loop. Preserve
 /// the loader, digest order and synchronous upload behavior while locating
 /// which phase is worth pipelining. Device readback verification is separate.
-struct LoadTiming { start:Option<Instant>, seconds:[f64;5] }
+struct LoadTiming { start:Option<Instant>, seconds:[f64;5], read_wait_seconds:f64 }
 impl LoadTiming {
     fn new()->Self {Self{start:(std::env::var("CANADA_SCRATCH_WEIGHT_LOAD_TIMING").as_deref()==Ok("1"))
-        .then(Instant::now),seconds:[0.;5]}}
+        .then(Instant::now),seconds:[0.;5],read_wait_seconds:0.}}
     fn tick(&self)->Option<Instant> {self.start.map(|_|Instant::now())}
     fn add(&mut self,stage:usize,start:Option<Instant>) {if let Some(start)=start{self.seconds[stage]+=start.elapsed().as_secs_f64();}}
     fn report(&self,kind:&str,rank:usize,prefixes:&[&str],bytes:usize) {
         if let Some(start)=self.start {eprintln!("weight_load_timing {}",serde_json::json!({
             "kind":kind,"rank":rank,"prefixes":prefixes,"bytes":bytes,
-            "read_s":self.seconds[0],"validate_and_compact_s":self.seconds[1],
+            "read_s":self.seconds[0],"read_wait_s":self.read_wait_seconds,"validate_and_compact_s":self.seconds[1],
             "sha256_s":self.seconds[2],"upload_s":self.seconds[3],
             "device_digest_s":self.seconds[4],"total_s":start.elapsed().as_secs_f64()}));}
     }
@@ -600,6 +600,15 @@ impl Weights {
         })
     }
     fn device_digest(&self, cp: &Checkpoint) -> Result<String> {
+        let pipeline=match std::env::var("CANADA_SCRATCH_WEIGHT_DIGEST_PIPELINE"){
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid device digest pipeline policy");value=="1"},
+            // Pipeline ordered readback and hashing without skipping bytes
+            // or changing the canonical SHA256 identity.
+            Err(std::env::VarError::NotPresent)=>true,Err(error)=>return Err(error.into()),
+        };
+        if pipeline{self.device_digest_pipelined(cp)}else{self.device_digest_serial(cp)}
+    }
+    fn device_digest_serial(&self, cp: &Checkpoint) -> Result<String> {
         let mut order: Vec<_> = self.views.keys().collect();
         order.sort_by_key(|name| {
             let t = &cp.tensors[*name];
@@ -620,6 +629,20 @@ impl Weights {
         }
         let device_sha = format!("{:x}", digest.finalize());
         Ok(device_sha)
+    }
+    fn device_digest_pipelined(&self,cp:&Checkpoint)->Result<String>{
+        use crate::ordered_digest::Part;
+        let _host_staging=crate::memory::reserve_host_workspace(2*CHUNK)?;
+        let mut order:Vec<_>=self.views.keys().collect();
+        order.sort_by_key(|name|{let t=&cp.tensors[*name];(t.file.clone(),t.data_offsets[0])});
+        let parts:Vec<_>=order.into_iter().map(|name|{
+            let v=&self.views[name];let mut prefix=Vec::new();
+            prefix.extend_from_slice(&(name.len()as u64).to_le_bytes());
+            prefix.extend_from_slice(name.as_bytes());
+            prefix.extend_from_slice(&(v.bytes as u64).to_le_bytes());
+            Part{prefix,offset:v.offset,bytes:v.bytes}
+        }).collect();
+        crate::ordered_digest::digest(&parts,CHUNK,|offset,out|self.atlas.download_part_into(offset,out))
     }
     /// Lossless per-rank source-byte cache for cluster nodes that do not own
     /// the canonical NVMe checkpoint. Export only unprepared original units.
@@ -694,7 +717,7 @@ impl Weights {
         prefixes: &[&str],
         directory: &Path,
     ) -> Result<Self> {
-        Self::load_staged_impl(cuda,cp,plan,prefixes,directory,None,false)
+        Self::load_staged_impl(cuda,cp,plan,prefixes,directory,None,false,None)
     }
     pub(crate) fn load_staged_reserved(
         cuda:&Cuda,cp:&Checkpoint,plan:&RankPlan,prefixes:&[&str],directory:&Path,
@@ -702,14 +725,32 @@ impl Weights {
     )->Result<Self> {
         // Only target layer owners call this entry point. Model I/O and draft
         // owners retain their original allocation policy and canonical bytes.
-        Self::load_staged_impl(cuda,cp,plan,prefixes,directory,reserved,compressed_target_weights_requested()?)
+        Self::load_staged_impl(cuda,cp,plan,prefixes,directory,reserved,compressed_target_weights_requested()?,None)
     }
     fn load_staged_impl(
         cuda:&Cuda,cp:&Checkpoint,plan:&RankPlan,prefixes:&[&str],directory:&Path,
-        reserved:Option<&mut StagedReservation>,compressed:bool,
+        reserved:Option<&mut StagedReservation>,compressed:bool,reader_override:Option<u8>,
     )->Result<Self> {
-        use std::io::Read;
         let mut timing=LoadTiming::new();
+        let pipeline=match reader_override {
+            Some(value)=>{ensure!(value<=2,"invalid staged reader mode");value!=0},
+            None=>match std::env::var("CANADA_SCRATCH_WEIGHT_READ_AHEAD") {
+                Ok(value)=>{ensure!(value=="0"||value=="1","invalid weight read-ahead policy");value=="1"},
+                // Bounded read-ahead overlaps file I/O with the unchanged
+                // ordered hash, scale checks and synchronous CUDA uploads.
+                // The final full device digest remains mandatory. An explicit
+                // zero retains the serial control for diagnostics/recovery.
+                Err(std::env::VarError::NotPresent)=>true,Err(error)=>return Err(error.into()),
+            },
+        };
+        let hash_pipeline=match reader_override {
+            Some(value)=>value==2,
+            None=>match std::env::var("CANADA_SCRATCH_WEIGHT_HASH_PIPELINE") {
+                Ok(v)=>{ensure!(v=="0"||v=="1","invalid weight hash pipeline policy");v=="1"},
+                Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
+            },
+        };
+        ensure!(!hash_pipeline||pipeline,"ordered hash pipeline requires read-ahead");
         let metadata = std::fs::read(directory.join("atlas.json"))?;
         ensure!(
             metadata.len() <= 64 * 1024 * 1024,
@@ -728,12 +769,15 @@ impl Weights {
                 && m.checkpoint_sha256 == format!("{:x}", Sha256::digest(serde_json::to_vec(cp)?)),
             "staged atlas checkpoint/TP/layout contract mismatch"
         );
+        // Charge every bounded pipeline buffer before any atlas allocation. The
+        // reservation is dropped before returning the completed weight owner.
+        let _host_staging=if pipeline {Some(crate::memory::reserve_host_workspace((if hash_pipeline{3}else{2})*CHUNK)?)}else{None};
         let available = cuda.admission_memory()?;
         // A reserved atlas is already fully charged to the current memory
         // report. Still reserve the same physical floor and host staging;
         // counting those device bytes a second time would reject valid loads.
         let allocated=if compressed {cuda.compressible_bytes(total)?}else{total};
-        let additional=if reserved.is_some(){CHUNK}else{allocated};
+        let additional=if reserved.is_some(){if pipeline{0}else{CHUNK}}else{allocated};
         ensure!(
             additional
                 .checked_add(RESERVE)
@@ -753,13 +797,10 @@ impl Weights {
             None if compressed=>cuda.allocate_compressible::<u8>(total)?,
             None=>cuda.allocate::<u8>(total)?,
         };
-        let mut staging = vec![0u8; CHUNK];
         let mut hash = Sha256::new();
-        for offset in (0..total).step_by(CHUNK) {
-            let n = CHUNK.min(total - offset);
-            let began=timing.tick();
-            input.read_exact(&mut staging[..n])?;
-            timing.add(0,began);let began=timing.tick();
+        let mut consume=|offset:usize,staging:&[u8]| {
+          (||->Result<()> {
+            let n=staging.len();let began=timing.tick();
             for &(begin, end) in &scale_ranges {
                 let begin = begin.max(offset);
                 let end = end.min(offset + n);
@@ -773,11 +814,21 @@ impl Weights {
                 }
             }
             timing.add(1,began);let began=timing.tick();
-            hash.update(&staging[..n]);
+            if !hash_pipeline{hash.update(staging);}
             timing.add(2,began);let began=timing.tick();
-            atlas.upload_part(offset, &staging[..n])?;
+            atlas.upload_part(offset, staging)?;
             timing.add(3,began);
-        }
+            Ok(())
+          })().map_err(std::io::Error::other)
+        };
+        let(reads,ordered_hash)=if hash_pipeline {
+            let(reads,digest,hash_seconds)=crate::ordered_read_hash::chunks(&mut input,total,CHUNK,&mut consume)?;
+            timing.seconds[2]=hash_seconds;(reads,Some(digest))
+        }else{(crate::ordered_read::chunks(&mut input,total,CHUNK,pipeline,&mut consume)?,None)};
+        timing.seconds[0]=reads.read_seconds;timing.read_wait_seconds=reads.wait_seconds;
+        // The read/hash workers have joined and their buffers are gone. The subsequent
+        // digest reserves its own bounded pair, rather than charging both.
+        drop(_host_staging);
         let after = input.metadata()?;
         ensure!(
             (
@@ -796,7 +847,7 @@ impl Weights {
             "staged atlas changed during upload"
         );
         ensure!(
-            format!("{:x}", hash.finalize()) == m.atlas_sha256,
+            ordered_hash.unwrap_or_else(||format!("{:x}", hash.finalize())) == m.atlas_sha256,
             "staged atlas data hash mismatch"
         );
         let result = Self {
@@ -811,8 +862,75 @@ impl Weights {
             result.device_digest(cp)? == result.source_sha256,
             "staged GPU bytes differ from qualified checkpoint TP bytes"
         );
-        timing.add(4,began);timing.report("staged",plan.rank,prefixes,total);
+        timing.add(4,began);timing.report(if hash_pipeline{"staged-read-hash-pipeline"}else if pipeline{"staged-read-ahead"}else{"staged"},plan.rank,prefixes,total);
         Ok(result)
+    }
+
+    /// One-atlas screen; keeps all normal host and device integrity checks.
+    pub fn probe_read_ahead(path:&Path)->Result<serde_json::Value> {
+        #[derive(Deserialize)]
+        struct Input {checkpoint:PathBuf,config:PathBuf,stage:PathBuf,rank:usize,layer:usize}
+        ensure!(std::env::var("CANADA_SCRATCH_WEIGHT_READ_AHEAD_SCREEN").as_deref()==Ok("1"),
+            "finite staged reader screen requires explicit admission");
+        let p:Input=serde_json::from_slice(&std::fs::read(path)?)?;
+        ensure!(p.rank<4&&p.layer<40,"staged reader screen geometry");
+        let cp:Checkpoint=serde_json::from_slice(&std::fs::read(&p.checkpoint)?)?;
+        let config:crate::config::ModelConfig=serde_json::from_slice(&std::fs::read(&p.config)?)?;
+        let plan=RankPlan::build(&cp,&config,p.rank,4)?;
+        let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;
+        let prefix=format!("layers.{}.",p.layer);let mut records=Vec::new();
+        let hash_screen=std::env::var("CANADA_SCRATCH_WEIGHT_HASH_PIPELINE_SCREEN").as_deref()==Ok("1");
+        for cold in [true,false] {
+            for (trial,pipeline) in [false,true,true,false].into_iter().enumerate() {
+                #[cfg(target_os="linux")]
+                if cold {
+                    use std::os::fd::AsRawFd;
+                    let file=File::open(p.stage.join("atlas.bin"))?;
+                    let code=unsafe{libc::posix_fadvise(file.as_raw_fd(),0,0,libc::POSIX_FADV_DONTNEED)};
+                    ensure!(code==0,"staged reader cache advisory failed:{code}");
+                }
+                let began=Instant::now();
+                let mode=if hash_screen{if pipeline{2}else{1}}else{u8::from(pipeline)};
+                let weights=Self::load_staged_impl(&cuda,&cp,&plan,&[&prefix],&p.stage,None,true,Some(mode))?;
+                records.push(serde_json::json!({"cold_advisory":cold,"trial":trial,"pipeline":pipeline,
+                    "read_hash_pipeline":mode==2,
+                    "seconds":began.elapsed().as_secs_f64(),"bytes":weights.bytes(),
+                    "source_sha256":weights.source_sha256,"all_bytes_verified":true}));
+                drop(weights);
+            }
+        }
+        Ok(serde_json::json!({"rank":p.rank,"layer":p.layer,"records":records,
+            "compressed_allocation":true,"scope":"Single canonical atlas; cold-cache advisory and warm ABBA. Same host SHA256, scale-domain, file identity and complete device digest checks; no inference policy change."}))
+    }
+    pub fn probe_device_digest(path:&Path)->Result<serde_json::Value>{
+        #[derive(Deserialize)]
+        struct Input{checkpoint:PathBuf,config:PathBuf,stage:PathBuf,rank:usize,layer:usize}
+        ensure!(std::env::var("CANADA_SCRATCH_WEIGHT_DIGEST_SCREEN").as_deref()==Ok("1"),
+            "finite device digest screen requires explicit admission");
+        let p:Input=serde_json::from_slice(&std::fs::read(path)?)?;
+        ensure!(p.rank<4&&p.layer<40,"device digest screen geometry");
+        let cp:Checkpoint=serde_json::from_slice(&std::fs::read(&p.checkpoint)?)?;
+        let config:crate::config::ModelConfig=serde_json::from_slice(&std::fs::read(&p.config)?)?;
+        let plan=RankPlan::build(&cp,&config,p.rank,4)?;
+        let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;
+        let prefix=format!("layers.{}.",p.layer);
+        let weights=Self::load_staged_impl(&cuda,&cp,&plan,&[&prefix],&p.stage,None,true,Some(1))?;
+        let mut records=Vec::new();
+        // One immutable GPU allocation, alternating order. The source hash is
+        // independently verified by the unchanged loader before either arm.
+        for repeat in 0..6{
+            let order=if repeat%2==0{[false,true]}else{[true,false]};
+            for pipeline in order{
+                let began=Instant::now();
+                let hash=if pipeline{weights.device_digest_pipelined(&cp)?}else{weights.device_digest_serial(&cp)?};
+                let seconds=began.elapsed().as_secs_f64();
+                ensure!(hash==weights.source_sha256,"ordered device digest differs from canonical bytes");
+                records.push(serde_json::json!({"repeat":repeat,"pipeline":pipeline,"seconds":seconds,"exact":true}));
+            }
+        }
+        Ok(serde_json::json!({"rank":p.rank,"layer":p.layer,"bytes":weights.bytes(),
+            "source_sha256":weights.source_sha256,"records":records,"host_buffers_bytes":2*CHUNK,
+            "scope":"One canonical GPU atlas, complete serial and pipelined SHA256 readback; same allocation, alternating order. No inference or startup policy change."}))
     }
     pub fn qualify(
         &self,

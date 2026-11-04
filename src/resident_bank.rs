@@ -237,6 +237,8 @@ impl Worker {
         ensure!(self.control.all_admit(copy_before.admitted_available>=required)?,
             "second copy-profile construction would consume physical reserve");
         let mut copy=fork(32)?;copy.set_graph_replay(true)?;
+        let adaptive_engram32=Target::adaptive_engram32_requested()?;
+        copy.apply_adaptive_engram32(adaptive_engram32)?;
         copy.enable_compact_history_sampling(&self.core,&self.stream)?;
         let copy_buffers=LongHistoryBuffers::with_rows(&self.cuda,&self.core,32)?;
         ensure!(prepared.prepare_copy_conditioning(&copy_buffers,&self.comm,&self.stream)?,
@@ -252,6 +254,7 @@ impl Worker {
             verify,long_verify:Some(long),long_history_buffers:Some(long_buffers),
             copy32_verify:Some(copy),copy32_buffers:Some(copy_buffers),
             copy32_admission:json!({"requested":true,"admitted":true,"compact_history_sampling":true,
+                "adaptive_engram_overlap":adaptive_engram32,
                 "wide_copy_conditioning_prepared":true,"construction_headroom_bytes":required,
                 "memory_before":copy_before,"memory_after":after}),wides,large,
             history:ResidentHistory::new(self.large.context_capacity(),self.cfg.eos_token_id)?,

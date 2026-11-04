@@ -467,12 +467,59 @@ impl RowStore {
         self.misses
             .fetch_add(plan.rows.len() as u64, Ordering::Relaxed);
     }
+    /// Two persistent CPU workers retain the ordinary independent io_uring
+    /// lookups. Neither CUDA nor mutable model state enters these closures.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn lookup_pair_with_pool(pool:&rayon::ThreadPool,a:&Self,ids_a:&[u64],out_a:&mut[u8],b:&Self,ids_b:&[u64],out_b:&mut[u8])->Result<()> {
+        ensure!(pool.current_num_threads()==2,"bounded paired Engram worker pool");
+        let(first,second)=pool.install(||rayon::join(
+            ||a.lookup_into(ids_a,out_a,8),||b.lookup_into(ids_b,out_b,8)));
+        first?;second?;Ok(())
+    }
+    /// Preserve the caller's cache/CPU placement for the first file, while
+    /// borrowing one persistent worker for the other. Scope completion joins
+    /// the borrowed output slice before it can be uploaded or reused.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn lookup_pair_with_worker(pool:&rayon::ThreadPool,a:&Self,ids_a:&[u64],out_a:&mut[u8],b:&Self,ids_b:&[u64],out_b:&mut[u8])->Result<()> {
+        ensure!(pool.current_num_threads()==1,"one paired Engram helper");
+        let mut second=None;
+        let first=pool.in_place_scope(|scope| {
+            scope.spawn(|_|{second=Some(b.lookup_into(ids_b,out_b,8));});
+            a.lookup_into(ids_a,out_a,8)
+        });
+        first?;second.context("paired Engram helper did not return")??;Ok(())
+    }
+    /// Keep the no-thread warm path without serializing discovery of cold
+    /// rows. Tags are only a scheduling hint: the chosen lookup still checks
+    /// every row under its normal lock and retrieves canonical bytes on a miss.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn lookup_pair_warm_or_parallel(a:&Self,ids_a:&[u64],out_a:&mut[u8],b:&Self,ids_b:&[u64],out_b:&mut[u8])->Result<()> {
+        Self::lookup_pair_warm_or_parallel_on(None,a,ids_a,out_a,b,ids_b,out_b)
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn lookup_pair_warm_or_parallel_on(pool:Option<&rayon::ThreadPool>,a:&Self,ids_a:&[u64],out_a:&mut[u8],b:&Self,ids_b:&[u64],out_b:&mut[u8])->Result<()> {
+        for (store,ids,out) in [(a,ids_a,&*out_a),(b,ids_b,&*out_b)] {
+            ensure!(ids.len()<=32*24 && out.len()==ids.len()*ROW_BYTES
+                && ids.iter().all(|&id|id<store.shard.global_rows)
+                &&store.io_reader.is_some(),"adaptive paired Engram input extent/domain/reader");
+        }
+        if !a.misses_any(ids_a.iter().copied())? && !b.misses_any(ids_b.iter().copied())? {
+            return Self::lookup_pair_into(a,ids_a,out_a,b,ids_b,out_b);
+        }
+        if let Some(pool)=pool {return Self::lookup_pair_with_worker(pool,a,ids_a,out_a,b,ids_b,out_b);}
+        std::thread::scope(|scope|->Result<()> {
+            let other=scope.spawn(||b.lookup_into(ids_b,out_b,8));
+            let first=a.lookup_into(ids_a,out_a,8);
+            let second=other.join().map_err(|_|anyhow::anyhow!("adaptive Engram reader thread panicked"))?;
+            first?;second?;Ok(())
+        })
+    }
     /// Narrow-row experiment: preserve exact independent cache semantics while
     /// submitting both files' misses together, with no transient worker thread.
     #[cfg(target_os = "linux")]
     pub(crate) fn lookup_pair_into(a:&Self,ids_a:&[u64],out_a:&mut[u8],b:&Self,ids_b:&[u64],out_b:&mut[u8])->Result<()> {
         for (store,ids,out) in [(a,ids_a,&*out_a),(b,ids_b,&*out_b)] {
-            ensure!(ids.len()<=16*24 && out.len()==ids.len()*ROW_BYTES
+            ensure!(ids.len()<=32*24 && out.len()==ids.len()*ROW_BYTES
                 && ids.iter().all(|&id|id<store.shard.global_rows),"paired Engram input extent/domain");
             ensure!(store.io_reader.is_some(),"paired Engram requires io_uring stores");
         }

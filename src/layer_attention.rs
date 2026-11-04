@@ -17,6 +17,13 @@ use anyhow::{Result, ensure};
 use half::bf16;
 use std::{cell::{Cell, RefCell}, path::Path, rc::Rc};
 
+pub(crate) fn wide_epilogues_enabled()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_WIDE_EPILOGUES") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid wide epilogue policy");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
+    }
+}
+
 pub(crate) fn generation_fp32_attention_enabled()->Result<bool> {
     match std::env::var("CANADA_SCRATCH_GENERATION_FP32_ATTENTION") {
         Err(std::env::VarError::NotPresent)=>Ok(false),
@@ -95,11 +102,14 @@ pub struct Layer {
     gathered_qkv: Option<Buffer<bf16>>,
     qb: Linear,
     qb_prefetch: Option<crate::l2_prefetch::Window>,
+    woa_prefetch: Option<crate::l2_prefetch::Window>,
+    woa_prefetch_active: bool,
     kv: Option<Linear>,
     ob: Linear,
     normalized: Buffer<bf16>,
     q_stride: usize,
     qstore: Query,
+    wide_qrope: Option<crate::triton_ops::Operator>,
     kstore: Store,
     decode: Execution,
     append_decode: Option<Execution>,
@@ -140,6 +150,14 @@ enum WoA {
     Medium(crate::woa_medium::Grouped),
 }
 impl Layer {
+    pub(crate) fn set_wide_epilogues_for_probe(&mut self,enabled:bool,kernels:&Path)->Result<()> {
+        ensure!([16,32].contains(&self.rows)&&matches!(self.qstore,Query::Medium(_))
+            &&std::env::var("CANADA_SCRATCH_WIDE_EPILOGUE_SCREEN").as_deref()==Ok("1"),
+            "isolated wide query-store screen");
+        self.wide_qrope=if enabled {
+            Some(crate::triton_ops::Operator::load(&self.cuda,&kernels.join("q-rope-cuda-v1"),"q_rope_small")?)
+        }else{None};Ok(())
+    }
     pub(crate) fn cached_woa_allocation(&self) -> Option<(u64, usize)> {
         match &self.woa { WoA::Medium(v) => v.cached_allocation(), _ => None }
     }
@@ -459,6 +477,10 @@ impl Layer {
             Some(Execution::Prefill(crate::attention::Prefill::new_split_bf16(cuda,kernels,rows,512,
                 if rows==16{if fp32_partials{3}else{2}}else{8},fp32_partials,false)?))
         }else{None};
+        let woa_prefetch=if !draft && rows==6
+            &&std::env::var("CANADA_SCRATCH_WOA_PREFETCH_SCREEN").as_deref()==Ok("1") {
+            Some(crate::l2_prefetch::Window::new_woa(cuda,module,stream,weights.clone(),id)?)
+        }else{None};
         let mut woa = if rows <= 8 {
             WoA::Small(Grouped::new_named(
                 cuda,
@@ -507,11 +529,16 @@ impl Layer {
             },
             qb,
             qb_prefetch,
+            woa_prefetch,
+            woa_prefetch_active: false,
             kv,
             ob,
             normalized,
             q_stride,
             qstore,
+            wide_qrope:if [16,32].contains(&rows)&&!draft&&wide_epilogues_enabled()? {
+                Some(crate::triton_ops::Operator::load(cuda,&kernels.join("q-rope-cuda-v1"),"q_rope_small")?)
+            }else{None},
             kstore,
             decode,
             append_decode,
@@ -642,7 +669,7 @@ impl Layer {
             self.paired_input_projection()?;
             ensure!(shard.is_none()&&quantized.is_none()&&comm.is_some(),"precomputed QKV input path");
         }
-        ensure!(quantized.is_none() || (shard.is_none() && self.rows == 6
+        ensure!(quantized.is_none() || (shard.is_none() && matches!(self.rows, 6 | 16)
             && matches!(self.mode,InputMode::Split(_)) && !self.qa.narrow_projection()),
             "prequantized normalized attention requires the checked legacy QKV quantizer");
         if let Some(q) = &self.query_overlap {
@@ -716,6 +743,10 @@ impl Layer {
                 query_stream,
             )?,
             Query::Medium(q) => {
+                if let Some(op)=&self.wide_qrope {
+                    unsafe{op.launch(self.rows as u32,&[self.qb.output().ptr(),q.ptr(),
+                        self.frequencies.values().ptr(),positions.values().ptr()],query_stream)?;}
+                }else{
                 unsafe {
                     self.cuda
                         .copy_device(q.ptr(), self.qb.output().ptr(), q.bytes(), query_stream)
@@ -728,6 +759,7 @@ impl Layer {
                     false,
                     query_stream,
                 )?;
+                }
             }
         }
         if let Some(q) = &self.query_overlap { q.done.record(query_stream)?; }
@@ -800,6 +832,12 @@ impl Layer {
     pub fn quantized_lora(&self) -> (&Buffer<u8>, &Buffer<u8>) {
         self.qb.quantized_input()
     }
+    pub(crate) fn set_woa_prefetch_for_probe(&mut self,enabled:bool)->Result<()> {
+        ensure!(self.rows==6 && self.woa_prefetch.is_some()
+            &&std::env::var("CANADA_SCRATCH_WOA_PREFETCH_SCREEN").as_deref()==Ok("1"),
+            "WO-A hint screen owner");
+        self.woa_prefetch_active=enabled;Ok(())
+    }
     pub fn finish(
         &mut self,
         positions: &Positions,
@@ -815,6 +853,7 @@ impl Layer {
             q.done.wait(stream)?;
             q.pending.set(false);
         }
+        if self.woa_prefetch_active {self.woa_prefetch.as_ref().unwrap().begin(stream)?;}
         self.decode.run(
             self.qstore.output(),
             cache,
@@ -842,6 +881,9 @@ impl Layer {
                 self.ob.run(w.output(), stream)
             }
         }?;
+        // No data dependency: immutable prefetch can finish after its consumer.
+        // Join before the next layer so the side stream remains graph-owned.
+        if self.woa_prefetch_active {self.woa_prefetch.as_ref().unwrap().join(stream)?;}
         // Read-only hints need no consumer dependency. Match the reference's
         // late join at the next communication boundary rather than stalling QB.
         if let Some(hint) = &self.qb_prefetch {

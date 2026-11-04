@@ -45,13 +45,20 @@ impl Geometry {
     /// Additional bytes while encoding one image. Weights and the explicit
     /// 32MiB cuBLAS workspace are already resident. The attention operator
     /// refuses hidden global scratch at load time.
-    pub(crate) fn workspace_bytes(self, include_patches: bool) -> Result<usize> {
-        Ok(WorkspacePlan::new(self)?.admission_bytes(include_patches))
+    pub(crate) fn workspace_bytes(self, include_patches: bool, compact:bool) -> Result<usize> {
+        Ok(WorkspacePlan::new(self)?.admission_bytes(include_patches,compact))
     }
 }
 
-/// Allocation lengths and admission accounting share one layout. All buffers
-/// coexist through encoding; no lifetime overlap is assumed to save memory.
+pub(crate) fn compact_workspace()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_VISION_COMPACT_WORKSPACE").as_deref() {
+        Err(std::env::VarError::NotPresent)|Ok("1")=>Ok(true),Ok("0")=>Ok(false),
+        _=>anyhow::bail!("vision compact workspace must be0or1"),
+    }
+}
+
+/// Logical lengths and owned allocation accounting share one layout. Aliases
+/// are ordered on one stream and never escape the encoder with the final span.
 struct WorkspacePlan {
     bf16: [usize; 15],
     fp32: [usize; 3],
@@ -74,15 +81,38 @@ impl WorkspacePlan {
             patches: n * 588,
         })
     }
-    fn admission_bytes(&self, include_patches: bool) -> usize {
-        // Round every allocation up to 2MiB and keep another 64MiB for
-        // driver/allocator overhead. This is additional to the 8GiB UMA floor.
+    fn backings(&self,compact:bool)->[usize;15] {
+        let mut b=self.bf16;
+        if compact {
+            // gate/up -> QKV, either projection delta, then unfolded features.
+            b[8]=b[8].max(b[2]).max(b[7]).max(b[10]);
+            // gated -> either pre-projection norm (not concurrently live).
+            b[9]=b[9].max(b[1]);
+            // Q/K/V die before the aligner begins.
+            for (owner,view) in [(3,11),(4,12),(5,13)] {b[owner]=b[owner].max(b[view]);}
+            for view in [1,2,7,10,11,12,13] {b[view]=0;}
+        }
+        b
+    }
+    fn fp32_backings(&self,compact:bool)->[usize;3] {
+        let mut b=self.fp32;
+        // Only bias-bearing projections write FP32 scratch. The larger
+        // bias-free gate/up projection writes BF16 directly and never uses it.
+        if compact {b[0]=self.bf16[2].max(self.bf16[11]);}
+        b
+    }
+    fn admission_bytes(&self, include_patches: bool,compact:bool) -> usize {
+        // A live GB10 image allocation burst consumed up to ~430MiB more
+        // physical headroom than tensor bytes. The former64MiB allowance was
+        // insufficient under pressure. This transient admission allowance is
+        // not allocated, does not lower the UMA floor, and is released when
+        // encoding finishes. The post-allocation check remains authoritative.
         let rounded = |bytes: usize| bytes.next_multiple_of(2 << 20);
-        self.bf16.iter().map(|n| rounded(n * 2)).sum::<usize>()
-            + self.fp32.iter().map(|n| rounded(n * 4)).sum::<usize>()
+        self.backings(compact).iter().map(|n| rounded(n * 2)).sum::<usize>()
+            + self.fp32_backings(compact).iter().map(|n| rounded(n * 4)).sum::<usize>()
             + self.i32.iter().map(|n| rounded(n * 4)).sum::<usize>()
             + if include_patches { rounded(self.patches * 2) } else { 0 }
-            + (64 << 20)
+            + (512 << 20)
     }
 }
 
@@ -217,7 +247,7 @@ impl Vision {
         stream: &Stream,
     ) -> Result<()> {
         ensure!(
-            x.len() >= m * k && y.len() >= m * n && scratch.len() >= m * n,
+            x.len() >= m * k && y.len() >= m * n && (!bias || scratch.len() >= m * n),
             "vision projection buffer extent"
         );
         let w = self.weights.ptr(&format!("{name}.weight"))?;
@@ -280,6 +310,14 @@ impl Vision {
         stream: &Stream,
         tap: &mut Tap<'_>,
     ) -> Result<ImageSpan> {
+        self.encode_layout(patches,geometry,stream,compact_workspace()?,tap)
+    }
+    pub(crate) fn encode_with_workspace(&self,patches:&Buffer<bf16>,geometry:Geometry,
+        stream:&Stream,compact:bool)->Result<ImageSpan> {
+        self.encode_layout(patches,geometry,stream,compact,&mut |_,_,_,_,_|Ok(()))
+    }
+    fn encode_layout(&self,patches:&Buffer<bf16>,geometry:Geometry,stream:&Stream,
+        compact:bool,tap:&mut Tap<'_>)->Result<ImageSpan> {
         let g = geometry.validate()?;
         let n = g.rows();
         let m = g.feature_rows();
@@ -291,47 +329,53 @@ impl Vision {
             "vision input extent/context"
         );
         let layout = WorkspacePlan::new(g)?;
-        let needed = layout.admission_bytes(false); // patches are already resident
+        let needed = layout.admission_bytes(false,compact); // patches are already resident
         let reserve = self.cuda.allocation_reserve_bytes();
         let memory_before = self.cuda.admission_memory()?;
         ensure!(
             needed + reserve < memory_before.admitted_available,
-            "vision workspace exceeds available UMA above reserve"
+            crate::memory::InputCapacityError("vision workspace exceeds available UMA above reserve", needed + reserve)
         );
-        let [x, norm, qkv, q, k, v, attn, delta, gate_up, gated,
+        let [x, norm, qkv, _q, _k, _v, attn, delta, _gate_up, _gated,
             unfolded, align1, gelu, features, span] = layout.bf16;
-        let [scratch, co, si] = layout.fp32;
+        let [scratch, co, si] = layout.fp32_backings(compact);
         let [starts, lengths] = layout.i32;
-        let x = self.cuda.allocate::<bf16>(x)?;
-        let norm = self.cuda.allocate::<bf16>(norm)?;
-        let qkv = self.cuda.allocate::<bf16>(qkv)?;
-        let q = self.cuda.allocate::<bf16>(q)?;
-        let k = self.cuda.allocate::<bf16>(k)?;
-        let v = self.cuda.allocate::<bf16>(v)?;
-        let attn = self.cuda.allocate::<bf16>(attn)?;
-        let delta = self.cuda.allocate::<bf16>(delta)?;
-        let gate_up = self.cuda.allocate::<bf16>(gate_up)?;
-        let gated = self.cuda.allocate::<bf16>(gated)?;
-        let scratch = self.cuda.allocate::<f32>(scratch)?;
-        let co = self.cuda.allocate::<f32>(co)?;
-        let si = self.cuda.allocate::<f32>(si)?;
-        let unfolded = self.cuda.allocate::<bf16>(unfolded)?;
-        let align1 = self.cuda.allocate::<bf16>(align1)?;
-        let gelu = self.cuda.allocate::<bf16>(gelu)?;
-        let features = self.cuda.allocate::<bf16>(features)?;
-        let span = self.cuda.allocate::<bf16>(span)?;
-        let mut starts = self.cuda.allocate::<i32>(starts)?;
-        let mut lengths = self.cuda.allocate::<i32>(lengths)?;
+        let backing=layout.backings(compact);
+        let x = self.cuda.allocate_input::<bf16>(x)?;
+        let gate_up = self.cuda.allocate_input::<bf16>(backing[8])?;
+        let gated = self.cuda.allocate_input::<bf16>(backing[9])?;
+        let q = self.cuda.allocate_input::<bf16>(backing[3])?;
+        let k = self.cuda.allocate_input::<bf16>(backing[4])?;
+        let v = self.cuda.allocate_input::<bf16>(backing[5])?;
+        // SAFETY: all accesses below use the same stream, with these lifetimes:
+        // norm -> QKV -> split/attention -> delta/residual -> norm -> gate/up
+        // -> gated -> delta/residual. The aligner starts after the last block.
+        // Taps may inspect only during their callback. Parents remain in this
+        // scope through synchronization on success and on execution failure.
+        let norm = if compact {unsafe{gated.view(0,norm)?}}else{self.cuda.allocate_input::<bf16>(norm)?};
+        let qkv = if compact {unsafe{gate_up.view(0,qkv)?}}else{self.cuda.allocate_input::<bf16>(qkv)?};
+        let attn = self.cuda.allocate_input::<bf16>(attn)?;
+        let delta = if compact {unsafe{gate_up.view(0,delta)?}}else{self.cuda.allocate_input::<bf16>(delta)?};
+        let scratch = self.cuda.allocate_input::<f32>(scratch)?;
+        let co = self.cuda.allocate_input::<f32>(co)?;
+        let si = self.cuda.allocate_input::<f32>(si)?;
+        let unfolded = if compact {unsafe{gate_up.view(0,unfolded)?}}else{self.cuda.allocate_input::<bf16>(unfolded)?};
+        let align1 = if compact {unsafe{q.view(0,align1)?}}else{self.cuda.allocate_input::<bf16>(align1)?};
+        let gelu = if compact {unsafe{k.view(0,gelu)?}}else{self.cuda.allocate_input::<bf16>(gelu)?};
+        let features = if compact {unsafe{v.view(0,features)?}}else{self.cuda.allocate_input::<bf16>(features)?};
+        let span = self.cuda.allocate_input::<bf16>(span)?;
+        let mut starts = self.cuda.allocate_input::<i32>(starts)?;
+        let mut lengths = self.cuda.allocate_input::<i32>(lengths)?;
         starts.upload(&[0])?;
         lengths.upload(&[n as i32])?;
         stream.join_default()?;
         let memory_allocated = self.cuda.admission_memory()?;
         eprintln!("vision workspace admission: {}", serde_json::json!({
-            "geometry":g,"admission_bytes":needed,"reserve_bytes":reserve,"memory_before":memory_before,
+            "geometry":g,"compact_workspace":compact,"admission_bytes":needed,"reserve_bytes":reserve,"memory_before":memory_before,
             "memory_allocated":memory_allocated
         }));
         ensure!(memory_allocated.admitted_available > reserve,
-            "vision allocations consumed the UMA reserve");
+            crate::memory::InputCapacityError("vision allocations consumed the UMA reserve", needed + reserve));
         // Every local tensor/module outlives queued work even if a tap errors.
         let run = (|| -> Result<()> {
             self.elementwise(
@@ -554,5 +598,28 @@ impl Vision {
             data: span,
             geometry: g,
         })
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    #[test]
+    fn compact_views_fit_every_supported_geometry_without_increasing_admission() {
+        let mut geometries=0;
+        for height in 1..=3063 {
+            for width in 1..=3063.min(9198/height) {
+                let g=Geometry{height,width};if g.validate().is_err(){continue;}
+                let p=WorkspacePlan::new(g).unwrap();let b=p.backings(true);
+                for (view,owner) in [(1,9),(2,8),(7,8),(10,8),(11,3),(12,4),(13,5)] {
+                    assert!(p.bf16[view]<=b[owner],"{g:?}: view{view}/owner{owner}");
+                }
+                assert!(p.fp32_backings(true)[0]>=p.bf16[2]);
+                assert!(p.fp32_backings(true)[0]>=p.bf16[11]);
+                assert!(p.admission_bytes(true,true)<=p.admission_bytes(true,false));
+                geometries+=1;
+            }
+        }
+        assert!(geometries>10_000);
     }
 }

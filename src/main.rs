@@ -5,6 +5,18 @@ use std::{env, fs::File, path::Path};
 fn main() -> Result<()> {
     let args: Vec<_> = env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("gpu-local-sampler-readout") if args.len()==4=>{
+            let report=canada_engine::probe_local_sampler_readout(Path::new(&args[2]))?;
+            serde_json::to_writer_pretty(std::fs::OpenOptions::new().write(true).create_new(true).open(&args[3])?,&report)?;
+        }
+        Some("gpu-device-digest") if args.len()==4=>{
+            let report=canada_engine::weights::Weights::probe_device_digest(Path::new(&args[2]))?;
+            serde_json::to_writer_pretty(std::fs::OpenOptions::new().write(true).create_new(true).open(&args[3])?,&report)?;
+        }
+        Some("gpu-staged-read-ahead") if args.len()==4 => {
+            let report=canada_engine::weights::Weights::probe_read_ahead(Path::new(&args[2]))?;
+            serde_json::to_writer_pretty(std::fs::OpenOptions::new().write(true).create_new(true).open(&args[3])?,&report)?;
+        }
         Some("gpu-prompt-media") if args.len() == 3 => {
             println!("{}", serde_json::to_string_pretty(&canada_engine::prompt_media_probe::run(std::path::Path::new(&args[2]))?)?);
         }
@@ -143,6 +155,11 @@ fn main() -> Result<()> {
         Some("gpu-woa-cache") if args.len() == 4 => {
             let report = canada_engine::woa_cache_probe::run(Path::new(&args[2]))?;
             std::fs::write(&args[3], serde_json::to_vec_pretty(&report)?)?;
+        }
+        Some("gpu-sampler-graph") if args.len()==4 => {
+            let report=canada_engine::probe_sampler_graph(Path::new(&args[2]))?;
+            std::fs::write(&args[3],serde_json::to_vec_pretty(&report)?)?;
+            anyhow::ensure!(report["all_correct"]==true,"native sampler graph failed");
         }
         Some("gpu-sampler-readout") if args.len()==4 => {
             let report=canada_engine::probe_sampler_readout(Path::new(&args[2]))?;
@@ -629,6 +646,11 @@ fn main() -> Result<()> {
                 Path::new(&args[5]), Path::new(&args[6]),
             )?;
             serde_json::to_writer_pretty(File::create(&args[7])?, &result)?;
+        }
+        Some("gpu-hierarchical-categorical-probe") if args.len()==8=>{
+            let result=canada_engine::hierarchical_categorical::run(args[2].parse()?,&args[3],
+                &std::fs::read(&args[4])?,Path::new(&args[5]),Path::new(&args[6]))?;
+            serde_json::to_writer_pretty(File::create(&args[7])?,&result)?;
         }
         Some("gpu-paired-shared-up-probe") if args.len()==8 => {
             let result=canada_engine::fp8_linear::paired_shared_up_probe(

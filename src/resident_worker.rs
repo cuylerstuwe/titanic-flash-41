@@ -26,6 +26,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "output_projection_probe.rs"]
+mod output_projection_probe;
+#[path = "ffn32_refresh_probe.rs"]
+mod ffn32_refresh_probe;
+#[path = "ffn32_generation_probe.rs"]
+mod ffn32_generation_probe;
+#[path = "sampler_generation_probe.rs"]
+mod sampler_generation_probe;
+#[path = "wide_epilogue_probe.rs"]
+mod wide_epilogue_probe;
+#[path = "moe_late_pdl_probe.rs"]
+mod moe_late_pdl_probe;
+#[path = "moe_cacheca_probe.rs"]
+mod moe_cacheca_probe;
+#[path = "ffn16_refresh_probe.rs"]
+mod ffn16_refresh_probe;
+#[path = "ffn16_generation_probe.rs"]
+mod ffn16_generation_probe;
+
 #[path = "worker_interleave_probe.rs"]
 mod interleave_probe;
 #[path = "request_checkpoint.rs"]
@@ -67,20 +86,32 @@ mod fixed_prefix_quality_probe;
 mod matched_path_probe;
 #[path = "chunk_plan_probe.rs"]
 mod chunk_plan_probe;
+#[path = "chunk_economics_probe.rs"]
+mod chunk_economics_probe;
 #[path = "prefill_wait_probe.rs"]
 mod prefill_wait_probe;
 #[path = "verify_wait_probe.rs"]
 mod verify_wait_probe;
+#[path = "wide_mhc_probe.rs"]
+mod wide_mhc_probe;
 #[path = "mhc_pdl_probe.rs"]
 mod mhc_pdl_probe;
 #[path = "clock_verify_probe.rs"]
 mod clock_verify_probe;
 #[path = "clock_workload_probe.rs"]
 mod clock_workload_probe;
+#[path="gather_rows_probe.rs"]
+mod gather_rows_probe;
 #[path = "sampler_law_probe.rs"]
 mod sampler_law_probe;
 #[path = "step_budget_probe.rs"]
 mod step_budget_probe;
+#[path = "hierarchical_model_probe.rs"]
+mod hierarchical_model_probe;
+#[path = "wide_engram_probe.rs"]
+mod wide_engram_probe;
+#[path = "woa_prefetch_probe.rs"]
+mod woa_prefetch_probe;
 #[path = "block_progress_probe.rs"]
 mod block_progress_probe;
 #[path = "confidence_economics_probe.rs"]
@@ -1158,6 +1189,8 @@ impl Worker {
         // around2.7GiB; 12GiB leaves the8GiB physical reserve plus margin.
         // Refusal keeps M16/M6 serving available under the same memory caps.
         control.agree(&[u8::from(use_copy32)])?;
+        let adaptive_engram32=Target::adaptive_engram32_requested()?;
+        control.agree(&[u8::from(adaptive_engram32)])?;
         control.agree(&[u8::from(peer_prefill_enabled)])?;
         control.agree(&peer_prefill_slice_ms.to_le_bytes())?;
         control.agree(&[u8::from(LongHistoryBuffers::wide_conditioning_requested()?)])?;
@@ -1168,6 +1201,7 @@ impl Worker {
             ensure!(use_long_history&&long_verify.is_some(),"M32 requires the existing M16 fallback");
             let mut target=fork_narrow(32)?;
             target.set_graph_replay(true)?;
+            target.apply_adaptive_engram32(adaptive_engram32)?;
             if compact_history_sampling {target.enable_compact_history_sampling(&core_bytes,&stream)?;}
             ensure!(large.shared_state_report(&target)["all_weights_and_causal_storage_shared"]==true,
                 "M32 serving duplicated model state");
@@ -1184,6 +1218,7 @@ impl Worker {
         ensure!(control.all_admit(copy32_after.admitted_available>=8*1024usize.pow(3))?,
             "M32 admission consumed physical reserve");
         let copy32_admission=json!({"requested":use_copy32,"admitted":copy32_verify.is_some(),
+            "adaptive_engram_overlap":adaptive_engram32&&copy32_verify.is_some(),
             "compact_history_sampling":compact_history_sampling,
             "wide_copy_conditioning_prepared":copy_conditioning_prepared,
             "construction_headroom_bytes":12*1024usize.pow(3),"memory_before":copy32_before,"memory_after":copy32_after});
@@ -2764,6 +2799,9 @@ impl Worker {
 /// opens no model files, sockets, events or CUDA contexts. Extend it when a new
 /// configuration-only precondition is introduced; device/state checks stay live.
 fn validate_startup_config(p:&WorkerConfig,http:bool)->Result<()> {
+    ensure!(!http||std::env::var("CANADA_SCRATCH_GATHER_ROWS_SCREEN").as_deref()!=Ok("1"),
+        "gathered-row diagnostic is unavailable in HTTP serving");
+    crate::sampler_transport::Policy::from_env()?;
     crate::dspark_generation::serving_causal_three_threshold()?;
     let flag=|name:&str|->Result<bool>{match std::env::var(name){
         Ok(v)=>{ensure!(v=="0"||v=="1","{name} must be0or1");Ok(v=="1")},
@@ -2943,6 +2981,10 @@ pub fn run_file(path: &Path) -> Result<()> {
         history32_generation_probe::execute(&mut worker,Command::Finish(Finish::Length))?;
         history32_generation_probe::execute(&mut worker,Command::Shutdown)?;return Ok(());
     }
+    if std::env::var("CANADA_SCRATCH_GATHER_ROWS_SCREEN").as_deref()==Ok("1") {
+        gather_rows_probe::run(&mut worker,p.rank,p.events.parent().unwrap())?;
+        history32_generation_probe::execute(&mut worker,Command::Shutdown)?;return Ok(());
+    }
     if std::env::var("CANADA_SCRATCH_CLOCK_WORKLOAD_SCREEN").as_deref()==Ok("1") {
         return clock_workload_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
     }
@@ -2951,6 +2993,67 @@ pub fn run_file(path: &Path) -> Result<()> {
     }
     if std::env::var("CANADA_SCRATCH_VERIFY_WAIT_SCREEN").as_deref()==Ok("1") {
         return verify_wait_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_SOLO_FFN_COMBINED_SCREEN").as_deref()==Ok("1") {
+        ensure!(std::env::var("CANADA_SCRATCH_FFN16_GENERATION_SCREEN").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_FFN32_REFRESH_SCREEN").as_deref()==Ok("1"),
+            "combined FFN qualification requires both finite screens");
+        ffn16_generation_probe::run(&mut worker,p.rank,p.events.parent().unwrap())?;
+        ffn32_refresh_probe::run(&mut worker,p.rank,p.events.parent().unwrap())?;
+        history32_generation_probe::execute(&mut worker,Command::Shutdown)?;
+        return Ok(());
+    }
+    if std::env::var("CANADA_SCRATCH_FFN16_GENERATION_SCREEN").as_deref()==Ok("1") {
+        return ffn16_generation_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_SOLO_COMPOSITION_SCREEN").as_deref()==Ok("1") {
+        ensure!(std::env::var("CANADA_SCRATCH_FFN32_GENERATION_SCREEN").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_VERIFY16_OVERLAP_SCREEN").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_MOE_CACHE_CA_SCREEN").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_SAMPLER_GENERATION_SCREEN").as_deref()==Ok("1"),"overnight composition flags");
+        return ffn32_generation_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_SOLO_CACHE_SAMPLER_COMBINED_SCREEN").as_deref()==Ok("1") {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_CACHE_CA_SCREEN").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_SAMPLER_GENERATION_SCREEN").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_BLOCK_FUSED_SCREEN").as_deref()==Ok("1"),"combined cache/sampler flags");
+        moe_cacheca_probe::run(&mut worker,p.rank,p.events.parent().unwrap())?;
+        worker.verify.set_cache_ca_for_probe(true,&worker.stream)?;
+        return sampler_generation_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_SAMPLER_GENERATION_SCREEN").as_deref()==Ok("1") {
+        return sampler_generation_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_SOLO_MICRO_COMBINED_SCREEN").as_deref()==Ok("1") {
+        ensure!(std::env::var("CANADA_SCRATCH_WIDE_EPILOGUE_SCREEN").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_MOE_LATE_PDL_SCREEN").as_deref()==Ok("1"),
+            "combined micro screen flags");
+        wide_epilogue_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap())?;
+        return moe_late_pdl_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_WIDE_EPILOGUE_SCREEN").as_deref()==Ok("1") {
+        return wide_epilogue_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_MOE_LATE_PDL_SCREEN").as_deref()==Ok("1") {
+        return moe_late_pdl_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_FFN32_GENERATION_SCREEN").as_deref()==Ok("1") {
+        return ffn32_generation_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_FFN32_REFRESH_SCREEN").as_deref()==Ok("1") {
+        return ffn32_refresh_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_FFN16_REFRESH_SCREEN").as_deref()==Ok("1") {
+        return ffn16_refresh_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_WOA_PREFETCH_SCREEN").as_deref()==Ok("1") {
+        return woa_prefetch_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_OUTPUT_PROJECTION_SCREEN").as_deref()==Ok("1") {
+        return output_projection_probe::run(&mut worker,p.rank,&p.kernels,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_WIDE_MHC_SCREEN").as_deref()==Ok("1") {
+        return wide_mhc_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
     }
     if std::env::var("CANADA_SCRATCH_MHC_PDL_PAIR_SCREEN").as_deref()==Ok("1") {
         return mhc_pdl_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
@@ -3142,11 +3245,20 @@ pub fn run_file(path: &Path) -> Result<()> {
     if std::env::var("CANADA_SCRATCH_FIXED_PREFIX_QUALITY_SCREEN").as_deref()==Ok("1") {
         return fixed_prefix_quality_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
     }
+    if std::env::var("CANADA_SCRATCH_CHUNK_ECONOMICS_SCREEN").as_deref()==Ok("1") {
+        return chunk_economics_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
     if std::env::var("CANADA_SCRATCH_CHUNK_PLAN_SCREEN").as_deref()==Ok("1") {
         return chunk_plan_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
     }
     if std::env::var("CANADA_SCRATCH_PREFILL_WAIT_SCREEN").as_deref()==Ok("1") {
         return prefill_wait_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_HIERARCHICAL_MODEL_SCREEN").as_deref()==Ok("1") {
+        return hierarchical_model_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_WIDE_ENGRAM_SCREEN").as_deref()==Ok("1") {
+        return wide_engram_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
     }
     if sampler_law_probe::enabled() {
         return sampler_law_probe::run(&mut worker,p.rank,p.events.parent().unwrap());

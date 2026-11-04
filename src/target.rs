@@ -540,6 +540,10 @@ pub struct Target {
     engram_split14_m3_only: bool,
     engram_split14_adaptive: bool,
     paired_engram_io: bool,
+    paired_engram32: bool,
+    paired_engram32_adaptive: bool,
+    engram32_worker: Option<rayon::ThreadPool>,
+    engram32_worker_enabled: bool,
     graph_captures: usize,
     // Validated first-use optimization. Recording a graph does not execute
     // it: retain the successful eager prefill instead of immediately replaying.
@@ -562,6 +566,10 @@ pub struct Target {
     // Its sampling graph references IO's local head, so drop before IO.
     compact_categorical: Option<crate::sharded_categorical_probe::CompactSampler>,
     compact_sampling_enabled: bool,
+    local_target_enabled: bool,
+    // Native row transport fixes the live count inside each capture. A tail
+    // captured for three rows cannot publish a later six-row distribution.
+    local_target_gather: Vec<Option<Graph>>,
     last_head_local_only: bool,
     cuda: Cuda,
     io: ModelIo,
@@ -911,6 +919,10 @@ impl Target {
                     && std::env::var("CANADA_SCRATCH_ENGRAM_URING").as_deref()==Ok("1"),
                 Err(error)=>return Err(error.into()),
             },
+            paired_engram32: false,
+            paired_engram32_adaptive: false,
+            engram32_worker: None,
+            engram32_worker_enabled: false,
             graph_captures: 0,
             prefill_capture_once: match std::env::var("CANADA_SCRATCH_PREFILL_CAPTURE_ONCE") {
                 Ok(value) => {
@@ -946,6 +958,9 @@ impl Target {
             categorical: crate::categorical::Categorical::new(cuda, core_bytes, rows)?,
             compact_categorical: None,
             compact_sampling_enabled: false,
+            local_target_enabled: rows==6&&source_phase==Phase::Verify
+                &&crate::sampler_transport::Policy::from_env()?.local_target,
+            local_target_gather: (0..=rows).map(|_|None).collect(),
             last_head_local_only: false,
             last_live: 0,
             last_append_metrics: None,
@@ -980,6 +995,7 @@ impl Target {
         };
         target.share_index_scores_before_capture(cuda,stream)?;
         target.share_narrow_moe_before_capture(cuda,stream)?;
+        target.enable_verify16_ffn_before_capture(stream)?;
         target.install_communication_hints(core, stream)?;
         Ok(target)
     }
@@ -1471,6 +1487,10 @@ impl Target {
             engram_split14_m3_only: false,
             engram_split14_adaptive: false,
             paired_engram_io: self.paired_engram_io,
+            paired_engram32: self.paired_engram32,
+            paired_engram32_adaptive: self.paired_engram32_adaptive,
+            engram32_worker: None,
+            engram32_worker_enabled: false,
             graph_captures: 0,
             prefill_capture_once: self.prefill_capture_once,
             verification_capture_once: self.verification_capture_once,
@@ -1492,6 +1512,9 @@ impl Target {
             categorical: crate::categorical::Categorical::new(cuda, core_bytes, rows)?,
             compact_categorical: None,
             compact_sampling_enabled: false,
+            local_target_enabled: rows==6&&phase==Phase::Verify
+                &&crate::sampler_transport::Policy::from_env()?.local_target,
+            local_target_gather: (0..=rows).map(|_|None).collect(),
             last_head_local_only: false,
             last_live: 0,
             last_append_metrics: None,
@@ -1526,9 +1549,26 @@ impl Target {
         };
         target.share_index_scores_before_capture(cuda,stream)?;
         target.share_narrow_moe_before_capture(cuda,stream)?;
+        target.enable_verify16_ffn_before_capture(stream)?;
         target.install_communication_hints(core, stream)?;
         cuda.report_allocation_sites(&format!("rank{} forkM{rows} independent={independent}",self.rank))?;
         Ok(target)
+    }
+    fn enable_verify16_ffn_before_capture(&mut self,stream:&Stream)->Result<()> {
+        // Wide verification can overlap the independent shared-expert branch.
+        // Configure it before capture; the owner also serves tiny retained
+        // appends. Bulk-prefill profiles retain their own schedule.
+        if ![16,32].contains(&self.rows) || self.source_phase!=Phase::Verify
+            || !crate::ffn::wide_overlap_enabled(self.rows)? {return Ok(());}
+        ensure!(self.graph_captures==0&&self.pending.is_none()&&self.stream==stream.raw()as usize,
+            "M16 FFN overlap must precede capture/execution");
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            layer.enable_verify16_ffn_before_capture(stream)?;
+        }
+        ensure!(self.layer_owners().iter().all(|l|l.ffn_overlap_flags()==(true,true)),
+            "all forty Verify16 FFN schedules must agree");
+        Ok(())
     }
     fn share_index_scores_before_capture(&mut self,cuda:&Cuda,stream:&Stream)->Result<()> {
         let requested=match std::env::var("CANADA_SCRATCH_SHARED_INDEX_SCORES") {
@@ -2346,6 +2386,11 @@ impl Target {
     pub(crate) fn attention_coefficient_overlap_layers(&self) -> usize {
         self.layer_owners().iter().filter(|l| l.attention_coefficients_overlap()).count()
     }
+    pub(crate) fn ffn_overlap_layers(&self)->(usize,usize) {
+        let owners=self.layer_owners();
+        (owners.iter().filter(|l|l.ffn_overlap_flags().0).count(),
+            owners.iter().filter(|l|l.ffn_overlap_flags().1).count())
+    }
     pub(crate) fn cached_woa_allocations(&self) -> Vec<(u64, usize)> {
         self.layer_owners().iter().filter_map(|l|l.attention().cached_woa_allocation()).collect()
     }
@@ -2462,19 +2507,37 @@ impl Target {
         self.io.set_lossless_head_for_probe(enabled)
     }
     pub(crate) fn set_verify16_schedule_for_probe(&mut self, mask: u8, stream: &Stream) -> Result<()> {
-        ensure!(std::env::var("CANADA_SCRATCH_VERIFY16_OVERLAP_SCREEN").as_deref()==Ok("1")
-            && self.rows==16 && self.source_phase==Phase::Verify && self.pending.is_none()
+        ensure!(crate::ffn::wide_overlap_probe(self.rows)
+            && self.source_phase==Phase::Verify && self.pending.is_none()
             && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
-            && stream.raw() as usize==self.stream && mask<=3,"idle graph-enabled M16 overlap screen");
+            && stream.raw() as usize==self.stream && mask<=3 && self.cached_decoder.is_none(),
+            "idle generation-bank wide overlap screen");
         stream.synchronize()?;
         // Destroy every graph referencing the old event schedule before it is
         // replaced. No causal storage or immutable operands are changed.
         for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph=None; }
         for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph=None; }
         self.decoder_graph=None;
+        self.tiny_append_graphs=None;
         for layer in self.early.iter_mut().chain(self.group8.layers_mut())
             .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
             layer.set_verify16_schedule_for_probe(mask,stream)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_wide_epilogues_for_probe(&mut self,enabled:bool,kernels:&Path,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_WIDE_EPILOGUE_SCREEN").as_deref()==Ok("1")
+            &&[16,32].contains(&self.rows)&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.cached_decoder.is_none(),
+            "wide epilogue switch requires idle uncached verifier");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            layer.set_wide_epilogues_for_probe(enabled,kernels)?;
         }
         Ok(())
     }
@@ -2561,6 +2624,45 @@ impl Target {
         for layer in self.layer_owners(){layer.narrow_workspace().set_fc_pdl_for_probe(enabled,stream)?;}
         Ok(())
     }
+    pub(crate) fn set_late_fc_pdl_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_LATE_PDL_SCREEN").as_deref()==Ok("1")
+            &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),"idle late FC PDL screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        for layer in self.layer_owners(){layer.narrow_workspace().set_late_fc_pdl_for_probe(enabled,stream)?;}
+        Ok(())
+    }
+    pub(crate) fn set_cache_ca_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_CACHE_CA_SCREEN").as_deref()==Ok("1")
+            &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),"idle cache-ca screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        for layer in self.layer_owners(){layer.narrow_workspace().set_cache_ca_for_probe(enabled,stream)?;}
+        Ok(())
+    }
+    pub(crate) fn set_woa_prefetch_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_WOA_PREFETCH_SCREEN").as_deref()==Ok("1")
+            &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),"idle WO-A hint screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            layer.set_woa_prefetch_for_probe(enabled)?;
+        }
+        Ok(())
+    }
     pub(crate) fn set_key_sharded_index_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
         let publisher_only=std::env::var("CANADA_SCRATCH_KEY_SHARDED_PUBLISHER_SCREEN").as_deref()==Ok("1");
         ensure!(std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX_SCREEN").as_deref()==Ok("1")
@@ -2599,15 +2701,15 @@ impl Target {
         Ok(())
     }
     pub(crate) fn prepare_wo_b_alternates_for_probe(&self,kernels:&Path)->Result<Vec<crate::fp8_linear::Linear>> {
-        ensure!(std::env::var("CANADA_SCRATCH_WO_B_PDL_SCREEN").as_deref()==Ok("1")
-            &&self.rows==6&&self.pending.is_none()&&self.lease.is_current()
+        ensure!(crate::fp8_linear::output_projection_probe(self.rows)
+            &&self.pending.is_none()&&self.lease.is_current()
             &&self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024usize.pow(2),
             "alternate WO-B screen memory/ownership");
         self.layer_owners().into_iter().map(|l|l.attention().wo_b_pdl_for_probe(kernels)).collect()
     }
     pub(crate) fn set_wo_b_pdl_for_probe(&mut self,mode:u8,other:&mut[crate::fp8_linear::Linear],stream:&Stream)->Result<()> {
-        ensure!(std::env::var("CANADA_SCRATCH_WO_B_PDL_SCREEN").as_deref()==Ok("1")
-            &&self.rows==6&&self.source_phase==Phase::Verify&&other.len()==40&&self.pending.is_none()
+        ensure!(crate::fp8_linear::output_projection_probe(self.rows)
+            &&self.source_phase==Phase::Verify&&other.len()==40&&self.pending.is_none()
             &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
             &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),
             "idle pre-warmup WO-B projection screen");
@@ -2618,6 +2720,22 @@ impl Target {
         for(layer,alternate)in self.early.iter_mut().chain(self.group8.layers_mut())
             .chain(self.group14.layers_mut()).chain(self.late.layers_mut()).zip(other){
             layer.set_wo_b_pdl_for_probe(mode,alternate)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_wide_mhc_for_probe(&mut self,mode:u8,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_WIDE_MHC_SCREEN").as_deref()==Ok("1")
+            &&self.rows==16&&mode<=3&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),
+            "idle M16 mHC comparison owner");
+        stream.synchronize()?;
+        for g in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*g=None;}
+        for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*g=None;}
+        self.decoder_graph=None;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            layer.set_wide_mhc_for_probe(mode)?;
         }
         Ok(())
     }
@@ -3097,7 +3215,52 @@ impl Target {
         self.rows1.input_kind()
     }
     pub(crate) fn paired_engram_io_enabled(&self)->bool {
-        self.paired_engram_io && self.rows<=16
+        self.paired_engram_io && (self.rows<=16 ||
+            (self.rows==32&&self.source_phase==Phase::Verify&&self.paired_engram32))
+    }
+    pub(crate) fn adaptive_engram32_requested()->Result<bool> {
+        match std::env::var("CANADA_SCRATCH_ENGRAM32_ADAPTIVE_OVERLAP") {
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid M32 Engram schedule");Ok(value=="1")},
+            Err(std::env::VarError::NotPresent)=>Ok(false),
+            Err(error)=>Err(error.into()),
+        }
+    }
+    /// The M32 owner uses paired warm reads,
+    /// parallel misses, and overlaps those immutable reads with layer0.
+    /// M6 and M16 keep their separately qualified schedules.
+    pub(crate) fn apply_adaptive_engram32(&mut self,enabled:bool)->Result<()> {
+        if !enabled {return Ok(());}
+        ensure!(self.lease.is_current()&&self.position()==0&&self.pending.is_none()
+            &&self.source_phase==Phase::Verify&&self.rows==32&&self.wide.is_none()
+            &&self.graph_replay&&self.graph_captures==0&&self.paired_engram_io
+            &&self.graphs.iter().all(Option::is_none)&&self.engram_graphs.iter().all(Option::is_none),
+            "M32 Engram schedule requires a fresh graph-enabled paired-I/O owner");
+        self.paired_engram32=true;
+        self.paired_engram32_adaptive=true;
+        self.engram_overlap=true;
+        Ok(())
+    }
+    pub(crate) fn set_paired_engram32_for_probe(&mut self,enabled:bool)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_WIDE_ENGRAM_SCREEN").as_deref()==Ok("1")
+            &&self.lease.is_current()&&self.pending.is_none()&&self.rows==32
+            &&self.source_phase==Phase::Verify&&self.paired_engram_io,
+            "paired32 I/O requires the idle wide Engram probe owner");
+        self.paired_engram32=enabled;self.paired_engram32_adaptive=false;Ok(())
+    }
+    pub(crate) fn set_adaptive_engram32_for_probe(&mut self,enabled:bool)->Result<()> {
+        self.set_paired_engram32_for_probe(enabled)?;
+        self.paired_engram32_adaptive=enabled;Ok(())
+    }
+    pub(crate) fn set_engram32_worker_for_probe(&mut self,enabled:bool)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_ENGRAM32_WORKER_SCREEN").as_deref()==Ok("1")
+            &&self.lease.is_current()&&self.pending.is_none()&&self.rows==32
+            &&self.source_phase==Phase::Verify&&self.paired_engram32_adaptive,
+            "Engram helper screen needs idle adaptive M32 verification");
+        if enabled&&self.engram32_worker.is_none() {
+            self.engram32_worker=Some(rayon::ThreadPoolBuilder::new().num_threads(1).stack_size(512*1024)
+                .thread_name(|_|"engram32-reader".to_owned()).build()?);
+        }
+        self.engram32_worker_enabled=enabled;Ok(())
     }
     pub(crate) fn encoder_tail_digest(&self) -> Result<Option<serde_json::Value>> {
         ensure!(
@@ -3162,9 +3325,9 @@ impl Target {
     /// complete uploads through an explicit default-to-model stream event.
     pub(crate) fn set_engram_overlap_for_probe(&mut self, enabled: bool) -> Result<()> {
         ensure!(self.lease.is_current() && self.pending.is_none()
-            && self.source_phase == Phase::Verify && self.rows == 6
+            && self.source_phase == Phase::Verify && [6,16,32].contains(&self.rows)
             && self.graph_replay && self.wide.is_none(),
-            "Engram overlap requires the idle graph-enabled Verify6 owner");
+            "Engram overlap requires an idle graph-enabled verification owner");
         self.engram_overlap = enabled;
         Ok(())
     }
@@ -3487,7 +3650,23 @@ impl Target {
     fn compact_sampling_active(&self)->bool {
         // The alternate M16 EXTEND bank still publishes full prompt logits.
         // Its graph topology remains independent of ordinary copy verification.
-        self.compact_sampling_enabled&&self.cached_decoder.is_none()
+        (self.compact_sampling_enabled||(self.local_target_enabled&&self.rows==6
+            &&self.source_phase==Phase::Verify&&!self.prefill_last_head))&&self.cached_decoder.is_none()
+    }
+    pub(crate) fn local_target_enabled(&self)->bool {self.local_target_enabled}
+    pub(crate) fn set_local_target_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_LOCAL_TARGET_MODEL_SCREEN").as_deref()==Ok("1")
+            &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&!self.prefill_last_head
+            &&self.cached_decoder.is_none()&&self.encoder_graph.is_none()&&self.decoder_graph.is_none()
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
+            "finite local target requires idle narrow verification");
+        if enabled==self.local_target_enabled{return Ok(())}
+        stream.synchronize()?;
+        for g in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*g=None;}
+        for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*g=None;}
+        for graph in &mut self.local_target_gather {*graph=None;}
+        self.local_target_enabled=enabled;Ok(())
     }
 
     /// Start a new sequence without reloading immutable weights or discarding
@@ -3575,12 +3754,20 @@ impl Target {
         self.tokens.clear_images()
     }
     pub fn append(&mut self, ids: &[u32], comm: &Roce, stream: &Stream) -> Result<()> {
-        self.execute_rows(ids, comm, stream, false)
+        self.execute_rows(ids, comm, stream, false, false)
     }
     /// Evaluate a speculative block without advancing accepted history. This
     /// holds the shared writer busy until finish_verification; another profile
     /// cannot adopt it or publish speculative state. Drop/error fails closed.
     pub fn begin_verification(&mut self, ids: &[u32], comm: &Roce, stream: &Stream) -> Result<()> {
+        self.begin_verification_mode(ids,comm,stream,false)
+    }
+    pub(crate) fn begin_local_verification(&mut self,ids:&[u32],comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(self.local_target_enabled&&self.rows==6&&self.cached_decoder.is_none()
+            &&(2..=6).contains(&ids.len()),"local verification eligibility");
+        self.begin_verification_mode(ids,comm,stream,true)
+    }
+    fn begin_verification_mode(&mut self,ids:&[u32],comm:&Roce,stream:&Stream,local_only:bool)->Result<()> {
         ensure!(
             self.source_phase == Phase::Verify
                 && crate::config::verification_rows(self.rows)
@@ -3592,7 +3779,7 @@ impl Target {
                         || std::env::var("CANADA_SCRATCH_RESIDENT_SMALL_APPEND").as_deref()==Ok("1")))),
             "verification execution policy"
         );
-        self.execute_rows(ids, comm, stream, true)
+        self.execute_rows(ids, comm, stream, true, local_only)
     }
     fn execute_rows(
         &mut self,
@@ -3600,6 +3787,7 @@ impl Target {
         comm: &Roce,
         stream: &Stream,
         verification: bool,
+        local_only: bool,
     ) -> Result<()> {
         ensure!(
             self.pending.is_none() && self.lease.is_current(),
@@ -3660,7 +3848,7 @@ impl Target {
         padded[..ids.len()].copy_from_slice(ids);
         let batch = self.history.prepare_padded(&padded, ids.len(), &self.hashes)?;
         marks.push(("history_hash", Instant::now()));
-        ensure!(!self.engram_overlap || (verification && self.graph_replay && self.rows == 6),
+        ensure!(!self.engram_overlap || (verification && self.graph_replay && [6,16,32].contains(&self.rows)),
             "experimental Engram overlap is verification-only");
         let deferred_rows = self.engram_overlap && self.engram_graphs[ids.len()].is_some();
         if self.engram_split14_adaptive {
@@ -3833,6 +4021,21 @@ impl Target {
             self.enqueue(comm, stream)?;
         }
         marks.push(("forward_enqueue", Instant::now()));
+        // Narrow local-target graphs omit the vocabulary gather. Ordinary
+        // callers, including point-mass history, greedy and accepted append,
+        // still receive complete logits through a small tail graph per live
+        // count. Native row transport captures that count as a fixed extent.
+        // This avoids retaining a duplicate forty-layer graph bank.
+        let gathered_tail=self.local_target_enabled&&self.compact_sampling_active()&&!local_only;
+        if gathered_tail {
+            if self.graph_replay {
+                if self.local_target_gather[ids.len()].is_none() {
+                    self.io.gather_logits(comm,stream)?;stream.synchronize()?;comm.health()?;
+                    self.local_target_gather[ids.len()]=Some(stream.capture(||self.io.gather_logits(comm,stream))?);
+                    self.graph_captures+=1;
+                }else{unsafe{self.local_target_gather[ids.len()].as_ref().unwrap().launch(stream)?;}}
+            }else{self.io.gather_logits(comm,stream)?;}
+        }
         if verification&&self.verification_poll_us>0&&self.cached_decoder.is_none() {
             stream.synchronize_polling(self.verification_poll_us)?;
         }else{stream.synchronize()?;}
@@ -3843,7 +4046,7 @@ impl Target {
             ensure!(cache.error()? == 0, "encoder tail publication fault");
         }
         marks.push(("candidate_checks", Instant::now()));
-        self.last_head_local_only=self.compact_sampling_active();
+        self.last_head_local_only=self.compact_sampling_active()&&!gathered_tail;
         if verification {
             self.pending = Some(PendingVerification {
                 hash_batch: batch,
@@ -3893,7 +4096,13 @@ impl Target {
         ensure!(std::env::var("CANADA_SCRATCH_INDEX_SCORE_MODEL_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_PAIR_STEP_PROFILE").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_ATTENTION16_REFRESH_SCREEN").as_deref()==Ok("1")
-            ||std::env::var("CANADA_SCRATCH_INDEPENDENT_OWNER_SCREEN").as_deref()==Ok("1"),
+            ||std::env::var("CANADA_SCRATCH_INDEPENDENT_OWNER_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_WIDE_MHC_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_OUTPUT_PROJECTION_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_FFN32_REFRESH_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_WIDE_EPILOGUE_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_WIDE_ENGRAM_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_FFN16_REFRESH_SCREEN").as_deref()==Ok("1"),
             "local logit readout requires finite score storage screen");
         let pending=self.pending.as_ref().context("no completed verification")?;
         ensure!(self.lease.is_busy_revision(),"local logit readout lost writer revision");
@@ -3910,6 +4119,27 @@ impl Target {
             "pending verification lost writer revision"
         );
         Ok((self.io.logits(), pending.live))
+    }
+
+    pub(crate) fn gathered_rows_proof_for_probe(&self)->Result<serde_json::Value> {
+        use sha2::{Digest,Sha256};
+        ensure!(std::env::var("CANADA_SCRATCH_GATHER_ROWS_SCREEN").as_deref()==Ok("1")
+            &&self.rows==6&&self.local_target_enabled,"finite gathered-row diagnostic");
+        let(full,live)=self.pending_logits()?;
+        let shard_bytes=32320*4;let row_bytes=4*shard_bytes;
+        let local=unsafe{self.cuda.read_device(self.io.local_logits().ptr(),live*shard_bytes)}?;
+        let gathered=unsafe{self.cuda.read_device(full.ptr(),live*row_bytes)}?;
+        let exact=(0..live).all(|r|local[r*shard_bytes..(r+1)*shard_bytes]
+            ==gathered[r*row_bytes+self.rank*shard_bytes..r*row_bytes+(self.rank+1)*shard_bytes]);
+        Ok(serde_json::json!({"live":live,"rank":self.rank,"exact":exact,
+            "local_sha256":format!("{:x}",Sha256::digest(&local)),
+            "gathered_sha256":format!("{:x}",Sha256::digest(&gathered))}))
+    }
+    pub(crate) fn pending_local_target_logits(&self)->Result<(&Buffer<f32>,usize)> {
+        let pending=self.pending.as_ref().context("no local target verification")?;
+        ensure!(self.local_target_enabled&&self.rows==6&&self.last_head_local_only
+            &&self.lease.is_busy_revision(),"local target logit ownership");
+        Ok((self.io.local_logits(),pending.live))
     }
     pub fn verification_greedy(&mut self, stream: &Stream) -> Result<Vec<u32>> {
         let (_, live) = self.pending_logits()?;
@@ -4546,6 +4776,12 @@ impl Target {
     /// Both Engram layers' row lookups (NVMe-bound on cache misses) run
     /// concurrently; uploads stay on this CUDA-context thread.
     fn prepare_engram_rows(&mut self, hashes: &[[[u64; 24]; 2]]) -> Result<()> {
+        #[cfg(target_os="linux")]
+        let paired=self.paired_engram_io_enabled();
+        #[cfg(target_os="linux")]
+        let adaptive=paired&&self.rows==32&&self.paired_engram32_adaptive;
+        #[cfg(not(target_os="linux"))]
+        let paired=false;
         let first: Vec<[u64; 24]> = hashes.iter().map(|r| r[0]).collect();
         let second: Vec<[u64; 24]> = hashes.iter().map(|r| r[1]).collect();
         let (rows14, store14) = self.group14.engram_rows()?;
@@ -4553,12 +4789,12 @@ impl Target {
         let (flat1, staging1) = self.rows1.stage(&first, &self.row_store1)?;
         let store1 = &*self.row_store1;
         #[cfg(target_os="linux")]
-        let paired=self.paired_engram_io && self.rows<=16;
-        #[cfg(not(target_os="linux"))]
-        let paired=false;
-        #[cfg(target_os="linux")]
         if paired {
-            RowStore::lookup_pair_into(store1,&flat1,staging1,store14,&flat14,staging14)?;
+            if adaptive {
+                let helper=if self.engram32_worker_enabled {self.engram32_worker.as_ref()}else{None};
+                RowStore::lookup_pair_warm_or_parallel_on(helper,store1,&flat1,staging1,store14,&flat14,staging14)?;
+            }
+            else {RowStore::lookup_pair_into(store1,&flat1,staging1,store14,&flat14,staging14)?;}
         }
         if !paired {
             let (looked1, looked14) = std::thread::scope(|scope| {

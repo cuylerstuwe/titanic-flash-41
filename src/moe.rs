@@ -132,6 +132,10 @@ pub struct Workspace {
     scale_codes: Option<PackedInput>,
     scale_codes_enabled: Cell<bool>,
     fc_pdl: Option<PackedInput>,
+    late_fc_pdl: Option<PackedInput>,
+    late_fc_pdl_enabled: Cell<bool>,
+    cache_ca: Option<PackedInput>,
+    cache_ca_enabled: Cell<bool>,
     // 0: ordinary input addressing; 1: all live rows (finite screen);
     // 3: the measured three-row-only policy.
     fc_pdl_mode: Cell<u8>,
@@ -280,6 +284,10 @@ impl Workspace {
             scale_codes: None,
             scale_codes_enabled: Cell::new(false),
             fc_pdl: None,
+            late_fc_pdl: None,
+            late_fc_pdl_enabled: Cell::new(false),
+            cache_ca: None,
+            cache_ca_enabled: Cell::new(false),
             fc_pdl_mode: Cell::new(0),
             stream: Cell::new(None),
         })
@@ -450,6 +458,18 @@ impl Workspace {
             grouped.enable_fc_pdl(&kernels.join("moe-runtime-m6-fc-pdl-v1"))?;
             grouped.fc_pdl_mode.set(if pdl_m3 {3}else{0});
         }
+        let cache_ca=match std::env::var("CANADA_SCRATCH_MOE_CACHE_CA") {
+            Ok(v)=>{ensure!(v=="0"||v=="1","invalid expert cache-ca policy");v=="1"},
+            Err(std::env::VarError::NotPresent)=>input_address&&!task_order&&!task_order_m3&&!scale&&grouped.scale_codes.is_none(),
+            Err(e)=>return Err(e.into()),
+        };
+        if cache_ca || std::env::var("CANADA_SCRATCH_MOE_CACHE_CA_SCREEN").as_deref()==Ok("1") {
+            grouped.enable_cache_ca(&kernels.join("moe-runtime-m6-cache-ca-v1"))?;
+            grouped.cache_ca_enabled.set(cache_ca);
+        }
+        if std::env::var("CANADA_SCRATCH_MOE_LATE_PDL_SCREEN").as_deref()==Ok("1") {
+            grouped.enable_late_fc_pdl(&kernels.join("moe-runtime-m6-fc-pdl-late-v1"))?;
+        }
         Ok(grouped)
     }
     pub(crate) fn live_bounds(&self) -> bool { self.live_bounds }
@@ -535,6 +555,53 @@ impl Workspace {
         self.fc_pdl_mode.set(if !enabled {0}
             else if std::env::var("CANADA_SCRATCH_MOE_FC_PDL_M3").as_deref()==Ok("1") {3}else{1});Ok(())
     }
+    fn enable_late_fc_pdl(&mut self,root:&Path)->Result<()> {
+        let alternate=Self::new(&self.cuda,root)?;let c=&alternate.contract;
+        let patch=c.fc1_input_address_overlay.as_ref().context("late FC PDL provenance absent")?;
+        ensure!(self.late_fc_pdl.is_none()&&self.fc_pdl.is_some()&&self.live_bounds
+            &&self.input_address_enabled.get()&&self.scale_codes.is_none()
+            &&(c.rows,c.experts,c.topk,c.scratch_bytes)==(6,384,6,4118728)
+            &&c.kernel_library_sha256=="85a84f6f50286ecc0d716fa11f5a7822126dc8e397ddafff13088d1350461413"
+            &&patch["base_commit"]=="a7d7d29b2ef8869086e0ceaa787321f17544e3c9"
+            &&patch["fc_pdl"]==true&&patch["late_pdl_trigger"]==true&&patch["hoisted_input"]==true
+            &&patch["stages"]==serde_json::json!([2,2])
+            &&patch["files"]["w4a8_phase1.py"]["patched_sha256"]=="1707386b4f8345763655734a7e80a3fa26e4ab8d62b589e87aacc219d48cb3d7"
+            &&patch["files"]["w4a8_phase2.py"]["patched_sha256"]=="3aff59cbaee697abc3ef33177beb3cc996b11d52d31c928edc2bbba89dedc54f"
+            &&c.scratch_bytes==self.contract.scratch_bytes&&c.nodes.len()==self.contract.nodes.len()
+            &&c.nodes.iter().zip(&self.contract.nodes).all(|(a,b)|a.kernel_id==b.kernel_id&&a.scalars==b.scalars&&a.pointers==b.pointers),
+            "unqualified late FC PDL ABI");
+        self.late_fc_pdl=Some(PackedInput{primitives:alternate.primitives,contract:alternate.contract});Ok(())
+    }
+    pub(crate) fn set_late_fc_pdl_for_probe(&self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_LATE_PDL_SCREEN").as_deref()==Ok("1")
+            &&self.late_fc_pdl.is_some()&&self.input_address_enabled.get()&&self.live_bounds
+            &&self.fc_pdl_mode.get()==3&&!self.scale_codes_enabled.get(),"late FC PDL screen admission");
+        self.guard_stream(stream)?;self.late_fc_pdl_enabled.set(enabled);Ok(())
+    }
+    fn enable_cache_ca(&mut self,root:&Path)->Result<()> {
+        let alternate=Self::new(&self.cuda,root)?;let c=&alternate.contract;
+        let patch=c.fc1_input_address_overlay.as_ref().context("MoE cache-ca provenance absent")?;
+        ensure!(self.cache_ca.is_none()&&self.live_bounds
+            &&self.input_address_enabled.get()&&self.scale_codes.is_none()
+            &&(c.rows,c.experts,c.topk,c.scratch_bytes)==(6,384,6,4118728)
+            &&c.kernel_library_sha256=="e68e2711f1603e0b2261c939e67650ea00ae1f9dfffb2b344ea49792214554de"
+            &&patch["base_commit"]=="a7d7d29b2ef8869086e0ceaa787321f17544e3c9"
+            &&patch["fc_pdl"]==false&&patch["async_copy_cache_operator"]=="ca"&&patch["hoisted_input"]==true
+            &&patch["stages"]==serde_json::json!([2,2])
+            &&patch["files"]["w4a8_phase1.py"]["patched_sha256"]=="5192ef5daa86b0f8c70c596d2f9be176f6a3496c32046a60685fd8b304b61509"
+            &&patch["files"]["w4a8_phase2.py"]["patched_sha256"]=="0c9fce39b243676e6754ea1fe111f765b5a993b6d6946ac410301a4663d1c5c3"
+            &&patch["files"]["intrinsics.py"]["patched_sha256"]=="673c83d70fd4b6c365738ad84172b6f0d2352baa2326821a01c2abaad6f1db7f"
+            &&c.scratch_bytes==self.contract.scratch_bytes&&c.nodes.len()==self.contract.nodes.len()
+            &&c.nodes.iter().zip(&self.contract.nodes).all(|(a,b)|a.kernel_id==b.kernel_id&&a.scalars==b.scalars&&a.pointers==b.pointers),
+            "unqualified MoE cache-ca ABI");
+        self.cache_ca=Some(PackedInput{primitives:alternate.primitives,contract:alternate.contract});Ok(())
+    }
+    pub(crate) fn set_cache_ca_for_probe(&self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_CACHE_CA_SCREEN").as_deref()==Ok("1")
+            &&self.cache_ca.is_some()&&self.input_address_enabled.get()&&self.live_bounds
+            &&self.fc_pdl_mode.get()==3&&!self.scale_codes_enabled.get(),"MoE cache-ca screen admission");
+        self.guard_stream(stream)?;self.cache_ca_enabled.set(enabled);Ok(())
+    }
     /// s581 qualified the existing M16 library at live widths8/10/12/16.
     /// Only launch bounds change; scratch capacities and arithmetic stay fixed.
     pub(crate) fn new_live16(cuda: &Cuda, kernels: &Path) -> Result<Self> {
@@ -591,12 +658,20 @@ impl Workspace {
         }
         ensure!(input.len() == self.contract.rows * self.contract.hidden && self.cuda.owns_buffer(input),
             "BF16 MoE operand");
+        if self.late_fc_pdl_enabled.get() {
+            let p=self.late_fc_pdl.as_ref().context("late expert FC PDL plan absent")?;
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
+        }
         if self.fc_pdl_mode.get()==1 || (self.fc_pdl_mode.get()==3 && live==3) {
             let p=self.fc_pdl.as_ref().context("expert FC PDL plan absent")?;
             return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
         }
         if self.scale_codes_enabled.get() {
             let p=self.scale_codes.as_ref().context("expert scale-code plan absent")?;
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
+        }
+        if self.cache_ca_enabled.get() && self.input_address_enabled.get() && live==6 {
+            let p=self.cache_ca.as_ref().context("expert cache-ca plan absent")?;
             return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
         }
         if self.input_address_enabled.get() {

@@ -87,7 +87,8 @@ impl Target {
         prepared.marks.push(("forward_enqueue",enqueue));
         prepared.marks.push(("gpu_completion",completed));
         prepared.marks.push(("candidate_checks",Instant::now()));
-        self.last_head_local_only=self.compact_sampling_active();
+        // enqueue_pair_model always publishes the full M6 vocabulary.
+        self.last_head_local_only=false;
         self.last_append_metrics=Some(AppendMetrics{
             live_rows:prepared.pending.live,physical_rows:self.rows,phase:format!("{:?}",self.source_phase),
             captured_new_graph:captured,engram_split14:false,engram_split14_adaptive:false,

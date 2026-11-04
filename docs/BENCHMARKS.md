@@ -1,5 +1,8 @@
 # Reproducing the published single-stream comparison
 
+The current source release is s1291 (November 4). The published comparison below
+remains the historical s1173 pass; no s1291 benchmark is claimed here.
+
 Run on the **head node**, against its direct loopback endpoint, with no other requests. Use a freshly started model process if measuring the first uncached long prompt. Do not route through a remote client or proxy.
 
 ```sh

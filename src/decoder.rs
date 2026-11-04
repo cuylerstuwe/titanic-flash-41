@@ -178,6 +178,13 @@ struct PairAttentionInput { residual:u64, pre:u64, stream:usize }
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum PairAttention { Ordinary, Defer, Prepared(PairAttentionInput), Projected(PairAttentionInput) }
 impl SwaLayer {
+    pub(crate) fn enable_verify16_ffn_before_capture(&mut self,stream:&Stream)->Result<()> {
+        self.ffn.enable_verify16_overlap_before_capture(stream)?;
+        self.ffn_boundary.enable_verify16_overlap_before_capture(stream)
+    }
+    pub(crate) fn ffn_overlap_flags(&self)->(bool,bool) {
+        (self.ffn.schedule_flags().0,self.ffn_boundary.overlap_active())
+    }
     pub(crate) fn set_verify16_schedule_for_probe(&mut self, mask: u8, stream: &Stream) -> Result<()> {
         ensure!(mask<=3,"M16 FFN overlap component mask");
         if std::env::var("CANADA_SCRATCH_VERIFY16_ATTN_ONLY").as_deref()==Ok("1") {
@@ -1016,6 +1023,15 @@ impl SwaLayer {
         self.attn_boundary.set_two_mma_for_probe(enabled,stream)?;
         self.ffn_boundary.set_two_mma_for_probe(enabled,stream)
     }
+    pub(crate) fn set_wide_mhc_for_probe(&mut self,mode:u8)->Result<()> {
+        self.attn_boundary.set_wide_mhc_for_probe(mode)?;
+        self.ffn_boundary.set_wide_mhc_for_probe(mode)
+    }
+    pub(crate) fn set_wide_epilogues_for_probe(&mut self,enabled:bool,kernels:&Path)->Result<()> {
+        self.attention.set_wide_epilogues_for_probe(enabled,kernels)?;
+        self.attn_boundary.set_wide_epilogues_for_probe(enabled,kernels)?;
+        self.ffn_boundary.set_wide_epilogues_for_probe(enabled,kernels)
+    }
     pub(crate) fn set_mhc_pdl_pair_for_probe(&mut self, mode: u8) -> Result<()> {
         ensure!(mode <= 3, "MHC PDL screen mode");
         for boundary in [&mut self.attn_boundary, &mut self.ffn_boundary] {
@@ -1026,6 +1042,9 @@ impl SwaLayer {
     }
     pub(crate) fn set_append_bf16_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
         self.attention.set_append_bf16_for_probe(enabled,stream)
+    }
+    pub(crate) fn set_woa_prefetch_for_probe(&mut self,enabled:bool)->Result<()> {
+        self.attention.set_woa_prefetch_for_probe(enabled)
     }
     pub(crate) fn set_append_split_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
         self.attention.set_append_split_for_probe(enabled,stream)

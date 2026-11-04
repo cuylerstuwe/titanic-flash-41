@@ -819,6 +819,16 @@ impl Roce {
         );
         unsafe { self.collect_row_prefix(input,output,local_columns,stream,local_columns/4) }
     }
+    /// Exact FP64 payload copy through the same aligned16-byte row-gather
+    /// transport. No conversion or floating-point arithmetic is performed.
+    pub(crate) unsafe fn gather_f64(
+        &self,input:&Buffer<f64>,output:&mut Buffer<f64>,columns:usize,stream:&Stream,
+    )->Result<()> {
+        ensure!(columns>0&&columns%2==0&&input.len()%columns==0
+            &&input.len().checked_mul(4)==Some(output.len())&&self.gather.is_some(),
+            "FP64 bit-copy gather row shape/transport");
+        unsafe{self.collect_row_prefix(input,output,columns,stream,columns/2)}
+    }
     /// Bit-copy into a retained FP32 row without an intermediate output copy.
     /// The complete destination range must fit the same owned allocation.
     pub(crate) unsafe fn gather_f32_at(
@@ -867,7 +877,7 @@ impl Roce {
         self.health()?;
         ensure!(
             (std::mem::size_of::<T>() == 2
-                || (row_packs.is_some() && std::mem::size_of::<T>() == 4))
+                || (row_packs.is_some() && [4,8].contains(&std::mem::size_of::<T>())))
                 && self.cuda.owns_buffer(input)
                 && self.cuda.owns_buffer(output)
                 && self.cuda.owns_stream(stream),

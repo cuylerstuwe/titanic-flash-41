@@ -180,6 +180,9 @@ pub(super) fn run(w: &mut Worker, rank: usize, out: &Path) -> Result<()> {
                 tokens: prompt.clone(),
                 images: Vec::new(),
             })?;
+            if std::env::var("CANADA_SCRATCH_HIERARCHICAL_MODEL_SCREEN").as_deref()==Ok("1") {
+                w.session.as_mut().context("law sampled session")?.set_hierarchical_for_probe(true,&w.stream)?;
+            }
             ensure!(
                 event["cached_tokens"].as_u64() == Some(prompt.len() as u64),
                 "law did not restore the exact prompt"

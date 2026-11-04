@@ -116,6 +116,7 @@ pub(crate) struct GreedySession {
     history_lookup: Option<HistoryLookup>,
     draft_warmed: bool,
     block_verification: bool,
+    local_history_sampling: bool,
     acceptance_temperature_frontiers: usize,
     /// Diagnostic sampler has separate scratch and never supplies emitted tokens.
     reasoning_temperature_probe: Option<Rejection>,
@@ -315,6 +316,7 @@ impl PreparedSession {
             causal_short_rows: 3, stop_token: None, history_lookup: None,
             draft_warmed: false,
             block_verification: false,
+            local_history_sampling:crate::sampler_transport::Policy::from_env()?.local_history,
             acceptance_temperature_frontiers: 0,
             encoder_cache_trace:None,
             buffered_draw_trace:None,
@@ -576,6 +578,18 @@ impl GreedySession {
     pub(crate) fn root_feedback_report(&self)->Result<serde_json::Value> {
         Ok(self.root_feedback.as_ref().ok_or_else(||anyhow::anyhow!("root feedback not prepared"))?.report())
     }
+    pub(crate) fn set_hierarchical_for_probe(&mut self,active:bool,stream:&Stream)->Result<()> {
+        ensure!(!self.poisoned&&self.target_seed.is_some()&&self.rejection.is_some()&&self.block_verification
+            &&self.root_feedback.is_none()&&self.buffered_draw_trace.is_none()&&self.encoder_cache_trace.is_none(),
+            "hierarchical draft requires isolated sampled block mode without full-q diagnostics");
+        self.draft.set_hierarchical_for_probe(active,stream)
+    }
+    pub(crate) fn set_local_history_for_probe(&mut self,active:bool)->Result<()> {
+        ensure!(!self.poisoned&&self.rejection.is_some()
+            &&std::env::var("CANADA_SCRATCH_LOCAL_HISTORY_MODEL_SCREEN").as_deref()==Ok("1"),
+            "finite local history sampler control");
+        self.local_history_sampling=active;Ok(())
+    }
     pub(crate) fn block_verification(&self)->bool {self.block_verification}
     pub(crate) fn conditioning_split(&self)->bool{self.draft.conditioning_split()}
     pub(crate) fn set_markov_cache_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()>{
@@ -645,6 +659,9 @@ impl GreedySession {
             ||std::env::var("CANADA_SCRATCH_ACTIVE_ENCODER_CHECKPOINT_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_INDEX_SCORE_MODEL_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_PEER_PREFILL_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_FFN16_GENERATION_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_FFN32_GENERATION_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_SAMPLER_GENERATION_SCREEN").as_deref()==Ok("1")
             ||(crate::config::history32_probe_enabled()
                 &&std::env::var("CANADA_SCRATCH_HISTORY32_GENERATION_SCREEN").as_deref()==Ok("1"))),
             "history digest requires finite encoder cache screen");
@@ -765,6 +782,12 @@ impl GreedySession {
     pub(crate) fn set_sampler_readout_for_probe(&mut self,mode:u8,stream:&Stream)->Result<()> {
         ensure!(!self.poisoned&&self.rejection.is_some(),"sampled readout requires a valid session");
         self.rejection.as_mut().unwrap().set_readout_for_probe(mode,stream)
+    }
+    pub(crate) fn swap_sampler_for_graph_probe(&mut self,other:&mut Rejection,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_SAMPLER_GENERATION_SCREEN").as_deref()==Ok("1")
+            &&!self.poisoned&&self.cuda.owns_stream(stream)&&self.rejection.is_some(),
+            "sampler switch only at a completed draw");
+        stream.synchronize()?;std::mem::swap(self.rejection.as_mut().unwrap(),other);Ok(())
     }
     pub(crate) fn set_block_progress_for_probe(&mut self,enabled:bool,validate:bool,stream:&Stream)->Result<()> {
         ensure!(!self.poisoned&&self.rejection.is_some()&&self.block_verification,"sampled block progress session");
@@ -1477,8 +1500,12 @@ impl GreedySession {
             let mut block_prefix=None;
             let mut acceptance_expected_lengths=None;
             let mut next_root_temperature=None;
-            let verified_result = target
-                .begin_verification(&verify[..live], comm, stream)
+            let local_history=self.local_history_sampling&&lookup.is_some();
+            let local_target=target.local_target_enabled()&&self.draft.hierarchical_active()
+                &&self.block_verification&&self.target_seed.is_some()&&(lookup.is_none()||local_history)&&!context_tail&&live>1;
+            let verified_result = if local_target {
+                    target.begin_local_verification(&verify[..live],comm,stream)
+                }else{target.begin_verification(&verify[..live],comm,stream)}
                 .and_then(|_| {
                     if self.target_seed.is_none() {
                         // Greedy p is a point mass: accept exactly the matching
@@ -1489,13 +1516,26 @@ impl GreedySession {
                         // the point-mass proposal or is its conditional residual.
                         // Taking the matching prefix and first mismatch/bonus
                         // therefore preserves p without constructing dense q.
-                        target.verification_sample(self.target_seed
-                            .ok_or_else(|| anyhow::anyhow!("lookup needs target sampling"))?, stream)
+                        let seed=self.target_seed.ok_or_else(||anyhow::anyhow!("lookup needs target sampling"))?;
+                        if local_target {
+                            let(logits,rows)=target.pending_local_target_logits()?;
+                            ensure!(rows==live&&local_history,"point-mass target extent");
+                            self.rejection.as_mut().ok_or_else(||anyhow::anyhow!("compact point-mass sampler"))?
+                                .sample_point_mass_sharded(logits,live,seed,start+1,comm,stream)
+                        }else{target.verification_sample(seed,stream)}
                     } else if let Some(rejection) = &mut self.rejection {
-                        let (logits, rows) = target.pending_logits()?;
+                        let (logits, rows) = if local_target{target.pending_local_target_logits()?}else{target.pending_logits()?};
                         ensure!(rows == live, "stochastic verification rows");
                         let sample = if self.block_verification { Rejection::sample_block } else { Rejection::sample };
-                        let draw = sample(rejection,
+                        let draw = if self.draft.hierarchical_active() {
+                            ensure!(self.block_verification,"sharded q requires block rejection");
+                            let(q,selected)=self.draft.sharded_probabilities(live-1)?;
+                            let result=rejection.sample_block_sharded(logits,q,selected,&draft_tokens[..live-1],live,
+                                round_seed.unwrap(),start+1,local_target,comm,stream)?;
+                            if local_target {rejection.capture_root_branch_for_probe(q,live,
+                                self.target_seed.unwrap(),start+1,comm.rank())?;}
+                            result
+                        }else{sample(rejection,
                             logits,
                             self.draft.proposal_probabilities_prefix(live-1)?,
                             &draft_tokens[..live - 1],
@@ -1503,7 +1543,7 @@ impl GreedySession {
                             round_seed.unwrap(),
                             start + 1,
                             stream,
-                        )?;
+                        )?};
                         if let Some(trace)=self.buffered_draw_trace.as_ref().filter(|_|live>1) {
                             let compact=trace.borrow().compact_peer();
                             let detail=trace.borrow().peer_detail();

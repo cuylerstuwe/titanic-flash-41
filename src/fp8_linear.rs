@@ -109,6 +109,11 @@ pub(crate) fn pdl_enabled() -> bool {
 pub(crate) fn narrow_enabled() -> bool {
     std::env::var("CANADA_SCRATCH_FP8_NARROW").as_deref() == Ok("1")
 }
+pub(crate) fn output_projection_probe(rows:usize)->bool {
+    (rows==6 && std::env::var("CANADA_SCRATCH_WO_B_PDL_SCREEN").as_deref()==Ok("1"))
+        || ([6,16].contains(&rows)
+            &&std::env::var("CANADA_SCRATCH_OUTPUT_PROJECTION_SCREEN").as_deref()==Ok("1"))
+}
 pub struct Linear {
     cuda: Cuda,
     stream: Cell<usize>,
@@ -308,7 +313,7 @@ impl Linear {
                                 && f.mma_tiler_mn == [16, 64] && f.quantizer_grid == 128)
                             || (g.rows == 6 && matrix.n == 1280 && matrix.k == 15360
                                 && f.mma_tiler_mn == [16, 64] && f.quantizer_grid == 128)
-                            || (g.rows == 6 && matrix.n == 5120 && matrix.k == 2048
+                            || ([6,16].contains(&g.rows) && matrix.n == 5120 && matrix.k == 2048
                                 && f.mma_tiler_mn == [16, 128] && f.quantizer_grid == 32))
                         && matrix.padded_k == matrix.k
                         && g.quantizer.is_none()
@@ -448,8 +453,8 @@ impl Linear {
         match self.backend {Backend::B12x=>0,Backend::FlashInfer{enable_pdl}=>1+u8::from(enable_pdl)}
     }
     pub(crate) fn set_wo_b_dependency_for_probe(&mut self,enabled:bool)->Result<()> {
-        ensure!(std::env::var("CANADA_SCRATCH_WO_B_PDL_SCREEN").as_deref()==Ok("1")
-            &&self.geometry.rows==6&&(self.matrix.n,self.matrix.k)==(5120,2048)
+        ensure!(output_projection_probe(self.geometry.rows)
+            &&(self.matrix.n,self.matrix.k)==(5120,2048)
             &&matches!(self.backend,Backend::FlashInfer{..}),"WO-B dependency isolation");
         let mode=usize::from(enabled);let entries=&self.primitives.bindings.entries;
         self.quant=find(entries,&format!("flashinfer.mxfp8.quant.pdl{mode}"))?;
@@ -457,15 +462,18 @@ impl Linear {
         self.backend=Backend::FlashInfer{enable_pdl:enabled};Ok(())
     }
     pub(crate) fn wo_b_pdl_for_probe(&self,kernels:&Path)->Result<Self> {
-        ensure!(std::env::var("CANADA_SCRATCH_WO_B_PDL_SCREEN").as_deref()==Ok("1")
-            &&self.geometry.rows==6&&(self.matrix.n,self.matrix.k,self.matrix.padded_k)==(5120,2048,2048)
+        ensure!(output_projection_probe(self.geometry.rows)
+            &&(self.matrix.n,self.matrix.k,self.matrix.padded_k)==(5120,2048,2048)
             &&matches!(self.backend,Backend::B12x),"alternate WO-B geometry");
-        let other=Self::load_shared(&self.cuda,&kernels.join("fp8-flashinfer-wo-b-m6-s809"),self.matrix.clone())?;
+        let bundle=if std::env::var("CANADA_SCRATCH_OUTPUT_PROJECTION_SCREEN").as_deref()==Ok("1") {
+            format!("fp8-flashinfer-wo-b-m{}-fenced-20261102",self.geometry.rows)
+        }else{"fp8-flashinfer-wo-b-m6-s809".to_owned()};
+        let other=Self::load_shared(&self.cuda,&kernels.join(bundle),self.matrix.clone())?;
         ensure!(other.pdl_active(),"WO-B alternate must be the qualified PDL bundle");Ok(other)
     }
     pub(crate) fn swap_wo_b_backend_for_probe(&mut self,other:&mut Self)->Result<()> {
-        ensure!(std::env::var("CANADA_SCRATCH_WO_B_PDL_SCREEN").as_deref()==Ok("1")
-            &&self.geometry.rows==6&&other.geometry.rows==6
+        ensure!(output_projection_probe(self.geometry.rows)
+            &&other.geometry.rows==self.geometry.rows
             &&(self.matrix.n,self.matrix.k,self.matrix.padded_k)==(5120,2048,2048)
             &&Rc::ptr_eq(&self.matrix,&other.matrix)&&(self.wo_b_mode()==0)!=(other.wo_b_mode()==0)
             &&self.values.len()==other.values.len()&&self.scale_mma.len()==other.scale_mma.len()
@@ -619,11 +627,12 @@ impl Linear {
     /// (including joined auxiliary work) and destroyed every referencing graph.
     /// Only then may these same owned buffers be rebound for the next capture.
     pub(crate) unsafe fn release_verify16_probe_binding(&mut self) -> Result<()> {
-        ensure!((std::env::var("CANADA_SCRATCH_VERIFY16_OVERLAP_SCREEN").as_deref()==Ok("1")
+        ensure!(crate::ffn::wide_overlap_probe(self.geometry.rows)
+            || ((std::env::var("CANADA_SCRATCH_VERIFY16_OVERLAP_SCREEN").as_deref()==Ok("1")
                 || std::env::var("CANADA_SCRATCH_GROUPED16_SERIAL_QUERY").as_deref()==Ok("1")
                 || std::env::var("CANADA_SCRATCH_GROUPED16_SERIAL_ATTENTION").as_deref()==Ok("1")
                 || std::env::var("CANADA_SCRATCH_QKV_SCHEDULE_SCREEN").as_deref()==Ok("1"))
-            && self.geometry.rows==16,"isolated idle M16 projection rebind");
+            && self.geometry.rows==16),"isolated idle wide projection rebind");
         self.stream.set(0);
         Ok(())
     }

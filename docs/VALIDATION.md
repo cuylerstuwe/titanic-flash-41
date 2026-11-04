@@ -1,5 +1,73 @@
 # Validation status
 
+## November 4 engine update (s1291)
+
+This source update carries the qualified s1242 engine and its s1291 full-logit
+correctness fix. The CUDA graph cache now distinguishes the number of live rows:
+replaying a capture made for a smaller batch can no longer leave later gathered
+rows stale. It does not change target arithmetic, checkpoint precision or sampling
+settings. The earlier distributed sampler avoids gathering the complete vocabulary
+on its ordinary multirow path; full-logit and greedy consumers still require the
+correct gathered rows.
+
+The accumulated release also includes image-allocation admission and reclaim
+handling, distribution-preserving sharded sampling and fused transport, overlap
+for wide verification and Engram reads, and pipelined weight verification/loading.
+It preserves canonical target weights, FP32 logits, the 2350 MHz profile, the
+8 GiB physical-memory reserve, two full-context request owners, native priority,
+image reuse and Pi-compatible timing. The serving defaults match all 167 native
+model environment settings. Later performance experiments are excluded.
+
+Native qualification before activation:
+
+- All 48 rank/trial combinations matched gathered live rows against the local
+  FP32 logits, with exact rollback state.
+- Six HTTP requests passed greedy and recommended-settings text/image paths,
+  prompt reuse and Pi timing/cache accounting.
+- The underlying s1242 release passed a matched 36-request single-stream panel,
+  followed by focused cancellation/image resubmission, duplicate image reuse,
+  priority, tool and completed coding checks. These are scoped checks, not a
+  general quality score or a new published-client benchmark.
+- Nine installation/recovery fixtures passed, including interrupted installation
+  and rollback. The native activation retains s1242 as its failed-start fallback.
+
+Activation on November 4 freshly rebooted all four GB10s and loaded s1291 once
+per device. All four runtime hashes, the 2350 MHz clock policy and independent
+host-policy recovery guards passed. A synthetic image request through the
+normal external router completed correctly at temperature 1 / top-p 1 / high
+reasoning, with Pi-compatible prefill timings and consistent token accounting.
+The maintenance reservation was released after Ready; the router configuration
+was unchanged.
+
+Portable package checks for this update:
+
+- `cargo check --locked --features serving --all-targets` passed.
+- `cargo test --locked --features serving --lib`: **190 passed, 16 ignored**.
+  Ignored hardware/specialized checks are not counted as passed.
+- **39 Python deployment tests** passed. A new inventory check rejects a missing
+  fenced projection replacement before runtime preparation or verification.
+- All **2,144** bundled artifact hashes and **83** compiled projection mappings
+  were checked. Seven 32-row projection bundles were added with their native
+  executable bytes unchanged and required source/license notices retained.
+- Public source, binaries and metadata were scanned for personal information and
+  secrets. No new private prompts, decoded conversation fixtures or operational
+  configuration are included.
+
+Portable compiled-source fingerprint:
+`9a7a8351482dd691c43d0b3f7f9aed3c2223cde9b5b6c30bddde403203927bf4`.
+Native qualified-source fingerprint:
+`8394bfba7ba369edc643b85fa2be111b2ee841b294923231c3fa7f4e059f520f`.
+They differ because the portable package retains its naming, network/path
+adaptations and package tests. The existing pinned build recipe compiles the
+updated Rust and core CUDA sources; prebuilt projection dependencies are checked
+by the runtime inventory.
+
+This update has **not** repeated the portable Arm64 build and four-node portable
+controller startup. Those were last exercised for s1173 below. The native s1291
+release has separate real-hardware qualification; CPU package checks do not
+establish a new portable GPU run or empty-fleet provisioning result. The README
+benchmark remains explicitly attributed to the November 1 s1173 pass.
+
 ## November 1 engine update (s1173)
 
 The updated engine is active in its qualified four-GB10 deployment. This checkout

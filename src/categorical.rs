@@ -68,7 +68,14 @@ impl Categorical {
         unsafe {self.cuda.read_device(self.uniforms.ptr(),rows*8)}
     }
     pub fn new(cuda: &Cuda, core: &[u8], capacity: usize) -> Result<Self> {
+        Self::with_uniform_allocator(cuda,core,capacity,cuda)
+    }
+    /// The optional control allocator affects CPU-supplied RNG uniforms only;
+    /// GPU-written probabilities, reductions and outputs retain ordinary storage.
+    pub(crate) fn with_uniform_allocator(cuda:&Cuda,core:&[u8],capacity:usize,controls:&Cuda)->Result<Self> {
         ensure!((1..=crate::config::MAX_WIDE_ROWS).contains(&capacity), "categorical row capacity");
+        let uniforms=controls.allocate(capacity)?;
+        ensure!(cuda.owns_buffer(&uniforms),"categorical control allocator context");
         let shared_probability_factors = match std::env::var("CANADA_SCRATCH_SHARED_PROBABILITY_FACTORS") {
             Ok(value) => {
                 ensure!(value == "0" || value == "1", "invalid probability factor policy");
@@ -109,7 +116,7 @@ impl Categorical {
             capacity,
             maxima: cuda.allocate(capacity * TILES)?,
             sums: cuda.allocate(capacity * TILES)?,
-            uniforms: cuda.allocate(capacity)?,
+            uniforms,
             tiles: cuda.allocate(capacity)?,
             fractions: cuda.allocate(capacity)?,
             normalization: cuda.allocate(2 * capacity)?,

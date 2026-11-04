@@ -16,8 +16,17 @@ def module(name, path):
 fleet = module('fleet', ROOT/'deploy/fleet.py')
 pack = module('pack_engram', ROOT/'tools/pack_engram.py')
 download = module('download_model', ROOT/'tools/download_model.py')
+prepare = module('prepare_runtime', ROOT/'tools/prepare_runtime.py')
 
 class DeploymentChecks(unittest.TestCase):
+    def test_runtime_contains_every_compiled_projection_replacement(self):
+        inventory = json.loads((ROOT/'runtime/artifacts.json').read_text())
+        prepare.validate_fenced_bundles(inventory)
+        incomplete = copy.deepcopy(inventory)
+        del incomplete['files']['kernels/fp8-shared-w13-r0-m32-v1-pipeline-fence-v1/manifest.json']
+        with self.assertRaisesRegex(AssertionError, 'missing fenced projection artifact'):
+            prepare.validate_fenced_bundles(incomplete)
+
     def test_vision_distribution_uses_selected_host_and_unchanged_canonical_atlas(self):
         profile = json.loads((ROOT/'deploy/profile.json').read_text())
         self.assertEqual(fleet.vision_encoder_rank(profile), 3)

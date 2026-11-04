@@ -6,7 +6,9 @@ A native Rust inference engine and OpenAI-compatible server for **DeepSeek-V4.1-
 
 The engine includes GPU model execution, speculative decoding, SSD-backed Engram lookup, prompt reuse, streaming tool calls, image input, and native foreground/background scheduling. It admits two requests, each with the full context capacity, and queues additional requests. Rust owns model execution and request scheduling; CUDA and compiled GPU operators perform model arithmetic. Python utilities handle installation and fleet lifecycle.
 
-This checkout carries the **November 1 engine update (s1173)**. Its portable deployment passed focused four-device startup, serving, caching, image-input and timing checks. The benchmark below remeasures the installed native s1173 build after a four-device reboot. See [validation scope](docs/VALIDATION.md), including the remaining empty-fleet provisioning limitation.
+This checkout carries the **November 4 engine update (s1291)**: safer image-memory admission, reduced sampling/transport overhead, wider verification overlap, faster verified weight loading, and a fix for stale full-logit rows when verification width changes. Target precision and recommended sampling settings are preserved. See [release validation](docs/VALIDATION.md) for the native deployment checks and portable-package scope.
+
+The benchmark table below remains the **November 1 s1173 measurement**. It has not been relabeled as a measurement of s1291.
 
 ## Performance
 

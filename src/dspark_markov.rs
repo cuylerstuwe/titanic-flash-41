@@ -52,6 +52,9 @@ pub(crate) struct Markov {
     temperature_index: usize,
     direct_gather: bool,
     categorical: Vec<Categorical>,
+    hierarchical: Option<HierarchicalDraft>,
+    hierarchical_active: bool,
+    staged_inputs: Option<Rc<crate::cuda::MetadataStaging>>,
     proposal_probabilities: Buffer<f64>,
     sampled: bool,
     cuda: Cuda,
@@ -93,7 +96,60 @@ pub(crate) struct Markov {
     ready: bool,
     poisoned: bool,
 }
+struct HierarchicalDraft {
+    draws: Vec<crate::hierarchical_categorical::Hierarchical>,
+    q: Buffer<f64>,
+}
 impl Markov {
+    fn flush_inputs(&self,stream:&Stream)->Result<()>{
+        if let Some(staging)=&self.staged_inputs{unsafe{staging.flush(Some(stream))?;}}
+        Ok(())
+    }
+    pub(crate) fn hierarchical_active(&self)->bool { self.hierarchical_active }
+    pub(crate) fn set_hierarchical_for_probe(&mut self,active:bool,stream:&Stream)->Result<()> {
+        self.guard(stream)?;
+        ensure!(std::env::var("CANADA_SCRATCH_HIERARCHICAL_MODEL_SCREEN").as_deref()==Ok("1")
+            &&self.hierarchical.is_some(),"isolated hierarchical draft control");
+        if self.hierarchical_active!=active {
+            stream.synchronize()?;
+            // Captured kernels refer to either the full-vocab or sharded
+            // sampler buffers. Never replay the other mode's graph.
+            for g in &mut self.graphs {*g=None;}
+            for g in &mut self.prefix_graphs {*g=None;}
+            for g in &mut self.conditional_prefix_graphs {*g=None;}
+            self.history_teacher_graph=None;
+            self.hierarchical_active=active;
+        }
+        self.invalidate_results();Ok(())
+    }
+    pub(crate) fn sharded_probabilities(&self,requested:usize)->Result<(&Buffer<f64>,[u64;5])> {
+        ensure!(self.hierarchical_active&&self.ready&&!self.poisoned&&self.sampled
+            &&requested<=self.produced,"rank-local proposal probabilities unavailable");
+        let h=self.hierarchical.as_ref().unwrap();
+        Ok((&h.q,std::array::from_fn(|i|h.draws[i].selected_q().ptr())))
+    }
+    fn upload_proposal_uniforms(&mut self,seed:u64,position:u64)->Result<()> {
+        ensure!(position.checked_add(5).is_some(),"draft RNG overflow");
+        if self.hierarchical_active {
+            for(step,draw)in self.hierarchical.as_mut().unwrap().draws.iter_mut().enumerate(){
+                draw.upload_uniforms(seed,position+step as u64)?;
+            }
+        }else{
+            for(step,draw)in self.categorical.iter_mut().enumerate(){
+                draw.upload_uniforms(&[uniform(seed,DRAFT_DOMAIN,position+step as u64)])?;
+            }
+        }
+        Ok(())
+    }
+    fn sampled_output(&self,step:usize)->u64 {
+        if self.hierarchical_active{self.hierarchical.as_ref().unwrap().draws[step].output().ptr()}
+        else{self.categorical[step].device_output().ptr()}
+    }
+    fn sampled_errors(&self,step:usize)->u64 {
+        if self.hierarchical_active{self.hierarchical.as_ref().unwrap().draws[step].errors().ptr()}
+        else{self.categorical[step].device_errors().ptr()}
+    }
+
     pub(crate) fn set_strength_for_probe(&mut self,strength:f32,stream:&Stream)->Result<()>{
         self.guard(stream)?;
         ensure!(std::env::var("CANADA_SCRATCH_MARKOV_STRENGTH_SCREEN").as_deref()==Ok("1")
@@ -183,6 +239,13 @@ impl Markov {
             cuda.owns_stream(stream) && weights.in_context(cuda) && rank < 4,
             "DSpark Markov context"
         );
+        let staged=match std::env::var("CANADA_SCRATCH_MARKOV_STAGED_INPUTS"){
+            Ok(value)=>{ensure!(value=="0"||value=="1","invalid Markov input staging policy");value=="1"},
+            Err(std::env::VarError::NotPresent)=>false,Err(error)=>return Err(error.into()),
+        };
+        // Only the CPU-written anchor and hierarchical uniforms use this
+        // storage. Every run synchronizes before the caller can rewrite it.
+        let controls=if staged{unsafe{cuda.staged_metadata_allocator()?}}else{cuda.clone()};
         for (name, shape) in [("embed", vec![129280, 256]), ("head", vec![32320, 256])] {
             let w = weights.view(&format!("mtp.2.markov_head.{name}.weight"))?;
             ensure!(
@@ -263,9 +326,16 @@ impl Markov {
             Err(std::env::VarError::NotPresent)=>true,
             Err(e)=>return Err(e.into()),
         };
+        // Select once, before any graph capture. The cache hint changes neither
+        // canonical BF16 operands nor the FP32 reduction/output boundary.
+        let head_cg=match std::env::var("CANADA_SCRATCH_MARKOV_HEAD_CG") {
+            Ok(v)=>{ensure!(v=="0"||v=="1","invalid Markov head cache policy");v=="1"},
+            Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
+        };
         let fused_head=match std::env::var("CANADA_SCRATCH_MARKOV_FUSED_HEAD") {
             Ok(value)if value=="1"=>{
-                let op=crate::triton_ops::Operator::load(cuda,&kernels.join("draft-markov-gemv-v1"),"markov_head_m1")?;
+                let root=if head_cg {"draft-markov-gemv-cg-v1"}else{"draft-markov-gemv-v1"};
+                let op=crate::triton_ops::Operator::load(cuda,&kernels.join(root),"markov_head_m1")?;
                 ensure!(op.entry.arguments.iter().map(|a|(a.name.as_str(),a.kind.as_str())).collect::<Vec<_>>()
                     ==[("X","*bf16"),("W","*bf16"),("Base","*fp32"),("Y","*fp32")]
                     && op.entry.grid.rows_div==16 && op.entry.grid.x_mul==1 && op.entry.grid.x_add==0
@@ -277,6 +347,7 @@ impl Markov {
             Ok(value)if value=="0"=>None,
             _=>anyhow::bail!("invalid fused Markov head policy"),
         };
+        ensure!(!head_cg||fused_head.is_some(),"Markov cache policy requires fused head");
         let scaled_head=if std::env::var("CANADA_SCRATCH_MARKOV_STRENGTH_SCREEN").as_deref()==Ok("1") {
             ensure!(fused_head.is_some(),"Markov strength requires the fused head");
             let root=kernels.join("draft-markov-scaled-v1");
@@ -346,6 +417,13 @@ impl Markov {
             confidence_fused,
             confidence_terms:cuda.allocate(5)?,
             categorical,
+            hierarchical:if crate::sampler_transport::Policy::from_env()?.hierarchical_draft
+                ||std::env::var("CANADA_SCRATCH_HIERARCHICAL_MODEL_SCREEN").as_deref()==Ok("1") {
+                Some(HierarchicalDraft{draws:(0..5).map(|_|crate::hierarchical_categorical::Hierarchical::with_uniform_allocator(cuda,core,rank,&controls)).collect::<Result<Vec<_>>>()?,
+                    q:cuda.allocate(5*32320)?})
+            }else{None},
+            hierarchical_active:crate::sampler_transport::Policy::from_env()?.hierarchical_draft,
+            staged_inputs:controls.metadata_staging(),
             proposal_probabilities: cuda.allocate(5 * VOCAB)?,
             sampled: false,
             cuda: cuda.clone(),
@@ -366,7 +444,7 @@ impl Markov {
             confidence_gathered_limit: cuda.allocate(16)?,
             last_confidence: None,
             weights,
-            anchor: cuda.allocate(1)?,
+            anchor: controls.allocate(1)?,
             latent: cuda.allocate(256)?,
             errors,
             head,
@@ -420,19 +498,14 @@ impl Markov {
                     position.checked_add(5).is_some(),
                     "draft sampling position overflow"
                 );
-                for (step, sampler) in self.categorical.iter_mut().enumerate() {
-                    sampler.upload_uniforms(&[uniform(
-                        seed,
-                        DRAFT_DOMAIN,
-                        position + step as u64,
-                    )])?;
-                }
+                self.upload_proposal_uniforms(seed,position)?;
             }
             let sampled = sampling.is_some();
             let graph_index = proposal_graph_index(sampled,self.direct_gather,self.temperature_index,
                 self.fused_head_active,self.confidence_fused_active,self.draft_schedule,self.correction_cache_active,self.scaled_head_active);
             self.sampled = sampled;
             stream.join_default()?;
+            self.flush_inputs(stream)?;
             if self.graphs[graph_index].is_none() {
                 self.enqueue(base, post_hc, sampled, comm, stream)?;
                 stream.synchronize()?;
@@ -541,13 +614,13 @@ impl Markov {
     }
     pub(crate) fn root_logits_for_feedback(&self)->Result<&Buffer<f32>> {
         ensure!(std::env::var("CANADA_SCRATCH_ROOT_FEEDBACK_SCREEN").as_deref()==Ok("1")
-            && self.ready && !self.poisoned && self.sampled && self.produced>0,
+            && !self.hierarchical_active && self.ready && !self.poisoned && self.sampled && self.produced>0,
             "completed root draft required for feedback");
         Ok(&self.corrected)
     }
     pub(crate) fn probabilities_prefix(&self,requested:usize) -> Result<&Buffer<f64>> {
         ensure!(
-            self.ready && !self.poisoned && self.sampled && requested<=self.produced,
+            !self.hierarchical_active && self.ready && !self.poisoned && self.sampled && requested<=self.produced,
             "stochastic draft probabilities unavailable"
         );
         Ok(&self.proposal_probabilities)
@@ -594,10 +667,9 @@ impl Markov {
             }
             self.invalidate_results();self.sampled=true;
             self.anchor.upload(&[anchor as i32])?;
-            for(step,sampler)in self.categorical.iter_mut().enumerate(){
-                sampler.upload_uniforms(&[uniform(seed,DRAFT_DOMAIN,position+step as u64)])?;
-            }
+            self.upload_proposal_uniforms(seed,position)?;
             stream.join_default()?;
+            self.flush_inputs(stream)?;
             unsafe{self.prefix_graphs[index].as_ref().unwrap().0.launch(stream)}?;
             stream.synchronize()?;comm.health()?;
             let words=self.readout.download()?;
@@ -645,10 +717,9 @@ impl Markov {
             self.conditional_prefix_graphs[index]=Some((threshold.to_bits(),graph));
         }
         self.invalidate_results();self.sampled=true;self.anchor.upload(&[anchor as i32])?;
-        for(step,sampler)in self.categorical.iter_mut().enumerate(){
-            sampler.upload_uniforms(&[uniform(seed,DRAFT_DOMAIN,position+step as u64)])?;
-        }
+        self.upload_proposal_uniforms(seed,position)?;
         stream.join_default()?;
+        self.flush_inputs(stream)?;
         unsafe{self.conditional_prefix_graphs[index].as_ref().unwrap().1.launch(stream)}?;
         stream.synchronize()?;comm.health()?;
         let words=self.conditional_readout.download()?;
@@ -697,6 +768,7 @@ impl Markov {
         &mut self, base: &Buffer<f32>, post_hc: &Buffer<bf16>, sampled: bool,
         comm: &Roce, stream: &Stream, first: usize, prefix_only: bool, previous_override:Option<u64>,
     ) -> Result<()> {
+        ensure!(!self.hierarchical_active||previous_override.is_none(),"teacher q requires full-vocabulary sampler");
         ensure!((first == 0 || first == 2) && (!prefix_only || first == 0),
             "Markov segment geometry");
         if (first != 0 || prefix_only) && !self.prefix_stop_enabled &&
@@ -715,7 +787,7 @@ impl Markov {
             } else if step == 0 {
                 self.anchor.ptr()
             } else if sampled {
-                self.categorical[step - 1].device_output().ptr()
+                self.sampled_output(step-1)
             } else {
                 self.samplers[step - 1].device_output()?.ptr()
             };
@@ -818,6 +890,12 @@ impl Markov {
                 )
             }?;
             }
+            if sampled&&self.hierarchical_active {
+                let temperature=temperature_at(self.draft_schedule,self.proposal_temperature,step);
+                let h=self.hierarchical.as_mut().unwrap();
+                h.draws[step].enqueue(&self.local,0,&h.q,step,temperature,comm,stream)?;
+                continue;
+            }
             let direct = sampled && self.direct_gather;
             if direct {
                 unsafe { comm.gather_f32_at(&self.local,&mut self.corrected,step*VOCAB,32320,stream) }?;
@@ -870,7 +948,7 @@ impl Markov {
         for step in 0..5 {
             let step=step.min(produced-1);
             pointers.push(if sampled {
-                self.categorical[step].device_output().ptr()
+                self.sampled_output(step)
             } else {
                 self.samplers[step].device_output()?.ptr()
             });
@@ -878,7 +956,7 @@ impl Markov {
         for step in 0..5 {
             let step=step.min(produced-1);
             pointers.push(if sampled {
-                self.categorical[step].device_errors().ptr()
+                self.sampled_errors(step)
             } else {
                 self.samplers[step].device_errors()?.ptr()
             });

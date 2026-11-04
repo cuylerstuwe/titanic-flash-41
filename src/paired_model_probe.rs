@@ -131,7 +131,10 @@ impl Target {
             for target in [&mut *self,&mut *other] {
                 let _scope=target.pair_scopes(comm,stream)?;
                 if pooled_head.is_none(){target.io.run_head(target.late.output(),target.late.pre(),stream)?;}
-                if !target.compact_sampling_active(){target.io.gather_logits(comm,stream)?;}
+                // The paired M6 executor retains its complete target logits.
+                // Solo local-target transport has a separate graph bank and
+                // must not silently alter this executor's output contract.
+                target.io.gather_logits(comm,stream)?;
             }
             Ok(())
         })();

@@ -55,6 +55,30 @@ pub(crate) struct Window {
     _router: Option<Rc<Weights>>,
 }
 impl Window {
+    /// Finite WO-A experiment: immutable canonical FP8/E8M0 bytes only.
+    /// The checkpoint owner outlives the hint and every captured replay.
+    pub(crate) fn new_woa(cuda:&Cuda,module:&Module,parent:&Stream,
+        weights:Rc<Weights>,id:crate::layer_id::LayerId)->Result<Self> {
+        ensure!(std::env::var("CANADA_SCRATCH_WOA_PREFETCH_SCREEN").as_deref()==Ok("1")
+            && !id.is_draft() && cuda.owns_stream(parent) && weights.in_context(cuda),
+            "WO-A hint requires the finite target screen");
+        let key=format!("{}.attn.wo_a",id.prefix());
+        let w=weights.view(&format!("{key}.weight"))?;
+        let s=weights.view(&format!("{key}.scale"))?;
+        ensure!(w.dtype==crate::checkpoint::Dtype::Fp8 && w.shape==[2048,4096]
+            && w.bytes==8*1024*1024 && s.dtype==crate::checkpoint::Dtype::E8m0
+            && s.shape==[64,128] && s.bytes==8192,"WO-A immutable hint extent");
+        let wp=weights.ptr(&format!("{key}.weight"))?;
+        let sp=weights.ptr(&format!("{key}.scale"))?;
+        ensure!(wp%16==0 && sp%16==0,"WO-A hint alignment");
+        let mut segments=cuda.allocate(4)?;
+        segments.upload(&[wp,w.bytes as u64,sp,s.bytes as u64])?;
+        parent.join_default()?;
+        module.function("ca_l2_hint")?;
+        Ok(Self {cuda:cuda.clone(),module:module.clone(),side:cuda.auxiliary_stream(parent)?,
+            parent:parent.raw()as usize,ready:cuda.fence_event()?,done:cuda.fence_event()?,
+            segments,count:2,chunk:16384,open:Cell::new(false),_matrices:Vec::new(),_router:Some(weights)})
+    }
     pub(crate) fn new(
         cuda: &Cuda,
         module: &Module,

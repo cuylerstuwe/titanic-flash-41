@@ -17,6 +17,14 @@ def digest(path):
     with path.open('rb') as f:
         return hashlib.file_digest(f, 'sha256').hexdigest()
 
+def validate_fenced_bundles(inventory):
+    """Require every compiled projection replacement before copying runtime data."""
+    registry = json.loads((ROOT/'src/dense_pipeline_fence_bundles.json').read_text())
+    for directory in set(registry.values()):
+        for name in ('manifest.json', 'bindings.json', 'libcanada_primitives.so'):
+            relative = f'kernels/{directory}/{name}'
+            assert relative in inventory['files'], f'missing fenced projection artifact: {relative}'
+
 def fetch(url, path, expected=None):
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -38,6 +46,7 @@ def main():
     if not a.with_external_woa:
         ap.error('read THIRD_PARTY_NOTICES.md, then use --with-external-woa; this component is required')
     inventory = json.loads((ROOT/'runtime/artifacts.json').read_text())
+    validate_fenced_bundles(inventory)
     for name, expected in inventory['files'].items():
         src = ROOT/'runtime'/name
         assert digest(src) == expected, f'bundled artifact mismatch: {name}'
