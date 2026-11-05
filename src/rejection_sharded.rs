@@ -113,7 +113,8 @@ impl Rejection {
         if local_target {
             let sampler=self.local_targets[live-1].as_mut().unwrap();
             let local=unsafe{logits.view(0,live*32320)}?;
-            if self.bundled_ids{sampler.enqueue_deferred_probabilities(&local,&self.proposals,&self.p,1.,comm,stream)?;}
+            if h.fused_probabilities{sampler.enqueue_deferred_factors(&local,&self.proposals,&self.p,comm,stream)?;}
+            else if self.bundled_ids{sampler.enqueue_deferred_probabilities(&local,&self.proposals,&self.p,1.,comm,stream)?;}
             else{sampler.enqueue_local_probabilities(&local,&self.proposals,&self.p,1.,comm,stream)?;}
         }else {
             self.target.enqueue(logits,0,live,1.,stream)?;
@@ -123,9 +124,11 @@ impl Rejection {
             else{self.target.device_output()};
         if local_target&&self.bundled_ids{
             let target=self.local_targets[live-1].as_ref().unwrap();
+            let local=unsafe{logits.view(0,live*32320)}?;
+            let probabilities=if h.fused_probabilities{Some(target.deferred_probabilities(&local)?)}else{None};
             h.enqueue_deferred(&self.p,q,&self.proposals,&self.accept_u,&self.residual_u,bonus,
                 &self.block_weights,&self.state,&self.output,&self.errors,live,comm,stream,
-                target.local_output(),target.errors())
+                target.local_output(),target.errors(),probabilities)
         }else{
             h.enqueue(&self.p,q,&self.proposals,&self.accept_u,&self.residual_u,bonus,
                 &self.block_weights,&self.state,&self.output,&self.errors,live,comm,stream)

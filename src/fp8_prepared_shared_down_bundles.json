@@ -1,0 +1,14 @@
+{
+  "6": {
+    "bundle": "fp8-prepared-shared-w2-m6-16x64-fenced-v1",
+    "manifest_sha256": "348fb2dd825f6bcd86ded37059e74b67b6888984181e727e37311844d74e8230",
+    "bindings_sha256": "434d520d988d07db7c291fce5f3dfda2d5fc5fa1d7fb76942bd14f8f5bb0401b",
+    "library_sha256": "1d11c3995733001fc5cce48899b9be6d151efac34b7c13d8f6fa031199d07165"
+  },
+  "16": {
+    "bundle": "fp8-prepared-shared-w2-m16-16x64-fenced-v1",
+    "manifest_sha256": "41f06cf05899f65801bcc4f45f0e6cff57bd8e339386ee657a6db89db5891ce0",
+    "bindings_sha256": "405eeee91781ccf7beb9c58f3500b1b4421864a1cbc992d2f63a03b3c073912b",
+    "library_sha256": "f3c905d72021161e68c929bb03ed0cbf1379591de25769611d50273393c31c05"
+  }
+}

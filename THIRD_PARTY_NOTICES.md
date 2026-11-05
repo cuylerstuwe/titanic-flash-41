@@ -23,6 +23,8 @@ This software contains source code provided by NVIDIA Corporation. NVIDIA CUDA c
 
 The runtime requires the low-level lossless W8 WO-A operator from [MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks), revision `64b02dea8681fb1d8e3a659ea432a8e9e9ba3995`. It is **AGPL-3.0**, with the text retained in [licenses/Mia-AGPL-3.0-external.txt](licenses/Mia-AGPL-3.0-external.txt). It is compiled together with the separately licensed SGLang reduction/quantization operator. `tools/prepare_runtime.py --with-external-woa` fetches pinned source and licenses into the local data directory and compiles the operators there.
 
+The setup now also builds the M16/M32 compact WO-A specialization from that same pinned source, with FP32 partial accumulation and one BF16 output rounding. Its four kernels are verified alongside the fourteen small-row operators. The build recipe is in `tools/build_external_woa_mid.py`.
+
 The AGPL source and its compiled WO-A binaries are **not included in this Git repository**. Separate acquisition is not a statement that AGPL obligations disappear: use, modification, network service and redistribution of a combined deployment must respect the applicable licenses. No claim is made that the whole application can be distributed under a permissive license. Other optional AGPL kernel experiments are not part of this release.
 
 ## Rust dependencies and modifications

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 static HOST_WORKSPACE_RESERVED: AtomicUsize = AtomicUsize::new(0);
 #[path = "memory_image_storage.rs"]
 mod image_storage;
-pub(crate) use image_storage::{ImageStorageCharge, allocate_image_storage};
+pub(crate) use image_storage::{ImageStorageCharge, allocate_image_storage,retained_image_bytes};
 
 /// Release only allocator-free host pages. Live token histories, model state,
 /// immutable caches and CUDA allocations retain their storage and addresses.
@@ -123,6 +123,25 @@ fn field(text: &str, key: &str, kib: bool) -> Result<usize> {
 fn bounded_headroom(limit: usize, current: usize, inactive: usize) -> usize {
     limit.saturating_sub(current.saturating_sub(inactive.min(current)))
 }
+/// Failure diagnostics only. These pages are not credited to admission: usable
+/// reclamation above the existing reserve must be demonstrated separately.
+pub(crate) fn percpu_free_bytes() -> Option<usize> {
+    let text = std::fs::read_to_string("/proc/zoneinfo").ok()?;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 { return None; }
+    parse_percpu_free(&text, page as usize)
+}
+fn parse_percpu_free(text: &str, page: usize) -> Option<usize> {
+    let mut count = None;
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        if words.next() != Some("count:") { continue; }
+        let pages = words.next()?.parse::<usize>().ok()?;
+        if words.next().is_some() { return None; }
+        count = Some(count.unwrap_or(0usize).checked_add(pages)?);
+    }
+    count?.checked_mul(page)
+}
 impl Available {
     pub(crate) fn gb10(cuda_immediately_free: usize, cuda_total: usize) -> Result<Self> {
         let proc = std::fs::read_to_string("/proc/meminfo")?;
@@ -179,6 +198,16 @@ impl Available {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn percpu_diagnostic_counts_zones_without_changing_admission() {
+        let zones = "Node 0, zone DMA\n pagesets\n cpu: 0\n count: 2\n high: 9\n cpu: 1\n count: 3\nNode 0, zone Normal\n cpu: 0\n count: 5\n";
+        assert_eq!(parse_percpu_free(zones, 4096), Some(10 * 4096));
+        assert_eq!(parse_percpu_free("count: 0\n", 4096), Some(0));
+        assert_eq!(parse_percpu_free("high: 8\n", 4096), None);
+        assert_eq!(parse_percpu_free("count: invalid\n", 4096), None);
+        assert_eq!(parse_percpu_free("count: 1 extra\n", 4096), None);
+        assert_eq!(parse_percpu_free(&format!("count: {}\n", usize::MAX), 4096), None);
+    }
     #[cfg(target_os = "linux")]
     #[test]
     fn zero_buffer_commit_backs_unaligned_first_and_last_pages() {

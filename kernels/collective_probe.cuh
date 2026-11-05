@@ -77,6 +77,18 @@ extern "C" __global__ void ca_sequence_check(const __nv_bfloat16* y,const uint32
 }
 extern "C" __global__ void ca_sequence_advance(uint32_t* epoch){if(threadIdx.x==0)++*epoch;}
 
+// Flat rank-major gather oracle for arbitrary byte extents. The older
+// ca_sequence_check intentionally uses 5120-column model rows instead.
+extern "C" __global__ void ca_posting_check(const __nv_bfloat16* y,const uint32_t* epoch,
+ uint32_t* stats,int n,int pattern,int unused) {
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n*4)return;
+ uint16_t actual=__bfloat16_as_ushort(y[i]);
+ uint16_t expected=__bfloat16_as_ushort(__float2bfloat16_rn(ca_sequence_value(i%n,i/n,*epoch,pattern)));
+ if(actual!=expected){atomicAdd(stats,1u);
+  if(atomicCAS(stats+2,0xffffffffu,uint32_t(i))==0xffffffffu){stats[3]=actual;stats[4]=expected;stats[5]=*epoch;}
+ }
+}
+
 // Encoded FP4 fixtures for score-buffer ownership tests. No CPU model arithmetic.
 extern "C" __global__ void ca_mqa_score_pool_fixture(
  unsigned char* q,int* qs,float* qw,unsigned char* k,int* ks,int rows,int keys,int phase){

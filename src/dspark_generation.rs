@@ -30,6 +30,9 @@ pub(crate) fn serving_causal_three_threshold() -> Result<f32> {
 mod pair_probe;
 #[path = "matched_path_session.rs"]
 mod matched_path_session;
+#[path="query_reuse_generation_probe.rs"]
+mod query_reuse_probe;
+pub(crate) use query_reuse_probe::QueryReuseWorkspace;
 
 /// A short block of n rows contains the anchor and proposals1..n-1.
 /// Confidence n precedes proposal n and uses only that included prefix.
@@ -38,6 +41,13 @@ fn causal_prefix_rows(confidence: &[f32; 5], threshold: f32, short_rows: usize, 
     assert!((2..=5).contains(&short_rows));
     let cumulative: f32 = confidence[..short_rows].iter().product();
     if cumulative < threshold { limit.min(short_rows) } else { limit }
+}
+
+/// M2 uses only confidence0/1, before observing the excluded second proposal.
+/// If that boundary passes, retain the established causal M3/M6 choice.
+fn causal_two_three_rows(confidence:&[f32;5], two:f32, three:f32, limit:usize)->usize {
+    if confidence[0]*confidence[1]<two {limit.min(2)}
+    else {causal_prefix_rows(confidence,three,3,limit)}
 }
 
 /// Each confidence precedes the proposal it would admit. Stop at the first
@@ -56,7 +66,21 @@ fn causal_full_prefix_rows(confidence: &[f32; 5], threshold: f32, limit: usize) 
 
 #[cfg(test)]
 mod causal_depth_tests {
-    use super::{causal_prefix_rows, causal_full_prefix_rows};
+    use super::{causal_prefix_rows, causal_full_prefix_rows, causal_two_three_rows};
+    #[test]
+    fn two_three_stopping_boundary_ignores_excluded_draws_and_future_confidences() {
+        for tail in [[0.,0.,0.],[1.,1.,1.],[f32::NAN,f32::INFINITY,-1.]] {
+            for limit in 1..=6 {
+                assert_eq!(causal_two_three_rows(&[0.4,0.5,tail[0],tail[1],tail[2]],0.25,0.25,limit),limit.min(2));
+            }
+        }
+        for tail in [[0.,0.],[1.,1.],[f32::NAN,f32::INFINITY]] {
+            for limit in 1..=6 {
+                assert_eq!(causal_two_three_rows(&[0.8,0.5,0.5,tail[0],tail[1]],0.25,0.25,limit),limit.min(3));
+                assert_eq!(causal_two_three_rows(&[0.8,0.8,0.8,tail[0],tail[1]],0.25,0.25,limit),limit);
+            }
+        }
+    }
     #[test]
     fn full_prefix_stops_before_excluded_future_confidences() {
         for tail in [[0., 0., 0.], [1., 1., 1.], [f32::NAN, f32::INFINITY, -1.]] {
@@ -110,11 +134,15 @@ pub(crate) struct GreedySession {
     rejection: Option<Rejection>,
     stochastic_prefix_schedule: bool,
     causal_three_threshold: Option<f32>,
+    causal_two_threshold: Option<f32>,
     causal_full_threshold: Option<f32>,
     causal_short_rows: usize,
     stop_token: Option<u32>,
     history_lookup: Option<HistoryLookup>,
     draft_warmed: bool,
+    /// Process policy, independent of accepted causal state and cache images.
+    skip_unused_draft: bool,
+    launch_flags:crate::launch_flags::SessionFlags,
     block_verification: bool,
     local_history_sampling: bool,
     acceptance_temperature_frontiers: usize,
@@ -237,14 +265,14 @@ pub(crate) fn new_history_lookup(cuda:&Cuda,context:usize,prefix:&[u32])->Result
 #[derive(Clone)]
 pub(crate) struct ProposalPolicyImage {
     owner:Rc<()>,target_seed:Option<u64>,stop_token:Option<u32>,draft_warmed:bool,
-    causal_three_threshold:Option<f32>,causal_full_threshold:Option<f32>,causal_short_rows:usize,
+    causal_three_threshold:Option<f32>,causal_two_threshold:Option<f32>,causal_full_threshold:Option<f32>,causal_short_rows:usize,
     block_verification:bool,draft_temperature:f32,conditioning_split:bool,acceptance_temperature_frontiers:usize,
 }
 #[cfg(feature = "storage-fault-injection")]
 impl ProposalPolicyImage {
     pub(crate) fn retention_metadata(&self)->serde_json::Value {
         serde_json::json!({"target_seed":self.target_seed,"stop_token":self.stop_token,
-            "draft_warmed":self.draft_warmed,"causal_three_threshold":self.causal_three_threshold,
+            "draft_warmed":self.draft_warmed,"causal_three_threshold":self.causal_three_threshold,"causal_two_threshold":self.causal_two_threshold,
             "causal_full_threshold":self.causal_full_threshold,"causal_short_rows":self.causal_short_rows,
             "block_verification":self.block_verification,"draft_temperature":self.draft_temperature,
             "conditioning_split":self.conditioning_split,"acceptance_temperature_frontiers":self.acceptance_temperature_frontiers})
@@ -312,9 +340,15 @@ impl PreparedSession {
             features: Features::new(cuda, core, 6)?,
             prefill_features: Features::new(cuda, core, 128)?,
             poisoned: false, target_seed: None, stochastic_prefix_schedule,
-            causal_three_threshold: None, causal_full_threshold: None,
+            causal_three_threshold: None, causal_two_threshold: None, causal_full_threshold: None,
             causal_short_rows: 3, stop_token: None, history_lookup: None,
             draft_warmed: false,
+            skip_unused_draft: match std::env::var("CANADA_SCRATCH_SKIP_UNUSED_DRAFT") {
+                Ok(value) => { ensure!(value=="0"||value=="1","skip-unused-draft flag"); value=="1" },
+                Err(std::env::VarError::NotPresent) => false,
+                Err(error) => return Err(error.into()),
+            },
+            launch_flags:crate::launch_flags::SessionFlags::from_env(),
             block_verification: false,
             local_history_sampling:crate::sampler_transport::Policy::from_env()?.local_history,
             acceptance_temperature_frontiers: 0,
@@ -358,6 +392,7 @@ pub(crate) struct StateImage {
     history_lookup: Option<HistoryLookup>,
     draft_warmed: bool,
     causal_three_threshold: Option<f32>,
+    causal_two_threshold: Option<f32>,
     causal_full_threshold: Option<f32>,
     causal_short_rows: usize,
     block_verification: bool,
@@ -378,7 +413,7 @@ impl StateImage {
         Ok(serde_json::json!({"target":self.target.digest()?,"draft":self.draft.digest()?,
             "causal_history":self.target.causal_history(),"anchor":self.anchor,
             "seed":self.target_seed,"stop_token":self.stop_token,"draft_warmed":self.draft_warmed,
-            "causal_three_threshold":self.causal_three_threshold,
+            "causal_three_threshold":self.causal_three_threshold,"causal_two_threshold":self.causal_two_threshold,
             "causal_full_threshold":self.causal_full_threshold,
             "causal_short_rows":self.causal_short_rows,
             "block_verification":self.block_verification,"draft_temperature":self.draft_temperature,"conditioning_split":self.conditioning_split,
@@ -621,6 +656,7 @@ impl GreedySession {
         ensure!(!self.poisoned,"proposal policy snapshot needs a healthy owner");
         Ok(ProposalPolicyImage{owner:self.image_owner.clone(),target_seed:self.target_seed,stop_token:self.stop_token,
             draft_warmed:self.draft_warmed,causal_three_threshold:self.causal_three_threshold,
+            causal_two_threshold:self.causal_two_threshold,
             causal_full_threshold:self.causal_full_threshold,causal_short_rows:self.causal_short_rows,
             block_verification:self.block_verification,draft_temperature:self.draft.draft_temperature(),
             conditioning_split:self.draft.conditioning_split(),acceptance_temperature_frontiers:self.acceptance_temperature_frontiers})
@@ -631,6 +667,7 @@ impl GreedySession {
         self.draft.set_conditioning_split(saved.conditioning_split,stream)?;
         self.target_seed=saved.target_seed;self.stop_token=saved.stop_token;self.draft_warmed=saved.draft_warmed;
         self.causal_three_threshold=saved.causal_three_threshold;self.causal_full_threshold=saved.causal_full_threshold;
+        self.causal_two_threshold=saved.causal_two_threshold;
         self.causal_short_rows=saved.causal_short_rows;self.block_verification=saved.block_verification;
         self.acceptance_temperature_frontiers=saved.acceptance_temperature_frontiers;Ok(())
     }
@@ -640,7 +677,7 @@ impl GreedySession {
             "proposal policy report requires encoder cache screen");
         Ok(serde_json::json!({"warmed":self.draft_warmed,"graphs_ready":self.draft.sampled_graphs_ready(),
             "temperature":self.draft.draft_temperature(),"split":self.draft.conditioning_split(),
-            "three_threshold":self.causal_three_threshold,"full_threshold":self.causal_full_threshold,
+            "three_threshold":self.causal_three_threshold,"two_threshold":self.causal_two_threshold,"full_threshold":self.causal_full_threshold,
             "short_rows":self.causal_short_rows,"seed":self.target_seed,"stop":self.stop_token,
             "acceptance_ordinal":self.acceptance_temperature_frontiers,"block":self.block_verification}))
     }
@@ -656,12 +693,23 @@ impl GreedySession {
     }
     pub(crate) fn history_lookup_digest_for_probe(&self)->Result<Option<String>> {
         ensure!(!self.poisoned&&(std::env::var("CANADA_SCRATCH_ENCODER_CACHE_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_PREFILL_HEAD_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_FFN_HINT_MODEL_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_SHARDED_PREFIX_NATIVE_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_UNUSED_DRAFT_SCREEN").as_deref()==Ok("1")
+            ||std::env::var_os("CANADA_SCRATCH_CACHE_SLOTS_SCREEN").is_some()
+            ||std::env::var_os("CANADA_SCRATCH_FORWARD_CACHE_SCREEN").is_some()
+            ||std::env::var("CANADA_SCRATCH_IDLE_ANCHOR_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_ENCODER_RECYCLE_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_STATE_COPY_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_ACTIVE_ENCODER_CHECKPOINT_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_INDEX_SCORE_MODEL_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_PEER_PREFILL_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_FFN16_GENERATION_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_FFN32_GENERATION_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_SAMPLER_GENERATION_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_FFN_SUM_SHARED_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_APPEND_LAST_GATHER_SCREEN").as_deref()==Ok("1")
             ||(crate::config::history32_probe_enabled()
                 &&std::env::var("CANADA_SCRATCH_HISTORY32_GENERATION_SCREEN").as_deref()==Ok("1"))),
             "history digest requires finite encoder cache screen");
@@ -669,6 +717,17 @@ impl GreedySession {
     }
     pub(crate) fn conditioning_state_digest_for_probe(&mut self,comm:&Roce,stream:&Stream)->Result<String>{
         ensure!(!self.poisoned&&(std::env::var("CANADA_SCRATCH_CONDITIONING_AB").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_PREFILL_HEAD_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_FFN_HINT_MODEL_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_FFN_SUM_SHARED_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_APPEND_LAST_GATHER_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_SHARDED_PREFIX_NATIVE_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_UNUSED_DRAFT_SCREEN").as_deref()==Ok("1")
+            ||std::env::var_os("CANADA_SCRATCH_CACHE_SLOTS_SCREEN").is_some()
+            ||std::env::var_os("CANADA_SCRATCH_FORWARD_CACHE_SCREEN").is_some()
+            ||std::env::var("CANADA_SCRATCH_IDLE_ANCHOR_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_ENCODER_RECYCLE_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_STATE_COPY_SCREEN").as_deref()==Ok("1")
             || std::env::var("CANADA_SCRATCH_ENCODER_CHECKPOINT_SCREEN").as_deref()==Ok("1")
             || std::env::var("CANADA_SCRATCH_ENCODER_CACHE_SCREEN").as_deref()==Ok("1")
             || std::env::var("CANADA_SCRATCH_ACTIVE_ENCODER_CHECKPOINT_SCREEN").as_deref()==Ok("1")
@@ -676,6 +735,12 @@ impl GreedySession {
             || std::env::var("CANADA_SCRATCH_LONG_HISTORY_GENERATION").as_deref()==Ok("1")),
             "conditioning state digest requires isolated comparison");
         self.draft.save_state_image(4*1024*1024,comm,stream)?.digest()
+    }
+    pub(crate) fn accepted_conditioning_state_for_probe(&self,stream:&Stream)->Result<serde_json::Value>{
+        ensure!(!self.poisoned&&(std::env::var("CANADA_SCRATCH_UNUSED_DRAFT_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_QUERY_REUSE_SCREEN").as_deref()==Ok("1")),
+            "accepted conditioning diagnostic requires unused-draft screen");
+        self.draft.accepted_repeat_digest(stream)
     }
     pub(crate) fn probe_copy_conditioning(&self,core:&[u8],kernels:&Path,comm:&Roce,stream:&Stream)
         ->Result<serde_json::Value>{
@@ -1049,6 +1114,20 @@ impl GreedySession {
         self.profile_verify = true;
         Ok(())
     }
+    /// Isolated experiment: an additional causal stop before the second draft.
+    /// Keep the existing three/five-proposal generator and actual-q verifier.
+    /// Unused later draws are discarded; no future confidence selects M2.
+    pub(crate) fn set_causal_two_three_for_probe(&mut self, threshold: Option<f32>) -> Result<()> {
+        ensure!(!self.poisoned && self.rejection.is_some() && self.target_seed.is_some()
+            && self.block_verification && !self.stochastic_prefix_schedule
+            && self.causal_three_threshold==Some(0.25) && self.causal_short_rows==3
+            && self.causal_full_threshold.is_none()
+            && threshold.is_none_or(|v|v==0.25)
+            && std::env::var("CANADA_SCRATCH_CAUSAL_TWO_THREE_SCREEN").as_deref()==Ok("1"),
+            "two/three-row policy requires isolated canonical sampled screen");
+        self.causal_two_threshold=threshold;
+        Ok(())
+    }
     pub(crate) fn set_causal_three_threshold_for_probe(&mut self, threshold: Option<f32>) -> Result<()> {
         self.set_causal_depth_for_probe(3, threshold)
     }
@@ -1067,6 +1146,7 @@ impl GreedySession {
             && (rows==3 || std::env::var("CANADA_SCRATCH_CAUSAL_DEPTH_SCREEN").as_deref()==Ok("1")),
             "causal depth policy requires the isolated stochastic screen");
         self.causal_three_threshold = threshold;
+        self.causal_two_threshold = None;
         self.causal_full_threshold = None;
         self.causal_short_rows = rows;
         Ok(())
@@ -1117,6 +1197,7 @@ impl GreedySession {
             anchor, target_seed: self.target_seed, stop_token: self.stop_token,
             history_lookup: self.history_lookup.as_ref().map(HistoryLookup::clone_reserved), draft_warmed: self.draft_warmed,
             causal_three_threshold: self.causal_three_threshold, causal_short_rows: self.causal_short_rows,
+            causal_two_threshold: self.causal_two_threshold,
             causal_full_threshold: self.causal_full_threshold,
             block_verification:self.block_verification,draft_temperature:self.draft.draft_temperature(),
             conditioning_split:self.draft.conditioning_split(),
@@ -1160,6 +1241,7 @@ impl GreedySession {
         std::mem::swap(&mut self.history_lookup,&mut saved.history_lookup);
         std::mem::swap(&mut self.draft_warmed,&mut saved.draft_warmed);
         std::mem::swap(&mut self.causal_three_threshold,&mut saved.causal_three_threshold);
+        std::mem::swap(&mut self.causal_two_threshold,&mut saved.causal_two_threshold);
         std::mem::swap(&mut self.causal_full_threshold,&mut saved.causal_full_threshold);
         std::mem::swap(&mut self.causal_short_rows,&mut saved.causal_short_rows);
         std::mem::swap(&mut self.block_verification,&mut saved.block_verification);
@@ -1189,6 +1271,7 @@ impl GreedySession {
         self.history_lookup = lookup;
         self.draft_warmed = saved.draft_warmed;
         self.causal_three_threshold = saved.causal_three_threshold;
+        self.causal_two_threshold = saved.causal_two_threshold;
         self.causal_full_threshold = saved.causal_full_threshold;
         self.causal_short_rows = saved.causal_short_rows;
         self.acceptance_temperature_frontiers = saved.acceptance_temperature_frontiers;
@@ -1225,11 +1308,26 @@ impl GreedySession {
     pub(crate) fn configure_history_policy_for_probe(&mut self, minimum: Option<usize>) -> Result<()> {
         ensure!(!self.poisoned && self.block_verification && self.target_seed.is_some()
             && (std::env::var("CANADA_SCRATCH_HISTORY_POLICY_SCREEN").as_deref()==Ok("1")
+                || std::env::var("CANADA_SCRATCH_SOLO_ECONOMICS_SCREEN").as_deref()==Ok("1")
+                || std::env::var("CANADA_SCRATCH_EXPERT_PREFETCH_SCREEN").as_deref()==Ok("1")
                 || std::env::var("CANADA_SCRATCH_DRAFT_TEMPERATURE_SCREEN").as_deref()==Ok("1")
                 || std::env::var("CANADA_SCRATCH_LONG_HISTORY_GENERATION").as_deref()==Ok("1")),
             "history policy override requires the isolated block/T1 screen");
         self.history_lookup.as_mut().ok_or_else(||anyhow::anyhow!("history policy needs a lookup"))?
             .set_minimum_match(minimum)
+    }
+    pub(crate) fn expert_prefetch_inputs_for_probe(&mut self,target:&Target,anchor:u32,seed:u64,
+        comm:&Roce,stream:&Stream)->Result<[u32;6]> {
+        ensure!(!self.poisoned&&self.block_verification&&self.target_seed.is_some()
+            &&self.draft.position()?==target.position()&&target.profile_is_current()
+            &&std::env::var("CANADA_SCRATCH_EXPERT_PREFETCH_SCREEN").as_deref()==Ok("1"),
+            "expert hint fixed proposals need committed sampled frontier");
+        let before=self.draft.accepted_repeat_digest(stream)?;
+        self.draft.run(anchor,comm,stream)?;
+        let mut inputs=[anchor;6];
+        inputs[1..].copy_from_slice(&self.draft.stochastic_proposals(seed,comm,stream)?);
+        ensure!(self.draft.accepted_repeat_digest(stream)?==before,"hint proposals changed accepted draft state");
+        Ok(inputs)
     }
     pub(crate) fn configure_history_strong_backup_for_probe(&mut self,enabled:bool)->Result<()> {
         ensure!(!self.poisoned&&self.block_verification&&self.target_seed.is_some()
@@ -1302,7 +1400,7 @@ impl GreedySession {
         buffers:&mut LongHistoryBuffers,anchor:u32,limit:usize,comm:&Roce,stream:&Stream)->Result<Option<Step>> {
         match longer.physical_rows() {
             16=>self.try_history_block::<16>(target,longer,buffers,anchor,limit,comm,stream),
-            32 if crate::config::history32_enabled()=>
+            32 if self.launch_flags.history32=>
                 self.try_history_block::<32>(target,longer,buffers,anchor,limit,comm,stream),
             _=>anyhow::bail!("long history target geometry is not enabled"),
         }
@@ -1310,7 +1408,7 @@ impl GreedySession {
     #[allow(clippy::too_many_arguments)]
     fn try_history_block<const ROWS:usize>(&mut self,target:&mut Target,longer:&mut Target,
         buffers:&mut LongHistoryBuffers,anchor:u32,limit:usize,comm:&Roce,stream:&Stream)->Result<Option<Step>> {
-        ensure!(std::env::var("CANADA_SCRATCH_LONG_HISTORY_GENERATION").as_deref()==Ok("1")
+        ensure!(self.launch_flags.long_history
             && !self.poisoned && target.physical_rows()==6 && longer.physical_rows()==ROWS && buffers.rows==ROWS
             && target.profile_is_current() && target.position()==self.draft.position()?,
             "long history session frontier/profile");
@@ -1381,6 +1479,13 @@ impl GreedySession {
         ensure!(!self.poisoned,"prefix policy switch on poisoned session");
         self.draft.set_prefix_stop_for_probe(enabled,stream)
     }
+    pub(crate) fn set_skip_unused_draft_for_probe(&mut self, enabled: bool) -> Result<()> {
+        ensure!(!self.poisoned
+            && std::env::var("CANADA_SCRATCH_UNUSED_DRAFT_SCREEN").as_deref()==Ok("1"),
+            "unused draft override requires finite screen");
+        self.skip_unused_draft=enabled;
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn step_with_profile_barrier(
         &mut self,
@@ -1404,6 +1509,10 @@ impl GreedySession {
         // target draws instead; no draft probabilities are used at this edge.
         let context_tail = target.context_capacity().saturating_sub(start as usize)
             < crate::dspark_kv::QUERY_ROWS;
+        // At a one-row boundary no proposal can be accepted. Reuse the
+        // context-tail target draw, still committing target features into
+        // drafter KV below so a cached continuation has complete causal state.
+        let target_only = context_tail || (self.skip_unused_draft && limit==1);
         self.poisoned = true;
         let result = (|| {
             let begin = Instant::now();
@@ -1416,12 +1525,12 @@ impl GreedySession {
             // be reused without an otherwise unnecessary neural draft.
             let fallback_warm=self.draft_warmed
                 || (self.target_seed.is_some() && self.draft.sampled_graphs_ready());
-            let lookup = if fallback_warm && !context_tail {
+            let lookup = if fallback_warm && !target_only {
                 self.history_lookup.as_ref()
                     .map(|history| history.propose(start, anchor)).transpose()?.flatten()
             } else { None };
             let mut acceptance_temperature_probe=None;
-            let (draft_tokens, draft_confidence, scheduled_rows, produced_proposals) = if context_tail {
+            let (draft_tokens, draft_confidence, scheduled_rows, produced_proposals) = if target_only {
                 ([anchor; 5], None, 1, 0)
             } else if let Some(proposal) = &lookup {
                 // History-only deterministic proposals have point-mass q.
@@ -1435,7 +1544,7 @@ impl GreedySession {
                         round_seed.ok_or_else(||anyhow::anyhow!("reasoning probe needs seeded sampling"))?,comm,stream)?);
                 }
                 if self.acceptance_temperature_frontiers<24
-                    && std::env::var("CANADA_SCRATCH_ACCEPTANCE_TEMPERATURE_SCREEN").as_deref()==Ok("1") {
+                    && self.launch_flags.acceptance_temperature_screen {
                     acceptance_temperature_probe=Some(self.probe_acceptance_temperatures(target,anchor,
                         round_seed.ok_or_else(||anyhow::anyhow!("temperature probe needs seeded sampling"))?,comm,stream)?);
                 }
@@ -1458,7 +1567,7 @@ impl GreedySession {
             // Cumulative products cannot recover after crossing the threshold;
             // inclusion of proposal j is thus decided before observing it.
             // At that stopping boundary, the bonus is a fresh target draw.
-            let live = if context_tail {
+            let live = if target_only {
                 1
             } else if lookup.is_some() {
                 limit
@@ -1469,7 +1578,11 @@ impl GreedySession {
             } else if let Some(threshold) = self.causal_three_threshold {
                 let confidence = draft_confidence
                     .ok_or_else(|| anyhow::anyhow!("causal depth needs current draft confidence"))?;
-                causal_prefix_rows(&confidence, threshold, self.causal_short_rows, limit)
+                if let Some(two)=self.causal_two_threshold {
+                    causal_two_three_rows(&confidence,two,threshold,limit)
+                } else {
+                    causal_prefix_rows(&confidence, threshold, self.causal_short_rows, limit)
+                }
             } else if self.rejection.is_some() && !self.stochastic_prefix_schedule {
                 limit
             } else {
@@ -1502,7 +1615,7 @@ impl GreedySession {
             let mut next_root_temperature=None;
             let local_history=self.local_history_sampling&&lookup.is_some();
             let local_target=target.local_target_enabled()&&self.draft.hierarchical_active()
-                &&self.block_verification&&self.target_seed.is_some()&&(lookup.is_none()||local_history)&&!context_tail&&live>1;
+                &&self.block_verification&&self.target_seed.is_some()&&(lookup.is_none()||local_history)&&!target_only&&live>1;
             let verified_result = if local_target {
                     target.begin_local_verification(&verify[..live],comm,stream)
                 }else{target.begin_verification(&verify[..live],comm,stream)}
@@ -1511,7 +1624,7 @@ impl GreedySession {
                         // Greedy p is a point mass: accept exactly the matching
                         // target-argmax prefix, with its first mismatch as bonus.
                         target.verification_greedy(stream)
-                    } else if lookup.is_some() || context_tail {
+                    } else if lookup.is_some() || target_only {
                         // An independent categorical target draw either equals
                         // the point-mass proposal or is its conditional residual.
                         // Taking the matching prefix and first mismatch/bonus
@@ -1551,7 +1664,7 @@ impl GreedySession {
                             let mut sources:Vec<_>=if compact {Vec::new()}else{
                                 rejection.buffered_draw_sources(live,logits.ptr(),q.ptr())?
                                     .into_iter().map(|(name,ptr,bytes)|(name.to_string(),ptr,bytes)).collect()};
-                            if std::env::var("CANADA_SCRATCH_READOUT_LAYER_TRACE").as_deref()==Ok("1") {
+                            if self.launch_flags.readout_layer_trace {
                                 sources.extend(target.repeat_layer_sources(live,compact&&!detail)?);
                                 if detail {sources.extend(target.repeat_ffn_sources(live)?);}
                             }
@@ -1651,6 +1764,7 @@ impl GreedySession {
                 verified_rows: live,
                 draft_confidence,
                 proposal_source: if context_tail { "context_tail_target" }
+                    else if target_only { "one_row_target" }
                     else if lookup.is_some() { "history_point_mass" } else { "dspark" },
                 lookup_match_tokens: lookup.as_ref().map(|p| p.matched),
                 lookup_source_end: lookup.as_ref().map(|p| p.source_end),
@@ -1743,8 +1857,10 @@ impl GreedySession {
         ids:&[u32],comm:&Roce,stream:&Stream,
     )->Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1")
-            && !self.poisoned && (7..=16).contains(&ids.len()) && target.physical_rows()==16
-            && target.profile_is_current() && self.draft.position()?==previous
+            && !self.poisoned && ((target.physical_rows()==16&&(7..=16).contains(&ids.len()))
+                ||(target.physical_rows()==32&&(17..=32).contains(&ids.len())
+                    &&crate::config::append32_workspace_enabled()))
+            && buffers.rows==target.physical_rows() && target.profile_is_current() && self.draft.position()?==previous
             && previous.checked_add(ids.len()as u64)==Some(target.position()),
             "DSpark retained medium EXTEND ownership/frontier");
         self.poisoned=true;

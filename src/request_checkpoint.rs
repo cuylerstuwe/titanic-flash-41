@@ -64,9 +64,10 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
         .ok_or_else(||anyhow::anyhow!("probe checkpoint byte overflow"))?;
     let entries=w.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
     let budget = w.shared_image_budget.saturating_sub(other_charge);
-    let slots = if w.parking_extra_slots {5} else {4usize.saturating_sub(other_count)};
+    let slots = if w.parking_extra_slots {w.session_cache_slots+1}
+        else {w.session_cache_slots.saturating_sub(other_count)};
     let mut evictions = if let Some(mask) = protected {
-        ensure!(entries.len() <= 4 && u16::from(mask) < (1u16 << entries.len()), "park protection mask extent");
+        ensure!(cache_protection_mask_valid(mask,entries.len()), "park protection mask extent");
         let protected = (0..entries.len()).map(|i| mask & (1 << i) != 0).collect::<Vec<_>>();
         completed_cache_evictions(&entries, &vec![false; entries.len()], &protected,
             (usize::MAX, charge), budget, true, slots)

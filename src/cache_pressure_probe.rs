@@ -49,7 +49,7 @@ pub(super) fn run(w:&mut Worker,rank:usize,out:&Path)->Result<()> {
     let required=reserve+charge;
     let (_,slots)=w.cache_capacity(0,0);
     w.cache_pressure_reclaim=true;
-    let impossible=w.admit_cache_save(true,Some(Vec::new()),&prefix,&media,256*1024usize.pow(3),slots,&[])?;
+    let impossible=w.admit_cache_save(true,Some(Vec::new()),&prefix,&media,256*1024usize.pow(3),slots,&[],None)?;
     ensure!(!impossible.admitted&&impossible.forecast_refused&&impossible.evicted==0
         &&w.cached_sessions.len()==1,"infeasible forecast must preserve the old cache");
     // Only rank zero is constrained. Keep the full existing reserve, and

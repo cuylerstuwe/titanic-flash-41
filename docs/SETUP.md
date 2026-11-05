@@ -82,7 +82,7 @@ docker run --rm --cpus=2 --memory=3g --memory-swap=3g \
   /project/tools/prepare_runtime.py /data --with-external-woa
 ```
 
-These steps need no GPU. They build the serving-only Rust executable, compile the project CUDA kernels, verify/copy the checked SM121 operators and compile the external WO-A component. The build deliberately does not enable storage fault injection. Do not replace artifact files in a running deployment. Compiler identity and compiled source fingerprint are recorded in `data/runtime/provenance.json`.
+These steps need no GPU. They build the serving-only Rust executable, compile the project CUDA kernels, verify/copy the checked SM121 operators and compile all 18 external WO-A variants, including the compact 16/32-row paths. The build deliberately does not enable storage fault injection. Do not replace artifact files in a running deployment. Compiler identity and compiled source fingerprint are recorded in `data/runtime/provenance.json`.
 
 Verify the complete prepared runtime before weight staging:
 

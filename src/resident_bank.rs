@@ -67,10 +67,62 @@ impl Worker {
     /// copying the complete prefix here defeats long-conversation retention.
     pub(super) fn retain_resumed_bank_encoder(&mut self,prefix:&[u32],
         media:&crate::prompt_media::Identity)->Result<Value> {
+        self.retain_committed_bank_encoder(prefix,media,false,false)
+    }
+
+    /// Prepare the next forward continuation's
+    /// checkpoint using only already-free optional capacity. No stale-image
+    /// pruning, pressure reclamation or eviction is allowed to fund a guess.
+    /// HTTP callers must have checked ingress and paused owners first.
+    pub(super) fn idle_anchor_has_free_slot(&self)->bool {
+        let (budget,slots)=self.cache_capacity(0,0);
+        self.history.frontier()>=8192&&self.cached_sessions.len()<slots
+            &&self.cached_sessions.iter().map(|c|c.charge).sum::<usize>()<budget
+            &&!self.cached_sessions.iter().any(|c|c.speculative)
+    }
+
+    pub(super) fn retain_idle_bank_encoder(&mut self)->Result<Value> {
+        self.retain_idle_bank_encoder_impl(self.idle_anchor_rolling)
+    }
+
+    pub(super) fn idle_anchor_can_prepare(&self)->bool {
+        self.idle_anchor_has_free_slot()||(self.idle_anchor_rolling
+            &&self.cached_sessions.iter().filter(|c|c.speculative).count()==1
+            &&self.cached_sessions.iter().any(|c|c.speculative&&c.owner==self.bank_id
+                &&c.prefix.len()<self.history.frontier()
+                &&self.history.committed().starts_with(&c.prefix)
+                &&self.history.media().matches_prefix(&c.media,c.prefix.len())
+                &&self.cached_bank_image_valid(c)))
+    }
+
+    pub(super) fn refresh_idle_bank_encoder_for_probe(&mut self)->Result<Value> {
+        ensure!(std::env::var("CANADA_SCRATCH_IDLE_POLICY_SCREEN").as_deref()==Ok("1"),
+            "rolling idle anchor is a finite policy experiment");
+        self.retain_idle_bank_encoder_impl(true)
+    }
+
+    fn retain_idle_bank_encoder_impl(&mut self,refresh:bool)->Result<Value> {
+        ensure!((self.idle_anchor_enabled||std::env::var("CANADA_SCRATCH_IDLE_ANCHOR_SCREEN").as_deref()==Ok("1"))
+            &&self.current.is_none()&&self.suspended_image_count==0
+            &&self.pending_prefill.is_none()&&self.peer_bank.as_ref().is_none_or(|b|b.current.is_none())
+            &&self.history.frontier()>=8192,"idle anchor requires a sole completed owner");
+        // One unconsumed prediction at a time; never accumulate a branch tree
+        // merely because many short appends fail to use the prepared anchor.
+        if !refresh&&self.cached_sessions.iter().any(|c|c.speculative) {
+            return Ok(json!({"saved":false,"prediction_pending":true}));
+        }
+        let prefix=self.history.committed().to_vec();
+        let media=self.history.media().clone();
+        self.retain_committed_bank_encoder(&prefix,&media,true,refresh)
+    }
+
+    fn retain_committed_bank_encoder(&mut self,prefix:&[u32],
+        media:&crate::prompt_media::Identity,only_free_capacity:bool,refresh:bool)->Result<Value> {
+        ensure!(!refresh||only_free_capacity,"idle replacement cannot affect ordinary admission");
         ensure!(crate::config::bank_encoder_checkpoint_requested()&&self.encoder_prompt_checkpoint
             &&self.verify.profile_is_current()&&self.verify.position()==prefix.len()as u64,
             "resumed encoder checkpoint frontier");
-        self.prune_invalid_bank_images();
+        if !only_free_capacity {self.prune_invalid_bank_images();}
         let media=media.through(prefix.len());
         if self.cached_sessions.iter().any(|c|c.owner==self.bank_id&&c.prefix==prefix
             &&c.media.matches_prefix(&media,prefix.len())) {
@@ -88,30 +140,70 @@ impl Worker {
         let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
         let optional=self.cached_sessions.iter().map(CachedSession::opportunistic_logits).collect::<Vec<_>>();
         let(budget,slots)=self.cache_capacity(0,0);
-        let evictions=encoder_checkpoint_evictions(&entries,&optional,(prefix.len(),charge),None,
-            budget,self.session_cache_long_first,slots);
-        let eligible=device<=2*1024usize.pow(3)&&evictions.is_some();
+        // Replace only the one unconsumed prediction on this same forward
+        // lineage. Ordinary rewind/shared-prefix images are never candidates.
+        // Equal device extent lets us reuse the allocation without a new GPU
+        // allocation or a free on the incoming request's critical path.
+        let speculative=self.cached_sessions.iter().filter(|c|c.speculative).count();
+        let replacement=if refresh&&speculative==1 {
+            self.cached_sessions.iter().position(|c|c.speculative&&c.owner==self.bank_id
+                &&c.prefix.len()<prefix.len()&&prefix.starts_with(&c.prefix)
+                &&media.matches_prefix(&c.media,c.prefix.len())
+                &&self.cached_bank_image_valid(c)
+                &&matches!(&c.image,CachedState::Encoder{image,..}if image.reusable_storage(device)))
+        }else{None};
+        if refresh {
+            self.control.agree(&serde_json::to_vec(&(prefix.len(),replacement,&entries,speculative))?)?;
+        }
+        let retired_charge=replacement.map_or(0,|i|entries[i].1);
+        let evictions=if only_free_capacity {
+            ((speculative==0||replacement.is_some())
+                &&entries.len()+usize::from(replacement.is_none())<=slots
+                &&entries.iter().map(|e|e.1).sum::<usize>().checked_sub(retired_charge)
+                    .and_then(|n|n.checked_add(charge)).is_some_and(|n|n<=budget)).then(Vec::new)
+        }else{encoder_checkpoint_evictions(&entries,&optional,(prefix.len(),charge),None,
+            budget,self.session_cache_long_first,slots)};
+        let eligible=device<=2*1024usize.pow(3)&&evictions.is_some()
+            &&(!only_free_capacity||charge<=64<<20);
         let reserve=self.cache_reserve()?;
         // Retain the ordinary encoder checkpoint's preparation allowance.
         let required=reserve+charge+host;
-        let admission=self.admit_cache_save(eligible,evictions,prefix,&media,required,slots,&[])?;
-        let at=Instant::now();let mut saved=false;
+        let admission=if only_free_capacity {
+            let available=self.cuda.admission_memory()?.admitted_available;
+            let local_fits=available>=required;
+            CacheSaveAdmission{admitted:self.control.all_admit(eligible&&local_fits)?,available,
+                local_fits,evicted:0,pressure_evicted:0,forecast_refused:false,recycled:None}
+        }else{self.admit_cache_save(eligible,evictions,prefix,&media,required,slots,&[],None)?};
+        let at=Instant::now();let mut saved=false;let mut fused_copy=false;let mut recycled_device_bytes=0;
         if admission.admitted {
             let history=self.session.as_ref().unwrap().checkpoint_history_lookup(prefix.len()as u64,&[])?;
             ensure!(history.as_ref().map_or(0,crate::history_lookup::HistoryLookup::workspace_bytes)<=host,
                 "resumed encoder history exceeds its reservation");
             let policy=self.session.as_ref().unwrap().proposal_policy_image()?;
+            // Finish all prior readers before consuming an immutable image.
+            // The old prediction's model/history/binding metadata is dropped;
+            // the returned image receives the current frontier and a new binding.
+            let recycled=if let Some(i)=replacement {
+                self.stream.synchronize()?;
+                let retired=self.cached_sessions.remove(i);
+                let CachedState::Encoder{image,..}=retired.image else{unreachable!()};
+                let storage=image.into_retired_storage()?;recycled_device_bytes=storage.bytes();Some(storage)
+            }else{None};
             let control=&mut self.control;
-            if let Some(image)=self.large.try_save_committed_bank_encoder(device,reserve,&self.comm,&self.stream,
+            if let Some(image)=self.large.try_save_committed_bank_encoder(device,reserve,recycled,&self.comm,&self.stream,
                 &mut |fits|control.all_admit(fits))? {
                 ensure!(image.bytes()==device&&image.position()==prefix.len(),"resumed encoder image extent");
+                fused_copy=image.fused_copy();
                 self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,charge,
-                    prompt_logits:None,image:CachedState::Encoder{image,history,policy}});
+                    prompt_logits:None,speculative:only_free_capacity,image:CachedState::Encoder{image,history,policy}});
                 saved=true;
             }
         }
         self.verify.handoff_from(&self.large)?;
         Ok(json!({"saved":saved,"bank_retained":true,"encoder_only":true,"resumed_frontier":true,
+            "fused_copy":fused_copy,
+            "only_free_capacity":only_free_capacity,
+            "prediction_refreshed":saved&&replacement.is_some(),"recycled_device_bytes":recycled_device_bytes,
             "device_bytes":device,"image_charge_bytes":if saved{charge}else{0},
             "charged_bytes":self.cached_sessions.iter().map(|c|c.charge).sum::<usize>(),
             "saved_seconds":at.elapsed().as_secs_f64(),"late_memory_refused":admission.admitted&&!saved,

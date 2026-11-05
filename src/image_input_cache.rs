@@ -18,6 +18,14 @@ use std::{
 
 const WARM_BYTES: usize = 256 << 20;
 const LIVE_BYTES: usize = 2 << 30;
+// Metadata only: no encoded strings or extra strong image owners. Mutable HTTP
+// URLs are deliberately excluded; only an exact data URL and detail can hit.
+const SOURCE_ENTRIES: usize = 1024;
+#[derive(Clone, Copy)]
+struct SourceMemo {
+    identity: [u8; 32],
+    encoded_bytes: usize,
+}
 fn available_host_memory() -> Result<usize> {
     #[cfg(target_os = "linux")]
     {
@@ -49,12 +57,25 @@ fn workspace_bytes(width: usize, height: usize, p: &vision_input::Plan) -> usize
 struct State {
     warm: HashMap<[u8; 32], Arc<PatchInput>>,
     live: HashMap<[u8; 32], Weak<PatchInput>>,
+    source_info: HashMap<[u8;32],(ImageDetail,usize)>,
+    sources: HashMap<[u8; 32], SourceMemo>,
+    source_oldest: VecDeque<[u8; 32]>,
     oldest: VecDeque<[u8; 32]>,
     retained: usize,
     hits: u64,
     misses: u64,
+    source_hits: u64,
 }
 impl State {
+    fn remember_source(&mut self, key: [u8; 32], input: &PatchInput, encoded_bytes: usize) {
+        if self.sources.contains_key(&key) { return; }
+        while self.sources.len() >= SOURCE_ENTRIES {
+            let expired = self.source_oldest.pop_front().unwrap();
+            self.sources.remove(&expired);
+        }
+        self.sources.insert(key, SourceMemo { identity: input.identity, encoded_bytes });
+        self.source_oldest.push_back(key);
+    }
     fn clear_warm(&mut self) {
         self.warm.clear();
         self.oldest.clear();
@@ -92,6 +113,7 @@ pub struct Expanded {
     pub tokens: Vec<u32>,
     pub images: Vec<Descriptor>,
     pub inputs: Vec<Arc<PatchInput>>,
+    pub aliases: Vec<crate::protocol::ImageAlias>,
 }
 impl ImageInputCache {
     pub fn new() -> Self {
@@ -175,6 +197,21 @@ impl ImageInputCache {
         };
         Ok((bytes, detail))
     }
+    fn source_hit(&self, key: &[u8; 32], remaining_bytes: usize) -> Result<Option<(Arc<PatchInput>, usize)>> {
+        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?;
+        let Some(memo) = state.sources.get(key).copied() else { return Ok(None); };
+        let Some(input) = state.live.get(&memo.identity).and_then(Weak::upgrade) else {
+            state.sources.remove(key);
+            state.source_oldest.retain(|entry| entry != key);
+            return Ok(None);
+        };
+        // A memoized image still consumes its original request byte allowance.
+        ensure!(memo.encoded_bytes <= remaining_bytes, "request encoded image byte capacity exceeded");
+        state.hits += 1;
+        state.source_hits += 1;
+        state.retain(input.clone());
+        Ok(Some((input, memo.encoded_bytes)))
+    }
     fn prepare(&self, bytes: &[u8], detail: Detail) -> Result<Arc<PatchInput>> {
         let identity = vision_input::identity(bytes, detail);
         // Serialize cache misses as well as mutation: at most one decoder's
@@ -189,6 +226,12 @@ impl ImageInputCache {
             return Ok(input);
         }
         state.live.retain(|_, p| p.strong_count() > 0);
+        { let State {live,source_info,..}=&mut *state;source_info.retain(|key,_|live.contains_key(key)); }
+        {
+            let State {live,sources,source_oldest,..} = &mut *state;
+            sources.retain(|_, memo| live.contains_key(&memo.identity));
+            source_oldest.retain(|key| sources.contains_key(key));
+        }
         let reader = image::ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|_| anyhow::anyhow!(INVALID_IMAGE))?;
@@ -242,8 +285,29 @@ impl ImageInputCache {
         input.validate()?;
         state.misses += 1;
         state.live.insert(identity, Arc::downgrade(&input));
+        let canonical_detail=match detail {Detail::Low=>ImageDetail::Low,Detail::High=>ImageDetail::High,
+            Detail::Auto=>ImageDetail::Auto,Detail::Original=>ImageDetail::Original};
+        state.source_info.insert(identity,(canonical_detail,bytes.len()));
         state.retain(input.clone());
         Ok(input)
+    }
+    pub(crate) fn pin_references(&self, keys: &[[u8;32]]) -> Result<Vec<crate::protocol::ImageReference>> {
+        let mut state=self.state.lock().map_err(|_|anyhow::anyhow!("image input cache poisoned"))?;
+        let mut result=Vec::new();
+        for key in keys {
+            if result.iter().any(|r:&crate::protocol::ImageReference|r.input.identity==*key){continue;}
+            let input=state.live.get(key).and_then(Weak::upgrade).ok_or(crate::protocol::ContextImageMiss)?;
+            let (detail,encoded_bytes)=*state.source_info.get(key).ok_or(crate::protocol::ContextImageMiss)?;
+            state.retain(input.clone());
+            let identity=key.iter().map(|b|format!("{b:02x}")).collect::<String>();
+            result.push(crate::protocol::ImageReference{source:format!("http://titanic-context.invalid/{identity}"),
+                input,detail,encoded_bytes});
+        }
+        Ok(result)
+    }
+    #[cfg(test)]
+    pub(crate) fn forget_for_test(&self) {
+        let mut state=self.state.lock().unwrap();state.clear_warm();
     }
     pub fn expand(
         &self,
@@ -260,6 +324,14 @@ impl ImageInputCache {
         capacity: usize,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Expanded> {
+        self.expand_with_references(tokens, sources, capacity, cancelled, None)
+    }
+    pub(crate) fn expand_referenced(&self, tokens: Vec<u32>, sources: &[ImageSource],
+        capacity: usize, cancelled: &dyn Fn() -> bool, references: &[crate::protocol::ImageReference]) -> Result<Expanded> {
+        self.expand_with_references(tokens, sources, capacity, cancelled, Some(references))
+    }
+    fn expand_with_references(&self, tokens: Vec<u32>, sources: &[ImageSource],
+        capacity: usize, cancelled: &dyn Fn() -> bool, references: Option<&[crate::protocol::ImageReference]>) -> Result<Expanded> {
         ensure!(!cancelled(), "request cancelled during image processing");
         ensure!(
             tokens.iter().filter(|&&t| t == IMAGE_TOKEN).count() == sources.len(),
@@ -268,6 +340,7 @@ impl ImageInputCache {
         let mut output = Vec::with_capacity(tokens.len());
         let mut images = Vec::new();
         let mut inputs = Vec::new();
+        let mut aliases = Vec::new();
         let mut sources = sources.iter();
         let mut encoded_bytes = 0usize;
         for token in tokens {
@@ -275,14 +348,46 @@ impl ImageInputCache {
                 output.push(token);
             } else {
                 ensure!(!cancelled(), "request cancelled during image processing");
-                let (bytes, detail) = self.resolve(sources.next().unwrap())?;
+                let source = sources.next().unwrap();
+                let source_key = match source {
+                    ImageSource::DataUrl { data_url, detail, .. } => Some(crate::protocol::image_source_hash(data_url, *detail)),
+                    _ => None,
+                };
+                let internal = match source {
+                    ImageSource::Url { url, .. } if references.is_some() && url.starts_with("http://titanic-context.invalid/") => Some(url),
+                    _ => None,
+                };
+                let (input, source_bytes) = if let Some(url) = internal {
+                    let reference = references.unwrap().iter().find(|r| r.source == *url)
+                        .ok_or_else(|| anyhow::anyhow!("context_image_miss"))?;
+                    ensure!(reference.detail == source.detail()
+                        && (1..=MAX_ENCODED_BYTES).contains(&reference.encoded_bytes), "invalid cached image reference");
+                    let identity = reference.input.identity.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                    ensure!(url == &format!("http://titanic-context.invalid/{identity}"), "cached image hash differs");
+                    reference.input.validate()?;
+                    (reference.input.clone(), reference.encoded_bytes)
+                } else {
+                    let cached = source_key.as_ref().map(|key| self.source_hit(key, (128usize << 20) - encoded_bytes)).transpose()?.flatten();
+                    if let Some(input) = cached { input } else {
+                        let (bytes, detail) = self.resolve(source)?;
+                        ensure!(!cancelled(), "request cancelled during image processing");
+                        ensure!(encoded_bytes.saturating_add(bytes.len()) <= 128 << 20,
+                            "request encoded image byte capacity exceeded");
+                        let input = self.prepare(&bytes, detail)?;
+                        if let Some(key) = source_key {
+                            self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?
+                                .remember_source(key, &input, bytes.len());
+                        }
+                        (input, bytes.len())
+                    }
+                };
                 ensure!(!cancelled(), "request cancelled during image processing");
-                encoded_bytes += bytes.len();
+                encoded_bytes = encoded_bytes.checked_add(source_bytes)
+                    .ok_or_else(|| anyhow::anyhow!("request encoded image byte capacity exceeded"))?;
                 ensure!(
                     encoded_bytes <= 128 << 20,
                     "request encoded image byte capacity exceeded"
                 );
-                let input = self.prepare(&bytes, detail)?;
                 let count = input.geometry.tokens();
                 ensure!(
                     output.len() + count <= capacity,
@@ -294,6 +399,12 @@ impl ImageInputCache {
                     input: input.identity,
                 });
                 output.extend(std::iter::repeat_n(IMAGE_TOKEN, count));
+                if references.is_some() {
+                    if let Some(source_hash) = source_key {
+                        aliases.push(crate::protocol::ImageAlias{
+                            source_hash,identity:input.identity});
+                    }
+                }
                 inputs.push(input);
             }
             ensure!(
@@ -306,6 +417,7 @@ impl ImageInputCache {
             tokens: output,
             images,
             inputs,
+            aliases,
         })
     }
     pub fn metadata(&self) -> Result<serde_json::Value> {
@@ -318,7 +430,8 @@ impl ImageInputCache {
         };
         Ok(
             serde_json::json!({"hits":state.hits,"misses":state.misses,"warm_bytes":state.retained,
-            "live_bytes":state.live_bytes(),"warm_budget_bytes":WARM_BYTES,"live_budget_bytes":LIVE_BYTES}),
+            "live_bytes":state.live_bytes(),"warm_budget_bytes":WARM_BYTES,"live_budget_bytes":LIVE_BYTES,
+            "source_hits":state.source_hits,"source_entries":state.sources.len(),"source_entry_limit":SOURCE_ENTRIES}),
         )
     }
 }
@@ -339,6 +452,82 @@ mod tests {
             detail: ImageDetail::Auto,
             path: String::new(),
         }
+    }
+    fn data_source(bytes: &[u8], detail: ImageDetail, suffix: &str) -> ImageSource {
+        use base64::Engine as _;
+        ImageSource::DataUrl {
+            data_url: format!("data:image/png{suffix};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)),
+            detail,
+            path: String::new(),
+        }
+    }
+    #[test]
+    fn exact_source_reuse_preserves_identity_detail_aliases_and_admission() {
+        let cache = ImageInputCache::for_test();
+        let bytes = png(41);
+        let encoded = data_source(&bytes, ImageDetail::Auto, "");
+        let first = cache.expand(vec![IMAGE_TOKEN], std::slice::from_ref(&encoded), 4096).unwrap();
+        let repeat = cache.expand_referenced(vec![IMAGE_TOKEN], std::slice::from_ref(&encoded), 4096, &|| false, &[]).unwrap();
+        assert!(Arc::ptr_eq(&first.inputs[0], &repeat.inputs[0]));
+        assert_eq!(first.tokens, repeat.tokens);
+        assert_eq!(repeat.aliases[0].identity, first.inputs[0].identity);
+        let ImageSource::DataUrl { data_url, detail, .. } = &encoded else { unreachable!() };
+        let key = crate::protocol::image_source_hash(data_url, *detail);
+        assert_eq!(repeat.aliases[0].source_hash, key);
+        assert!(cache.source_hit(&key, bytes.len() - 1).err().unwrap().to_string().contains("byte capacity"));
+        assert!(cache.expand(vec![IMAGE_TOKEN], std::slice::from_ref(&encoded), 1).is_err());
+        assert!(cache.expand_cancellable(vec![IMAGE_TOKEN], std::slice::from_ref(&encoded), 4096, &|| true).is_err());
+        let raw = cache.expand(vec![IMAGE_TOKEN], &[source(bytes.clone())], 4096).unwrap();
+        assert!(Arc::ptr_eq(&first.inputs[0], &raw.inputs[0]));
+        let alternate = cache.expand(vec![IMAGE_TOKEN], &[data_source(&bytes, ImageDetail::Auto, ";variant=1")], 4096).unwrap();
+        assert!(Arc::ptr_eq(&first.inputs[0], &alternate.inputs[0]));
+        let changed_detail = cache.expand(vec![IMAGE_TOKEN], &[data_source(&bytes, ImageDetail::High, "")], 4096).unwrap();
+        assert_ne!(first.inputs[0].identity, changed_detail.inputs[0].identity);
+        assert_eq!(first.inputs[0].patches, changed_detail.inputs[0].patches);
+        let changed_bytes = cache.expand(vec![IMAGE_TOKEN], &[data_source(&png(42), ImageDetail::Auto, "")], 4096).unwrap();
+        assert_ne!(first.inputs[0].identity, changed_bytes.inputs[0].identity);
+        assert_eq!(cache.metadata().unwrap()["misses"], 3);
+    }
+    #[test]
+    fn source_metadata_is_bounded_and_does_not_keep_reclaimed_images_alive() {
+        let mut cache = ImageInputCache::for_test();
+        let bytes = png(43);
+        let original = data_source(&bytes, ImageDetail::Auto, "");
+        let first = cache.expand(vec![IMAGE_TOKEN], std::slice::from_ref(&original), 4096).unwrap();
+        let weak = Arc::downgrade(&first.inputs[0]);
+        for i in 0..SOURCE_ENTRIES + 1 {
+            let other = cache.expand(vec![IMAGE_TOKEN], &[data_source(&bytes, ImageDetail::Auto, &format!(";variant={i}"))], 4096).unwrap();
+            assert!(Arc::ptr_eq(&first.inputs[0], &other.inputs[0]));
+        }
+        {
+            let state = cache.state.lock().unwrap();
+            assert_eq!(state.sources.len(), SOURCE_ENTRIES);
+            assert_eq!(state.source_oldest.len(), SOURCE_ENTRIES);
+            assert_eq!(state.live_bytes(), first.inputs[0].bytes());
+        }
+        drop(first); cache.forget_for_test(); assert!(weak.upgrade().is_none());
+        // A source alias cannot bypass physical admission after its patches die.
+        cache.available_memory = || Ok(8usize << 30);
+        assert!(cache.expand(vec![IMAGE_TOKEN], &[data_source(&bytes, ImageDetail::Auto, &format!(";variant={SOURCE_ENTRIES}"))], 4096)
+            .err().unwrap().downcast_ref::<crate::memory::InputCapacityError>().is_some());
+        assert_eq!(cache.metadata().unwrap()["live_bytes"], 0);
+        cache.available_memory = || Ok(16usize << 30);
+        let fresh = cache.expand(vec![IMAGE_TOKEN], &[original], 4096).unwrap();
+        assert_eq!(fresh.inputs[0].identity, vision_input::identity(&bytes, Detail::Auto));
+        assert_eq!(cache.metadata().unwrap()["misses"], 2);
+    }
+    #[test]
+    fn concurrent_exact_sources_share_the_canonical_preparation() {
+        let cache = ImageInputCache::for_test();
+        let encoded = data_source(&png(44), ImageDetail::Auto, "");
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4).map(|_| scope.spawn(|| cache.expand(vec![IMAGE_TOKEN], std::slice::from_ref(&encoded), 4096).unwrap())).collect();
+            let results: Vec<_> = threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+            for result in &results[1..] { assert!(Arc::ptr_eq(&results[0].inputs[0], &result.inputs[0])); }
+        });
+        assert_eq!(cache.metadata().unwrap()["misses"], 1);
+        assert_eq!(cache.metadata().unwrap()["hits"], 3);
+        assert_eq!(cache.metadata().unwrap()["source_entries"], 1);
     }
     #[test]
     fn encoded_content_identity_order_detail_and_partial_admission() {
@@ -422,6 +611,7 @@ mod tests {
             .unwrap();
         let next = cache.expand(vec![IMAGE_TOKEN], &[input], 4096).unwrap();
         assert_ne!(first.images[0].input, next.images[0].input);
+        assert_eq!(cache.metadata().unwrap()["source_entries"], 0);
         server.join().unwrap();
     }
     #[test]

@@ -65,7 +65,8 @@ impl Protection {
     }
     pub(super) fn mask(&self, w: &Worker, queue: &Queue,
         ready: &VecDeque<(Option<u64>, Job)>, images: &[ParkedRequest]) -> Result<u8> {
-        ensure!(w.cached_sessions.len() <= 4, "park protection cache bound");
+        ensure!(w.cached_sessions.len()<=w.session_cache_slots
+            &&w.cached_sessions.len()<=MAX_SESSION_CACHE_SLOTS,"park protection cache bound");
         let entries = w.cached_sessions.iter().map(|c| (c.prefix.as_slice(), &c.media)).collect::<Vec<_>>();
         let mut protected = self.parent_mask(&entries);
         for (i, (tokens, media)) in entries.into_iter().enumerate() {
@@ -116,5 +117,11 @@ mod tests {
         assert_eq!(protection.parent_mask(&[(&tokens,&b),(&tokens,&a)]), 2);
         protection.parent=Parent::Unknown;
         assert_eq!(protection.parent_mask(&entries), 7, "metadata refusal must preserve cache");
+        let eight=(1..=8).map(|n|vec![10;n]).collect::<Vec<_>>();
+        let entries=eight.iter().map(|t|(t.as_slice(),&empty)).collect::<Vec<_>>();
+        assert_eq!(protection.parent_mask(&entries),255,"unknown parent protects all eight slots");
+        protection.parent=Parent::None;
+        remember(&mut protection,&[10;8],&empty);
+        assert_eq!(protection.parent_mask(&entries),128,"longest parent can occupy the high bit");
     }
 }

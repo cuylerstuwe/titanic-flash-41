@@ -1,5 +1,96 @@
 # Validation status
 
+## November 4 accumulated engine update (s1329)
+
+This update carries the qualified s1291 correctness fix plus prompt/image
+frontend reuse, bounded incremental context transport, idle continuation-cache
+preparation, reduced draft/sampling overhead, adaptive small-transfer transport,
+projection/cache hints, and measured prefill work bounds. The serving profile
+matches all **196** native model environment settings. Canonical target weights,
+BF16 LM-head weights, FP32 logits, the 2350 MHz cap, the 8 GiB physical reserve,
+two full-context owners, image admission, native priority and Pi timing remain.
+
+Wide WO-A verification reconstructs the checkpoint's operands exactly, retains
+FP32 split partials, and rounds its output once to BF16. Its reduction order can
+change sampled continuations. Native component/model checks and higher-precision
+projection diagnostics distinguish this admissible rounding change from a loss
+of checkpoint precision or stale state. Bitwise output identity is not claimed.
+
+Native release qualification:
+
+- Two 13-request arms were repeated in reverse launch order, with fresh boots
+  and one model load per node for every arm. All requests completed; all four
+  nodes stayed within the physical-memory/thermal guards and recorded no GPU
+  allocation or Xid errors.
+- At temperature 1 / top-p 1 / high reasoning, eight matching continuations
+  decoded **3.59%** and **3.38%** faster in the two orders. The final capped token
+  can use a different valid draw. Cold ~131K prefill was about **20.5 seconds**,
+  within 0.12% in both orders. The [complete paired records](../benchmarks/release-comparison-s1329.json)
+  retain changed trajectories and individual slower results.
+- Two completed coding tasks passed supplied and held-out checks, with no tool
+  errors. A maximum-effort tool request also passed. These are scoped quality
+  checks, not a general benchmark score.
+- Final release checks passed image cancellation with immediate resubmission,
+  processed-image reuse, prompt reuse, one-token completion, and background
+  pause/resume while a foreground request ran exclusively.
+- Nine installation/rollback fixtures passed, including interruption after
+  each changed file. The retained fallback is the previously qualified s1291.
+
+The copy fixture took **20.63 s versus 18.69 s** in the reversed pair, producing
+2,362 versus 2,123 tokens. Its shared prefix was faster; the trajectory changed
+after wide verification. Repeating the same seed reproduces that difference but
+does not establish a distribution-wide reasoning-length or outcome-speed effect.
+
+Portable package checks:
+
+- Native frozen source: **209 CPU tests passed, 22 ignored**. Portable source:
+  **212 passed, 22 ignored**, plus the all-target compile check. Ignored checks
+  require specialized fixtures/hardware and are not counted as passed.
+- **42 Python deployment tests** passed, including package/loader pin agreement
+  and missing enabled-kernel rejection. The last check covers a default-enabled MoE dependency even when no environment flag explicitly selects it.
+- The pinned Arm64 serving build passed. Runtime verification checked **2,248**
+  bundled artifact hashes, **18** separately built WO-A operators, **272** dynamic
+  libraries, and NCCL **2.30.7**. Kernel executable bytes imported from the native
+  qualification remain unchanged. Required notices are retained.
+- The source and artifact privacy scan found no unresolved personal identifiers,
+  machine addresses, credentials or private conversation fixtures. Synthetic
+  address tests and required third-party legal contacts remain.
+
+Portable compiled-source fingerprint:
+`82b473a00c2297d48e60599388aac6836d52fbf6210ab96f06a12f9ab4742504`.
+Native qualified-source fingerprint:
+`1e25b6aed39969302a60150edc2f6518e573719532611b44d9cccf27e89ac39f`.
+The portable fingerprint includes its naming, network/path adaptations and
+package checks. The new WO-A variants are fetched and built by the explicit
+external-component step in the setup recipe.
+
+The portable four-node build passed three streaming/cache/timing checks, a
+synthetic image request, four incremental-context checks (full history, extension,
+rewind and missing-reference rejection), and the complete 24-request head-local
+published-client benchmark. Startup initially exposed a missing default-enabled
+MoE artifact; the package now includes it and validates its presence before load.
+After the completed benchmark, Docker stop exceeded the wrapper's old timeout.
+Fallback cleanup succeeded. The final wrapper uses container init, stops the four
+ranks concurrently, and allows more time for GPU teardown. A separate fresh-boot
+startup/request/shutdown check passed with normal logging disabled, all four GPUs
+idle afterward, and no memory, thermal or kernel errors. Inference binaries,
+kernels and sampling profile are unchanged by this lifecycle correction.
+
+Native s1329 was activated on November 4 after rebooting all four devices,
+with one daily model load per node. All deployed runtime hashes, the 2350 MHz
+policy, independent host-policy recovery guards, and the physical-memory floor
+passed. Synthetic image and greedy text requests completed through the normal
+external router; Pi-compatible prefill timing and token accounting passed. The
+router configuration was unchanged. s1291 remains the failed-start fallback.
+The maintenance reservation was released after Ready. The native restoration wrapper initially
+exceeded its startup-command deadline after lengthy repeated asset verification. Its
+stationary retry recognized the same healthy generation and completed without
+reloading the model; the subsequent routed and host checks passed.
+
+The incremental protocol was tested directly on the portable endpoint; enabling
+it in an external client/proxy integration is a separate task. The empty-fleet
+provisioning limitation at the end of this document still applies.
+
 ## November 4 engine update (s1291)
 
 This source update carries the qualified s1242 engine and its s1291 full-logit
@@ -69,7 +160,7 @@ establish a new portable GPU run or empty-fleet provisioning result.
 
 The November 4 head-local published-client benchmark completed all 24 requests
 on this native s1291 generation, with six three-trial single-stream workloads
-and the first uncached ~131K prompt. The README now uses that complete pass.
+and the first uncached ~131K prompt. That historical pass remains available separately from the current s1329 table.
 The engine stayed Ready without a reload; this performance run does not expand
 the portable-wrapper or quality qualification. See [benchmark details](BENCHMARKS.md).
 

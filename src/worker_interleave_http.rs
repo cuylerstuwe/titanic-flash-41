@@ -23,6 +23,9 @@ use parking_protection::Protection;
 #[path = "parked_request.rs"]
 mod parked_request;
 use parked_request::{ParkedRequest,Storage};
+#[path = "idle_anchor_policy.rs"]
+pub(super) mod idle_anchor_policy;
+use idle_anchor_policy::Policy as IdlePolicy;
 enum Scheduled {
     Native(Command),
     Park(Option<u8>),
@@ -35,6 +38,7 @@ enum Scheduled {
     Priority(PrioritySnapshot),
     Hold,
     OutputWait,
+    IdleAnchor,
 }
 impl Scheduled {
     fn follows_progress(&self,paused_ids:&[u64],remaining:usize)->bool {
@@ -61,8 +65,9 @@ impl Scheduled {
             }
             Self::Hold=>Ok(vec![15]),
             Self::OutputWait=>Ok(vec![16]),
+            Self::IdleAnchor=>Ok(vec![19]),
             Self::Park(None)=>Ok(vec![7]),
-            Self::Park(Some(mask))=>{ensure!(*mask<16,"park protection mask");Ok(vec![7,*mask])},
+            Self::Park(Some(mask))=>Ok(vec![7,*mask]),
             Self::Exchange(id)=>{ensure!(*id>0,"invalid exchange request identity");let mut bytes=vec![17];bytes.extend(id.to_le_bytes());Ok(bytes)},
             Self::PairStep(id)=>{ensure!(*id>0,"invalid paired request identity");let mut bytes=vec![18];bytes.extend(id.to_le_bytes());Ok(bytes)},
             Self::Resume(id)|Self::Discard(id)=>{
@@ -74,12 +79,13 @@ impl Scheduled {
     fn decode(bytes:&[u8])->Result<Self> {
         match bytes {
             [7]=>Ok(Self::Park(None)),
-            [7,mask] if *mask<16=>Ok(Self::Park(Some(*mask))),
+            [7,mask]=>Ok(Self::Park(Some(*mask))),
             [11]=>Ok(Self::Prefill),
             [14,..] if bytes.len()==10 && bytes[9]<=1=>Ok(Self::Priority(PrioritySnapshot{
                 revision:u64::from_le_bytes(bytes[1..9].try_into().unwrap()),hold:bytes[9]!=0})),
             [15]=>Ok(Self::Hold),
             [16]=>Ok(Self::OutputWait),
+            [19]=>Ok(Self::IdleAnchor),
             [17,..]if bytes.len()==9=>{
                 let id=u64::from_le_bytes(bytes[1..].try_into().unwrap());ensure!(id>0,"invalid exchange request identity");Ok(Self::Exchange(id))
             },
@@ -128,6 +134,22 @@ fn execute(w:&mut Worker,images:&mut Vec<ParkedRequest>,command:Scheduled,
             ensure!(w.current.is_some() || !images.is_empty(), "output wait without retained request state");
             w.agree(&[])?;
             Ok(json!({"type":"output_wait"}))
+        }
+        Scheduled::IdleAnchor=>{
+            ensure!(w.idle_anchor_enabled&&images.is_empty()&&job.is_none(),"idle anchor has a request owner");
+            let at=Instant::now();
+            let started=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs_f64();
+            // Close the selection/broadcast race before allocating. A request
+            // received afterward can wait only for this single bounded image;
+            // record that overlap rather than assuming every gap is long enough.
+            let admitted=w.control.all_admit(queue.is_none_or(|q|!q.has_outstanding_requests()
+                &&!q.stopping()&&!q.router_hold()&&q.priority_pending().is_none()))?;
+            let mut event=if admitted{w.retain_idle_bank_encoder()?}
+                else{json!({"saved":false,"incoming_work_veto":true})};
+            event["type"]=json!("idle_anchor");event["seconds"]=json!(at.elapsed().as_secs_f64());
+            event["started_unix_seconds"]=json!(started);
+            event["request_arrived_during_preparation"]=json!(queue.is_some_and(Queue::has_outstanding_requests));
+            event["frontier"]=json!(w.history.frontier());Ok(event)
         }
         Scheduled::BeginBackground(command)=>w.start_background(command,queue,job),
         Scheduled::Prefill=>w.continue_background(queue,job),
@@ -233,7 +255,7 @@ fn runnable_peer(active_background:bool,peer_background:bool)->bool {
 
 fn choose(w:&mut Worker,queue:&Queue,active:&mut Option<Job>,ready:&mut VecDeque<(Option<u64>,Job)>,
     next_id:&mut u64,quantum_start:usize,_prefill_turn_done:bool,refused:bool,images:&[ParkedRequest],
-    _protection:&mut Protection,_turns:&mut Turns)->Result<Scheduled> {
+    _protection:&mut Protection,_turns:&mut Turns,_idle_policy:&mut IdlePolicy)->Result<Scheduled> {
     let paused_count=images.len();
     loop {
         // Paused clients retain their bounded output queue. Advance the stall
@@ -379,11 +401,14 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
     let mut next_id=1u64;let mut quantum_start=0;let mut prefill_turn_done=false;let mut refused=false;
     let mut authorized_next=None;
     let mut priority=PrioritySnapshot::default();
+    let mut idle_policy=if w.idle_anchor_rolling {
+        IdlePolicy::with_mode(idle_anchor_policy::Mode::EveryEligibleGap)
+    }else{IdlePolicy::new(w.idle_anchor_enabled)};
     let result=(||->Result<()>{
         loop {
             let began=Instant::now();
             let bytes=if authorized_next.is_some(){None}else if let Some(queue)=queue {
-                Some(select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns)?.encode()?)
+                Some(select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns,&mut idle_policy)?.encode()?)
             }else{None};
             let wire=if let Some(next)=authorized_next.take(){next}else{w.control.command(bytes.as_deref())?};
             let command=Scheduled::decode(&wire)?;
@@ -421,7 +446,7 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                 // an already paused request, or exchange two existing owners.
                 // It cannot admit a new prompt or a standalone restoration.
                 let agreement_began=Instant::now();
-                let next=queue.map(|queue|select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns)
+                let next=queue.map(|queue|select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns,&mut idle_policy)
                     .and_then(|command|command.encode())).transpose()?;
                 let tokens:Vec<u32>=serde_json::from_value(event["output_ids"].clone())?;
                 let wire=w.control.agree_and_next(&w.agreement_state(&tokens),next.as_deref())?;
@@ -449,6 +474,10 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                     job.record_prefill_timing(&event);
                 }
                 if started && !input_refused {
+                    idle_policy.began(event["retained_session_cache"]["active_reuse"]==true,
+                        event["cached_tokens"].as_u64().unwrap_or(0)as usize,
+                        event["prompt_tokens"].as_u64().unwrap_or(0).saturating_sub(
+                            event["cached_tokens"].as_u64().unwrap_or(0))as usize);
                     // Capture this request's media receipt before another
                     // request can replace the worker's active receipt.
                     job.emit(BackendEvent::Ready{fingerprint:w.identity.clone(),
@@ -461,6 +490,7 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                 }else if event["type"]=="tokens" {
                     job.emit(BackendEvent::Tokens(serde_json::from_value(event["output_ids"].clone())?));
                 }else if finished {
+                    idle_policy.finished(matches!(event["reason"].as_str(),Some("stop"|"length")),job.background);
                     if two_stream && !job.background && matches!(event["reason"].as_str(),Some("stop"|"length")) {
                         protection.remember_foreground(w.history.committed(),w.history.media());
                     }
@@ -539,6 +569,9 @@ mod tests {
         assert_eq!(Scheduled::decode(&[15]).unwrap().encode().unwrap(),[15]);
         assert!(matches!(Scheduled::decode(&[16]).unwrap(),Scheduled::OutputWait));
         assert!(Scheduled::decode(&[16,0]).is_err());
+        assert!(matches!(Scheduled::decode(&[19]).unwrap(),Scheduled::IdleAnchor));
+        assert!(Scheduled::decode(&[19,0]).is_err());
+        assert!(!Scheduled::IdleAnchor.follows_progress(&[],6));
         assert!(Scheduled::OutputWait.follows_progress(&[],6));
         for id in [1,1u64<<40,u64::MAX] {
             for command in [Scheduled::Resume(id),Scheduled::Discard(id),Scheduled::Exchange(id),Scheduled::PairStep(id)] {
@@ -550,8 +583,13 @@ mod tests {
         assert!(Scheduled::decode(&[8,0,0,0,0,0,0,0,0]).is_err());
         assert!(Scheduled::decode(&[18,0,0,0,0,0,0,0,0]).is_err());
         assert_eq!(Scheduled::decode(&[7]).unwrap().encode().unwrap(),[7]);
-        for mask in 0..16 {assert_eq!(Scheduled::decode(&[7,mask]).unwrap().encode().unwrap(),[7,mask]);}
-        assert!(Scheduled::decode(&[7,16]).is_err());
+        for mask in 0..=255 {assert_eq!(Scheduled::decode(&[7,mask]).unwrap().encode().unwrap(),[7,mask]);}
+        // Wire parsing cannot know the live cache extent; all ranks validate
+        // the same mask against that extent before optional eviction or save.
+        for entries in 0..=8 {for mask in 0u8..=255 {
+            assert_eq!(cache_protection_mask_valid(mask,entries),u16::from(mask)<(1u16<<entries));
+        }}
+        assert!(!cache_protection_mask_valid(0,9));
         assert!(Scheduled::decode(&[7,0,0]).is_err());
     }
     #[test]

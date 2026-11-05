@@ -1,0 +1,239 @@
+--- _roce_proxy.c
++++ _roce_proxy.c
+@@ -41,19 +41,21 @@
+ #define ROCE_FLAG_STRIDE 128
+ #define ROCE_PORT 1
+ #define ROCE_SEND_DEPTH 256
+-#define ROCE_ABI_VERSION 3
++#define ROCE_ABI_VERSION 4
+ // Model graphs leave sub-millisecond gaps between collectives.  Keep the
+ // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+ // every collective on the graph's critical path.
+ #define ROCE_IDLE_SPINS 20000000
+ 
+ typedef struct {
++    uint32_t abi_version;
++    uint32_t n_hca;
+     uint64_t region_addr;
+     uint32_t rkey[ROCE_MAX_HCAS];
+     uint16_t lid[ROCE_MAX_HCAS];
+     uint8_t gid[ROCE_MAX_HCAS][16];
+     uint32_t mtu[ROCE_MAX_HCAS];
+-    uint32_t qp_num[ROCE_MAX_HCAS][ROCE_MAX_PEERS];
++    uint32_t qp_num[2][ROCE_MAX_HCAS][ROCE_MAX_PEERS];
+ } roce_blob_t;
+ 
+ typedef struct {
+@@ -61,7 +63,7 @@
+     struct ibv_pd *pd;
+     struct ibv_mr *mr;
+     struct ibv_cq *cq;
+-    struct ibv_qp *qp[ROCE_MAX_PEERS];
++    struct ibv_qp *qp[2][ROCE_MAX_PEERS];
+     uint32_t outstanding[ROCE_MAX_PEERS];
+     uint64_t writes_completed;
+     uint64_t bytes_posted;
+@@ -89,6 +91,8 @@
+     pthread_t thread;
+     atomic_int running;
+     atomic_int failed;
++    atomic_uint small_packet_threshold;
++    atomic_uint_fast64_t packet_ops[2];
+     uint32_t last_seq;
+     uint64_t ops_posted;
+     uint64_t writes_completed;
+@@ -194,6 +198,7 @@
+         set_err(c, "ibv_create_cq", errno);
+         return -1;
+     }
++    for (int bank = 0; bank < 2; bank++) {
+     for (int p = 0; p < c->world; p++) {
+         if (p == c->rank) {
+             continue;
+@@ -208,8 +213,8 @@
+         attr.cap.max_send_sge = 1;
+         attr.cap.max_recv_sge = 1;
+         attr.cap.max_inline_data = 16;
+-        hca->qp[p] = ibv_create_qp(hca->pd, &attr);
+-        if (hca->qp[p] == NULL) {
++        hca->qp[bank][p] = ibv_create_qp(hca->pd, &attr);
++        if (hca->qp[bank][p] == NULL) {
+             set_err(c, "ibv_create_qp", errno);
+             return -1;
+         }
+@@ -219,12 +224,13 @@
+         init.pkey_index = 0;
+         init.port_num = ROCE_PORT;
+         init.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
+-        int rc = ibv_modify_qp(hca->qp[p], &init,
++        int rc = ibv_modify_qp(hca->qp[bank][p], &init,
+                                IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+         if (rc != 0) {
+             set_err(c, "ibv_modify_qp(INIT)", rc);
+             return -1;
+         }
++    }
+     }
+     return 0;
+ }
+@@ -243,6 +249,11 @@
+         snprintf(err, err_len, "out of memory");
+         return NULL;
+     }
++    atomic_init(&c->running, 0);
++    atomic_init(&c->failed, 0);
++    atomic_init(&c->small_packet_threshold, 0);
++    atomic_init(&c->packet_ops[0], 0);
++    atomic_init(&c->packet_ops[1], 0);
+     c->world = world;
+     c->rank = rank;
+     c->n_hca = n_hca;
+@@ -270,6 +281,8 @@
+     }
+     roce_blob_t blob;
+     memset(&blob, 0, sizeof(blob));
++    blob.abi_version = ROCE_ABI_VERSION;
++    blob.n_hca = (uint32_t)c->n_hca;
+     blob.region_addr = (uint64_t)(uintptr_t)c->region;
+     for (int h = 0; h < c->n_hca; h++) {
+         blob.rkey[h] = c->hca[h].mr->rkey;
+@@ -277,20 +290,23 @@
+         blob.mtu[h] = (uint32_t)c->hca[h].mtu;
+         memcpy(blob.gid[h], c->hca[h].gid.raw, 16);
+         for (int p = 0; p < c->world; p++) {
+-            blob.qp_num[h][p] = (p == c->rank) ? 0 : c->hca[h].qp[p]->qp_num;
++            for (int bank = 0; bank < 2; bank++) {
++                blob.qp_num[bank][h][p] = (p == c->rank) ? 0 : c->hca[h].qp[bank][p]->qp_num;
++            }
+         }
+     }
+     memcpy(out, &blob, sizeof(blob));
+     return 0;
+ }
+ 
+-static int connect_qp(roce_ctx_t *c, int h, int p, const roce_blob_t *peer) {
++static int connect_qp(roce_ctx_t *c, int bank, int h, int p, const roce_blob_t *peer) {
+     roce_hca_t *hca = &c->hca[h];
+     struct ibv_qp_attr rtr;
+     memset(&rtr, 0, sizeof(rtr));
+     rtr.qp_state = IBV_QPS_RTR;
+     rtr.path_mtu = (enum ibv_mtu)(peer->mtu[h] < (uint32_t)hca->mtu ? peer->mtu[h] : (uint32_t)hca->mtu);
+-    rtr.dest_qp_num = peer->qp_num[h][c->rank];
++    if (bank == 1 && rtr.path_mtu > IBV_MTU_1024) rtr.path_mtu = IBV_MTU_1024;
++    rtr.dest_qp_num = peer->qp_num[bank][h][c->rank];
+     rtr.rq_psn = 0;
+     rtr.max_dest_rd_atomic = 1;
+     rtr.min_rnr_timer = 12;
+@@ -304,7 +320,7 @@
+     rtr.ah_attr.grh.hop_limit = 64;
+     rtr.ah_attr.grh.traffic_class = 106;
+     rtr.ah_attr.grh.flow_label = 0;
+-    int rc = ibv_modify_qp(hca->qp[p], &rtr,
++    int rc = ibv_modify_qp(hca->qp[bank][p], &rtr,
+                            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+     if (rc != 0) {
+@@ -319,7 +335,7 @@
+     rts.rnr_retry = 7;
+     rts.sq_psn = 0;
+     rts.max_rd_atomic = 1;
+-    rc = ibv_modify_qp(hca->qp[p], &rts,
++    rc = ibv_modify_qp(hca->qp[bank][p], &rts,
+                        IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+                            IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+     if (rc != 0) {
+@@ -330,11 +346,17 @@
+ }
+ 
+ int roce_connect(roce_ctx_t *c, const void *blobs, uint64_t blobs_len) {
+-    if (blobs_len < sizeof(roce_blob_t) * (uint64_t)c->world) {
++    if (blobs_len != sizeof(roce_blob_t) * (uint64_t)c->world) {
+         snprintf(c->err, sizeof(c->err), "peer blob buffer too small");
+         return -1;
+     }
+     const roce_blob_t *all = (const roce_blob_t *)blobs;
++    for (int p = 0; p < c->world; p++) {
++        if (all[p].abi_version != ROCE_ABI_VERSION || all[p].n_hca != (uint32_t)c->n_hca) {
++            snprintf(c->err, sizeof(c->err), "incompatible packet-policy endpoint");
++            return -1;
++        }
++    }
+     for (int p = 0; p < c->world; p++) {
+         if (p == c->rank) {
+             continue;
+@@ -342,8 +364,8 @@
+         c->peer_addr[p] = all[p].region_addr;
+         for (int h = 0; h < c->n_hca; h++) {
+             c->peer_rkey[h][p] = all[p].rkey[h];
+-            if (connect_qp(c, h, p, &all[p]) != 0) {
+-                return -1;
++            for (int bank = 0; bank < 2; bank++) {
++                if (connect_qp(c, bank, h, p, &all[p]) != 0) return -1;
+             }
+         }
+     }
+@@ -373,12 +395,15 @@
+ }
+ 
+ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+-    if (nbytes == 0 || nbytes % 16 != 0) {
++    if (nbytes == 0 || nbytes % 16 != 0 || nbytes > c->slot_bytes) {
+         snprintf(c->err, sizeof(c->err),
+                  "RoCE payload size must be a positive multiple of 16 bytes, got %u",
+                  nbytes);
+         return -1;
+     }
++    // Select once per message; payload and flag cannot diverge between banks.
++    uint32_t limit = atomic_load_explicit(&c->small_packet_threshold, memory_order_relaxed);
++    int bank = limit != 0 && nbytes <= limit;
+     uint32_t slot = seq & 1u;
+     uint8_t *send = c->region + c->send_off + (size_t)slot * c->slot_bytes;
+     uint32_t seq_copy = seq;
+@@ -454,7 +479,7 @@
+                 first_wr = &data_wr;
+             }
+             struct ibv_send_wr *bad = NULL;
+-            int rc = ibv_post_send(hca->qp[p], first_wr, &bad);
++            int rc = ibv_post_send(hca->qp[bank][p], first_wr, &bad);
+             if (rc != 0) {
+                 set_err(c, "ibv_post_send", rc);
+                 return -1;
+@@ -465,6 +490,7 @@
+         }
+     }
+     c->ops_posted += 1;
++    atomic_fetch_add_explicit(&c->packet_ops[bank], 1, memory_order_relaxed);
+     for (int h = 0; h < c->n_hca; h++) {
+         if (drain_cq(c, h) != 0) {
+             return -1;
+@@ -585,6 +611,19 @@
+     }
+ }
+ 
++// Callers change policy at a synchronized boundary. Different peers may select
++// different banks safely: both destination QPs are connected to the same MR.
++int roce_set_small_packet_threshold(roce_ctx_t *c, uint32_t bytes) {
++    if (bytes > c->slot_bytes || bytes % 16 != 0) return -1;
++    atomic_store_explicit(&c->small_packet_threshold, bytes, memory_order_relaxed);
++    return 0;
++}
++
++uint64_t roce_packet_stat(roce_ctx_t *c, int which) {
++    if (which < 0 || which > 1) return 0;
++    return atomic_load_explicit(&c->packet_ops[which], memory_order_relaxed);
++}
++
+ void roce_destroy(roce_ctx_t *c) {
+     if (c == NULL) {
+         return;
+@@ -593,8 +632,8 @@
+     for (int h = 0; h < ROCE_MAX_HCAS; h++) {
+         roce_hca_t *hca = &c->hca[h];
+         for (int p = 0; p < ROCE_MAX_PEERS; p++) {
+-            if (hca->qp[p] != NULL) {
+-                ibv_destroy_qp(hca->qp[p]);
++            for (int bank = 0; bank < 2; bank++) {
++                if (hca->qp[bank][p] != NULL) ibv_destroy_qp(hca->qp[bank][p]);
+             }
+         }
+         if (hca->cq != NULL) {

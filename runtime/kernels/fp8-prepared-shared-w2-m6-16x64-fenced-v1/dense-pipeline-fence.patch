@@ -1,0 +1,22 @@
+--- dense_blockscaled_gemm_sm120_b12x.py
++++ dense_blockscaled_gemm_sm120_b12x.py
+@@ -1469,6 +1469,9 @@
+                         )
+ 
+                         if k_block_idx == num_k_blocks - 1:
++                            if cutlass.const_expr(self.load_path == "tma"):
++                                cute.arch.fence_view_async_shared()
++                                cute.arch.sync_warp()
+                             mainloop_pipeline.consumer_release(mainloop_consumer_state)
+                             mainloop_consumer_state.advance()
+ 
+@@ -1563,6 +1566,9 @@
+                     )
+ 
+                     if k_block_idx == num_k_blocks - 1:
++                        if cutlass.const_expr(self.load_path == "tma"):
++                            cute.arch.fence_view_async_shared()
++                            cute.arch.sync_warp()
+                         mainloop_pipeline.consumer_release(mainloop_consumer_state)
+                         mainloop_consumer_state.advance()
+ 

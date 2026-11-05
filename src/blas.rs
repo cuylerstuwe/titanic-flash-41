@@ -325,9 +325,18 @@ impl Blas {
         rows: usize,
         stream: &Stream,
     ) -> Result<()> {
+        self.grouped_woa_bounded(x,weight,output,rows,rows,stream)
+    }
+    /// Keep allocation and group strides at their physical extent while
+    /// computing only a prefix. Inactive output rows must not be consumed.
+    pub(crate) fn grouped_woa_bounded(
+        &self,x:&Buffer<half::bf16>,weight:&Buffer<half::bf16>,
+        output:&mut Buffer<half::bf16>,rows:usize,compute:usize,stream:&Stream,
+    )->Result<()> {
         self.guard_stream(stream)?;
         ensure!(
             ((9..=384).contains(&rows) || crate::config::wide_rows(rows))
+                && (compute==rows || (rows==128&&(17..128).contains(&compute)))
                 && x.len() == rows * 8192
                 && weight.len() == 2 * 1024 * 4096
                 && output.len() == rows * 2048
@@ -359,7 +368,7 @@ impl Blas {
                     1,
                     0,
                     1024,
-                    rows as i32,
+                    compute as i32,
                     4096,
                     (&alpha as *const f32).cast(),
                     weight.ptr() as _,

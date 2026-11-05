@@ -15,7 +15,7 @@ use crate::{
     roce::Roce,
     weights::Weights,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::{cell::{Cell, RefCell}, path::Path, rc::Rc};
 pub struct ModelIo {
@@ -42,6 +42,15 @@ pub struct ModelIo {
     last_head: Projection<f32>,
     last_input: Buffer<bf16>,
     last_gathered: Buffer<f32>,
+    // Optional final-only head scratch; immutable encoding is shared with
+    // the existing M6 verifier. No second encoded/canonical weight copy.
+    append_encoded: Option<(Rc<crate::lossless_head::Head>,Buffer<bf16>)>,
+    prefill_encoded_active: bool,
+    prefill_row_pruned: bool,
+    // Private per-CTA row history for the final-only M128 publication kernel.
+    // Full/partial multirow writers must invalidate it on the same stream.
+    last_published_rows: Option<Buffer<i32>>,
+    sparse_publish_active: bool,
     logits: Buffer<f32>,
     stream: Cell<usize>,
 }
@@ -233,6 +242,11 @@ impl ModelIo {
             last_head,
             last_input: cuda.allocate(5120)?,
             last_gathered: cuda.allocate(129280)?,
+            append_encoded:None,
+            prefill_encoded_active:false,
+            prefill_row_pruned:false,
+            last_published_rows:None,
+            sparse_publish_active:false,
             logits: cuda.allocate(head_rows * 129280)?,
             stream: Cell::new(0),
         })
@@ -242,6 +256,72 @@ impl ModelIo {
     }
     pub(crate) fn set_lossless_head_for_probe(&self,active:bool)->Result<()> {
         self.head.set_lossless_for_probe(active)
+    }
+    pub(crate) fn prepare_append_encoded(&mut self,stream:&Stream)->Result<()> {
+        self.bind(stream)?;
+        ensure!(matches!(self.rows,16|32|128)&&!self.input_only,"final-head preparation geometry");
+        if self.append_encoded.is_some(){return Ok(());}
+        let head=self.lossless_atlas.borrow().as_ref().cloned()
+            .ok_or_else(||anyhow::anyhow!("final head needs the existing shared M6 encoding"))?;
+        ensure!(head.matches_canonical(&self.cuda,self.weights.ptr("head.weight")?,stream)
+            &&self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+6*5120*2,
+            "final head shared encoding/reserve");
+        let mut input=self.cuda.allocate::<bf16>(6*5120)?;input.zero()?;
+        stream.join_default()?;stream.synchronize()?;
+        self.append_encoded=Some((head,input));Ok(())
+    }
+    pub(crate) fn prefill_encoded_enabled(&self)->bool {self.prefill_encoded_active}
+    pub(crate) fn sparse_publish_enabled(&self)->bool {self.sparse_publish_active}
+    pub(crate) fn set_sparse_publish(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(self.rows==128&&!self.input_only,"sparse publication geometry");
+        self.bind(stream)?;
+        if enabled&&self.last_published_rows.is_none() {
+            ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024,
+                "sparse publication tracker reserve");
+            self.last_published_rows=Some(self.cuda.allocate::<i32>(505)?);
+        }
+        self.invalidate_last_publication(stream)?;
+        self.sparse_publish_active=enabled;Ok(())
+    }
+    fn invalidate_last_publication(&self,stream:&Stream)->Result<()> {
+        if let Some(previous)=&self.last_published_rows {
+            unsafe {self.cuda.zero_device(previous.ptr(),previous.bytes(),stream)?;}
+        }
+        Ok(())
+    }
+    pub(crate) fn prefill_row_pruned(&self)->bool {self.prefill_row_pruned}
+    pub(crate) fn set_prefill_row_pruned(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(self.rows==128&&!self.input_only,"last-row normalization geometry");
+        self.bind(stream)?;self.prefill_row_pruned=enabled;Ok(())
+    }
+    pub(crate) fn prefill_normalized_ptr(&self,live:usize)->Result<u64> {
+        ensure!((1..=self.rows).contains(&live),"prefill normalized live row");
+        Ok(if self.prefill_row_pruned {
+            if self.prefill_encoded_active {self.append_encoded.as_ref().context("encoded head input")?.1.ptr()}
+            else {self.last_input.ptr()}
+        }else{self.normalized.ptr()+((live-1)*5120*2)as u64})
+    }
+    pub(crate) fn set_prefill_encoded(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(self.rows==128&&!self.input_only,"prefill encoded head geometry");
+        self.bind(stream)?;
+        if enabled {self.prepare_append_encoded(stream)?;}
+        self.prefill_encoded_active=enabled;Ok(())
+    }
+    pub(crate) fn run_append_encoded_last(&mut self,residual:&Buffer<bf16>,pre:&Buffer<f32>,
+        tokens:&TokenRows,stream:&Stream)->Result<()> {
+        self.prepare_head(residual,pre,stream)?;
+        let live=tokens.active_rows();
+        ensure!(matches!(self.rows,16|32)&&tokens.ids().len()==self.rows
+            &&self.cuda.owns_buffer(tokens.live())&&(1..=self.rows).contains(&live),
+            "final encoded head live geometry");
+        let(head,input)=self.append_encoded.as_ref().ok_or_else(||anyhow::anyhow!("final head not prepared"))?;
+        // Each cached graph binds this CPU live count. Only row0 is consumed;
+        // the remaining five input rows stay zero in this private allocation.
+        unsafe{self.cuda.copy_device(input.ptr(),self.normalized.ptr()+((live-1)*5120*2)as u64,5120*2,stream)?;}
+        head.run(input.ptr(),self.head.output().ptr(),stream)?;
+        if live>1 {unsafe{self.cuda.copy_device(self.head.output().ptr()+((live-1)*32320*4)as u64,
+            self.head.output().ptr(),32320*4,stream)?;}}
+        Ok(())
     }
     pub(crate) fn with_draft_head_gemv(mut self, root: &Path) -> Result<Self> {
         ensure!(self.rows == 5 && !self.input_only, "M5 drafter IO profile required");
@@ -422,14 +502,20 @@ impl ModelIo {
         tokens: &TokenRows,
         stream: &Stream,
     ) -> Result<()> {
-        self.prepare_head(residual, pre, stream)?;
         ensure!(
-            self.cuda.owns_buffer(tokens.live()) && tokens.ids().len() == self.rows,
+            self.cuda.owns_buffer(tokens.live()) && tokens.ids().len() == self.rows
+                &&(1..=self.rows).contains(&tokens.active_rows()),
             "prefill head live-row metadata"
         );
+        if self.prefill_row_pruned {
+            self.prepare_last_head(residual,pre,tokens,stream)?;
+        }else{
+        self.prepare_head(residual, pre, stream)?;
         let mut input = self.normalized.ptr();
         let mut live = tokens.live().ptr();
-        let mut output = self.last_input.ptr();
+        let mut output = if self.prefill_encoded_active {
+            self.append_encoded.as_ref().context("prefill encoded head not prepared")?.1.ptr()
+        } else {self.last_input.ptr()};
         let mut rows = self.rows as i32;
         let mut args = [
             (&mut input as *mut u64).cast(),
@@ -446,7 +532,33 @@ impl ModelIo {
                 &mut args,
             )?;
         }
-        self.last_head.run(&self.last_input, stream)
+        }
+        if self.prefill_encoded_active {
+            let(head,input)=self.append_encoded.as_ref().context("prefill encoded head not prepared")?;
+            // Five unused input rows remain zero. The large profile already
+            // owns >=6 output rows; only row0 feeds the existing M1 gather.
+            head.run(input.ptr(),self.head.output().ptr(),stream)?;
+            unsafe {self.cuda.copy_device(self.last_head.output().ptr(),self.head.output().ptr(),32320*4,stream)}
+        } else {self.last_head.run(&self.last_input, stream)}
+    }
+    fn prepare_last_head(&mut self,residual:&Buffer<bf16>,pre:&Buffer<f32>,
+        tokens:&TokenRows,stream:&Stream)->Result<()> {
+        self.bind(stream)?;
+        ensure!(self.rows==128&&!self.input_only&&self.cuda.owns_buffer(residual)
+            &&self.cuda.owns_buffer(pre)&&residual.len()==self.rows*20480&&pre.len()==self.rows*4,
+            "last-row final model boundary shape/context");
+        let mut input=residual.ptr();let mut coefficients=pre.ptr();
+        let mut live=tokens.live().ptr();let mut combined=self.combined.ptr();let mut rows=self.rows as i32;
+        let mut args=[(&mut input as *mut u64).cast(),(&mut coefficients as *mut u64).cast(),
+            (&mut live as *mut u64).cast(),(&mut combined as *mut u64).cast(),(&mut rows as *mut i32).cast()];
+        unsafe {self.module.function("ca_final_hc_combine_last")?.launch([20,1,1],[256,1,1],0,stream,&mut args)?;}
+        // The view owns no allocation and never outlives this ModelIo owner.
+        // Captured addresses point into existing private head input storage.
+        let destination=if self.prefill_encoded_active {
+            &self.append_encoded.as_ref().context("encoded head input")?.1
+        }else{&self.last_input};
+        let mut output=unsafe{destination.view(0,5120)}?;
+        self.norm.rms(&self.combined,&self.norm_weight,&mut output,1,5120,stream)
     }
     pub(crate) fn prepare_head(
         &mut self,
@@ -511,13 +623,22 @@ impl ModelIo {
                 32320,
                 stream,
             )?;
-            self.cuda
-                .zero_device(self.logits.ptr(), self.logits.bytes(), stream)?;
+            if !self.sparse_publish_active {
+                self.cuda.zero_device(self.logits.ptr(), self.logits.bytes(), stream)?;
+            }
         }
         let mut input = self.last_gathered.ptr();
         let mut live = tokens.live().ptr();
         let mut output = self.logits.ptr();
         let mut rows = self.rows as i32;
+        if self.sparse_publish_active {
+            let mut previous=self.last_published_rows.as_ref().context("sparse publication tracker")?.ptr();
+            let mut args=[(&mut input as *mut u64).cast(),(&mut live as *mut u64).cast(),
+                (&mut previous as *mut u64).cast(),(&mut output as *mut u64).cast(),
+                (&mut rows as *mut i32).cast()];
+            return unsafe {self.module.function("ca_replace_last_head_logits")?.launch(
+                [505,1,1],[256,1,1],0,stream,&mut args)};
+        }
         let mut args = [
             (&mut input as *mut u64).cast(),
             (&mut live as *mut u64).cast(),
@@ -538,7 +659,20 @@ impl ModelIo {
         self.bind(stream)?;
         ensure!(!self.input_only, "wide encoder IO has no vocabulary head");
         ensure!(comm.rank() == self.rank, "logit transport rank mismatch");
-        unsafe { comm.gather_f32(self.head.output(), &mut self.logits, 32320, stream) }
+        unsafe { comm.gather_f32(self.head.output(), &mut self.logits, 32320, stream)?; }
+        self.invalidate_last_publication(stream)
+    }
+    pub(crate) fn gather_existing_last_logits(
+        &mut self, comm:&Roce, tokens:&TokenRows, stream:&Stream,
+    )->Result<()> {
+        self.bind(stream)?;
+        ensure!(!self.input_only && comm.rank()==self.rank
+            && self.cuda.owns_buffer(tokens.live()) && tokens.ids().len()==self.rows,
+            "existing last-logit transport metadata/context");
+        // The model graph bank is keyed by this CPU live count. Unlike the
+        // one-row prefill projection, this selects the unchanged full head.
+        unsafe {comm.gather_f32_last(self.head.output(),&mut self.logits,32320,tokens.active_rows(),stream)?;}
+        self.invalidate_last_publication(stream)
     }
     pub fn input(&self) -> &Buffer<bf16> {
         &self.expanded

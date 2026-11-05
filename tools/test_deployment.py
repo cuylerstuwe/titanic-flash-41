@@ -19,6 +19,46 @@ download = module('download_model', ROOT/'tools/download_model.py')
 prepare = module('prepare_runtime', ROOT/'tools/prepare_runtime.py')
 
 class DeploymentChecks(unittest.TestCase):
+    def test_stop_signals_peers_together_and_preserves_ownership_on_failure(self):
+        import subprocess
+        import threading
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = json.loads((ROOT/'deploy/fleet.example.json').read_text())
+            cfg['root'] = directory
+            inventory = Path(directory)/'fleet.json'
+            inventory.write_text(json.dumps(cfg))
+            class Cohort(fleet.Fleet):
+                def __init__(self, inventory):
+                    super().__init__(inventory)
+                    self.barrier = threading.Barrier(3)
+                    self.removed, self.stopped = set(), set()
+                def inspect(self, rank, name):
+                    return {'Id': name, 'Config': {'Labels': {
+                        'project': fleet.PROJECT, 'generation': 'other' if rank == 3 else 'ours'},
+                        'Entrypoint': ['/data/runtime/titanic-flash']}}
+                def run(self, args, rank=0, check=True, timeout=40):
+                    if args[:2] == ['docker', 'stop']:
+                        self.stopped.add(rank)
+                        self.barrier.wait(timeout=3)
+                        if rank == 1:
+                            raise subprocess.TimeoutExpired(args, timeout)
+                    elif args[:2] == ['docker', 'rm']:
+                        self.removed.add(rank)
+                    else:
+                        raise AssertionError(args)
+                    return SimpleNamespace(returncode=0, stdout='', stderr='')
+                def host_policies(self, action, state):
+                    self.restored = action == 'restore'
+            probe = Cohort(inventory)
+            state = dict(generation='ours', containers=['r0', 'r1', 'r2', 'r3'])
+            with self.assertRaisesRegex(RuntimeError, 'coordinated stop incomplete'):
+                probe.stop(state)
+            self.assertEqual(probe.stopped, {0, 1, 2})
+            self.assertEqual(probe.removed, {0, 2})
+            self.assertTrue(probe.restored)
+            self.assertFalse(state.get('stopped', False))
+
     def test_runtime_contains_every_compiled_projection_replacement(self):
         inventory = json.loads((ROOT/'runtime/artifacts.json').read_text())
         prepare.validate_fenced_bundles(inventory)
@@ -26,6 +66,23 @@ class DeploymentChecks(unittest.TestCase):
         del incomplete['files']['kernels/fp8-shared-w13-r0-m32-v1-pipeline-fence-v1/manifest.json']
         with self.assertRaisesRegex(AssertionError, 'missing fenced projection artifact'):
             prepare.validate_fenced_bundles(incomplete)
+
+    def test_runtime_requires_implicit_default_moe_dependency(self):
+        inventory = json.loads((ROOT/'runtime/artifacts.json').read_text())
+        del inventory['files']['kernels/moe-runtime-m6-cache-ca-v1/runtime-contract.json']
+        with self.assertRaisesRegex(AssertionError, 'missing default MoE artifact'):
+            prepare.validate_fenced_bundles(inventory)
+
+    def test_runtime_matches_loader_pins_and_enabled_overlays(self):
+        inventory = json.loads((ROOT/'runtime/artifacts.json').read_text())
+        wrong = copy.deepcopy(inventory)
+        wrong['files']['kernels/fp8-prepared-index-q-m16-16x128-fenced-v1/manifest.json'] = '0'*64
+        with self.assertRaisesRegex(AssertionError, 'compiled kernel pin mismatch'):
+            prepare.validate_fenced_bundles(wrong)
+        missing = copy.deepcopy(inventory)
+        del missing['files']['kernels/draft-markov-gemv-cg-v1/markov_head_m1.cubin']
+        with self.assertRaisesRegex(AssertionError, 'missing or mismatched enabled kernel artifact'):
+            prepare.validate_fenced_bundles(missing)
 
     def test_vision_distribution_uses_selected_host_and_unchanged_canonical_atlas(self):
         profile = json.loads((ROOT/'deploy/profile.json').read_text())

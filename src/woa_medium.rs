@@ -7,13 +7,15 @@ use crate::{
     checkpoint::Dtype,
     cuda::{Buffer, Cuda, Module, Stream},
     weights::Weights,
+    triton_ops::Operator,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     rc::{Rc, Weak},
+    path::Path,
 };
 
 // Immutable derived operands retain the canonical owner. Weak cache entries
@@ -35,6 +37,49 @@ pub(crate) fn cached_policy() -> Result<bool> {
         Err(e) => Err(e.into()),
     }
 }
+pub(crate) fn compact_policy()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_WOA_MID_COMPACT") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid compact medium WO-A policy");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
+    }
+}
+pub(crate) fn prefill_live_policy()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_WOA_PREFILL_LIVE") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid WO-A prefill row policy");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
+    }
+}
+thread_local! {
+    // Enqueue/capture-only bound. A graph owns its recorded geometry; this
+    // cannot affect another thread, stream, profile or decoder-tail replay.
+    static PREFILL_ROWS: Cell<Option<(usize,usize)>> = const { Cell::new(None) };
+}
+pub(crate) struct LiveRowsScope(std::marker::PhantomData<Rc<()>>);
+impl LiveRowsScope {
+    pub(crate) fn new(enabled:bool,live:usize,capacity:usize,stream:&Stream)->Result<Self> {
+        PREFILL_ROWS.with(|slot|->Result<()> {
+            ensure!(slot.get().is_none(),"nested WO-A prefill row scope");
+            if enabled {
+                ensure!(capacity==128&&(33..128).contains(&live),"WO-A prefill row geometry");
+                // The component screen found cuBLAS's M33 plan slower hot;
+                // the aligned64 plan improved both hot and displaced runs.
+                let compute=if live<=64 {live.div_ceil(32)*32}else{live};
+                slot.set(Some((compute,stream.raw()as usize)));
+            }
+            Ok(())
+        })?;
+        Ok(Self(std::marker::PhantomData))
+    }
+}
+impl Drop for LiveRowsScope {
+    fn drop(&mut self){PREFILL_ROWS.with(|slot|slot.set(None));}
+}
+struct Compact {
+    partial_op:Operator,
+    reduce_op:Operator,
+    partial:Buffer<f32>,
+    reference_op:Option<Operator>,
+}
 
 pub struct Scratch {
     cuda: Cuda,
@@ -45,6 +90,9 @@ pub struct Scratch {
     grouped: Buffer<bf16>,
     stream: Cell<Option<usize>>,
     cache_enabled: Cell<bool>,
+    compact: Option<Compact>,
+    compact_enabled: Cell<bool>,
+    reference_enabled: Cell<bool>,
 }
 impl Scratch {
     pub fn new(cuda: &Cuda, core: &[u8], rows: usize) -> Result<Rc<RefCell<Self>>> {
@@ -67,10 +115,14 @@ impl Scratch {
             grouped: cuda.allocate(rows * 2048)?,
             stream: Cell::new(None),
             cache_enabled: Cell::new(true),
+            compact:None,
+            compact_enabled:Cell::new(false),
+            reference_enabled:Cell::new(false),
         })))
     }
     pub fn owned_scratch_bytes(&self) -> usize {
         self.decoded.bytes() + self.grouped.bytes() + 32 * 1024 * 1024
+            +self.compact.as_ref().map_or(0,|c|c.partial.bytes())
     }
 }
 pub struct Grouped {
@@ -84,6 +136,42 @@ pub struct Grouped {
     cached: Option<Rc<DecodedWeight>>,
 }
 impl Grouped {
+    pub(crate) fn prepare_compact(&self,kernels:&Path,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(matches!(self.rows,16|32)&&self.cuda.owns_stream(stream),"compact WO-A profile/context");
+        let mut s=self.scratch.try_borrow_mut()?;
+        ensure!(s.stream.get().is_none(),"prepare compact WO-A before first execution");
+        if s.compact.is_none() {
+            let root=kernels.join("woa-mid-compact-v1");
+            let partial_op=Operator::load(&self.cuda,&root,&format!("woa_mid_partial_m{}",self.rows))?;
+            let reduce_op=Operator::load(&self.cuda,&root,&format!("woa_mid_reduce_m{}",self.rows))?;
+            ensure!(partial_op.entry.arguments.iter().map(|a|a.kind.as_str()).collect::<Vec<_>>()
+                ==["*bf16","*fp8e4nv","*u8","*fp32"]
+                &&reduce_op.entry.arguments.iter().map(|a|a.kind.as_str()).collect::<Vec<_>>()
+                ==["*fp32","*bf16"],"compact WO-A ABI");
+            let sk=if self.rows==16{4}else{2};
+            ensure!((partial_op.entry.grid.x_mul,partial_op.entry.grid.x_add,partial_op.entry.grid.y,partial_op.entry.grid.z)
+                ==(0,if self.rows==16{16}else{32},2,sk)
+                &&(reduce_op.entry.grid.rows_div,reduce_op.entry.grid.x_mul,reduce_op.entry.grid.x_add,reduce_op.entry.grid.y,reduce_op.entry.grid.z)
+                ==(1,8,0,1,1),"compact WO-A grid");
+            let mut partial=self.cuda.allocate(sk as usize*self.rows*2048)?;partial.zero()?;
+            let reference_op=if std::env::var("CANADA_SCRATCH_WOA_MID_REFERENCE_SCREEN").as_deref()==Ok("1") {
+                let op=Operator::load(&self.cuda,&kernels.join("woa-mid-reference-v1"),
+                    &format!("woa_fp64_m{}",self.rows))?;
+                ensure!(op.entry.arguments.iter().map(|a|a.kind.as_str()).collect::<Vec<_>>()
+                    ==["*bf16","*bf16","*bf16"],"WO-A diagnostic reference ABI");
+                ensure!((op.entry.grid.rows_div,op.entry.grid.x_mul,op.entry.grid.x_add,op.entry.grid.y,op.entry.grid.z)
+                    ==(1,256,0,1,1),"WO-A diagnostic reference grid");Some(op)
+            }else{None};
+            s.compact=Some(Compact{partial_op,reduce_op,partial,reference_op});
+        }
+        s.compact_enabled.set(enabled);Ok(())
+    }
+    pub(crate) fn set_compact_mode_for_probe(&self,mode:u8)->Result<()> {
+        let s=self.scratch.try_borrow()?;
+        ensure!(mode<=2&&s.compact.is_some(),"compact WO-A probe requires prepared shared scratch");
+        ensure!(mode!=2||s.compact.as_ref().unwrap().reference_op.is_some(),"WO-A reference must be prepared");
+        s.compact_enabled.set(mode==1);s.reference_enabled.set(mode==2);Ok(())
+    }
     pub fn new(
         cuda: &Cuda,
         weights: Rc<Weights>,
@@ -178,6 +266,20 @@ impl Grouped {
             "shared WO-A scratch requires one ordered stream"
         );
         s.stream.set(Some(raw));
+        if s.reference_enabled.get() {
+            let op=s.compact.as_ref().and_then(|c|c.reference_op.as_ref()).context("WO-A reference absent")?;
+            let w=self.cached.as_ref().context("WO-A reference needs canonical BF16 operands")?;
+            unsafe{op.launch(self.rows as u32,&[input.ptr(),w.values.ptr(),self.output.ptr()],stream)}?;
+            return Ok(());
+        }
+        if s.compact_enabled.get() {
+            let c=s.compact.as_ref().context("compact WO-A plan absent")?;
+            unsafe {
+                c.partial_op.launch(self.rows as u32,&[input.ptr(),self.weight,self.scales,c.partial.ptr()],stream)?;
+                c.reduce_op.launch(self.rows as u32,&[c.partial.ptr(),self.output.ptr()],stream)?;
+            }
+            return Ok(());
+        }
         let mut w = self.weight;
         let mut scales = self.scales;
         let mut decoded = s.decoded.ptr();
@@ -204,10 +306,20 @@ impl Grouped {
             ..
         } = &mut *s;
         let operand = cached.map_or(&*decoded, |v| &v.values);
-        blas.grouped_woa(input, operand, grouped, self.rows, stream)?;
+        let compute=PREFILL_ROWS.with(|slot|slot.get()
+            .filter(|(_,owner)|self.rows==128&&*owner==stream.raw()as usize)
+            .map_or(self.rows,|(rows,_)|rows));
+        blas.grouped_woa_bounded(input, operand, grouped, self.rows, compute, stream)?;
         let mut source = s.grouped.ptr();
         let mut dest = self.output.ptr();
         let mut rows = self.rows as i32;
+        if compute<self.rows {
+            let mut active=compute as i32;
+            let mut args=[(&mut source as *mut u64).cast(),(&mut dest as *mut u64).cast(),
+                (&mut rows as *mut i32).cast(),(&mut active as *mut i32).cast()];
+            return unsafe{s.module.function("ca_woa_token_major_bounded")?.launch(
+                [(self.rows*2048).div_ceil(256)as u32,1,1],[256,1,1],0,stream,&mut args)};
+        }
         let mut args = [
             (&mut source as *mut u64).cast(),
             (&mut dest as *mut u64).cast(),

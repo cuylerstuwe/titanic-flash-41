@@ -1,3 +1,4 @@
+mod launch_flags;
 pub mod attention;
 mod prefill_exchange;
 mod event_log;
@@ -99,6 +100,7 @@ mod tiny_encoder_probe;
 mod tiny_append_probe;
 mod append_distribution_probe;
 mod lossless_head;
+mod nvfp4_head;
 mod lossless_head_probe;
 mod split_attention_probe;
 mod mhc_stats_probe;
@@ -123,6 +125,7 @@ pub mod fp8_linear;
 pub mod gather_probe;
 pub mod logit_gather_probe;
 pub mod sum_grid_probe;
+pub mod posting_probe;
 pub mod hash_history;
 mod history_lookup;
 pub mod index;
@@ -149,6 +152,7 @@ pub mod prefill_plan;
 pub mod prelude;
 pub mod primitives;
 pub mod probe;
+pub mod image_recycle_probe;
 pub mod program;
 pub mod query_index;
 pub mod sparse_index;
@@ -162,6 +166,8 @@ mod natural_generation_probe;
 pub mod protocol;
 #[cfg(feature = "protocol")]
 mod prompt_regions;
+#[cfg(feature = "serving")]
+mod context_transport;
 #[cfg(feature = "serving")]
 mod http_server;
 pub mod roce;

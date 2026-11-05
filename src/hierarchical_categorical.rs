@@ -91,6 +91,22 @@ pub fn run(rank:usize,endpoint:&str,nonce:&[u8],root:&Path,core_path:&Path)->Res
  let mut referenceq=cuda.allocate::<f64>(rows*VOCAB)?;
  let mut reference=(0..rows).map(|_|Categorical::new(&cuda,&core,1)).collect::<Result<Vec<_>>>()?;
  let mut candidate=(0..rows).map(|_|Hierarchical::new(&cuda,&core,rank)).collect::<Result<Vec<_>>>()?;
+ if std::env::var("CANADA_SCRATCH_FUSED_PROBABILITY_RESIDUAL_SCREEN").as_deref()==Ok("1") {
+  // Isolate the new composition instead of repeating the already-qualified
+  // hierarchical algorithm and transport panels on every local fusion.
+  let(mut ptr,mut r,mut n,mut phase)=(local.ptr(),rank as i32,rows as i32,0i32);
+  launch!(module,"ca_sharded_categorical_fixture",[local.len().div_ceil(256)as u32,1,1],&stream;ptr,r,n,phase)?;
+  for step in 0..rows {
+   candidate[step].upload_uniforms(2026110401,step as u64)?;
+   stream.join_default()?;
+   candidate[step].enqueue(&local,step,&localq,step,1.,&comm,&stream)?;
+  }
+  stream.synchronize()?;comm.health()?;
+  let bundled=crate::bundled_sampler_probe::run(&cuda,&core,&localq,&candidate,&comm,&stream)?;
+  stream.synchronize()?;comm.health()?;
+  return Ok(json!({"rank":rank,"passed":true,"bundled":bundled,"all_peers_ready_before_gpu":true,
+   "scope":"Focused probability/residual fusion with the current hierarchical actual-q proposal law; no model weights loaded."}));
+ }
  let mut sum_input=cuda.allocate::<u16>(8)?;let mut sum_output=cuda.allocate::<u16>(8)?;
  sum_input.upload(&vec![half::bf16::from_f32((rank+1)as f32).to_bits();8])?;
  let mut cases=Vec::new();

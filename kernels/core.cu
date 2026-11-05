@@ -3,6 +3,7 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 #include "state_exchange.cuh"
+#include "state_image_copy.cuh"
 #include "paired_dense.cuh"
 
 // Ordered metadata for a bounded accepted draft prefix. The caller validates
@@ -124,6 +125,20 @@ extern "C" __global__ void ca_select_last_head_row(const uint16_t* input,
  int h=blockIdx.x*blockDim.x+threadIdx.x;if(h>=5120)return;
  int n=*live;output[h]=(n>=1&&n<=rows)?input[(n-1)*5120+h]:0;
 }
+// Each CTA owns its tracker word. Unused rows remain bitwise positive zero;
+// unknown state (including any full-logit writer) requires one complete clear.
+extern "C" __global__ void ca_replace_last_head_logits(const float* input,
+    const int* live, int* previous, float* output, int rows) {
+    const int h=blockIdx.x*blockDim.x+threadIdx.x;
+    const int old=previous[blockIdx.x], now=*live;
+    if(h<129280) {
+        if(old>=1 && old<=rows) output[(old-1)*129280+h]=0.0f;
+        else for(int r=0;r<rows;++r) output[r*129280+h]=0.0f;
+        if(now>=1 && now<=rows) output[(now-1)*129280+h]=input[h];
+    }
+    __syncthreads();
+    if(threadIdx.x==0) previous[blockIdx.x]=(now>=1&&now<=rows)?now:0;
+}
 extern "C" __global__ void ca_publish_last_head_logits(const float* input,
  const int32_t* live,float* output,int rows){
  int h=blockIdx.x*blockDim.x+threadIdx.x;if(h>=129280)return;
@@ -143,6 +158,13 @@ extern "C" __global__ void ca_woa_token_major(const uint16_t* grouped,uint16_t* 
  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*2048)return;
  int row=i/2048,g=(i%2048)/1024,col=i%1024;
  out[i]=grouped[(g*rows+row)*1024+col];
+}
+// Keep the physical group stride; never expose untouched cuBLAS padding to a
+// downstream projection or quantizer when only a prefix was computed.
+extern "C" __global__ void ca_woa_token_major_bounded(const uint16_t* grouped,uint16_t* out,int rows,int active){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*2048)return;
+ int row=i/2048,g=(i%2048)/1024,col=i%1024;
+ out[i]=row<active?grouped[(g*rows+row)*1024+col]:0;
 }
 
 // Independent deterministic greedy target sampling. Each pass keeps the
@@ -348,6 +370,22 @@ extern "C" __global__ void ca_final_hc_combine(const __nv_bfloat16* x,
         #pragma unroll
         for(int h=0;h<4;h++)acc=fmaf(pre[row*4+h],bf(x[(row*4+h)*5120+i]),acc);
         out[row*5120+i]=__float2bfloat16_rn(acc);
+    }
+}
+
+// Last-only prompt head: preserve the same four FMA/BF16 boundary while
+// avoiding preparation of rows whose logits will never be requested.
+extern "C" __global__ void ca_final_hc_combine_last(const __nv_bfloat16* x,
+    const float* pre,const int* live,__nv_bfloat16* out,int rows) {
+    const int n=*live;
+    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<5120;i+=gridDim.x*blockDim.x) {
+        float acc=0.f;
+        if(n>=1&&n<=rows) {
+            const int row=n-1;
+            #pragma unroll
+            for(int h=0;h<4;h++)acc=fmaf(pre[row*4+h],bf(x[(row*4+h)*5120+i]),acc);
+        }
+        out[i]=__float2bfloat16_rn(acc);
     }
 }
 
@@ -644,6 +682,7 @@ extern "C" __global__ void ca_dspark_confidence_readout(
 #include "hierarchy_local_fused.cuh"
 #include "sharded_block.cuh"
 #include "sharded_local_fused.cuh"
+#include "target_probability_residual.cuh"
 
 // s598: isolated FP64 probability normalization.
 #include "categorical_normalize.cuh"
@@ -683,3 +722,5 @@ extern "C" __global__ void ca_trace_copy_first(const uint32_t* current,
 #include "block_finish_parallel.cuh"
 
 #include "block_decide_finish_fused.cuh"
+
+#include "ffn_sum_shared.cuh"

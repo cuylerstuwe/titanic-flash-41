@@ -60,3 +60,11 @@ required-features = ["vision-input"]
 name = "host-input-pressure"
 required-features = ["protocol"]
 
+[[example]]
+name = "forward-roundtrip"
+required-features = ["protocol"]
+
+[[example]]
+name = "image-source-screen"
+required-features = ["vision-protocol"]
+

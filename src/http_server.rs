@@ -9,6 +9,10 @@ mod timing;
 mod admission;
 #[path = "http_raw_input.rs"]
 mod raw_input;
+#[path = "http_context.rs"]
+mod context;
+#[path = "input_reclaim_ack.rs"]
+mod reclaim_ack;
 use timing::{PrefillTiming, WithTimings};
 use anyhow::{Result, ensure};
 use axum::{
@@ -92,6 +96,9 @@ pub(crate) struct ServerConfig {
     pub allow_remote: bool,
     #[serde(default = "default_output_stall_seconds")]
     pub output_stall_seconds: u64,
+    /// Optional immutable input-message cache; zero keeps transport disabled.
+    #[serde(default)]
+    pub context_cache_mib: usize,
 }
 fn default_output_stall_seconds() -> u64 { 60 }
 
@@ -108,6 +115,7 @@ impl ServerConfig {
         ensure!(ip.is_loopback() || (self.allow_remote && fleet && self.priority_file.is_some()),
             "remote native HTTP requires explicit fleet binding and scheduler authentication");
         ensure!((1..=300).contains(&self.output_stall_seconds), "output stall timeout must be 1..300 seconds");
+        ensure!(self.context_cache_mib <= 128, "context transport cache is bounded at128MiB");
         Ok(())
     }
 }
@@ -118,7 +126,7 @@ fn listener_requires_explicit_authenticated_fleet_binding() {
     let config = |address: &str, allow_remote: bool, priority: bool| ServerConfig {
         bind: address.parse().unwrap(), tokenizer: "unused".into(), bearer_file: "unused".into(),
         priority_file: priority.then(|| PathBuf::from("scheduler.key")), allow_remote,
-        output_stall_seconds: 60,
+        output_stall_seconds: 60, context_cache_mib: 0,
     };
     assert!(config("127.0.0.1:18046", false, false).validate_listener().is_ok());
     assert!(config("[::1]:18046", false, false).validate_listener().is_ok());
@@ -135,6 +143,9 @@ fn listener_requires_explicit_authenticated_fleet_binding() {
 
 struct Shared {
     sender: mpsc::SyncSender<Job>,
+    // Separate, coalesced notifications do not consume request admission.
+    // Input pressure can need the owner before a model-ready Job exists.
+    wake_sender: mpsc::SyncSender<()>,
     frontend: Arc<Frontend>,
     capacity: usize,
     body_limit: usize,
@@ -147,6 +158,7 @@ struct Shared {
     waiting_inputs: AtomicUsize,
     waiting_image_budget: AtomicUsize,
     waiting_raw_pool: Mutex<Option<Arc<raw_input::Pool>>>,
+    context_cache: Option<Mutex<crate::context_transport::Cache>>,
     health: AtomicU8,
     progress: Arc<AtomicU64>,
     progress_gap_ms: AtomicU64,
@@ -168,13 +180,20 @@ struct Shared {
     output_stall_timeouts: AtomicU64,
     input_reclaim_target: AtomicUsize,
     input_reclaim_generation: AtomicU64,
+    input_reclaim_ack: reclaim_ack::Ack,
 }
 
 impl Shared {
+    fn wake_worker(&self) {
+        // Full means a wake is already pending. Disconnected means the owner
+        // has retired; the existing health/timeout path handles that case.
+        let _ = self.wake_sender.try_send(());
+    }
     fn fail(&self) {
         self.health.store(FAILED, Ordering::Release);
         self.shutdown.store(true, Ordering::Release);
         self.execution_admission.close();
+        self.wake_worker();
         // Wake streams even when the sole model owner is stuck in CUDA/NCCL
         // and cannot drop their backend senders. Keep HTTP health available
         // until the external supervisor retires this complete worker group.
@@ -354,6 +373,7 @@ fn prefill_turn_due(elapsed:Duration,normal:Duration,peer:Option<PrefillPeer>,sh
 }
 pub(crate) struct Queue {
     receiver: mpsc::Receiver<Job>,
+    wake_receiver: mpsc::Receiver<()>,
     pending: RefCell<VecDeque<Job>>,
     execution_owners: Cell<Option<usize>>,
     // Set by the two-owner scheduler, not inferred from raw third requests.
@@ -460,13 +480,17 @@ impl Queue {
         let deadline = Instant::now() + wait;
         loop {
             if let Some(job) = self.try_selected(false, fifo)? { return Ok(Some(job)); }
+            // The owner performs reclaim at its ordered scheduling boundary.
+            // Never do device work from an HTTP thread or inside this wait.
+            if self.shared.input_reclaim_target.load(Ordering::Acquire) > 0 || self.stopping() {
+                return Ok(None);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
             }
-            match self.receiver.recv_timeout(remaining) {
-                Ok(job) if job.cancelled() => continue,
-                Ok(job) => self.pending.borrow_mut().push_back(job),
+            match self.wake_receiver.recv_timeout(remaining) {
+                Ok(()) => continue,
                 Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
                 Err(error) => return Err(error.into()),
             }
@@ -513,13 +537,15 @@ impl Queue {
             ||self.shared.execution_admission.available_permits()<2-owners
     }
     pub fn input_reclaim_target(&self) -> usize {
-        self.shared.input_reclaim_target.load(Ordering::Acquire)
+        let target = self.shared.input_reclaim_target.load(Ordering::Acquire);
+        if target > 0 { context::reclaim(&self.shared); }
+        target
     }
     pub fn input_reclaimed(&self, target: usize) {
         // A larger request arriving during reclamation needs another pass.
         let _ = self.shared.input_reclaim_target.fetch_update(Ordering::AcqRel, Ordering::Acquire,
             |pending| (pending <= target).then_some(0));
-        self.shared.input_reclaim_generation.fetch_add(1, Ordering::Release);
+        self.shared.input_reclaim_ack.publish(&self.shared.input_reclaim_generation);
     }
     pub fn router_hold(&self) -> bool {
         self.shared.priority.as_ref().is_some_and(|p| p.hold())
@@ -680,6 +706,7 @@ async fn shutdown(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Resp
     shared.health.store(LOADING, Ordering::Release);
     shared.shutdown.store(true, Ordering::Release);
     shared.execution_admission.close();
+    shared.wake_worker();
     Json(json!({"shutdown_requested":true})).into_response()
 }
 
@@ -766,7 +793,9 @@ async fn reserve_with_input_reclaim<T>(
     mut reserve: impl FnMut() -> Result<T>,
     target: &AtomicUsize,
     generation: &AtomicU64,
+    ack: &reclaim_ack::Ack,
     ready: impl Fn() -> bool,
+    wake: impl Fn(),
     timeout: Duration,
 ) -> Result<T> {
     let error = match reserve() {
@@ -778,10 +807,8 @@ async fn reserve_with_input_reclaim<T>(
     if required == 0 || !ready() { return Err(error); }
     let before = generation.load(Ordering::Acquire);
     target.fetch_max(required, Ordering::AcqRel);
-    let deadline = Instant::now() + timeout;
-    while generation.load(Ordering::Acquire) == before && ready() && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wake();
+    ack.wait_async(generation,before,&ready,timeout).await;
     if ready() && generation.load(Ordering::Acquire) != before {
         reserve()
     } else {
@@ -792,17 +819,34 @@ async fn reserve_with_input_reclaim<T>(
 async fn reserve_input_workspace(shared: &Shared, bytes: usize)
     -> Result<crate::memory::HostWorkspaceReservation> {
     reserve_with_input_reclaim(
-        || crate::memory::reserve_host_workspace(bytes),
-        &shared.input_reclaim_target, &shared.input_reclaim_generation,
+        || context::reserve_after_reclaim(shared, || crate::memory::reserve_host_workspace(bytes)),
+        &shared.input_reclaim_target, &shared.input_reclaim_generation, &shared.input_reclaim_ack,
         || shared.health.load(Ordering::Acquire) == READY && !shared.shutdown.load(Ordering::Acquire),
+        || shared.wake_worker(),
         Duration::from_secs(5),
     ).await
 }
 
 async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Response {
+    chat_input(shared, request, false).await
+}
+async fn context_chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Response {
+    chat_input(shared, request, true).await
+}
+async fn chat_input(shared: Arc<Shared>, request: Request<Body>, incremental: bool) -> Response {
     if let Some(error) = check(&shared, request.headers()) {
         return error;
     }
+    if incremental {
+        if shared.context_cache.is_none() {
+            return error(StatusCode::NOT_FOUND, "context_unsupported", "incremental context transport is disabled");
+        }
+        let versions = request.headers().get_all("x-titanic-context").iter().collect::<Vec<_>>();
+        if versions.len() != 1 || versions[0] != "v1" {
+            return error(StatusCode::BAD_REQUEST, "context_version", "X-Titanic-Context: v1 is required");
+        }
+    }
+    let wire_limit = if incremental { shared.body_limit * 2 + 65536 } else { shared.body_limit };
     if shared.health.load(Ordering::Acquire) != READY {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -857,16 +901,16 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
     } else { None };
     let upload_workspace = if shared.body_limit == MAX_BODY && pooled_upload.is_none() {
         let bytes = request.headers().get("content-length").and_then(|v|v.to_str().ok())
-            .and_then(|v|v.parse::<usize>().ok()).unwrap_or(shared.body_limit);
-        if bytes > shared.body_limit { return error(StatusCode::PAYLOAD_TOO_LARGE, "body_limit", "request body exceeds its bound"); }
+            .and_then(|v|v.parse::<usize>().ok()).unwrap_or(wire_limit);
+        if bytes > wire_limit { return error(StatusCode::PAYLOAD_TOO_LARGE, "body_limit", "request body exceeds its bound"); }
         match if waiting_upload {
             // A waiting upload may reserve bounded CPU memory, but cannot
             // trigger GPU cache reclamation before it owns a lifetime slot.
-            crate::memory::reserve_waiting_host_workspace(bytes.max(1)*2,
-                shared.waiting_image_budget.load(Ordering::Acquire))
+            context::reserve_after_reclaim(&shared, || crate::memory::reserve_waiting_host_workspace(bytes.max(1)*2,
+                shared.waiting_image_budget.load(Ordering::Acquire)))
         } else { reserve_input_workspace(&shared, bytes.max(1)*2).await } {
             Ok(reservation) => Some(reservation),
-            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "input_capacity", "input upload cannot retain the memory reserve"),
+            Err(_) => return context::capacity_error(incremental, "input upload cannot retain the memory reserve"),
         }
     } else { None };
     let body = match tokio::time::timeout(
@@ -874,7 +918,7 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
         async {
             match pooled_upload {
                 Some(input) => input.read(request.into_body()).await,
-                None => to_bytes(request.into_body(), shared.body_limit).await.map_err(anyhow::Error::from),
+                None => to_bytes(request.into_body(), wire_limit).await.map_err(anyhow::Error::from),
             }
         },
     )
@@ -896,11 +940,27 @@ async fn chat(State(shared): State<Arc<Shared>>, request: Request<Body>) -> Resp
             );
         }
     };
-    admission::dispatch(shared,body,permit,background_permit,upload_workspace,background,upload_execution).await
+    let (body, permit, background_permit, upload_workspace, upload_execution) = if incremental {
+        // The upload slot must stay owned while blocking validation runs, even
+        // if the client disconnects. No materialization or inference happens here.
+        let validation = shared.clone();
+        match tokio::task::spawn_blocking(move || {
+            let prepared = context::prepare(&validation, &body);
+            (prepared, permit, background_permit, upload_workspace, upload_execution)
+        }).await {
+            Ok((Ok(prepared), permit, background_permit, workspace, execution)) =>
+                (context::Input::Incremental(prepared), permit, background_permit, workspace, execution),
+            Ok((Err(response), ..)) => return response,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "context_failure", "context preparation failed"),
+        }
+    } else { (context::Input::Raw(body), permit, background_permit, upload_workspace, upload_execution) };
+    let receipt = body.receipt();
+    let response = admission::dispatch(shared,body,permit,background_permit,upload_workspace,background,upload_execution).await;
+    context::confirm(response, receipt.as_ref())
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn finish_chat(shared: Arc<Shared>, body: Bytes, permit: OwnedSemaphorePermit,
+async fn finish_chat(shared: Arc<Shared>, body: context::Input, permit: OwnedSemaphorePermit,
     background_permit: Option<OwnedSemaphorePermit>,
     upload_workspace: Option<crate::memory::HostWorkspaceReservation>, background: bool,
     execution_permit: Option<OwnedSemaphorePermit>, mut registration: admission::Registered) -> Response {
@@ -912,7 +972,7 @@ async fn finish_chat(shared: Arc<Shared>, body: Bytes, permit: OwnedSemaphorePer
     // this conservative size-based allowance through the blocking task, even
     // if its HTTP caller disconnects. Decoder scratch has its own reservation.
     let conversion_workspace = if shared.body_limit == MAX_BODY {
-        match reserve_input_workspace(&shared, body.len()*16+(64<<20)).await {
+        match reserve_input_workspace(&shared, body.expanded_len()*16+(64<<20)).await {
             Ok(reservation) => Some(reservation),
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "input_capacity", "input conversion cannot retain the memory reserve"),
         }
@@ -928,31 +988,36 @@ async fn finish_chat(shared: Arc<Shared>, body: Bytes, permit: OwnedSemaphorePer
     // conversion still owns a potentially large body/decoder workspace.
     let (mut prepared, permit, background_permit, execution_permit) =
         match tokio::task::spawn_blocking(move || {
-            let _workspace = conversion_workspace;
             let cancelled = || preprocessing_cancel.load(Ordering::Acquire)
                 || preprocessing_shared.shutdown.load(Ordering::Acquire);
-            let mut prepared = frontend.prepare_chat_cancellable(&body, capacity, &cancelled);
-            let required = prepared.as_ref().err()
-                .and_then(|error| error.downcast_ref::<crate::memory::InputCapacityError>())
-                .map_or(0, |error| error.1);
-            if required > 0 && !cancelled() {
-                // Only the model owner can release CUDA-backed cache. Request
-                // one ordered pass, then retry the ordinary guarded conversion.
-                // Refusal remains explicit when active/paused owners need the
-                // space or the owner cannot service it within this short bound.
-                let generation = preprocessing_shared.input_reclaim_generation.load(Ordering::Acquire);
-                preprocessing_shared.input_reclaim_target.fetch_max(required, Ordering::AcqRel);
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while preprocessing_shared.input_reclaim_generation.load(Ordering::Acquire) == generation
-                    && Instant::now() < deadline && !cancelled()
-                    && preprocessing_shared.health.load(Ordering::Acquire) == READY {
-                    std::thread::sleep(Duration::from_millis(10));
+            let prepared = body.with_bytes(conversion_workspace, &preprocessing_shared, |body, references| {
+                let convert = || match references {
+                    None => frontend.prepare_chat_cancellable(body, capacity, &cancelled),
+                    Some(references) => frontend.prepare_chat_referenced(body, capacity, references, &cancelled),
+                };
+                let mut prepared = convert();
+                let required = prepared.as_ref().err()
+                    .and_then(|error| error.downcast_ref::<crate::memory::InputCapacityError>())
+                    .map_or(0, |error| error.1);
+                if required > 0 && !cancelled() {
+                    // Only the model owner can release CUDA-backed cache. Request
+                    // one ordered pass, then retry the ordinary guarded conversion.
+                    // Refusal remains explicit when active/paused owners need the
+                    // space or the owner cannot service it within this short bound.
+                    let generation = preprocessing_shared.input_reclaim_generation.load(Ordering::Acquire);
+                    preprocessing_shared.input_reclaim_target.fetch_max(required, Ordering::AcqRel);
+                    preprocessing_shared.wake_worker();
+                    preprocessing_shared.input_reclaim_ack.wait_sync(
+                        &preprocessing_shared.input_reclaim_generation,generation,
+                        ||!cancelled()&&preprocessing_shared.health.load(Ordering::Acquire)==READY,
+                        Duration::from_secs(5));
+                    if !cancelled() && preprocessing_shared.health.load(Ordering::Acquire) == READY
+                        && preprocessing_shared.input_reclaim_generation.load(Ordering::Acquire) != generation {
+                        prepared = convert();
+                    }
                 }
-                if !cancelled() && preprocessing_shared.health.load(Ordering::Acquire) == READY
-                    && preprocessing_shared.input_reclaim_generation.load(Ordering::Acquire) != generation {
-                    prepared = frontend.prepare_chat_cancellable(&body, capacity, &cancelled);
-                }
-            }
+                prepared
+            });
             (prepared, permit, background_permit, execution_permit)
         }).await {
             Ok((Ok(prepared), permit, background_permit, execution_permit)) => (prepared, permit, background_permit, execution_permit),
@@ -1027,7 +1092,7 @@ async fn finish_chat(shared: Arc<Shared>, body: Bytes, permit: OwnedSemaphorePer
     };
     registration.transferred = true;
     match shared.sender.try_send(job) {
-        Ok(()) => {}
+        Ok(()) => shared.wake_worker(),
         Err(mpsc::TrySendError::Full(_)) => {
             return error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -1140,8 +1205,10 @@ pub(crate) fn start(config: &ServerConfig, capacity: usize, images: bool) -> Res
     }
     listener.set_nonblocking(true)?;
     let (sender, receiver) = mpsc::sync_channel(QUEUE_DEPTH + 1);
+    let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
     let shared = Arc::new(Shared {
         sender,
+        wake_sender,
         frontend,
         capacity,
         body_limit: if images { MAX_BODY } else { 8 << 20 },
@@ -1154,6 +1221,8 @@ pub(crate) fn start(config: &ServerConfig, capacity: usize, images: bool) -> Res
         waiting_inputs: AtomicUsize::new(0),
         waiting_image_budget: AtomicUsize::new(0),
         waiting_raw_pool: Mutex::new(None),
+        context_cache: (config.context_cache_mib > 0).then(|| Mutex::new(crate::context_transport::Cache::new(
+            config.context_cache_mib << 20, 16, 30 * 60 * 1000))),
         health: AtomicU8::new(LOADING),
         progress: Arc::new(AtomicU64::new(0)),
         progress_gap_ms: AtomicU64::new(0),
@@ -1178,6 +1247,7 @@ pub(crate) fn start(config: &ServerConfig, capacity: usize, images: bool) -> Res
         output_stall_timeouts: AtomicU64::new(0),
         input_reclaim_target: AtomicUsize::new(0),
         input_reclaim_generation: AtomicU64::new(0),
+        input_reclaim_ack: reclaim_ack::Ack::default(),
     });
     let serving = shared.clone();
     std::thread::Builder::new()
@@ -1215,6 +1285,7 @@ pub(crate) fn start(config: &ServerConfig, capacity: usize, images: bool) -> Res
                         .route("/_native/diagnostics", get(diagnostics))
                         .route("/v1/models", get(models))
                         .route("/v1/chat/completions", post(chat))
+                        .route("/v1/context/chat/completions", post(context_chat))
                         .route("/v1/requests/{id}/cancel", post(cancel))
                         .route("/_native/shutdown", post(shutdown))
                         .route("/_native/priority", post(priority_control))
@@ -1233,7 +1304,7 @@ pub(crate) fn start(config: &ServerConfig, capacity: usize, images: bool) -> Res
                 eprintln!("native HTTP listener failed");
             }
         })?;
-    Ok(Queue { receiver, pending: RefCell::new(VecDeque::new()), execution_owners: Cell::new(None), prefill_peer_ready:Cell::new(false),
+    Ok(Queue { receiver, wake_receiver, pending: RefCell::new(VecDeque::new()), execution_owners: Cell::new(None), prefill_peer_ready:Cell::new(false),
             work_aware_prefill: Cell::new(false),
             prefill_peer_work: Cell::new(None),
             prefill_protected_until: Cell::new(None), decode_prefill_slice: Cell::new(None), shared })
@@ -1343,10 +1414,59 @@ mod tests {
         assert!(request_background(&headers).is_err());
     }
     #[test]
+    #[ignore = "finite latency screen; requires CANADA_TEST_TOKENIZER"]
+    fn idle_reclaim_latency_screen() {
+        let (queue, shared, _rt) = test_http_fixture();
+        for delay_ms in [5, 37, 149, 5, 37, 149] {
+            let shared = shared.clone();
+            let (start, started) = mpsc::sync_channel(0);
+            let client = std::thread::spawn(move || {
+                started.recv().unwrap();
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                let at = Instant::now();
+                let attempts = Cell::new(0);
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let result = rt.block_on(reserve_with_input_reclaim(|| {
+                    attempts.set(attempts.get() + 1);
+                    if attempts.get() == 1 {
+                        Err(crate::memory::InputCapacityError("latency screen", 8192).into())
+                    } else { Ok(17) }
+                }, &shared.input_reclaim_target, &shared.input_reclaim_generation, &shared.input_reclaim_ack,
+                    || true, || shared.wake_worker(), Duration::from_secs(2)));
+                assert_eq!(result.unwrap(), 17);
+                (at, at.elapsed().as_secs_f64() * 1000.)
+            });
+            start.send(()).unwrap();
+            assert!(queue.next_fifo(Duration::from_millis(500)).unwrap().is_none());
+            let observed = Instant::now();
+            assert_eq!(queue.input_reclaim_target(), 8192);
+            queue.input_reclaimed(8192);
+            let (arrival, client_ms) = client.join().unwrap();
+            println!("{}", serde_json::json!({"screen":"idle_reclaim", "delay_ms":delay_ms,
+                "owner_notice_ms":observed.duration_since(arrival).as_secs_f64()*1000.,
+                "client_ms":client_ms}));
+        }
+        // Coalesce many notifications, including one posted before waiting.
+        // A partial acknowledgement must not lose a larger pending request.
+        shared.input_reclaim_target.store(32768, Ordering::Release);
+        for _ in 0..4096 { shared.wake_worker(); }
+        let at = Instant::now();
+        assert!(queue.next_fifo(Duration::from_secs(1)).unwrap().is_none());
+        assert!(at.elapsed() < Duration::from_millis(200));
+        queue.input_reclaimed(8192);
+        assert_eq!(shared.input_reclaim_target.load(Ordering::Acquire), 32768);
+        queue.input_reclaimed(32768);
+        assert_eq!(shared.input_reclaim_target.load(Ordering::Acquire), 0);
+        let at = Instant::now();
+        assert!(queue.next_fifo(Duration::from_millis(5)).unwrap().is_none());
+        assert!(at.elapsed() >= Duration::from_millis(5), "stale wake returned spurious idle work");
+    }
+    #[test]
     fn input_workspace_reclaims_once_then_rechecks_the_unchanged_reservation() {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let target = AtomicUsize::new(0);
         let generation = AtomicU64::new(0);
+        let ack = reclaim_ack::Ack::default();
         let attempts = Cell::new(0);
         let capacity = Cell::new(false);
         rt.block_on(async {
@@ -1355,12 +1475,12 @@ mod tests {
                 if capacity.get() { Ok(17) } else {
                     Err(crate::memory::InputCapacityError("reserve unchanged", 8192).into())
                 }
-            }, &target, &generation, || true, Duration::from_secs(1));
+            }, &target, &generation, &ack, || true, || {}, Duration::from_secs(1));
             let owner = async {
                 tokio::task::yield_now().await;
                 assert_eq!(target.load(Ordering::Acquire), 8192);
                 capacity.set(true);
-                generation.fetch_add(1, Ordering::Release);
+                ack.publish(&generation);
             };
             let (result, ()) = tokio::join!(admission, owner);
             assert_eq!(result.unwrap(), 17);
@@ -1369,10 +1489,10 @@ mod tests {
         // Success and fixed per-input limits must not request GPU work.
         target.store(0, Ordering::Release);
         assert_eq!(rt.block_on(reserve_with_input_reclaim(|| Ok(23), &target,
-            &generation, || true, Duration::ZERO)).unwrap(), 23);
+            &generation, &ack, || true, || {}, Duration::ZERO)).unwrap(), 23);
         let fixed: Result<()> = rt.block_on(reserve_with_input_reclaim(||
             Err(crate::memory::InputCapacityError("fixed input cap", 0).into()),
-            &target, &generation, || true, Duration::ZERO));
+            &target, &generation, &ack, || true, || {}, Duration::ZERO));
         assert!(fixed.is_err());
         assert_eq!(target.load(Ordering::Acquire), 0);
         // No owner response: refuse rather than allocate or retry indefinitely.
@@ -1381,7 +1501,7 @@ mod tests {
         let unavailable: Result<()> = rt.block_on(reserve_with_input_reclaim(|| {
             attempts.set(attempts.get() + 1);
             Err(crate::memory::InputCapacityError("reserve unchanged", 8192).into())
-        }, &target, &generation, || true, Duration::ZERO));
+        }, &target, &generation, &ack, || true, || {}, Duration::ZERO));
         assert!(unavailable.is_err());
         assert_eq!(attempts.get(), 1);
         assert_eq!(target.load(Ordering::Acquire), 16384);
@@ -1397,16 +1517,22 @@ mod tests {
         drop(stream);
         assert!(flag.load(Ordering::Acquire));
     }
-    fn test_http_fixture() -> (Queue, Arc<Shared>, tokio::runtime::Runtime) {
-        let frontend = Arc::new(
-            Frontend::load(Path::new(&std::env::var("CANADA_TEST_TOKENIZER").unwrap())).unwrap(),
-        );
+    pub(super) fn test_http_fixture() -> (Queue, Arc<Shared>, tokio::runtime::Runtime) {test_http_fixture_images(false)}
+    pub(super) fn test_http_fixture_images(images:bool) -> (Queue, Arc<Shared>, tokio::runtime::Runtime) {
+        test_http_fixture_limits(images, 8 << 20)
+    }
+    pub(super) fn test_http_fixture_limits(images:bool, body_limit:usize) -> (Queue, Arc<Shared>, tokio::runtime::Runtime) {
+        let mut frontend=Frontend::load(Path::new(&std::env::var("CANADA_TEST_TOKENIZER").unwrap())).unwrap();
+        if images {frontend.enable_test_images();}
+        let frontend=Arc::new(frontend);
         let (sender, receiver) = mpsc::sync_channel(QUEUE_DEPTH + 1);
+        let (wake_sender, wake_receiver) = mpsc::sync_channel(1);
         let shared = Arc::new(Shared {
             sender,
+            wake_sender,
             frontend,
             capacity: 4096,
-            body_limit: 8 << 20,
+            body_limit,
             admission: Arc::new(Semaphore::new(QUEUE_DEPTH + 1)),
             background_admission: Arc::new(Semaphore::new(QUEUE_DEPTH)),
             decode_priority: AtomicBool::new(false),
@@ -1416,6 +1542,7 @@ mod tests {
             waiting_inputs: AtomicUsize::new(0),
             waiting_image_budget: AtomicUsize::new(0),
             waiting_raw_pool: Mutex::new(None),
+            context_cache: Some(Mutex::new(crate::context_transport::Cache::new(1 << 20, 16, 30 * 60 * 1000))),
             health: AtomicU8::new(READY),
             progress: Arc::new(AtomicU64::new(0)),
             progress_gap_ms: AtomicU64::new(0),
@@ -1435,11 +1562,13 @@ mod tests {
             output_stall_timeouts: AtomicU64::new(0),
             input_reclaim_target: AtomicUsize::new(0),
             input_reclaim_generation: AtomicU64::new(0),
+            input_reclaim_ack: reclaim_ack::Ack::default(),
             nonce: "test".into(),
             sequence: AtomicU64::new(1),
         });
         let queue = Queue {
             receiver,
+            wake_receiver,
             pending: RefCell::new(VecDeque::new()),
             execution_owners: Cell::new(None),
             prefill_peer_ready: Cell::new(false),
@@ -1799,7 +1928,7 @@ mod tests {
                 bearer_file: key,
                 priority_file: Some(priority_key),
                 allow_remote: false,
-                output_stall_seconds: 60,
+                output_stall_seconds: 60, context_cache_mib: 0,
             },
             4096,
             false,
@@ -1930,6 +2059,7 @@ mod tests {
             println!("TIMING_RECEIPT {}",json!({"stream":stream,"include_usage":include_usage,"timings":metadata}));
         }
         let second = request();
+        let (dispatched, may_disconnect) = mpsc::sync_channel(0);
         let disconnected = std::thread::spawn(move || {
             let mut socket = std::net::TcpStream::connect(address).unwrap();
             socket
@@ -1938,6 +2068,10 @@ mod tests {
             socket.write_all(second.as_bytes()).unwrap();
             let mut first = [0u8; 4096];
             assert!(socket.read(&mut first).unwrap() > 0);
+            // Headers can precede owner dispatch. This case specifically
+            // checks cancellation AFTER dispatch; an earlier disconnect is
+            // legitimately discarded before Queue::next returns a Job.
+            may_disconnect.recv().unwrap();
             // Client closes without a backend finish.
         });
         let job = queue.next(Duration::from_secs(5)).unwrap().unwrap();
@@ -1945,6 +2079,7 @@ mod tests {
             fingerprint: "test-worker".into(),
             cached_tokens: 0,
         });
+        dispatched.send(()).unwrap();
         disconnected.join().unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         while !job.cancelled() && Instant::now() < deadline {

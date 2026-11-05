@@ -203,13 +203,29 @@ pub fn run(config_path: &Path) -> Result<Value> {
     let all = crate::rendezvous::exchange_blob(
         p.rank,
         p.endpoint.parse()?,
-        &std::fs::read(p.ticket)?,
+        &std::fs::read(&p.ticket)?,
         &comm.blob()?,
     )?;
     comm.connect(&all)?;
     let mut graph = None;
     let mut reports = Vec::new();
     let mut all_equal = true;
+    let chunk_screen=std::env::var("CANADA_SCRATCH_FFN_PREFETCH_CHUNK_SCREEN").as_deref()==Ok("1");
+    let fine_chunks=std::env::var("CANADA_SCRATCH_FFN_PREFETCH_FINE_SCREEN").as_deref()==Ok("1");
+    ensure!(!fine_chunks||chunk_screen,"fine FFN hints require the chunk component screen");
+    let chunks=if fine_chunks {[16384u32,8192,4096,2048]}else{[16384u32,65536,262144,1048576]};
+    let region_screen=std::env::var("CANADA_SCRATCH_FFN_PREFETCH_REGION_SCREEN").as_deref()==Ok("1");
+    let budget_screen=std::env::var("CANADA_SCRATCH_FFN_PREFETCH_BUDGET_SCREEN").as_deref()==Ok("1");
+    ensure!([chunk_screen,region_screen,budget_screen].iter().filter(|v|**v).count()<=1,"independent hint component screens");
+    let hint_screen=chunk_screen||region_screen||budget_screen;
+    let displacement=if hint_screen {
+        ensure!(combined,"FFN granularity screen needs ordinary overlap and hints");
+        let mut address:std::net::SocketAddr=p.endpoint.parse()?;
+        address.set_port(address.port().checked_add(1).ok_or_else(||anyhow::anyhow!("hint ready port"))?);
+        ensure!(crate::rendezvous::exchange_blob(p.rank,address,&std::fs::read(&p.ticket)?,b"R")?==b"RRRR",
+            "FFN hint all peers connected");
+        Some(cuda.allocate::<u16>(64*1024*1024/2)?)
+    }else{None};
     for case in cases.cases {
         ensure!(
             ["initial", "changed", "zero", "padded"].contains(&case.name.as_str()),
@@ -245,6 +261,59 @@ pub fn run(config_path: &Path) -> Result<Value> {
             live as usize,
         )?;
         stream.join_default()?;
+        if hint_screen {
+            for displaced in [false,true] {
+                let mut variants=Vec::new();let mut baseline=None;let mut exact_hashes=None;
+                for variant in 0..4 {
+                    if region_screen {layer.set_ffn_prefetch_region_for_probe(variant,&stream)?;}
+                    else if budget_screen {layer.set_ffn_prefetch_budget_for_probe([6usize,8,10,12][variant as usize]*1024*1024,&stream)?;}
+                    else {layer.set_ffn_prefetch_chunk_for_probe(chunks[variant as usize],&stream)?;}
+                    let mut enqueue=||->Result<()> {
+                        if displaced {
+                            let d=displacement.as_ref().unwrap();
+                            let(mut ptr,mut n,mut rank,mut pattern)=(d.ptr(),d.len()as i32,p.rank as i32,0i32);
+                            let mut args=[(&mut ptr as *mut u64).cast(),(&mut n as *mut i32).cast(),
+                                (&mut rank as *mut i32).cast(),(&mut pattern as *mut i32).cast()];
+                            unsafe{core.function("ca_collective_fixture")?.launch(
+                                [d.len().div_ceil(256)as u32,1,1],[256,1,1],0,&stream,&mut args)?;}
+                        }
+                        layer.run(&input,&positions,&locations,&mut cache,&candidates,&tokens,&comm,&stream)
+                    };
+                    enqueue()?;stream.synchronize()?;comm.health()?;
+                    variants.push(stream.capture(&mut enqueue)?);
+                    drop(enqueue);
+                    let values=snapshots(&cuda,&layer,&cache)?;
+                    if let Some(expected)=&baseline {ensure!(expected==&values,"FFN hint changed GPU bytes");}
+                    else {
+                        exact_hashes=Some(values.0.iter().chain(values.1.iter()).map(|(k,v)|
+                            (k.clone(),format!("{:x}",Sha256::digest(v)))).collect::<BTreeMap<_,_>>());
+                        baseline=Some(values);
+                    }
+                }
+                let mut samples=vec![Vec::new();4];
+                for repeat in 0..4 {
+                    let order=if repeat%2==0{[0,1,2,3]}else{[3,2,1,0]};
+                    for variant in order {
+                        for _ in 0..4 {unsafe{variants[variant].launch(&stream)?;}}
+                        stream.synchronize()?;
+                        let start=cuda.event()?;let end=cuda.event()?;start.record(&stream)?;
+                        for _ in 0..24 {unsafe{variants[variant].launch(&stream)?;}}
+                        end.record(&stream)?;samples[variant].push(end.elapsed_since(&start)?/24.);
+                        comm.health()?;
+                        ensure!(baseline.as_ref()==Some(&snapshots(&cuda,&layer,&cache)?),
+                            "FFN hint graph replay changed GPU bytes");
+                    }
+                }
+                reports.push(json!({"case":case.name,"live":live,"displaced":displaced,
+                    "chunks":if chunk_screen {json!(chunks)}else{Value::Null},
+                    "regions":if region_screen {json!(["router_and_partial_shared","router_only","partial_shared_only","disabled"])}else{Value::Null},
+                    "budgets_mib":if budget_screen {json!([6,8,10,12])}else{Value::Null},
+                    "samples_ms":samples,
+                    "all_bitwise_equal":true,"gpu_taps_sha256":exact_hashes}));
+                eprintln!("rank{} FFN hint {} displaced{displaced} exact",p.rank,case.name);
+            }
+            continue;
+        }
         if graph.is_none() {
             layer.run(
                 &input,
@@ -316,6 +385,11 @@ pub fn run(config_path: &Path) -> Result<Value> {
     }
     stream.synchronize()?;
     comm.health()?;
+    if hint_screen {
+        return Ok(json!({"rank":p.rank,"all_bitwise_equal":true,"cases":reports,
+            "source_checkpoint_tp_bytes_sha256":source_sha,"atlas_bytes":atlas_bytes,
+            "scope":"Same layer0 storage and consumers: fixed FFN hint chunk or owned descriptor-subset comparison. Real attention/mHC/FFN/TP4 transport; steady replay and64MiB displacement, original/changed/zero/padded inputs. All37 GPU tap buffers exact to current16KiB/full-descriptor control, not historical fixture precision. Displacement cost included; no whole-model claim."}));
+    }
     Ok(
         json!({"rank":p.rank,"all_bitwise_equal":all_equal,"cases":reports,"source_checkpoint_tp_bytes_sha256":source_sha,"atlas_bytes":atlas_bytes,
         "l2_prefetch_enabled":crate::l2_prefetch::enabled(),"split_qkv":p.split_qkv,

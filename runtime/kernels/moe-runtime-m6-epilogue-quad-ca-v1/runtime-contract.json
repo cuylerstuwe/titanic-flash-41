@@ -1,0 +1,275 @@
+{
+  "abi": 1,
+  "rows": 6,
+  "experts": 384,
+  "hidden": 5120,
+  "intermediate": 576,
+  "topk": 6,
+  "deterministic": true,
+  "swiglu_limit": 10.0,
+  "scratch_bytes": 4118728,
+  "scratch_initializer": "zero",
+  "kernel_library_sha256": "b9d555857a80d72e04b63467fb8c0e0604eef3120f946df2c6c9b0c5186feb59",
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+  "license": "Apache-2.0",
+  "nodes": [
+    {
+      "entry": 0,
+      "kernel_id": "integration.tp_moe.dynamic",
+      "pointers": {
+        "a_ptr": {
+          "role": "input",
+          "offset": 0
+        },
+        "topk_ids_ptr": {
+          "role": "ids",
+          "offset": 0
+        },
+        "topk_weights_ptr": {
+          "role": "routing_weights",
+          "offset": 0
+        },
+        "packed_a_ptr": {
+          "role": "scratch",
+          "offset": 789968
+        },
+        "sfa_ptr": {
+          "role": "scratch",
+          "offset": 3902928
+        },
+        "packed_a_storage_ptr": {
+          "role": "scratch",
+          "offset": 789968
+        },
+        "scale_storage_ptr": {
+          "role": "scratch",
+          "offset": 3902928
+        },
+        "intermediate_ptr": {
+          "role": "scratch",
+          "offset": 380368
+        },
+        "barrier_count": {
+          "role": "scratch",
+          "offset": 6576
+        },
+        "barrier_epoch": {
+          "role": "scratch",
+          "offset": 6720
+        },
+        "pair_head": {
+          "role": "scratch",
+          "offset": 4113888
+        },
+        "producers_done_count": {
+          "role": "scratch",
+          "offset": 4113904
+        },
+        "all_work_published": {
+          "role": "scratch",
+          "offset": 4113920
+        },
+        "task_head": {
+          "role": "scratch",
+          "offset": 4113936
+        },
+        "task_tail": {
+          "role": "scratch",
+          "offset": 4113952
+        },
+        "task_ready_ptr": {
+          "role": "scratch",
+          "offset": 4113968
+        },
+        "task_expert_ptr": {
+          "role": "scratch",
+          "offset": 4114736
+        },
+        "task_m_tile_ptr": {
+          "role": "scratch",
+          "offset": 4115504
+        },
+        "task_slice_begin_ptr": {
+          "role": "scratch",
+          "offset": 4116272
+        },
+        "task_slice_count_ptr": {
+          "role": "scratch",
+          "offset": 4117040
+        },
+        "task_valid_rows_ptr": {
+          "role": "scratch",
+          "offset": 4117808
+        },
+        "tile_write_count_ptr": {
+          "role": "scratch",
+          "offset": 4118576
+        },
+        "b_w13": {
+          "role": "w13",
+          "offset": 0
+        },
+        "sfb_w13_ptr": {
+          "role": "s13",
+          "offset": 0
+        },
+        "b_down": {
+          "role": "w2",
+          "offset": 0
+        },
+        "sfb_down_ptr": {
+          "role": "s2",
+          "offset": 0
+        },
+        "sfb_w13_mx_ptr": {
+          "role": "s13",
+          "offset": 0
+        },
+        "sfb_down_mx_ptr": {
+          "role": "s2",
+          "offset": 0
+        },
+        "w13_residual_ptr": {
+          "role": "scratch",
+          "offset": 5040
+        },
+        "down_residual_ptr": {
+          "role": "scratch",
+          "offset": 5040
+        },
+        "w13_rp_ptr": {
+          "role": "w13",
+          "offset": 0
+        },
+        "w13_sfb_rp_ptr": {
+          "role": "s13",
+          "offset": 0
+        },
+        "down_rp_ptr": {
+          "role": "w2",
+          "offset": 0
+        },
+        "down_sfb_rp_ptr": {
+          "role": "s2",
+          "offset": 0
+        },
+        "row_counts": {
+          "role": "scratch",
+          "offset": 5040
+        },
+        "expert_write_rows": {
+          "role": "scratch",
+          "offset": 4107728
+        },
+        "expert_tile_base": {
+          "role": "scratch",
+          "offset": 4109264
+        },
+        "input_global_scale": {
+          "role": "ones",
+          "offset": 0
+        },
+        "alpha": {
+          "role": "ones",
+          "offset": 0
+        },
+        "down_alpha": {
+          "role": "ones",
+          "offset": 0
+        },
+        "global_scale": {
+          "role": "ones",
+          "offset": 0
+        },
+        "scatter_ptr": {
+          "role": "scratch",
+          "offset": 11728
+        },
+        "token_map_ptr": {
+          "role": "scratch",
+          "offset": 6864
+        },
+        "token_weights_ptr": {
+          "role": "scratch",
+          "offset": 9296
+        }
+      },
+      "scalars": {
+        "num_tokens": 6,
+        "max_rows": 48,
+        "scatter_rows": 36,
+        "rows_padded": 608,
+        "max_tasks": 190,
+        "max_phys_tiles": 38,
+        "max_active_clusters": 48
+      }
+    },
+    {
+      "entry": 2,
+      "kernel_id": "moe.w4a16.topk_sum",
+      "pointers": {
+        "fc2_ptr": {
+          "role": "scratch",
+          "offset": 11728
+        },
+        "output_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "topk_weights_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "route_expert_ids_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "expert_map_ptr": {
+          "role": "output",
+          "offset": 0
+        },
+        "svh_ptr": {
+          "role": "output",
+          "offset": 0
+        }
+      },
+      "scalars": {
+        "weight_num_experts": 0,
+        "route_num_experts": 0,
+        "active_m": 6
+      }
+    }
+  ],
+  "fc1_input_address_overlay": {
+    "base_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+    "license": "Apache-2.0",
+    "source": "https://github.com/local-inference-lab/b12x",
+    "stages": [
+      2,
+      2
+    ],
+    "reuse_fc1_weight_scales": false,
+    "output_major_tasks": false,
+    "hoisted_input": true,
+    "cooperative_epilogue": true,
+    "fc_pdl": false,
+    "async_copy_cache_operator": "ca",
+    "files": {
+      "w4a8_phase1.py": {
+        "original_sha256": "fc9f78557b85fd415ebf0103e8bd6f345fbd1d166e033a38aaff5c4cfc343948",
+        "patched_sha256": "bf679a26a73466f08fb8ac966963ff11025892a451be05f8266e3528c99a0b76"
+      },
+      "w4a8_phase2.py": {
+        "original_sha256": "0c9fce39b243676e6754ea1fe111f765b5a993b6d6946ac410301a4663d1c5c3",
+        "patched_sha256": "0c9fce39b243676e6754ea1fe111f765b5a993b6d6946ac410301a4663d1c5c3"
+      },
+      "intrinsics.py": {
+        "original_sha256": "eedf142800d16dbd2e35b464396dbf3076aa1594b967a65a005041cc68326ac0",
+        "patched_sha256": "673c83d70fd4b6c365738ad84172b6f0d2352baa2326821a01c2abaad6f1db7f"
+      }
+    }
+  },
+  "fc_pdl": false,
+  "async_copy_cache_operator": "ca"
+}

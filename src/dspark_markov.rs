@@ -19,6 +19,8 @@ use std::{path::Path, rc::Rc};
 const DRAFT_TEMPERATURES: [f32;8] = [1.0,0.8,0.7,0.4,1.2,0.5,0.6,0.85];
 const TEMPERATURE_GRAPH_STRIDE: usize = 4*DRAFT_TEMPERATURES.len();
 const DRAFT_SCHEDULES: usize = 4;
+#[path = "markov_sharded_prefix_probe.rs"]
+mod sharded_prefix_probe;
 fn temperature_at(schedule:usize,temperature:f32,step:usize)->f32 {
     match schedule {
         0=>temperature,
@@ -1045,6 +1047,9 @@ impl Markov {
         &mut self, base:&Buffer<f32>, post_hc:&Buffer<bf16>, anchor:u32,
         position:u64, comm:&Roce, stream:&Stream,
     ) -> Result<serde_json::Value> {
+        if std::env::var("CANADA_SCRATCH_SHARDED_PREFIX_STOP_SCREEN").as_deref()==Ok("1") {
+            return self.probe_sharded_prefix_stop(base,post_hc,anchor,position,comm,stream);
+        }
         ensure!(std::env::var("CANADA_SCRATCH_MARKOV_PREFIX_STOP_SCREEN").as_deref()==Ok("1")
             && self.direct_gather && self.fused_head_active && self.confidence_fused_active,
             "prefix component requires current qualified draft kernels");

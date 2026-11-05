@@ -42,6 +42,9 @@ fn check(cuda: &Cuda, module: &Module, output: &Buffer<u16>, raw: &Buffer<f32>,
 }
 
 pub fn run(rank: usize, endpoint: &str, nonce: &[u8], root: &Path, core: &Path) -> Result<Value> {
+    if std::env::var("CANADA_SCRATCH_ADAPTIVE_RDMA_SCREEN").as_deref()==Ok("1") {
+        return run_adaptive_packets(rank,endpoint,nonce,root,core);
+    }
     if std::env::var("CANADA_SCRATCH_TWO_OWNER_TRANSPORT_SCREEN").as_deref()==Ok("1") {
         return run_two_owner_pool(rank,endpoint,nonce,root,core);
     }
@@ -122,6 +125,51 @@ pub fn run(rank: usize, endpoint: &str, nonce: &[u8], root: &Path, core: &Path) 
         "nccl_graph_stream_ordering":std::env::var("NCCL_GRAPH_STREAM_ORDERING").ok(),
         "results":results,"all_gpu_checks_pass":true,"serving_policy_changed":false,
         "scope":"BF16 sources; native FP32 sum versus exact promotion, NCCL FP32 sum, one BF16 output rounding. GPU-generated fixtures and FP64 oracle. Timing includes both conversion kernels; six balanced pairs, 256 reductions per interval. Component screen only."}))
+}
+
+/// Same allocation, GPU graph and arithmetic; only CPU-side QP selection varies.
+fn run_adaptive_packets(rank:usize,endpoint:&str,nonce:&[u8],root:&Path,core:&Path)->Result<Value> {
+    let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;let stream=cuda.stream()?;
+    let module=cuda.module(&std::fs::read(core)?)?;
+    let comm=Roce::local(&cuda,&root.join("roce-v0"),rank)?;
+    let all=crate::rendezvous::exchange_blob(rank,endpoint.parse()?,nonce,&comm.blob()?)?;comm.connect(&all)?;
+    let mut results=Vec::new();let thresholds=[0u32,96*1024,512*1024];
+    for (rows,columns) in [(1,5120),(6,5120),(8,5120),(12,5120),(16,5120),(32,5120),(128,5120),(6,6144)] {
+        let n=rows*columns;let mut input=cuda.allocate::<u16>(n)?;
+        let mut output=cuda.allocate::<u16>(n)?;let unused=cuda.allocate::<f32>(n)?;
+        fixture(&module,&mut input,rank,0,&stream)?;
+        let graph=stream.capture(||{for _ in 0..8 {unsafe{comm.sum_bf16(&input,&mut output,&stream)?;}}Ok(())})?;
+        for pattern in 0..3 {
+            fixture(&module,&mut input,rank,pattern,&stream)?;
+            let mut checks=Vec::new();
+            for &limit in &thresholds {
+                comm.set_small_packet_bytes_for_probe(limit,&stream)?;
+                unsafe{graph.launch(&stream)?;}stream.synchronize()?;
+                checks.push(check(&cuda,&module,&output,&unused,pattern,0,&stream)?);
+            }
+            ensure!(checks.iter().all(|x|x==&checks[0]),"packet policy changed native output");
+            let mut pairs=Vec::new();
+            for repeat in 0..6 {
+                let order=if repeat%2==0 {[0,1,2]}else{[2,1,0]};let mut ms=[0.;3];
+                for v in order {
+                    comm.set_small_packet_bytes_for_probe(thresholds[v],&stream)?;
+                    for _ in 0..4{unsafe{graph.launch(&stream)?;}}stream.synchronize()?;
+                    let start=cuda.event()?;let end=cuda.event()?;start.record(&stream)?;
+                    for _ in 0..16{unsafe{graph.launch(&stream)?;}}
+                    end.record(&stream)?;ms[v]=end.elapsed_since(&start)?/128.;comm.health()?;
+                }
+                pairs.push(json!({"repeat":repeat,"order":order,"milliseconds":ms}));
+            }
+            ensure!(check(&cuda,&module,&output,&unused,pattern,0,&stream)?==checks[0],
+                "packet replay changed native output");
+            results.push(json!({"rows":rows,"columns":columns,"pattern":pattern,"checks":checks,"pairs":pairs}));
+        }
+    }
+    stream.synchronize()?;comm.health()?;let counts=comm.packet_counts_for_probe()?;
+    ensure!(counts.iter().all(|&n|n>0),"both packet banks must execute");
+    Ok(json!({"rank":rank,"all_gpu_checks_pass":true,"threshold_bytes":thresholds,
+        "packet_counts_bulk_small":counts,"results":results,"serving_policy_changed":false,
+        "scope":"Single allocation and captured native graph, balanced threshold switches; GPU fixtures/FP64 bound and exact outputs across packet policies. No model or NCCL arithmetic changes."}))
 }
 
 /// Price the existing communication kernels before introducing a batched

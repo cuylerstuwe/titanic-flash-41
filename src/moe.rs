@@ -76,11 +76,42 @@ pub(crate) fn packed_gather_requested() -> Result<bool> {
     };
     Ok(enabled || std::env::var("CANADA_SCRATCH_PREFILL_MOE_GATHER_AB").as_deref() == Ok("1"))
 }
+pub(crate) fn wide_transfer_requested()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_MOE_WIDE_TRANSFER") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid wide expert transfer policy");Ok(v=="1")},
+        // M16/M128 code-only transfer passed component and same-allocation
+        // full-model ABBA screens. Resolve once while constructing the owner;
+        // captured graphs keep the chosen kernels with no runtime flag lookup.
+        Err(std::env::VarError::NotPresent)=>Ok(true),Err(e)=>Err(e.into()),
+    }
+}
+pub(crate) fn prefill_transfer_requested()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_MOE_PREFILL_TRANSFER") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid prefill expert transfer policy");Ok(v=="1")},
+        // s1320 full512/1024-row chunks saved0.9/0.5%; partial512 regressed.
+        // The partial1024 matched-input mean saved0.19%. Keep partial512 on
+        // its original kernel; the pooled median across two input patterns
+        // hides the small same-direction benefit for partial1024.
+        Err(std::env::VarError::NotPresent)=>Ok(true),Err(e)=>Err(e.into()),
+    }
+}
 pub struct Expert {
     weights: Rc<Weights>,
     layout: Prepared,
 }
 impl Expert {
+    pub(crate) fn prefetch_window_for_probe(&self,cuda:&Cuda,module:&crate::cuda::Module,
+        stream:&Stream,expert:usize)->Result<crate::l2_prefetch::Window> {
+        ensure!(self.layout.experts==384&&expert<384,"canonical expert hint index");
+        let mut regions=Vec::new();
+        for role in ["w13","s13"] {
+            let(base,bytes)=self.region(role)?;
+            ensure!(bytes%384==0,"expert hint stride");
+            let stride=bytes/384;
+            regions.push((base+u64::try_from(expert*stride)?,stride));
+        }
+        crate::l2_prefetch::Window::new_expert(cuda,module,stream,self.weights.clone(),&regions)
+    }
     pub(crate) fn layout_layer(&self) -> usize { self.layout.layer }
     pub(crate) fn same_layer_weights(&self,other:&Self)->bool {
         self.layout.layer==other.layout.layer && Rc::ptr_eq(&self.weights,&other.weights)
@@ -136,9 +167,15 @@ pub struct Workspace {
     late_fc_pdl_enabled: Cell<bool>,
     cache_ca: Option<PackedInput>,
     cache_ca_enabled: Cell<bool>,
+    cooperative_epilogues: [Option<PackedInput>; 2],
+    // 0: original; 1: six-row shared quad; 2: both experimental variants.
+    // s1285 retained only the six-row variant; three-row register conversion lost.
+    cooperative_epilogue_mode: Cell<u8>,
     // 0: ordinary input addressing; 1: all live rows (finite screen);
     // 3: the measured three-row-only policy.
     fc_pdl_mode: Cell<u8>,
+    wide_transfer: Option<Primitives>,
+    wide_transfer_enabled: Cell<bool>,
     stream: Cell<Option<usize>>,
 }
 /// Only the complete, sequential wide-prefill bank may lend this storage.
@@ -267,7 +304,7 @@ impl Workspace {
         ones.upload(&vec![1.; c.experts])?;
         let mut output = cuda.allocate::<bf16>(c.rows * c.hidden)?;
         output.zero()?;
-        Ok(Self {
+        let mut workspace=Self {
             cuda: cuda.clone(),
             primitives,
             contract: c,
@@ -288,9 +325,22 @@ impl Workspace {
             late_fc_pdl_enabled: Cell::new(false),
             cache_ca: None,
             cache_ca_enabled: Cell::new(false),
+            cooperative_epilogues: [None, None],
+            cooperative_epilogue_mode: Cell::new(0),
             fc_pdl_mode: Cell::new(0),
+            wide_transfer:None,
+            wide_transfer_enabled:Cell::new(false),
             stream: Cell::new(None),
-        })
+        };
+        if matches!(workspace.contract.rows,16|128|512|1024) {
+            let enabled=if workspace.contract.rows<=128{wide_transfer_requested()?}else{prefill_transfer_requested()?};
+            if enabled||std::env::var("CANADA_SCRATCH_MOE_WIDE_TRANSFER_SCREEN").as_deref()==Ok("1")
+                ||std::env::var("CANADA_SCRATCH_PREFILL_BOUNDS_SCREEN").as_deref()==Ok("1") {
+                workspace.enable_wide_transfer(root.parent().context("expert bundle parent")?)?;
+                workspace.wide_transfer_enabled.set(enabled);
+            }
+        }
+        Ok(workspace)
     }
     /// Must run outside the encoder CUDA graph before every wide chunk. The
     /// clear is ordered with both previous users and the next graph on the
@@ -364,7 +414,7 @@ impl Workspace {
         let p = self.packed.as_ref().context("packed MoE absent")?;
         self.guard_stream(stream)?;
         ensure!(input.len() == p.contract.input_bytes && self.cuda.owns_buffer(input), "packed MoE operand");
-        self.launch_plan(&p.contract, &p.primitives, expert, input.ptr(), input.len(), ids, routing, p.contract.rows, stream)
+        self.launch_plan(&p.contract, &p.primitives, expert, input.ptr(), input.len(), ids, routing, p.contract.rows, false, stream)
     }
     fn guard_stream(&self, stream: &Stream) -> Result<()> {
         let id = stream.raw() as usize;
@@ -469,6 +519,18 @@ impl Workspace {
         }
         if std::env::var("CANADA_SCRATCH_MOE_LATE_PDL_SCREEN").as_deref()==Ok("1") {
             grouped.enable_late_fc_pdl(&kernels.join("moe-runtime-m6-fc-pdl-late-v1"))?;
+        }
+        let cooperative=match std::env::var("CANADA_SCRATCH_MOE_COOPERATIVE_EPILOGUE") {
+            Ok(v)=>match v.as_str(){"0"=>0,"1"=>1,"2"=>2,
+                _=>anyhow::bail!("invalid expert cooperative-epilogue policy")},
+            Err(std::env::VarError::NotPresent)=>0,Err(e)=>return Err(e.into()),
+        };
+        let cooperative_screen=std::env::var("CANADA_SCRATCH_MOE_EPILOGUE_SCREEN").as_deref()==Ok("1");
+        if cooperative!=0 || cooperative_screen {
+            ensure!(input_address&&pdl_m3&&cache_ca&&grouped.late_fc_pdl.is_none()
+                &&grouped.scale_codes.is_none(),"cooperative epilogue requires the current M3/M6 plans");
+            grouped.enable_cooperative_epilogues(kernels,cooperative==2||cooperative_screen)?;
+            grouped.cooperative_epilogue_mode.set(cooperative);
         }
         Ok(grouped)
     }
@@ -602,6 +664,50 @@ impl Workspace {
             &&self.fc_pdl_mode.get()==3&&!self.scale_codes_enabled.get(),"MoE cache-ca screen admission");
         self.guard_stream(stream)?;self.cache_ca_enabled.set(enabled);Ok(())
     }
+    fn enable_cooperative_epilogues(&mut self,kernels:&Path,include_three_row:bool)->Result<()> {
+        ensure!(self.cooperative_epilogues.iter().all(Option::is_none)&&self.live_bounds,
+            "duplicate cooperative epilogue or unbounded workspace");
+        let variants=[
+            ("moe-runtime-m6-epilogue-register-pdl-v1",
+             "794201fb05754f2cacb767296566aa503224cdb6a2f1230c085ee014c83e07f1",
+             "7aaea8fb969a174b55a02012d54f9ef32c0a6f2f26a0950535aede2e7effeee5",
+             "3aff59cbaee697abc3ef33177beb3cc996b11d52d31c928edc2bbba89dedc54f",true),
+            ("moe-runtime-m6-epilogue-quad-ca-v1",
+             "b9d555857a80d72e04b63467fb8c0e0604eef3120f946df2c6c9b0c5186feb59",
+             "bf679a26a73466f08fb8ac966963ff11025892a451be05f8266e3528c99a0b76",
+             "0c9fce39b243676e6754ea1fe111f765b5a993b6d6946ac410301a4663d1c5c3",false),
+        ];
+        for (index,(name,library,phase1,phase2,pdl)) in variants.into_iter().enumerate() {
+            if index==0&&!include_three_row{continue;}
+            let alternate=Self::new(&self.cuda,&kernels.join(name))?;let c=&alternate.contract;
+            let patch=c.fc1_input_address_overlay.as_ref().context("cooperative epilogue provenance absent")?;
+            ensure!((c.rows,c.experts,c.hidden,c.intermediate,c.topk,c.scratch_bytes)==(6,384,5120,576,6,4118728)
+                &&c.kernel_library_sha256==library&&c.task_order_overlay.is_none()&&c.fc1_scale_reuse_overlay.is_none()
+                &&patch["base_commit"]=="a7d7d29b2ef8869086e0ceaa787321f17544e3c9"
+                &&patch["hoisted_input"]==true&&patch["fc_pdl"]==pdl
+                &&patch["output_major_tasks"]==false&&patch["reuse_fc1_weight_scales"]==false
+                &&patch["stages"]==serde_json::json!([2,2])
+                &&patch["files"]["w4a8_phase1.py"]["patched_sha256"]==phase1
+                &&patch["files"]["w4a8_phase2.py"]["patched_sha256"]==phase2
+                &&c.scratch_bytes==self.contract.scratch_bytes&&c.nodes.len()==self.contract.nodes.len()
+                &&c.nodes.iter().zip(&self.contract.nodes).all(|(a,b)|
+                    a.kernel_id==b.kernel_id&&a.scalars==b.scalars&&a.pointers==b.pointers),
+                "unqualified cooperative epilogue numerical/layout contract");
+            ensure!(if pdl {patch["cooperative_epilogue"]=="register"} else {
+                patch["cooperative_epilogue"]==true&&patch["async_copy_cache_operator"]=="ca"
+                &&patch["files"]["intrinsics.py"]["patched_sha256"]=="673c83d70fd4b6c365738ad84172b6f0d2352baa2326821a01c2abaad6f1db7f"
+            },"cooperative epilogue variant provenance");
+            self.cooperative_epilogues[index]=Some(PackedInput{primitives:alternate.primitives,contract:alternate.contract});
+        }
+        Ok(())
+    }
+    pub(crate) fn set_cooperative_epilogues_for_probe(&self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_EPILOGUE_SCREEN").as_deref()==Ok("1")
+            &&self.cooperative_epilogues.iter().all(Option::is_some)&&self.input_address_enabled.get()
+            &&self.live_bounds&&self.fc_pdl_mode.get()==3&&self.cache_ca_enabled.get()
+            &&!self.scale_codes_enabled.get()&&!self.late_fc_pdl_enabled.get(),"cooperative epilogue screen admission");
+        self.guard_stream(stream)?;self.cooperative_epilogue_mode.set(if enabled{2}else{0});Ok(())
+    }
     /// s581 qualified the existing M16 library at live widths8/10/12/16.
     /// Only launch bounds change; scratch capacities and arithmetic stay fixed.
     pub(crate) fn new_live16(cuda: &Cuda, kernels: &Path) -> Result<Self> {
@@ -624,6 +730,38 @@ impl Workspace {
         workspace.live_bounds=true;
         Ok(workspace)
     }
+    /// Transfer code only. Keep this workspace's original capacity, offsets,
+    /// launch bounds and output storage; M6 metadata is never used as M16/M128.
+    fn enable_wide_transfer(&mut self,kernels:&Path)->Result<()> {
+        let c=&self.contract;
+        let scratch=match c.rows{16=>10912148,128=>50170556,512=>88190076,1024=>138889596,_=>0};
+        ensure!(scratch>0&&(c.experts,c.hidden,c.intermediate,c.topk)==(384,5120,576,6)
+            &&c.deterministic&&c.swiglu_limit==10.0&&c.nodes.len()==2
+            &&c.kernel_library_sha256=="7c4cb9ca260c6bdc22cdde9d2690778d404249d0ad6bbb408c5cf407c94ce207"
+            &&c.scratch_bytes==scratch,"wide expert baseline contract");
+        let(name,pin)=if c.rows==16 {
+            ("moe-runtime-m6-cache-ca-v1","e68e2711f1603e0b2261c939e67650ea00ae1f9dfffb2b344ea49792214554de")
+        }else {
+            ("moe-runtime-m6-epilogue-quad-ca-v1","b9d555857a80d72e04b63467fb8c0e0604eef3120f946df2c6c9b0c5186feb59")
+        };
+        let root=kernels.join(name);
+        let alternate=Primitives::open(&self.cuda,&root.join("libcanada_moe_primitives.so"),&root.join("bindings.json"))?;
+        ensure!(alternate.bindings.library_sha256==pin&&alternate.bindings.abi==1
+            &&alternate.bindings.source_commit=="a7d7d29b2ef8869086e0ceaa787321f17544e3c9"
+            &&alternate.bindings.entries.len()==self.primitives.bindings.entries.len()
+            &&alternate.bindings.entries.iter().zip(&self.primitives.bindings.entries).all(|(a,b)|
+                a.index==b.index&&a.kernel_id==b.kernel_id&&a.pointers==b.pointers
+                &&a.i32_scalars==b.i32_scalars&&a.arguments.is_empty()&&b.arguments.is_empty()),
+            "wide expert transferred kernel ABI/pin");
+        self.wide_transfer=Some(alternate);Ok(())
+    }
+    pub(crate) fn wide_transfer_enabled(&self)->bool {self.wide_transfer_enabled.get()}
+    pub(crate) fn set_wide_transfer_for_probe(&self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!((std::env::var("CANADA_SCRATCH_MOE_WIDE_TRANSFER_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_PREFILL_BOUNDS_SCREEN").as_deref()==Ok("1"))
+            &&matches!(self.contract.rows,16|128|512|1024)&&self.wide_transfer.is_some(),"wide expert probe admission");
+        self.guard_stream(stream)?;self.wide_transfer_enabled.set(enabled);Ok(())
+    }
     pub(crate) fn task_order(&self) -> bool { self.contract.task_order_overlay.is_some() }
     pub(crate) fn task_order_m3(&self)->bool {self.three_row_task_order.is_some()}
     pub(crate) fn scale_reuse(&self) -> bool { self.contract.fc1_scale_reuse_overlay.is_some() }
@@ -637,53 +775,100 @@ impl Workspace {
     ) -> Result<()> {
         self.run_live(expert,input,ids,routing_weights,self.contract.rows,stream)
     }
-    pub(crate) fn run_live(
+    pub(crate) fn run_live(&self,expert:&Expert,input:&Buffer<bf16>,ids:&Buffer<i32>,
+        routing_weights:&Buffer<f32>,live:usize,stream:&Stream)->Result<()> {
+        self.run_live_inner(expert,input,ids,routing_weights,live,false,stream)
+    }
+    /// Route scratch stays owned by this workspace and its stream. Ordinary
+    /// callers still receive the fully reduced output; only LayerFfn may defer.
+    pub(crate) fn run_live_for_ffn(&self,expert:&Expert,input:&Buffer<bf16>,ids:&Buffer<i32>,
+        routing_weights:&Buffer<f32>,live:usize,fuse_sum:bool,stream:&Stream)->Result<Option<(u64,usize)>> {
+        let fuse=fuse_sum && matches!(self.contract.rows,6|16|32)
+            // The short M3 model screen lost time despite the component
+            // saving. Keep its existing shared-expert overlap schedule.
+            && (self.contract.rows!=6 || live==6)
+            && !(live==1&&self.single_row_micro.is_some())
+            && !(live==3&&self.three_row_task_order.is_some());
+        let region=if fuse {Some((self.scratch.ptr()+Self::sum_input_offset(&self.contract)? as u64,
+            if self.live_bounds {live}else{self.contract.rows}))}else{None};
+        self.run_live_inner(expert,input,ids,routing_weights,live,fuse,stream)?;
+        Ok(region)
+    }
+    fn sum_input_offset(c:&Contract)->Result<usize> {
+        ensure!(matches!(c.rows,6|16|32)&&c.hidden==5120&&c.topk==6
+            && c.projection_dtype.is_none(),"fused FFN sum requires BF16 route outputs");
+        let tail=c.nodes.last().context("missing expert sum")?;
+        ensure!(tail.kernel_id=="moe.w4a16.topk_sum"
+            &&c.nodes.iter().filter(|n|n.kernel_id=="moe.w4a16.topk_sum").count()==1
+            &&tail.scalars.get("active_m")==Some(&(c.rows as i32))
+            &&tail.scalars.get("weight_num_experts")==Some(&0)
+            &&tail.scalars.get("route_num_experts")==Some(&0),"fused expert sum contract");
+        let input=tail.pointers.get("fc2_ptr").context("missing expert route pointer")?;
+        let output=tail.pointers.get("output_ptr").context("missing expert sum output")?;
+        ensure!(input.role=="scratch"&&input.offset+c.rows*6*5120*2<=c.scratch_bytes
+            &&output.role=="output"&&output.offset==0,"fused expert route bounds");
+        Ok(input.offset)
+    }
+    fn run_live_inner(
         &self,
         expert: &Expert,
         input: &Buffer<bf16>,
         ids: &Buffer<i32>,
         routing_weights: &Buffer<f32>,
         live: usize,
+        defer_sum: bool,
         stream: &Stream,
     ) -> Result<()> {
         ensure!(live<=self.contract.rows && (!self.live_bounds || live>0),"MoE live row domain");
         self.guard_stream(stream)?;
         if live==1 {
             if let Some(micro)=&self.single_row_micro {
+                ensure!(!defer_sum,"micro expert output is already reduced");
                 return micro.run_live(expert,input,ids,routing_weights,live,stream);
             }
         }
         if live==3 && let Some(alternative)=&self.three_row_task_order {
+            ensure!(!defer_sum,"alternate task-order workspace sum cannot be deferred");
             return alternative.run_live(expert,input,ids,routing_weights,live,stream);
         }
         ensure!(input.len() == self.contract.rows * self.contract.hidden && self.cuda.owns_buffer(input),
             "BF16 MoE operand");
+        let cooperative=self.cooperative_epilogue_mode.get();
+        if (cooperative!=0&&live==6)||(cooperative==2&&live==3) {
+            let p=self.cooperative_epilogues[usize::from(live==6)].as_ref()
+                .context("cooperative expert epilogue plan absent")?;
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
+        }
         if self.late_fc_pdl_enabled.get() {
             let p=self.late_fc_pdl.as_ref().context("late expert FC PDL plan absent")?;
-            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
         }
         if self.fc_pdl_mode.get()==1 || (self.fc_pdl_mode.get()==3 && live==3) {
             let p=self.fc_pdl.as_ref().context("expert FC PDL plan absent")?;
-            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
         }
         if self.scale_codes_enabled.get() {
             let p=self.scale_codes.as_ref().context("expert scale-code plan absent")?;
-            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
         }
         if self.cache_ca_enabled.get() && self.input_address_enabled.get() && live==6 {
             let p=self.cache_ca.as_ref().context("expert cache-ca plan absent")?;
-            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
         }
         if self.input_address_enabled.get() {
             let p=self.input_address.as_ref().context("expert input-address plan absent")?;
-            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,stream);
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
         }
-        self.launch_plan(&self.contract, &self.primitives, expert, input.ptr(), input.len()*2, ids, routing_weights, live, stream)
+        let primitives=if self.wide_transfer_enabled.get()
+            && (self.contract.rows!=512 || live==self.contract.rows) {
+            self.wide_transfer.as_ref().context("wide expert transfer plan absent")?
+        }else{&self.primitives};
+        self.launch_plan(&self.contract, primitives, expert, input.ptr(), input.len()*2, ids, routing_weights, live, defer_sum, stream)
     }
     #[allow(clippy::too_many_arguments)]
     fn launch_plan(&self, c: &Contract, primitives: &Primitives, expert: &Expert,
         input: u64, input_bytes: usize, ids: &Buffer<i32>, routing_weights: &Buffer<f32>,
-        live: usize, stream: &Stream) -> Result<()> {
+        live: usize, defer_sum: bool, stream: &Stream) -> Result<()> {
         ensure!(self.sequential_scratch.as_ref().is_none_or(|s|s.rows.get()==c.rows),
             "wide MoE scratch layout was not prepared before enqueue/capture");
         ensure!(
@@ -703,7 +888,7 @@ impl Workspace {
         let bounded512=c.rows==512 && bounded_rows.is_some();
         let bounded1024=c.rows==1024 && bounded_rows.is_some();
         if bounded128 {
-            ensure!(bounded_rows==Some(live) && (17..=64).contains(&live)
+            ensure!(bounded_rows==Some(live) && (17..128).contains(&live)
                 && c.kernel_library_sha256=="7c4cb9ca260c6bdc22cdde9d2690778d404249d0ad6bbb408c5cf407c94ce207"
                 && c.scratch_bytes==50170556 && c.nodes.len()==2,"qualified M128 live expert contract");
             for node in &c.nodes {
@@ -770,7 +955,12 @@ impl Workspace {
                 "scale-code operand ownership/size");
             roles.insert("s13",(codes.ptr(),codes.len()));
         }
+        if defer_sum {
+            ensure!(Self::sum_input_offset(c)?==Self::sum_input_offset(&self.contract)?,
+                "selected expert plan changed deferred route storage");
+        }
         for node in &c.nodes {
+            if defer_sum && node.kernel_id=="moe.w4a16.topk_sum" {continue;}
             let entry = &primitives.bindings.entries[node.entry as usize];
             let pointers = entry
                 .pointers

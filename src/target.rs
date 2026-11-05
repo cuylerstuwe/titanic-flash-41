@@ -128,6 +128,18 @@ pub(crate) use bank_encoder_lineage::Witness as BankEncoderWitness;
 mod bank_encoder_checkpoint;
 impl EncoderPrefixImage {
     pub(crate) fn bytes(&self)->usize {self.0.bytes()}
+    pub(crate) fn reusable_storage(&self,bytes:usize)->bool {
+        self.bytes()==bytes&&matches!(&self.0.image,crate::state_image::Storage::Copy(_))
+    }
+    pub(crate) fn fused_copy(&self)->bool {
+        matches!(&self.0.image,crate::state_image::Storage::Copy(image)if image.fused_copy())
+    }
+    /// Consumes a checkpoint already selected for ordinary eviction. None of
+    /// its model/history/lineage metadata survives; only charged byte storage.
+    pub(crate) fn into_retired_storage(self)->Result<crate::state_image::Image> {
+        match self.0.image {crate::state_image::Storage::Copy(image)=>Ok(image),
+            _=>anyhow::bail!("mutable exchange storage cannot become an encoder snapshot")}
+    }
     pub(crate) fn position(&self)->usize {self.0.history.position as usize}
     pub(crate) fn lineage(&self)->u64 {self.0.history.lineage}
     /// Payload stays immutable; the binding identifies the bank lineage that
@@ -167,6 +179,14 @@ fn short_prefill_rows_enabled(name:&str)->Result<bool> {
         Ok(v)if v=="0"=>Ok(false),Ok(v)if v=="1"=>Ok(true),
         Err(std::env::VarError::NotPresent)=>Ok(true),
         _=>anyhow::bail!("{name} must be0or1"),
+    }
+}
+pub(crate) fn prefill_upper_rows_requested()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_PREFILL_UPPER_ROWS") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid upper prefill row policy");Ok(v=="1")},
+        // s1320 same-allocation native ABBA: exact logits, state and following
+        // verification at65/96/127 rows;0.6–2.9% faster cached appends.
+        Err(std::env::VarError::NotPresent)=>Ok(true),Err(e)=>Err(e.into()),
     }
 }
 fn verification_mhc_live_row_limit()->Result<usize> {
@@ -514,6 +534,8 @@ pub struct Target {
     tiny_prefix_gather: bool,
     prefill_dense_live_rows: bool,
     prefill_moe_live_rows: bool,
+    prefill_upper_rows: bool,
+    prefill_woa_live: bool,
     prefill_partial_dense_rows: bool,
     prefill_partial_moe_rows: bool,
     // 1: qualified dense bounds; 2 also enables the experimental expert bound.
@@ -536,6 +558,9 @@ pub struct Target {
     alternate_index_engram_graphs: Vec<Option<Vec<Graph>>>,
     adaptive_sparse_active: bool,
     engram_overlap: bool,
+    engram_projection_ahead: bool,
+    engram_projection_m3_only: bool,
+    engram_projection_active: bool,
     engram_split14: bool,
     engram_split14_m3_only: bool,
     engram_split14_adaptive: bool,
@@ -562,6 +587,8 @@ pub struct Target {
     replay: Option<crate::decoder_tail::Replay>,
     graph_replay: bool,
     prefill_last_head: bool,
+    append_last_gather: bool,
+    append_encoded_head: bool,
     comm_instance: Option<u64>,
     // Its sampling graph references IO's local head, so drop before IO.
     compact_categorical: Option<crate::sharded_categorical_probe::CompactSampler>,
@@ -860,7 +887,13 @@ impl Target {
             crate::engram::target_cache_bytes()?,
         )?);
         let rows1 = Rows::new(cuda, rows, &row_store1)?;
-        let io = ModelIo::new(cuda, core_bytes, stream, cp, plan, io_stage, kernels, rows)?;
+        let mut io = ModelIo::new(cuda, core_bytes, stream, cp, plan, io_stage, kernels, rows)?;
+        let append_encoded_head=source_phase==Phase::Verify&&matches!(rows,16|32)
+            &&crate::config::append_encoded_head_requested()?;
+        if append_encoded_head {
+            ensure!(crate::config::append_last_gather_requested()?,"encoded append head requires final-only output");
+            io.prepare_append_encoded(stream)?;
+        }
         let source2 = source2.ok_or_else(|| anyhow::anyhow!("source2 absent"))?;
         let step = Step::new(
             cuda,
@@ -883,6 +916,8 @@ impl Target {
             tiny_native_reduce: false,
             prefill_dense_live_rows: short_prefill_rows_enabled("CANADA_SCRATCH_PREFILL_DENSE_LIVE_ROWS")?,
             prefill_moe_live_rows: short_prefill_rows_enabled("CANADA_SCRATCH_PREFILL_MOE_LIVE_ROWS")?,
+            prefill_upper_rows: prefill_upper_rows_requested()?,
+            prefill_woa_live: crate::woa_medium::prefill_live_policy()?,
             prefill_partial_dense_rows: short_prefill_rows_enabled("CANADA_SCRATCH_PREFILL_PARTIAL_DENSE_ROWS")?,
             prefill_partial_moe_rows: short_prefill_rows_enabled("CANADA_SCRATCH_PREFILL_PARTIAL_MOE_ROWS")?,
             prefill_partial1024_rows: match std::env::var("CANADA_SCRATCH_PREFILL_PARTIAL1024_ROWS").as_deref() {
@@ -907,6 +942,9 @@ impl Target {
             alternate_index_engram_graphs: (0..=rows).map(|_| None).collect(),
             adaptive_sparse_active: false,
             engram_overlap: false,
+            engram_projection_ahead: false,
+            engram_projection_m3_only: false,
+            engram_projection_active: false,
             engram_split14: false,
             engram_split14_m3_only: false,
             engram_split14_adaptive: false,
@@ -951,6 +989,9 @@ impl Target {
             replay: None,
             graph_replay: false,
             prefill_last_head: false,
+            append_last_gather: source_phase==Phase::Verify && [6,16,32].contains(&rows)
+                && crate::config::append_last_gather_requested()?,
+            append_encoded_head,
             comm_instance: None,
             cuda: cuda.clone(),
             io,
@@ -996,6 +1037,7 @@ impl Target {
         target.share_index_scores_before_capture(cuda,stream)?;
         target.share_narrow_moe_before_capture(cuda,stream)?;
         target.enable_verify16_ffn_before_capture(stream)?;
+        target.enable_engram_projection_before_capture(kernels)?;
         target.install_communication_hints(core, stream)?;
         Ok(target)
     }
@@ -1074,6 +1116,9 @@ impl Target {
         if self.cached_decoder.is_some() {target.enable_cached_extend_floor()?;}
         target.set_graph_replay(self.graph_replay)?;
         target.set_prefill_last_head(self.prefill_last_head)?;
+        if self.io.prefill_encoded_enabled() {target.set_prefill_encoded_head(true,stream)?;}
+        if self.io.prefill_row_pruned() {target.set_prefill_row_head(true,stream)?;}
+        if self.io.sparse_publish_enabled() {target.set_prefill_sparse_publish(true,stream)?;}
         ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3),
             "independent owner consumed physical reserve");
         ensure!(self.independent_state_report(&target)?["independent_causal_owners"]==true,
@@ -1438,9 +1483,15 @@ impl Target {
         let rows1 = Rows::new(cuda, rows, &self.row_store1)?;
         let io_build=||if independent {self.io.fork_owner(cuda,core_bytes,stream,kernels,rows)}
             else {self.io.fork_profile(cuda,core_bytes,stream,kernels,rows)};
-        let io=if let Some(arena)=wide.as_ref().and_then(|w|w.input_arena()) {
+        let mut io=if let Some(arena)=wide.as_ref().and_then(|w|w.input_arena()) {
             cuda.with_row_arena(arena,io_build)?
         }else{cuda.without_row_arena(io_build)?};
+        let append_encoded_head=phase==Phase::Verify&&matches!(rows,16|32)
+            &&crate::config::append_encoded_head_requested()?;
+        if append_encoded_head {
+            ensure!(crate::config::append_last_gather_requested()?,"encoded append head requires final-only output");
+            io.prepare_append_encoded(stream)?;
+        }
         let step = Step::new(
             cuda,
             &source2,
@@ -1465,6 +1516,8 @@ impl Target {
             tiny_native_reduce: false,
             prefill_dense_live_rows: self.prefill_dense_live_rows,
             prefill_moe_live_rows: self.prefill_moe_live_rows,
+            prefill_upper_rows: self.prefill_upper_rows,
+            prefill_woa_live: self.prefill_woa_live,
             prefill_partial_dense_rows: self.prefill_partial_dense_rows,
             prefill_partial_moe_rows: self.prefill_partial_moe_rows,
             prefill_partial1024_rows: self.prefill_partial1024_rows,
@@ -1483,6 +1536,9 @@ impl Target {
             alternate_index_engram_graphs: (0..=rows).map(|_| None).collect(),
             adaptive_sparse_active: false,
             engram_overlap: false,
+            engram_projection_ahead: false,
+            engram_projection_m3_only: false,
+            engram_projection_active: false,
             engram_split14: false,
             engram_split14_m3_only: false,
             engram_split14_adaptive: false,
@@ -1505,6 +1561,9 @@ impl Target {
             replay: None,
             graph_replay: false,
             prefill_last_head: false,
+            append_last_gather: phase==Phase::Verify && [6,16,32].contains(&rows)
+                && crate::config::append_last_gather_requested()?,
+            append_encoded_head,
             comm_instance: self.comm_instance,
             cuda: cuda.clone(),
             io,
@@ -1550,9 +1609,31 @@ impl Target {
         target.share_index_scores_before_capture(cuda,stream)?;
         target.share_narrow_moe_before_capture(cuda,stream)?;
         target.enable_verify16_ffn_before_capture(stream)?;
+        target.enable_engram_projection_before_capture(kernels)?;
         target.install_communication_hints(core, stream)?;
         cuda.report_allocation_sites(&format!("rank{} forkM{rows} independent={independent}",self.rank))?;
         Ok(target)
+    }
+    /// Opt-in accumulated candidate. The M3 graph owns separate mutable WKV
+    /// scratch; its ordinary M6 peer and all bulk-prefill profiles stay intact.
+    /// s1274 checked mixed-width captures and asymmetric immutable-row misses.
+    fn enable_engram_projection_before_capture(&mut self,kernels:&Path)->Result<()> {
+        let enabled=match std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_M3").as_deref() {
+            Err(std::env::VarError::NotPresent)|Ok("0")=>false,Ok("1")=>true,
+            _=>anyhow::bail!("Engram M3 projection policy must be0or1"),
+        };
+        if !enabled||self.rows!=6||self.source_phase!=Phase::Verify{return Ok(());}
+        ensure!(self.graph_captures==0&&!self.engram_split14&&!self.engram_split14_adaptive,
+            "Engram M3 policy must precede graph capture");
+        // Only row-sized values/scales/output and stream/module bookkeeping are
+        // new. Canonical weights remain shared. Keep margin above the normal
+        // allocation floor; this does not borrow an optional conversation slot.
+        ensure!(self.cuda.admission_memory()?.admitted_available>=
+            self.cuda.allocation_reserve_bytes()+8*1024*1024,
+            "Engram projection workspace would consume the physical reserve");
+        self.group14.set_engram_projection_ahead_for_probe(true,kernels)?;
+        self.engram_projection_ahead=true;self.engram_projection_m3_only=true;
+        Ok(())
     }
     fn enable_verify16_ffn_before_capture(&mut self,stream:&Stream)->Result<()> {
         // Wide verification can overlap the independent shared-expert branch.
@@ -1614,7 +1695,7 @@ impl Target {
         Ok(())
     }
     fn install_communication_hints(&mut self, core: &Module, stream: &Stream) -> Result<()> {
-        if !crate::l2_prefetch::enabled() || self.rows > 8 {
+        if !crate::l2_prefetch::enabled_for_rows(self.rows,4)? {
             return Ok(());
         }
         let inputs: Vec<_> = self
@@ -1975,6 +2056,7 @@ impl Target {
         };
         let regions = self.state_image_regions(self.history.position as usize,compact)?;
         let mut image = crate::state_image::Image::allocate(&self.cuda, &regions, budget, stream)?;
+        image.configure_copy_kernel(self.io.core_module())?;
         stream.synchronize()?;
         comm.health()?;
         self.lease.begin()?;
@@ -2021,7 +2103,7 @@ impl Target {
         restore:Option<EncoderPrefixRestore<'_>>,prefix:&[u32],suffix:&[u32],budget:Option<usize>,
         comm:&Roce,stream:&Stream)->Result<(Option<EncoderPrefixImage>,serde_json::Value)> {
         let (image,details,progress)=self.prefill_with_encoder_checkpoint_interruptible(wides,
-            restore,prefix,suffix,budget,comm,stream,&mut |_|Ok(false),&mut |admit|Ok(admit))?;
+            restore,prefix,suffix,budget,None,comm,stream,&mut |_|Ok(false),&mut |admit|Ok(admit))?;
         ensure!(progress.done==prefix.len()+suffix.len(),"uninterrupted encoder checkpoint extent");
         Ok((image,details))
     }
@@ -2031,9 +2113,12 @@ impl Target {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prefill_with_encoder_checkpoint_interruptible(&mut self,wides:&mut[Self],
         restore:Option<EncoderPrefixRestore<'_>>,prefix:&[u32],suffix:&[u32],budget:Option<usize>,
+        recycled:Option<crate::state_image::Image>,
         comm:&Roce,stream:&Stream,should_yield:&mut impl FnMut(usize)->Result<bool>,
         admit_image:&mut impl FnMut(bool)->Result<bool>,
     )->Result<(Option<EncoderPrefixImage>,serde_json::Value,PrefillProgress)> {
+        let recycled_bytes=recycled.as_ref().map_or(0,crate::state_image::Image::bytes);
+        ensure!(recycled.is_none()||budget==Some(recycled_bytes),"encoder recycled storage extent");
         let previous=restore.as_ref().map_or(self.history.position as usize,|r|r.image_and_lineage().0.position());
         ensure!(encoder_checkpoint_enabled()&&suffix.len()>=128&&previous+prefix.len()>=128
             && prefix.len()+suffix.len()<=self.context.saturating_sub(previous)
@@ -2080,15 +2165,19 @@ impl Target {
             // caller's initial cache admission. Recheck at allocation time;
             // the checkpoint is optional and never owns the live model state.
             let fits=self.cuda.admission_memory()?.admitted_available
-                >=8*1024usize.pow(3)+16*1024usize.pow(2)+budget;
+                >=8*1024usize.pow(3)+16*1024usize.pow(2)+budget-recycled_bytes;
             if admit_image(fits)? {
                 let bank_retained=crate::config::bank_encoder_checkpoint_requested();
                 let regions=self.state_image_regions_for_layers_mode(self.history.position as usize,true,true,bank_retained)?;
-                let mut allocation=crate::state_image::Image::try_allocate(&self.cuda,&regions,budget,stream)?;
+                let mut allocation=match recycled {
+                    Some(retired)=>retired.try_recycle(&regions,budget,stream)?,
+                    None=>crate::state_image::Image::try_allocate(&self.cuda,&regions,budget,stream)?,
+                };
                 let fits=allocation.is_some() && self.cuda.admission_memory()?.admitted_available
                     >=8*1024usize.pow(3)+16*1024usize.pow(2);
                 if admit_image(fits)? {
                     let mut image=allocation.take().ok_or_else(||anyhow::anyhow!("all-rank image admission differs"))?;
+                    image.configure_copy_kernel(self.io.core_module())?;
                     stream.synchronize()?;comm.health()?;self.lease.begin()?;
                     ensure!(self.encoder_cache.as_ref().unwrap().error()?==0,"encoder checkpoint cache fault");
                     image.save(&regions,stream)?;comm.health()?;self.lease.finish_read()?;
@@ -2598,6 +2687,57 @@ impl Target {
             "alternate QKV screen memory/ownership");
         self.layer_owners().into_iter().map(|l|l.attention().legacy_qkv_for_probe(kernels)).collect()
     }
+    pub(crate) fn prepare_qkv_fence_alternates_for_probe(&self,kernels:&Path)->Result<Vec<crate::fp8_linear::Linear>> {
+        ensure!(std::env::var("CANADA_SCRATCH_QKV_FENCE_SCREEN").as_deref()==Ok("1")
+            && matches!(self.rows,6|16)&&self.pending.is_none()&&self.lease.is_current()
+            &&self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024usize.pow(2),
+            "QKV fence alternate admission/ownership");
+        self.layer_owners().into_iter().map(|l|l.attention().producer_qkv_for_probe(kernels)).collect()
+    }
+    pub(crate) fn set_shared_down_flash_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_SHARED_DOWN_FLASH_SCREEN").as_deref()==Ok("1")
+            &&matches!(self.rows,6|16)&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.cached_decoder.is_none(),
+            "idle shared-down graph owner");
+        stream.synchronize()?;
+        for g in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*g=None;}
+        for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*g=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        for layer in self.layer_owners(){layer.ffn().set_shared_down_flash_for_probe(enabled)?;}
+        Ok(())
+    }
+    pub(crate) fn set_index_query_flash_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_INDEX_QUERY_FLASH_SCREEN").as_deref()==Ok("1")
+            &&self.rows==16&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.cached_decoder.is_none(),
+            "idle index query graph owner");
+        stream.synchronize()?;
+        for g in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*g=None;}
+        for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*g=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        let branches=self.index_queries();
+        ensure!(branches.iter().all(Option::is_some),"index query source count");
+        for branch in branches.into_iter().flatten(){branch.set_query_flash_for_probe(enabled)?;}
+        Ok(())
+    }
+    pub(crate) fn swap_qkv_fence_for_probe(&mut self,other:&mut[crate::fp8_linear::Linear],stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_QKV_FENCE_SCREEN").as_deref()==Ok("1")
+            &&matches!(self.rows,6|16)&&other.len()==40&&self.source_phase==Phase::Verify
+            &&self.pending.is_none()&&self.lease.is_current()&&self.graph_replay
+            &&self.cuda.owns_stream(stream)&&stream.raw()as usize==self.stream
+            &&self.cached_decoder.is_none(),"idle QKV fence graph owner");
+        stream.synchronize()?;
+        for g in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*g=None;}
+        for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*g=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        for(layer,alternate)in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()).zip(other){
+            layer.swap_qkv_fence_for_probe(alternate)?;
+        }
+        Ok(())
+    }
     pub(crate) fn set_moe_input_address_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_MOE_INPUT_ADDRESS_SCREEN").as_deref()==Ok("1")
             &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
@@ -2636,6 +2776,107 @@ impl Target {
         for layer in self.layer_owners(){layer.narrow_workspace().set_late_fc_pdl_for_probe(enabled,stream)?;}
         Ok(())
     }
+    pub(crate) fn ffn_hint_chunks(&self)->std::collections::BTreeMap<u32,usize> {
+        let mut counts=std::collections::BTreeMap::new();
+        for layer in self.layer_owners() {
+            if let Some(chunk)=layer.ffn().prefetch_chunk() {*counts.entry(chunk).or_default()+=1;}
+        }
+        counts
+    }
+    pub(crate) fn set_ffn_hint_chunk_for_probe(&mut self,chunk:u32,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_FFN_HINT_MODEL_SCREEN").as_deref()==Ok("1")
+            &&[2048,16384].contains(&chunk)&&self.rows==6&&self.source_phase==Phase::Verify
+            &&self.pending.is_none()&&self.lease.is_current()&&self.graph_replay
+            &&self.cuda.owns_stream(stream)&&stream.raw()as usize==self.stream,
+            "idle finite FFN hint model screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            layer.set_ffn_prefetch_chunk_for_probe(chunk,stream)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_wide_hints_for_probe(&mut self,mask:u8,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_WIDE_L2_SCREEN").as_deref()==Ok("1")
+            &&mask<=7&&matches!(self.rows,16|32)&&self.source_phase==Phase::Verify
+            &&self.pending.is_none()&&self.lease.is_current()&&self.lease.shared_idle()
+            &&self.graph_replay&&self.cuda.owns_stream(stream)&&stream.raw()as usize==self.stream,
+            "idle finite wide L2 hint verifier");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            layer.set_wide_hints_for_probe(mask,stream)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_ffn_sum_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_FFN_SUM_SHARED_SCREEN").as_deref()==Ok("1")
+            &&matches!(self.rows,6|16|32)&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),"idle fused FFN sum screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        for layer in self.layer_owners(){layer.ffn().set_fused_sum_for_probe(enabled)?;}
+        Ok(())
+    }
+    pub(crate) fn set_moe_wide_transfer_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!((std::env::var("CANADA_SCRATCH_MOE_WIDE_TRANSFER_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_PREFILL_BOUNDS_SCREEN").as_deref()==Ok("1"))
+            &&matches!(self.rows,16|128|512|1024)&&self.pending.is_none()&&self.lease.shared_idle()
+            &&(self.graph_replay||self.wide.is_some())&&self.cuda.owns_stream(stream)&&stream.raw()as usize==self.stream,
+            "idle wide expert transfer screen");
+        if self.layer_owners().iter().all(|l|l.narrow_workspace().wide_transfer_enabled()==enabled){return Ok(());}
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        self.encoder_graph=None;self.encoder_graph_live=None;
+        for layer in self.layer_owners(){layer.narrow_workspace().set_wide_transfer_for_probe(enabled,stream)?;}
+        Ok(())
+    }
+    pub(crate) fn set_prefill_upper_rows_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_PREFILL_BOUNDS_SCREEN").as_deref()==Ok("1")
+            &&self.rows==128&&self.source_phase==Phase::Extend&&self.pending.is_none()
+            &&self.lease.shared_idle()&&self.cuda.owns_stream(stream)&&stream.raw()as usize==self.stream,
+            "idle upper prefill row screen");
+        if self.prefill_upper_rows==enabled{return Ok(())}
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;self.prefill_upper_rows=enabled;Ok(())
+    }
+    pub(crate) fn set_prefill_woa_rows_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_WOA_PREFILL_SCREEN").as_deref()==Ok("1")
+            &&self.rows==128&&self.source_phase==Phase::Extend&&self.pending.is_none()
+            &&self.lease.is_current()&&self.lease.shared_idle()
+            &&self.cuda.owns_stream(stream)&&stream.raw()as usize==self.stream,
+            "idle WO-A prefill row screen");
+        if self.prefill_woa_live==enabled{return Ok(())}
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;self.prefill_woa_live=enabled;Ok(())
+    }
+    pub(crate) fn set_cooperative_epilogues_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_EPILOGUE_SCREEN").as_deref()==Ok("1")
+            &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),"idle cooperative epilogue screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        for layer in self.layer_owners(){layer.narrow_workspace().set_cooperative_epilogues_for_probe(enabled,stream)?;}
+        Ok(())
+    }
     pub(crate) fn set_cache_ca_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_MOE_CACHE_CA_SCREEN").as_deref()==Ok("1")
             &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
@@ -2660,6 +2901,26 @@ impl Target {
         for layer in self.early.iter_mut().chain(self.group8.layers_mut())
             .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
             layer.set_woa_prefetch_for_probe(enabled)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_expert_prefetch_for_probe(&mut self,selected:Option<&[usize]>,core:&[u8],stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_EXPERT_PREFETCH_SCREEN").as_deref()==Ok("1")
+            &&selected.is_none_or(|s|s.len()==40&&s.iter().all(|&e|e<384))
+            &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream,"idle expert hint screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        // Ordinary warmup can already own an append bank. Drop it alongside
+        // the verifier banks before replacing any captured hint descriptor.
+        self.tiny_append_graphs=None;
+        let module=self.cuda.module(core)?;
+        for (index,layer) in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()).enumerate() {
+            layer.set_expert_prefetch_for_probe(&module,stream,selected.map(|s|s[index]))?;
         }
         Ok(())
     }
@@ -2815,6 +3076,23 @@ impl Target {
         for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph=None; }
         self.decoder_graph=None;
         for layer in self.layer_owners() { layer.attention().set_cached_woa_for_probe(enabled)?; }
+        Ok(())
+    }
+    pub(crate) fn set_woa_compact_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        self.set_woa_compact_mode_for_probe(u8::from(enabled),stream)
+    }
+    pub(crate) fn set_woa_compact_mode_for_probe(&mut self,mode:u8,stream:&Stream)->Result<()> {
+        ensure!(mode<=2&&(mode!=2||std::env::var("CANADA_SCRATCH_WOA_MID_REFERENCE_SCREEN").as_deref()==Ok("1")),
+            "finite WO-A reference admission");
+        ensure!(std::env::var("CANADA_SCRATCH_WOA_MID_SCREEN").as_deref()==Ok("1")
+            &&matches!(self.rows,16|32)&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.lease.shared_idle(),"idle compact WO-A verifier");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        for layer in self.layer_owners(){layer.attention().set_compact_woa_for_probe(mode)?;}
         Ok(())
     }
     pub(crate) fn micro_moe_layers(&self) -> usize {
@@ -3027,6 +3305,30 @@ impl Target {
             "scope":"Public-task fixed-input verification buffers; pending/committed and physical/live rows recorded explicitly. Pending padding must contain id=-1 and weight=0. Only canonical input/ids/routing for layers0,28 saved onrank3. No expert workspace or causalcache used as a component oracle."});
         if self.rank==3{std::fs::write(root.join("index.json"),serde_json::to_vec_pretty(&index)?)?;}
         Ok(index)
+    }
+    /// Read only per-layer route IDs after a finite neural verification commits.
+    /// `last_live` is the accepted prefix, whereas `verified_rows` also includes
+    /// rejected proposals. Do not confuse those extents when pricing prefetch.
+    pub(crate) fn capture_consecutive_routes_for_probe(&self,verified_rows:usize,stream:&Stream)
+        ->Result<serde_json::Value> {
+        ensure!((std::env::var("CANADA_SCRATCH_SOLO_ECONOMICS_SCREEN").as_deref()==Ok("1")
+                ||std::env::var("CANADA_SCRATCH_EXPERT_PREFETCH_SCREEN").as_deref()==Ok("1"))
+            &&self.rows==6&&self.source_phase==Phase::Verify&&self.lease.is_current()
+            &&self.pending.is_none()&&(1..=self.rows).contains(&verified_rows)
+            &&self.last_live>0&&self.last_live<=verified_rows
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
+            "consecutive route capture needs a completed finite neural step");
+        stream.synchronize()?;
+        let mut layers=Vec::new();
+        for (layer,owner) in self.layer_owners().iter().enumerate() {
+            let ids=owner.ffn().router().ids().download()?;
+            ensure!(ids.len()==self.rows*6&&ids[..verified_rows*6].iter().all(|id|(0..384).contains(id)),
+                "invalid live route IDs");
+            layers.push(serde_json::json!({"layer":layer,"ids":&ids[..verified_rows*6]}));
+        }
+        ensure!(layers.len()==40,"consecutive route layer count");
+        Ok(serde_json::json!({"rank":self.rank,"position":self.history.position,
+            "accepted_rows":self.last_live,"verified_rows":verified_rows,"layers":layers}))
     }
     pub(crate) fn expert_routes_for_probe(&self) -> Result<serde_json::Value> {
         // Verification does not publish last_live until its accepted prefix
@@ -3331,13 +3633,29 @@ impl Target {
         self.engram_overlap = enabled;
         Ok(())
     }
+    pub(crate) fn set_engram_projection_ahead_for_probe(&mut self,mode:u8,kernels:&Path,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_SCREEN").as_deref()==Ok("1")
+            &&mode<=2
+            &&matches!(self.rows,6|16)&&self.source_phase==Phase::Verify
+            &&self.pending.is_none()&&self.lease.is_current()&&self.graph_replay
+            &&self.cuda.owns_stream(stream)&&stream.raw()as usize==self.stream
+            &&self.cached_decoder.is_none()&&!self.engram_split14&&!self.engram_split14_adaptive,
+            "idle Engram projection requires the common two-part schedule");
+        stream.synchronize()?;
+        for g in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*g=None;}
+        for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*g=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        self.group14.set_engram_projection_ahead_for_probe(mode!=0,kernels)?;
+        self.engram_projection_ahead=mode!=0;self.engram_projection_m3_only=mode==2;
+        self.engram_projection_active=false;Ok(())
+    }
     /// Use distinct layer0, layers1..13, and layers14..39 captures so the
     /// second immutable Engram read can overlap the middle graph.
     pub(crate) fn set_engram_split14_for_probe(&mut self,enabled:bool)->Result<()> {
         ensure!((std::env::var("CANADA_SCRATCH_ENGRAM_SPLIT14_SCREEN").as_deref()==Ok("1")
             || std::env::var("CANADA_SCRATCH_VERIFICATION_FUSION_SCREEN").as_deref()==Ok("1"))
             && self.lease.is_current() && self.pending.is_none() && self.rows==6
-            && self.source_phase==Phase::Verify && self.graph_replay && self.engram_overlap
+            && self.source_phase==Phase::Verify && self.graph_replay && self.engram_overlap && !self.engram_projection_ahead
             && self.engram_graphs.iter().chain(&self.alternate_index_engram_graphs).all(Option::is_none),
             "Engram split14 requires an idle uncaptured verification profile");
         self.engram_split14=enabled;
@@ -3407,7 +3725,8 @@ impl Target {
                 || std::env::var("CANADA_SCRATCH_NATIVE_ROW_TRANSPORT_SCREEN").as_deref()==Ok("1")
                 || std::env::var("CANADA_SCRATCH_RESIDENT_SMALL_APPEND").as_deref()==Ok("1"))
             && (self.rows==6 || (self.rows==16
-                && std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1")))
+                && std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1"))
+                ||(self.rows==32&&crate::config::append32_workspace_enabled()))
             && self.source_phase==Phase::Verify && self.pending.is_none()
             && self.lease.is_current() && self.encoder_cache.is_some()
             && self.cuda.owns_stream(stream) && self.stream==stream.raw()as usize,
@@ -3462,6 +3781,39 @@ impl Target {
                 self.group14.source(),self.late.source(),&pairs,&singles,6,self.context,
                 self.early_caches[0].capacity(),self.swa_layout,Phase::Extend)?);
         } else {self.cached_decoder=None;}
+        Ok(())
+    }
+
+    pub(crate) fn append_last_gather_enabled(&self)->bool {self.append_last_gather}
+    pub(crate) fn append_encoded_head_enabled(&self)->bool {self.append_encoded_head}
+    pub(crate) fn set_append_encoded_head_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_APPEND_HEAD_SCREEN").as_deref()==Ok("1")
+            &&matches!(self.rows,16|32)&&self.source_phase==Phase::Verify&&self.append_last_gather
+            &&self.pending.is_none()&&self.lease.is_current()&&self.cached_decoder.is_none()
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
+            "finite append head needs idle final-only profile");
+        stream.synchronize()?;
+        if enabled {self.io.prepare_append_encoded(stream)?;}
+        if self.append_encoded_head!=enabled {self.tiny_append_graphs=None;self.append_encoded_head=enabled;}
+        Ok(())
+    }
+    pub(crate) fn append_head_normalized_for_probe(&self)->Result<Vec<u8>> {
+        ensure!(std::env::var("CANADA_SCRATCH_APPEND_HEAD_SCREEN").as_deref()==Ok("1")
+            &&self.pending.is_none()&&self.last_live>0&&self.lease.is_current(),"finite final-head input capture");
+        unsafe{self.cuda.read_device(self.io.normalized().ptr()+((self.last_live-1)*5120*2)as u64,5120*2)}
+    }
+    pub(crate) fn set_append_last_gather_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_APPEND_LAST_GATHER_SCREEN").as_deref()==Ok("1")
+            && [6,16,32].contains(&self.rows) && self.source_phase==Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.cached_decoder.is_none()
+            && self.cuda.owns_stream(stream) && self.stream==stream.raw()as usize,
+            "last-logit append comparison needs an idle ordinary verifier");
+        if self.append_last_gather==enabled{return Ok(())}
+        stream.synchronize()?;
+        // Only the inactive retained-append bank contains this transport tail.
+        // Ordinary verification continues publishing every requested row.
+        self.tiny_append_graphs=None;
+        self.append_last_gather=enabled;
         Ok(())
     }
 
@@ -3600,6 +3952,56 @@ impl Target {
         );
         self.prefill_last_head = enabled;
         Ok(())
+    }
+    pub(crate) fn prefill_encoded_head_enabled(&self)->bool {self.io.prefill_encoded_enabled()}
+    /// Startup selection, or an isolated same-allocation comparison. Every
+    /// graph that can contain the final head is invalidated before switching.
+    pub(crate) fn set_prefill_encoded_head(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(self.rows==128&&self.source_phase==Phase::Extend&&self.prefill_last_head
+            &&self.pending.is_none()&&self.lease.shared_idle()
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize
+            &&(self.position()==0||std::env::var("CANADA_SCRATCH_PREFILL_HEAD_SCREEN").as_deref()==Ok("1")),
+            "prefill head selection requires startup or finite idle comparison");
+        if self.io.prefill_encoded_enabled()==enabled{return Ok(());}
+        stream.synchronize()?;
+        for g in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) {*g=None;}
+        for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) {*g=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        self.io.set_prefill_encoded(enabled,stream)
+    }
+    pub(crate) fn prefill_head_input_for_probe(&self)->Result<Vec<u8>> {
+        ensure!(std::env::var("CANADA_SCRATCH_PREFILL_HEAD_SCREEN").as_deref()==Ok("1")
+            &&self.rows==128&&self.pending.is_none()&&self.last_live>0&&self.lease.is_current(),
+            "finite prefill head input capture");
+        unsafe {self.cuda.read_device(self.io.prefill_normalized_ptr(self.last_live)?,5120*2)}
+    }
+    pub(crate) fn prefill_row_head_enabled(&self)->bool {self.io.prefill_row_pruned()}
+    pub(crate) fn set_prefill_row_head(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(self.rows==128&&self.source_phase==Phase::Extend&&self.prefill_last_head
+            &&self.pending.is_none()&&self.lease.shared_idle()
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize
+            &&(self.position()==0||std::env::var("CANADA_SCRATCH_PREFILL_HEAD_SCREEN").as_deref()==Ok("1")),
+            "last-row normalization requires startup or finite idle comparison");
+        if self.io.prefill_row_pruned()==enabled{return Ok(());}
+        stream.synchronize()?;
+        for g in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*g=None;}
+        for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*g=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        self.io.set_prefill_row_pruned(enabled,stream)
+    }
+    pub(crate) fn prefill_sparse_publish_enabled(&self)->bool {self.io.sparse_publish_enabled()}
+    pub(crate) fn set_prefill_sparse_publish(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(self.rows==128&&self.source_phase==Phase::Extend&&self.prefill_last_head
+            &&self.pending.is_none()&&self.lease.shared_idle()
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize
+            &&(self.position()==0||std::env::var("CANADA_SCRATCH_PREFILL_HEAD_SCREEN").as_deref()==Ok("1")),
+            "sparse logit publication requires startup or finite idle comparison");
+        if self.io.sparse_publish_enabled()==enabled{return Ok(());}
+        stream.synchronize()?;
+        for g in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*g=None;}
+        for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*g=None;}
+        self.decoder_graph=None;self.tiny_append_graphs=None;
+        self.io.set_sparse_publish(enabled,stream)
     }
 
     pub(crate) fn compact_history_sampling_requested()->Result<bool> {
@@ -3773,7 +4175,8 @@ impl Target {
                 && crate::config::verification_rows(self.rows)
                 && !self.prefill_last_head
                 && (self.cached_decoder.is_none() || ((self.rows==6 || (self.rows==16
-                    && std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1")))
+                    && std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1"))
+                    ||(self.rows==32&&crate::config::append32_workspace_enabled()))
                     && (std::env::var("CANADA_SCRATCH_TINY_APPEND_SCREEN").as_deref()==Ok("1")
                         || std::env::var("CANADA_SCRATCH_NATIVE_ROW_TRANSPORT_SCREEN").as_deref()==Ok("1")
                         || std::env::var("CANADA_SCRATCH_RESIDENT_SMALL_APPEND").as_deref()==Ok("1")))),
@@ -3829,6 +4232,14 @@ impl Target {
         self.last_append_metrics = None;
         self.carry_saved_start = None;
         let begin = Instant::now();
+        // Live count is agreed by all ranks and is already a graph-cache key.
+        // Keep both projections bound to their own stream so changing widths
+        // does not destroy a warmed graph or rebind mutable scratch.
+        if self.engram_projection_ahead {
+            self.engram_projection_active=self.engram_overlap&&self.graph_replay
+                &&(!self.engram_projection_m3_only||ids.len()==3);
+            self.group14.select_engram_projection_ahead(self.engram_projection_active)?;
+        }
         self.select_index_graph_bank(stream)?;
         let mut marks = vec![("begin", begin)];
         let mut captured_new_graph = false;
@@ -3898,10 +4309,15 @@ impl Target {
         // fresh and retained prompts so reset/reuse cannot change the policy
         // of an existing capture. Decoder-tail replay remains outside scope.
         let bounded_prefill=self.rows==128 && self.source_phase==Phase::Extend
-            && (17..=64).contains(&ids.len());
+            && ((17..=64).contains(&ids.len())||(self.prefill_upper_rows&&(65..128).contains(&ids.len())));
         let _dense_rows=crate::fp8_linear::LivePrefillRowsScope::new(
             self.prefill_dense_live_rows && bounded_prefill,self.prefill_moe_live_rows && bounded_prefill,
             ids.len(),self.rows,stream)?;
+        let _woa_rows=crate::woa_medium::LiveRowsScope::new(
+            self.prefill_woa_live&&self.rows==128&&self.source_phase==Phase::Extend
+                // Leave near-full tiles alone:127 rows was flat in the native
+                // screen. Retain at least16 avoided rows to pay for a new plan.
+                &&(33..=112).contains(&ids.len()),ids.len(),self.rows,stream)?;
         let _mhc_rows=crate::mhc::ActiveRowsScope::new(
             (ids.len()<=self.verification_mhc_live_rows&&self.rows==6&&self.source_phase==Phase::Verify)
                 ||self.prefill_mhc_live_rows&&bounded_prefill,
@@ -4094,15 +4510,22 @@ impl Target {
     /// graph or adding an all-gather. The finite screen compares all four ranks.
     pub(crate) fn pending_local_logits_for_probe(&self) -> Result<(&Buffer<f32>, usize)> {
         ensure!(std::env::var("CANADA_SCRATCH_INDEX_SCORE_MODEL_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_SHARED_DOWN_FLASH_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_FFN_HINT_MODEL_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_FFN_SUM_SHARED_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_PAIR_STEP_PROFILE").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_ATTENTION16_REFRESH_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_INDEPENDENT_OWNER_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_WIDE_MHC_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_OUTPUT_PROJECTION_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_WOA_MID_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_WIDE_L2_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_FFN32_REFRESH_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_WIDE_EPILOGUE_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_WIDE_ENGRAM_SCREEN").as_deref()==Ok("1")
-            ||std::env::var("CANADA_SCRATCH_FFN16_REFRESH_SCREEN").as_deref()==Ok("1"),
+            ||std::env::var("CANADA_SCRATCH_FFN16_REFRESH_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_TRANSPORT_PLACEMENT_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_SCREEN").as_deref()==Ok("1"),
             "local logit readout requires finite score storage screen");
         let pending=self.pending.as_ref().context("no completed verification")?;
         ensure!(self.lease.is_busy_revision(),"local logit readout lost writer revision");
@@ -4110,6 +4533,8 @@ impl Target {
     }
     pub fn pending_logits(&self) -> Result<(&Buffer<f32>, usize)> {
         ensure!(!self.last_head_local_only,"compact verification has no gathered full-vocabulary logits");
+        ensure!(!(self.append_last_gather&&self.cached_decoder.is_some()),
+            "retained append publishes only its final distribution");
         let pending = self
             .pending
             .as_ref()
@@ -4156,6 +4581,19 @@ impl Target {
             self.pending = None;
         } // Keep lease poisoned.
         result
+    }
+    /// Startup's aborted retained appends publish only the final distribution.
+    /// Warm that actual serving consumer without reopening the all-row API or
+    /// committing any synthetic token/state. Ordinary policy keeps its prior warmup.
+    pub(crate) fn warm_pending_append_sampler(&mut self,stream:&Stream)->Result<()> {
+        if !self.append_last_gather {self.verification_greedy(stream)?;return Ok(())}
+        let pending=self.pending.as_ref().context("append sampler warmup needs pending rows")?;
+        ensure!(self.cached_decoder.is_some() && self.lease.is_busy_revision()
+            && !self.last_head_local_only && pending.live>0 && self.cuda.owns_stream(stream)
+            && stream.raw()as usize==self.stream,"append sampler warmup ownership");
+        self.categorical.sample(self.io.logits(),pending.live-1,1,1.,0,
+            crate::categorical::TARGET_DOMAIN,pending.start+pending.live as u64,stream)?;
+        Ok(())
     }
     /// Sample each verified row from the target at T=1, top_p=1. With a
     /// deterministic proposal, matching these independent target samples until
@@ -4204,6 +4642,9 @@ impl Target {
                 && comm.rank() == self.rank,
             "verification commit owner/prefix/stream"
         );
+        ensure!(!(self.append_last_gather&&self.cached_decoder.is_some())
+            || accepted==0 || accepted==pending.live,
+            "last-logit append must commit all rows or abort");
         let pending = self.pending.take().unwrap();
         let restored = unsafe {
             self.carry_snapshot
@@ -5376,6 +5817,14 @@ impl Target {
         self.enqueue_encoder_from_engram14(comm,stream)
     }
     fn enqueue_before_engram14(&mut self, comm:&Roce, stream:&Stream)->Result<()> {
+        if self.engram_projection_active {
+            // Moving this reduction earlier changes the collective order.
+            // Rank-local split-I/O graph choices therefore cannot coexist
+            // with this schedule. Both row sets must already be prepared.
+            ensure!(!self.engram_split14&&!self.engram_split14_adaptive,
+                "Engram projection requires a common collective schedule");
+            self.group14.prepare_engram_projection_ahead(comm,stream)?;
+        }
         let (first, rest) = self.early.split_first_mut().unwrap();
         let (_, caches) = self.early_caches.split_first_mut().unwrap();
         let mut previous_output = first.output();
@@ -5534,9 +5983,13 @@ impl Target {
                 .run_head_last(self.late.output(), self.late.pre(), &self.tokens, stream)?;
             self.io.gather_logits_last(comm, &self.tokens, stream)?;
         } else {
-            self.io
-                .run_head(self.late.output(), self.late.pre(), stream)?;
-            if !self.compact_sampling_active() {self.io.gather_logits(comm, stream)?;}
+            if self.append_encoded_head&&self.cached_decoder.is_some() {
+                ensure!(self.append_last_gather,"final encoded head needs final-only publication");
+                self.io.run_append_encoded_last(self.late.output(),self.late.pre(),&self.tokens,stream)?;
+            } else {self.io.run_head(self.late.output(), self.late.pre(), stream)?;}
+            if self.append_last_gather&&self.cached_decoder.is_some()&&self.tokens.active_rows()>1 {
+                self.io.gather_existing_last_logits(comm,&self.tokens,stream)?;
+            } else if !self.compact_sampling_active() {self.io.gather_logits(comm, stream)?;}
         }
         Ok(())
     }

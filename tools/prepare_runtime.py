@@ -19,11 +19,45 @@ def digest(path):
 
 def validate_fenced_bundles(inventory):
     """Require every compiled projection replacement before copying runtime data."""
+    # The M6 expert cache policy defaults on in the Rust loader even without an
+    # explicit environment flag. Absence must fail before loading model weights.
+    directory = 'moe-runtime-m6-cache-ca-v1'
+    for name in ('manifest.json', 'runtime-contract.json', 'bindings.json', 'libcanada_moe_primitives.so'):
+        relative = f'kernels/{directory}/{name}'
+        assert relative in inventory['files'], f'missing default MoE artifact: {relative}'
+    library = f'kernels/{directory}/libcanada_moe_primitives.so'
+    assert inventory['files'][library] == 'e68e2711f1603e0b2261c939e67650ea00ae1f9dfffb2b344ea49792214554de', 'default MoE library differs from the Rust loader pin'
     registry = json.loads((ROOT/'src/dense_pipeline_fence_bundles.json').read_text())
     for directory in set(registry.values()):
         for name in ('manifest.json', 'bindings.json', 'libcanada_primitives.so'):
             relative = f'kernels/{directory}/{name}'
             assert relative in inventory['files'], f'missing fenced projection artifact: {relative}'
+
+    # These manifests are pinned by the Rust loader as well as the package.
+    # Check the two boundaries agree before a lengthy model download or launch.
+    prepared = list(json.loads((ROOT/'src/fp8_prepared_shared_down_bundles.json').read_text()).values())
+    prepared.append(json.loads((ROOT/'src/fp8_prepared_index_query_bundle.json').read_text()))
+    for bundle in prepared:
+        for name, field in [('manifest.json', 'manifest_sha256'),
+                            ('bindings.json', 'bindings_sha256'),
+                            ('libcanada_primitives.so', 'library_sha256')]:
+            relative = f"kernels/{bundle['bundle']}/{name}"
+            assert inventory['files'].get(relative) == bundle[field], f'compiled kernel pin mismatch: {relative}'
+
+    profile = json.loads((ROOT/'deploy/profile.json').read_text())
+    optional = {
+        'CANADA_SCRATCH_HEAD_WEIGHT_CG': ['target-head-lossless-weight-cg-v1'],
+        'CANADA_SCRATCH_MARKOV_HEAD_CG': ['draft-markov-gemv-cg-v1'],
+    }
+    for flag, directories in optional.items():
+        if profile.get(flag) == '1':
+            for directory in directories:
+                relative = f'kernels/{directory}/manifest.json'
+                assert relative in inventory['files'], f'missing enabled kernel artifact: {relative}'
+                manifest = json.loads((ROOT/'runtime'/relative).read_text())
+                for entry in manifest['entries']:
+                    relative = f"kernels/{directory}/{entry['name']}.cubin"
+                    assert inventory['files'].get(relative) == entry['artifact_sha256'], f'missing or mismatched enabled kernel artifact: {relative}'
 
 def fetch(url, path, expected=None):
     if not path.exists():
@@ -76,6 +110,16 @@ def main():
         assert not out.exists(), 'partial external export preserved; inspect it before retrying'
         (a.data/'build').mkdir(exist_ok=True)
         subprocess.run([sys.executable, str(ROOT/'tools/build_external_woa.py'), str(out)], check=True)
+    compact = a.data/'kernels/woa-mid-compact-v1'
+    if not (compact/'manifest.json').exists():
+        assert not compact.exists(), 'partial compact WO-A export preserved; inspect it before retrying'
+        subprocess.run([sys.executable, str(ROOT/'tools/build_external_woa_mid.py'), str(compact)], check=True)
+    manifest = json.loads((compact/'manifest.json').read_text())
+    assert manifest['source_sha256'] == digest(external/'mia/adapter/wo_a_w8.py')
+    assert {e['name'] for e in manifest['entries']} == {
+        'woa_mid_partial_m16', 'woa_mid_reduce_m16', 'woa_mid_partial_m32', 'woa_mid_reduce_m32'}
+    for entry in manifest['entries']:
+        assert digest(compact/(entry['name']+'.cubin')) == entry['artifact_sha256']
     print('Kernel and model metadata setup verified. Model weights are staged separately.')
 
 if __name__ == '__main__':

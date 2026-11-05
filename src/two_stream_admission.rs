@@ -39,7 +39,7 @@ fn occupied(active: bool, ready: &VecDeque<(Option<u64>, Job)>) -> usize {
 pub(super) fn choose(w:&mut Worker, queue:&Queue, active:&mut Option<Job>,
     ready:&mut VecDeque<(Option<u64>,Job)>, next_id:&mut u64,
     quantum_start:usize, prefill_turn_done:bool, refused:bool, images:&[ParkedRequest],
-    protection:&mut Protection,turns:&mut Turns)->Result<Scheduled> {
+    protection:&mut Protection,turns:&mut Turns,idle_policy:&mut IdlePolicy)->Result<Scheduled> {
     let paused_count=images.len();
     loop {
         queue.set_prefill_peer_ready(false);
@@ -169,6 +169,23 @@ pub(super) fn choose(w:&mut Worker, queue:&Queue, active:&mut Option<Job>,
         // Raw queued inputs and admitted CPU conversions are still part of
         // this fan-out, even during a gap with no model-ready Job.
         if !queue.has_outstanding_requests() {protection.end_epoch();}
+        if idle_policy.take()&&w.idle_anchor_can_prepare() {
+            // A full logical cache cannot admit this prediction. Avoid even
+            // the distributed command/physical-memory query in that case.
+            // Let the completed SSE response retire its ingress permit. This
+            // waits only while idle and wakes for a ready request or reclaim.
+            // A raw upload/conversion also vetoes preparation, even before it
+            // has produced a model-ready Job. Do not retry a missed idle gap.
+            if let Some(job)=queue.next_fifo(Duration::from_millis(2))? {
+                ready.push_back((None,job));continue;
+            }
+            if queue.stopping(){continue;}
+            if let Some(s)=queue.priority_pending(){return Ok(Scheduled::Priority(s));}
+            if !queue.router_hold()&&!queue.has_outstanding_requests()
+                &&queue.input_reclaim_target()==0&&images.is_empty() {
+                return Ok(Scheduled::IdleAnchor);
+            }
+        }
         // Wake immediately when a request arrives, just like the solo path;
         // polling sleep here would add avoidable first-token latency.
         if let Some(job)=queue.next_fifo(Duration::from_millis(500))? {

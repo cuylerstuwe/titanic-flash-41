@@ -17,6 +17,7 @@ pub(crate) struct ShardedBlock {
  packed:Buffer<f32>,gathered:Buffer<f32>,pub(crate) global_mass:Buffer<f64>,
  bundled:Buffer<f32>,bundled_gathered:Buffer<f32>,
  pub(crate) fused_local:bool,
+ pub(crate) fused_probabilities:bool,
 }
 impl ShardedBlock {
  pub(crate) fn bind_rank(&mut self,rank:usize)->Result<()> {
@@ -34,7 +35,8 @@ impl ShardedBlock {
    tile:cuda.allocate(capacity)?,fraction:cuda.allocate(capacity)?,total:cuda.allocate(capacity)?,
    packed:cuda.allocate(capacity*4)?,gathered:cuda.allocate(capacity*16)?,global_mass:cuda.allocate(capacity)?,
    bundled:cuda.allocate(capacity*8)?,bundled_gathered:cuda.allocate(capacity*32)?,
-   fused_local:crate::sampler_transport::Policy::from_env()?.fused_residual_local})
+   fused_local:crate::sampler_transport::Policy::from_env()?.fused_residual_local,
+   fused_probabilities:crate::sampler_transport::Policy::from_env()?.fused_probability_residual})
  }
  pub(crate) fn uniforms(&mut self,seed:u64,position:u64,live:usize)->Result<()> {
   ensure!(live<=self.capacity&&position.checked_add(live as u64).is_some(),"sharded residual RNG extent");
@@ -46,34 +48,49 @@ impl ShardedBlock {
  pub(crate) fn enqueue(&mut self,p:&Buffer<f64>,q:&Buffer<f64>,proposals:&Buffer<i32>,
   accept:&Buffer<f64>,residual:&Buffer<f64>,bonus:&Buffer<i32>,weights:&Buffer<f64>,
   state:&Buffer<u32>,output:&Buffer<i32>,errors:&Buffer<u32>,live:usize,comm:&Roce,stream:&Stream)->Result<()> {
-  self.enqueue_inner(p,q,proposals,accept,residual,bonus,weights,state,output,errors,live,comm,stream,None)
+  self.enqueue_inner(p,q,proposals,accept,residual,bonus,weights,state,output,errors,live,comm,stream,None,None)
  }
  #[allow(clippy::too_many_arguments)]
  pub(crate) fn enqueue_deferred(&mut self,p:&Buffer<f64>,q:&Buffer<f64>,proposals:&Buffer<i32>,
   accept:&Buffer<f64>,residual:&Buffer<f64>,bonus:&Buffer<i32>,weights:&Buffer<f64>,
   state:&Buffer<u32>,output:&Buffer<i32>,errors:&Buffer<u32>,live:usize,comm:&Roce,stream:&Stream,
-  local_bonus:&Buffer<i32>,target_errors:&Buffer<u32>)->Result<()> {
+  local_bonus:&Buffer<i32>,target_errors:&Buffer<u32>,
+  probabilities:Option<crate::sharded_categorical_probe::DeferredProbabilities<'_>>)->Result<()> {
   ensure!(local_bonus.len()>=live&&target_errors.len()>=live&&bonus.len()>=live
     &&self.cuda.owns_buffer(local_bonus)&&self.cuda.owns_buffer(target_errors)&&self.cuda.owns_buffer(bonus),
     "deferred target readout identity/extent");
   self.enqueue_inner(p,q,proposals,accept,residual,bonus,weights,state,output,errors,live,comm,stream,
-    Some((local_bonus,target_errors)))
+    Some((local_bonus,target_errors)),probabilities)
  }
  #[allow(clippy::too_many_arguments)]
  fn enqueue_inner(&mut self,p:&Buffer<f64>,q:&Buffer<f64>,proposals:&Buffer<i32>,
   accept:&Buffer<f64>,residual:&Buffer<f64>,bonus:&Buffer<i32>,weights:&Buffer<f64>,
   state:&Buffer<u32>,output:&Buffer<i32>,errors:&Buffer<u32>,live:usize,comm:&Roce,stream:&Stream,
-  deferred:Option<(&Buffer<i32>,&Buffer<u32>)>)->Result<()> {
+  deferred:Option<(&Buffer<i32>,&Buffer<u32>)>,
+  probabilities:Option<crate::sharded_categorical_probe::DeferredProbabilities<'_>>)->Result<()> {
   ensure!(live>=2&&live<=self.capacity&&p.len()>=live*VOCAB&&q.len()>=(live-1)*COLS
    &&comm.rank()==self.rank&&self.cuda.owns_stream(stream)&&self.cuda.owns_buffer(p)&&self.cuda.owns_buffer(q),
    "sharded block owner/geometry");
+  if let Some(input)=&probabilities {
+   ensure!(deferred.is_some_and(|(_,e)|e.ptr()==input.errors.ptr())
+     &&input.logits.len()==live*COLS&&input.maxima.len()>=live*127&&input.normalized.len()>=live*127
+     &&input.errors.len()>=live&&self.cuda.owns_buffer(input.logits)&&self.cuda.owns_buffer(input.maxima)
+     &&self.cuda.owns_buffer(input.normalized)&&self.cuda.owns_buffer(input.errors),
+     "fused target probability ownership/geometry");
+  }
   let(mut pp,mut qp,mut sp,mut props,mut wp,mut ep,mut drafts,mut rank)=
    (p.ptr(),q.ptr(),self.selected.ptr(),proposals.ptr(),weights.ptr(),errors.ptr(),(live-1)as i32,self.rank as i32);
   unsafe{self.cuda.zero_device(errors.ptr(),errors.bytes(),stream)?;}
   launch!(self.module,"ca_sharded_block_weights",[1,1,1],32,stream;pp,sp,props,wp,ep,drafts)?;
   let(mut sums,mut tiles,mut fractions,mut totals,mut u)=
    (self.sums.ptr(),self.tile.ptr(),self.fraction.ptr(),self.total.ptr(),self.local_uniforms.ptr());
-  launch!(self.module,"ca_sharded_block_partials",[32,live as u32,1],256,stream;pp,qp,wp,sums,ep,drafts,rank)?;
+  if let Some(input)=probabilities {
+   let(mut x,mut maxima,mut normalized,mut te)=(input.logits.ptr(),input.maxima.ptr(),input.normalized.ptr(),input.errors.ptr());
+   launch!(self.module,"ca_target_probability_residual",[32,live as u32,1],256,stream;
+     x,maxima,normalized,te,pp,qp,wp,sums,ep,drafts,rank)?;
+  }else{
+   launch!(self.module,"ca_sharded_block_partials",[32,live as u32,1],256,stream;pp,qp,wp,sums,ep,drafts,rank)?;
+  }
   let mut packed=self.packed.ptr();
   let fused=self.fused_local&&deferred.is_some();
   if fused {

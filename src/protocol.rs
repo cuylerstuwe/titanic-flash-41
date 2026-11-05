@@ -37,6 +37,34 @@ pub struct Frontend {
     #[cfg(feature = "vision-protocol")]
     image_cache: Option<crate::image_input_cache::ImageInputCache>,
 }
+/// Already processed immutable image input for the experimental compact-context
+/// path. These handles are supplied by trusted Rust cache ownership, never
+/// deserialized from an ordinary HTTP request.
+pub struct ImageReference {
+    pub source: String,
+    pub input: Arc<crate::worker_media::PatchInput>,
+    pub detail: deepseek_recipe_core::multimodal::ImageDetail,
+    pub encoded_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct ImageAlias {
+    pub source_hash: [u8; 32],
+    pub identity: [u8; 32],
+}
+pub(crate) fn image_source_hash(url: &str, detail: deepseek_recipe_core::multimodal::ImageDetail) -> [u8;32] {
+    use deepseek_recipe_core::multimodal::ImageDetail;
+    let mut h=Sha256::new();h.update(b"titanic-context-image-source-v1\0");
+    h.update([match detail {ImageDetail::Low=>0,ImageDetail::High=>1,ImageDetail::Auto=>2,ImageDetail::Original=>3}]);
+    h.update(url.as_bytes());h.finalize().into()
+}
+#[derive(Debug)]
+pub(crate) struct ContextImageMiss;
+impl std::fmt::Display for ContextImageMiss {
+    fn fmt(&self, f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str("context_image_miss")}
+}
+impl std::error::Error for ContextImageMiss {}
+
 pub struct PreparedChat {
     pub converted: ConversationRequest,
     pub tokens: Vec<u32>,
@@ -44,6 +72,7 @@ pub struct PreparedChat {
     pub rendered_sha256: String,
     pub images: Vec<crate::image_cache::Descriptor>,
     pub image_inputs: Vec<Arc<crate::worker_media::PatchInput>>,
+    pub image_aliases: Vec<ImageAlias>,
 }
 
 #[cfg(feature = "serving")]
@@ -326,17 +355,37 @@ impl Frontend {
         #[cfg(not(feature = "vision-protocol"))]
         { Ok(None) }
     }
+    #[cfg(feature = "vision-protocol")]
+    pub(crate) fn pin_context_images(&self, keys: &[[u8;32]]) -> Result<Vec<ImageReference>> {
+        if keys.is_empty() { return Ok(Vec::new()); }
+        self.image_cache.as_ref().ok_or(ContextImageMiss)?.pin_references(keys)
+    }
+    #[cfg(all(test, feature = "vision-protocol"))]
+    pub(crate) fn enable_test_images(&mut self) {self.image_cache=Some(crate::image_input_cache::ImageInputCache::for_test());}
+    #[cfg(all(test, feature = "vision-protocol"))]
+    pub(crate) fn forget_context_images_for_test(&self) {
+        if let Some(cache)=&self.image_cache {cache.forget_for_test();}
+    }
     pub(crate) fn prepare_chat_cancellable(&self, body: &[u8], context_capacity: usize,
         cancelled: &dyn Fn() -> bool) -> Result<PreparedChat> {
-        self.prepare_chat_inner(body, context_capacity, if self.use_region_cache { 2 } else { 1 }, cancelled)
+        self.prepare_chat_inner(body, context_capacity, if self.use_region_cache { 2 } else { 1 }, cancelled, None)
     }
     // The legacy branch is retained solely for a bounded CPU comparison. Both
     // branches use Recipe 0.2.0's canonical region-aware tokenizer unchanged.
     fn prepare_chat_impl(&self, body: &[u8], context_capacity: usize, mode: u8) -> Result<PreparedChat> {
-        self.prepare_chat_inner(body, context_capacity, mode, &|| false)
+        self.prepare_chat_inner(body, context_capacity, mode, &|| false, None)
+    }
+    /// Component probe only: preserve the full canonical converter and region
+    /// tokenizer while replacing old encoded images with pinned processed inputs.
+    /// The HTTP adapter does not accept these internal references yet.
+    #[doc(hidden)]
+    #[cfg(feature = "vision-protocol")]
+    pub fn prepare_chat_referenced(&self, body: &[u8], context_capacity: usize,
+        references: &[ImageReference], cancelled: &dyn Fn() -> bool) -> Result<PreparedChat> {
+        self.prepare_chat_inner(body, context_capacity, if self.use_region_cache { 2 } else { 1 }, cancelled, Some(references))
     }
     fn prepare_chat_inner(&self, body: &[u8], context_capacity: usize, mode: u8,
-        cancelled: &dyn Fn() -> bool) -> Result<PreparedChat> {
+        cancelled: &dyn Fn() -> bool, _references: Option<&[ImageReference]>) -> Result<PreparedChat> {
         ensure!(!cancelled(), "request cancelled during input processing");
         ensure!(
             context_capacity > 0 && context_capacity <= crate::config::MODEL_CONTEXT,
@@ -387,14 +436,17 @@ impl Frontend {
             !tokens.is_empty() && tokens.iter().all(|&id| id < 129280),
             "encoded prompt token domain"
         );
-        let (tokens, images, image_inputs) = if rendered.image_sources.is_empty() {
-            (tokens, Vec::new(), Vec::new())
+        let (tokens, images, image_inputs, image_aliases) = if rendered.image_sources.is_empty() {
+            (tokens, Vec::new(), Vec::new(), Vec::new())
         } else {
             #[cfg(feature = "vision-protocol")]
             {
                 let cache = self.image_cache.as_ref().ok_or_else(|| anyhow::anyhow!("native vision is not enabled"))?;
-                let expanded = cache.expand_cancellable(tokens, &rendered.image_sources, context_capacity, cancelled)?;
-                (expanded.tokens, expanded.images, expanded.inputs)
+                let expanded = match _references {
+                    None => cache.expand_cancellable(tokens, &rendered.image_sources, context_capacity, cancelled)?,
+                    Some(references) => cache.expand_referenced(tokens, &rendered.image_sources, context_capacity, cancelled, references)?,
+                };
+                (expanded.tokens, expanded.images, expanded.inputs, expanded.aliases)
             }
             #[cfg(not(feature = "vision-protocol"))]
             { anyhow::bail!("vision inputs await native vision qualification"); }
@@ -412,6 +464,7 @@ impl Frontend {
             max_new_tokens,
             images,
             image_inputs,
+            image_aliases,
             rendered_sha256: format!("{:x}", Sha256::digest(rendered.prompt.as_bytes())),
         })
     }

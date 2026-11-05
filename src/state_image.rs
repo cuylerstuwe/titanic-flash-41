@@ -1,7 +1,7 @@
 //! Lossless, bounded device copies of explicitly enumerated causal storage.
 //! Model owners supply identity, committed-frontier and single-writer checks.
 //! This is in-memory checkpointing, not host/SSD parking or crash recovery.
-use crate::cuda::{Buffer, Cuda, DeviceElement, Stream};
+use crate::cuda::{Buffer, Cuda, DeviceElement, Module, Stream};
 use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, marker::PhantomData};
@@ -28,6 +28,8 @@ impl std::ops::Deref for ImageBuffer {
 
 #[path = "state_exchange.rs"]
 pub(crate) mod exchange;
+#[path = "state_image_copy.rs"]
+pub(crate) mod copy;
 
 /// Only returned before snapshot copying or lease mutation. Callers may drop
 /// this optional snapshot and continue using the unchanged live model owner.
@@ -189,6 +191,7 @@ pub(crate) struct Image {
     offsets: Vec<usize>,
     storage: ImageBuffer,
     saved: bool,
+    copy_module: Option<Module>,
 }
 impl Image {
     /// Admission/allocation are separate from mutation so a budget refusal
@@ -227,7 +230,53 @@ impl Image {
             offsets,
             storage,
             saved: false,
+            copy_module: None,
         }))
+    }
+    pub(crate) fn configure_copy_kernel(&mut self,module:&Module)->Result<()> {
+        ensure!(!self.saved,"copy path must be selected before capture");
+        if copy::enabled() {
+            let ranges=self.descriptors.iter().zip(&self.offsets).map(|(r,offset)|
+                (r.pointer,self.storage.ptr()+*offset as u64,r.bytes)).collect::<Vec<_>>();
+            if copy::eligible(&ranges) {self.copy_module=Some(module.clone());}
+        }
+        Ok(())
+    }
+    /// Consume an already-retired image, retaining exactly its physical storage
+    /// and accounting charge. The caller must own it exclusively and finish
+    /// every prior reader before retirement. This never reuses a live cache
+    /// entry. Exact size only: no hidden slack, growth or persistent pool.
+    pub(crate) fn try_recycle(mut self,regions:&[Region<'_>],budget:usize,stream:&Stream)
+        ->Result<Option<Self>> {
+        ensure!(self.cuda.owns_stream(stream)
+            &&regions.iter().all(|r|r.cuda.owns_stream(stream)),"recycled image context/stream");
+        let descriptors=regions.iter().map(|r|r.descriptor.clone()).collect::<Vec<_>>();
+        let(offsets,total)=layout(&descriptors,budget)?;
+        if total!=self.storage.bytes() {return Ok(None);}
+        ensure!(descriptors.iter().all(|r|r.pointer+r.bytes as u64<=self.storage.ptr()
+            ||self.storage.ptr()+total as u64<=r.pointer),"recycled image aliases live storage");
+        if self.cuda.admission_memory()?.admitted_available<RESERVE.max(self.cuda.allocation_reserve_bytes()) {
+            return Ok(None);
+        }
+        self.descriptors=descriptors;self.offsets=offsets;self.saved=false;self.copy_module=None;
+        Ok(Some(self))
+    }
+    fn copy_regions<'a>(&self,regions:impl Iterator<Item=&'a Descriptor>+Clone,save:bool,stream:&Stream)->Result<()> {
+        if let Some(module)=&self.copy_module {
+            let ranges=regions.clone().zip(&self.offsets).map(|(r,offset)| {
+                let image=self.storage.ptr()+*offset as u64;
+                if save {(r.pointer,image,r.bytes)}else{(image,r.pointer,r.bytes)}
+            }).collect::<Vec<_>>();
+            // layout/validate_import and the owning writer lease establish
+            // disjoint ranges and lifetime. Always join below, even on error.
+            if unsafe{copy::launch(&self.cuda,module,&ranges,stream)}? {return Ok(());}
+        }
+        for(r,offset)in regions.zip(&self.offsets) {
+            let image=self.storage.ptr()+*offset as u64;
+            let (source,destination)=if save{(r.pointer,image)}else{(image,r.pointer)};
+            unsafe{self.cuda.copy_device(destination,source,r.bytes,stream)}?;
+        }
+        Ok(())
     }
     pub(crate) fn validate(&self, regions: &[Region<'_>], stream: &Stream) -> Result<()> {
         ensure!(
@@ -253,32 +302,14 @@ impl Image {
     }
     unsafe fn import(&self,source:&[Region<'_>],destination:&[Region<'_>],stream:&Stream)->Result<()> {
         self.validate_import(source,destination,stream)?;
-        let copies=(||{
-            for (r,offset)in destination.iter().zip(&self.offsets) {
-                unsafe{self.cuda.copy_device(r.descriptor.pointer,self.storage.ptr()+*offset as u64,
-                    r.descriptor.bytes,stream)}?;
-            }
-            Ok(())
-        })();
+        let copies=self.copy_regions(destination.iter().map(|r|&r.descriptor),false,stream);
         let completed=stream.synchronize();copies.and(completed)
     }
     /// The owning model must exclude writers on every participating stream.
     pub(crate) fn save(&mut self, regions: &[Region<'_>], stream: &Stream) -> Result<()> {
         self.validate(regions, stream)?;
         ensure!(!self.saved, "state images are immutable after capture");
-        let copies = (|| {
-            for (r, offset) in self.descriptors.iter().zip(&self.offsets) {
-                unsafe {
-                    self.cuda.copy_device(
-                        self.storage.ptr() + *offset as u64,
-                        r.pointer,
-                        r.bytes,
-                        stream,
-                    )
-                }?;
-            }
-            Ok(())
-        })();
+        let copies=self.copy_regions(self.descriptors.iter(),true,stream);
         let completed = stream.synchronize();
         copies.and(completed)?;
         self.saved = true;
@@ -290,27 +321,16 @@ impl Image {
     pub(crate) unsafe fn restore(&self, regions: &[Region<'_>], stream: &Stream) -> Result<()> {
         self.validate(regions, stream)?;
         ensure!(self.saved, "uncaptured state image");
-        let copies = (|| {
-            for (r, offset) in self.descriptors.iter().zip(&self.offsets) {
-                unsafe {
-                    self.cuda.copy_device(
-                        r.pointer,
-                        self.storage.ptr() + *offset as u64,
-                        r.bytes,
-                        stream,
-                    )
-                }?;
-            }
-            Ok(())
-        })();
+        let copies=self.copy_regions(self.descriptors.iter(),false,stream);
         let completed = stream.synchronize();
         copies.and(completed)
     }
     pub(crate) fn bytes(&self) -> usize {
         self.storage.bytes()
     }
+    pub(crate) fn fused_copy(&self)->bool {self.copy_module.is_some()}
     pub(crate) fn manifest(&self) -> serde_json::Value {
-        serde_json::json!({"bytes":self.bytes(),"regions":self.descriptors.iter()
+        serde_json::json!({"bytes":self.bytes(),"fused_copy":self.copy_module.is_some(),"regions":self.descriptors.iter()
             .map(|r| serde_json::json!({"name":r.name,"bytes":r.bytes})).collect::<Vec<_>>()})
     }
     /// Bounded diagnostic reads only; no CPU execution or numeric conversion.

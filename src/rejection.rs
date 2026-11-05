@@ -73,6 +73,14 @@ impl Rejection {
     pub(crate) fn new_for_graph_probe(cuda:&Cuda,core:&[u8],candidate:bool)->Result<Self> {
         ensure!(std::env::var("CANADA_SCRATCH_SAMPLER_GENERATION_SCREEN").as_deref()==Ok("1"),
             "isolated sampler construction");
+        if std::env::var("CANADA_SCRATCH_FUSED_PROBABILITY_RESIDUAL_MODEL_SCREEN").as_deref()==Ok("1") {
+            let mut sampler=Self::new(cuda,core,6)?;
+            ensure!(sampler.bundled_ids && sampler.graph_replay && sampler.graph_readout,
+                "probability fusion screen requires current sampler graph and transport");
+            sampler.sharded.as_mut().ok_or_else(||anyhow::anyhow!("probability fusion screen needs sharded actual q"))?
+                .fused_probabilities=candidate;
+            return Ok(sampler);
+        }
         let finish_probe=std::env::var("CANADA_SCRATCH_BLOCK_FINISH_SCREEN").as_deref()==Ok("1");
         let fused_probe=std::env::var("CANADA_SCRATCH_BLOCK_FUSED_SCREEN").as_deref()==Ok("1");
         let composition=std::env::var("CANADA_SCRATCH_SOLO_COMPOSITION_SCREEN").as_deref()==Ok("1");
@@ -127,7 +135,8 @@ impl Rejection {
     }
     /// Called immediately after a completed draw, before the next sampler use.
     pub(crate) fn root_probabilities_after_draw_for_probe(&self)->Result<&Buffer<f64>> {
-        ensure!(std::env::var("CANADA_SCRATCH_ROOT_FEEDBACK_SCREEN").as_deref()==Ok("1"),
+        ensure!(std::env::var("CANADA_SCRATCH_ROOT_FEEDBACK_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_QUERY_REUSE_SCREEN").as_deref()==Ok("1"),
             "root-feedback target probabilities require isolated admission");
         Ok(&self.p)
     }

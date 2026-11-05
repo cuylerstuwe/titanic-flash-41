@@ -27,6 +27,13 @@ def main():
     assert len(manifest['entries']) == 14
     for entry in manifest['entries']:
         assert sha(external/(entry['name']+'.cubin')) == entry['artifact_sha256']
+    compact = a.data/'kernels/woa-mid-compact-v1'
+    manifest = json.loads((compact/'manifest.json').read_text())
+    assert manifest['source_sha256'] == 'e642f230de3d2f2da94ff19e8d6f0b5565a77450fb012851be1c61931cd53901'
+    assert {e['name'] for e in manifest['entries']} == {
+        'woa_mid_partial_m16', 'woa_mid_reduce_m16', 'woa_mid_partial_m32', 'woa_mid_reduce_m32'}
+    for entry in manifest['entries']:
+        assert sha(compact/(entry['name']+'.cubin')) == entry['artifact_sha256']
     provenance = json.loads((a.data/'runtime/provenance.json').read_text())
     assert provenance['serving'] and provenance['vision_protocol'] and not provenance['storage_fault_injection']
     current = subprocess.check_output(['python3', str(ROOT/'tools/source_identity.py')], text=True).strip()
@@ -42,7 +49,7 @@ def main():
     version = ctypes.c_int()
     assert nccl.ncclGetVersion(ctypes.byref(version)) == 0
     assert version.value == 23007, 'use the pinned NCCL 2.30.7 runtime'
-    print(json.dumps(dict(passed=True, checked_artifacts=len(expected), external_operators=14,
+    print(json.dumps(dict(passed=True, checked_artifacts=len(expected), external_operators=18,
                          dynamic_libraries=len(libraries), nccl_version=version.value,
                          source_sha256=current, scope='CPU integrity/ABI dependencies; no GPU inference')))
 

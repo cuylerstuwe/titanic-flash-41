@@ -64,6 +64,25 @@ struct Manifest {
     proxy_abi: i32,
     proxy_library_sha256: String,
 }
+fn validate_manifest_policy(manifest:&Manifest,adaptive:bool,packet_threshold:u32)->Result<()> {
+    let l=&manifest.layout;
+    ensure!((manifest.proxy_abi==3||(manifest.proxy_abi==4&&adaptive))
+        && l.slot_bytes==64*1024*1024 && l.slots==2 && l.flag_stride==128
+        && l.total_bytes<=1024*1024*1024,"unsupported RoCE layout");
+    ensure!(packet_threshold==0||manifest.proxy_abi==4,"packet policy needs ABI4 proxy");
+    Ok(())
+}
+fn load_startup_manifest(root:&Path)->Result<(Manifest,u32)> {
+    let manifest:Manifest=serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+    let threshold=match std::env::var("CANADA_SCRATCH_SMALL_PACKET_BYTES") {
+        Err(std::env::VarError::NotPresent)=>0u32,
+        Ok(value)=>value.parse::<u32>()?,
+        Err(error)=>return Err(error.into()),
+    };
+    validate_manifest_policy(&manifest,
+        std::env::var("CANADA_SCRATCH_ADAPTIVE_RDMA").as_deref()==Ok("1"),threshold)?;
+    Ok((manifest,threshold))
+}
 pub struct Roce {
     instance: u64,
     moe_pipeline:Option<crate::moe_transport::Pipeline>,
@@ -77,6 +96,7 @@ pub struct Roce {
     native_sum_selected: Cell<bool>,
     prefill_rows: Cell<Option<ReductionRows>>,
     native_sum_rows: Cell<Option<ReductionRows>>,
+    native_row_flags:crate::launch_flags::NativeRowFlags,
     native_gather_rows: Cell<Option<ReductionRows>>,
     column_gather: Option<(crate::cuda::Module, RefCell<Buffer<u16>>)>,
     column_gather_live_rows: Cell<bool>,
@@ -104,6 +124,9 @@ pub struct Roce {
     failed: unsafe extern "C" fn(Handle) -> i32,
     error: unsafe extern "C" fn(Handle) -> *const c_char,
     destroy: unsafe extern "C" fn(Handle),
+    set_packet_threshold: Option<unsafe extern "C" fn(Handle, u32) -> i32>,
+    packet_stat: Option<unsafe extern "C" fn(Handle, i32) -> u64>,
+    packet_threshold: Cell<u32>,
     poisoned: Cell<bool>,
     stream: Cell<Option<usize>>,
     rank: usize,
@@ -136,7 +159,14 @@ impl Roce {
             "small_prefill_sum":self.small_prefill_sum,
             "native_prefill_rs":self.native_prefill_rs.is_some(),
             "native_prefill_rs_enqueues":self.native_prefill_rs.as_ref().map_or(0,|p|p.calls()),
-            "small_prefill_enqueues":self.small_prefill_enqueues.get()})
+            "small_prefill_enqueues":self.small_prefill_enqueues.get(),
+            "small_packet_threshold_bytes":self.packet_threshold.get()})
+    }
+    /// Read-only admission before the resident worker allocates model state.
+    /// The normal constructor repeats this check and verifies the pinned library.
+    pub(crate) fn validate_startup(root:&Path)->Result<()> {
+        load_startup_manifest(root)?;
+        Ok(())
     }
     pub fn local(cuda: &Cuda, root: &Path, rank: usize) -> Result<Self> {
         ensure!(rank < 4, "RoCE rank outside TP4");
@@ -144,17 +174,8 @@ impl Roce {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| anyhow::anyhow!("RoCE instance identity exhausted"))?;
         cuda.qualify_gb10()?;
-        let mut manifest: Manifest =
-            serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        let (mut manifest,packet_threshold)=load_startup_manifest(root)?;
         let l = &manifest.layout;
-        ensure!(
-            manifest.proxy_abi == 3
-                && l.slot_bytes == 64 * 1024 * 1024
-                && l.slots == 2
-                && l.flag_stride == 128
-                && l.total_bytes <= 1024 * 1024 * 1024,
-            "unsupported RoCE layout"
-        );
         let path = root.join("libcanada_roce_proxy.so");
         ensure!(
             format!("{:x}", Sha256::digest(std::fs::read(&path)?)) == manifest.proxy_library_sha256,
@@ -167,7 +188,11 @@ impl Roce {
             };
         }
         let abi: unsafe extern "C" fn() -> i32 = sym!("roce_abi_version");
-        ensure!(unsafe { abi() } == 3, "RoCE proxy ABI mismatch");
+        ensure!(unsafe { abi() } == manifest.proxy_abi, "RoCE proxy ABI mismatch");
+        let set_packet_threshold:Option<unsafe extern "C" fn(Handle,u32)->i32>=
+            if manifest.proxy_abi==4 {Some(sym!("roce_set_small_packet_threshold"))}else{None};
+        let packet_stat:Option<unsafe extern "C" fn(Handle,i32)->u64>=
+            if manifest.proxy_abi==4 {Some(sym!("roce_packet_stat"))}else{None};
         let layout_fn: unsafe extern "C" fn(i32, u64, *mut u64) -> i32 = sym!("roce_layout");
         let mut layout = [0u64; 7];
         ensure!(
@@ -209,6 +234,8 @@ impl Roce {
                 flag_stride:derived[5],slots:derived[6]};
         }
         let l=&manifest.layout;
+        ensure!(packet_threshold as u64<=l.slot_bytes && packet_threshold%16==0,
+            "packet threshold outside transport geometry");
         ensure!(cuda.admission_memory()?.admitted_available as u64
             >l.total_bytes+2*1024*1024*1024,"insufficient memory for bounded RoCE region");
         // Deployment-specific rail identities must be explicit. Checking each
@@ -287,6 +314,12 @@ impl Roce {
             unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy()
         );
         let destroy: unsafe extern "C" fn(Handle) = sym!("roce_destroy");
+        if let Some(set)=set_packet_threshold {
+            if unsafe{set(handle,packet_threshold)}!=0 {
+                unsafe{destroy(handle);}
+                anyhow::bail!("initial packet policy rejected");
+            }
+        }
         let kernels = match Primitives::open(
             cuda,
             &root.join("libcanada_primitives.so"),
@@ -319,6 +352,7 @@ impl Roce {
             native_sum_selected: Cell::new(false),
             prefill_rows: Cell::new(None),
             native_sum_rows: Cell::new(None),
+            native_row_flags:crate::launch_flags::NativeRowFlags::from_env(),
             native_gather_rows: Cell::new(None),
             column_gather: None,
             column_gather_live_rows: Cell::new(std::env::var("CANADA_SCRATCH_PREFILL_ENGRAM_GATHER_ROWS").as_deref()!=Ok("0")),
@@ -330,6 +364,9 @@ impl Roce {
             failed: sym!("roce_failed"),
             error: sym!("roce_error"),
             destroy,
+            set_packet_threshold,
+            packet_stat,
+            packet_threshold:Cell::new(packet_threshold),
             _lib: lib,
             handle,
             layout: manifest.layout,
@@ -572,16 +609,9 @@ impl Roce {
     }
     pub(crate) fn native_row_scope(&self, sum:bool, gather:bool, live:usize, capacity:usize,
         stream:&Stream)->Result<NativeRowScope<'_>> {
-        ensure!(!sum || std::env::var("CANADA_SCRATCH_TINY_APPEND_PREFIX_SUM").as_deref()==Ok("1")
-            || std::env::var("CANADA_SCRATCH_NATIVE_ROW_TRANSPORT_SCREEN").as_deref()==Ok("1")
-            || (capacity==128 && live<=64 && std::env::var("CANADA_SCRATCH_MEDIUM_NATIVE_TRANSPORT").as_deref()==Ok("1"))
-            || ([6,16].contains(&capacity) && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1")),
-            "native sum prefix requires an admitted target profile");
-        ensure!(!gather || std::env::var("CANADA_SCRATCH_TINY_APPEND_PREFIX_GATHER").as_deref()==Ok("1")
-            || std::env::var("CANADA_SCRATCH_NATIVE_ROW_TRANSPORT_SCREEN").as_deref()==Ok("1")
-            || (capacity==128 && live<=64 && std::env::var("CANADA_SCRATCH_MEDIUM_NATIVE_TRANSPORT").as_deref()==Ok("1"))
-            || ([6,16].contains(&capacity) && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1")),
-            "native gather prefix requires an admitted target profile");
+        let (sum_allowed,gather_allowed)=self.native_row_flags.permits(sum,gather,live,capacity);
+        ensure!(sum_allowed,"native sum prefix requires an admitted target profile");
+        ensure!(gather_allowed,"native gather prefix requires an admitted target profile");
         ensure!(self.cuda.owns_stream(stream)
             && self.stream.get().is_none_or(|s|s==stream.raw()as usize),"native prefix stream");
         let rows=if (sum || gather) && live<capacity {Some(ReductionRows::new(live,capacity)?)}else{None};
@@ -846,6 +876,27 @@ impl Roce {
             "FP32 gather destination range/transport");
         unsafe { self.collect_at(input,output,stream,Some(local_columns/4),output_offset) }
     }
+    /// Retained prefill consumes only its last live distribution. Select an
+    /// existing FP32 row without recomputing or rounding it, and leave all
+    /// other output rows defined as zero. Capture callers must key by `live`.
+    pub(crate) unsafe fn gather_f32_last(
+        &self, input: &Buffer<f32>, output: &mut Buffer<f32>,
+        local_columns: usize, live: usize, stream: &Stream,
+    ) -> Result<()> {
+        ensure!(local_columns > 0 && local_columns % 4 == 0
+            && input.len() % local_columns == 0
+            && input.len().checked_mul(4) == Some(output.len())
+            && (1..=input.len()/local_columns).contains(&live)
+            && self.cuda.owns_buffer(input) && self.cuda.owns_buffer(output)
+            && self.cuda.owns_stream(stream) && self.gather.is_some(),
+            "last FP32 gather extent/context");
+        let offset = (live - 1) * local_columns;
+        unsafe {
+            let row = input.view(offset, local_columns)?;
+            self.cuda.zero_device(output.ptr(), output.bytes(), stream)?;
+            self.gather_f32_at(&row, output, offset * 4, local_columns, stream)
+        }
+    }
     unsafe fn collect_row_prefix<T: DeviceElement>(&self,input:&Buffer<T>,output:&mut Buffer<T>,
         columns:usize,stream:&Stream,row_packs:usize)->Result<()> {
         // The prefill last-logit head has one row even in an M128 target.
@@ -972,6 +1023,16 @@ impl Roce {
 }
 impl Roce {
     /// Isolated component variants share the exact existing proxy, counters and
+    /// packet policy. The private proxy owns the additional builder-API control.
+    pub(crate) fn set_posting_mode_for_probe(&self,mode:u32,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_POSTING_API_SCREEN").as_deref()==Ok("1")
+            &&mode<=2&&self.cuda.owns_stream(stream)
+            &&self.stream.get().is_none_or(|s|s==stream.raw()as usize),"finite posting API screen");
+        stream.synchronize()?;self.health()?;
+        let set:unsafe extern "C" fn(Handle,u32)->i32=unsafe{*self._lib.get(b"roce_set_posting_mode\0")?};
+        ensure!(unsafe{set(self.handle,mode)}==0,"posting API selection failed");Ok(())
+    }
+    /// Isolated component variants share the exact existing proxy, counters and
     /// scalar ABI. Selection affects future captures, never an in-flight graph.
     pub(crate) fn attach_notification_probe(&mut self, root:&Path)->Result<()> {
         let mode=std::env::var("CANADA_SCRATCH_NOTIFY_SCREEN");
@@ -1001,6 +1062,21 @@ impl Roce {
         ensure!(matches!(std::env::var("CANADA_SCRATCH_NOTIFY_SCREEN").as_deref(),Ok("1"|"2"))
             &&self.notification_probe_kernels.len()==3&&variant<=3,"notification variant not admitted");
         stream.synchronize()?;self.health()?;self.notification_probe_variant.set(variant);Ok(())
+    }
+    /// Isolated same-allocation experiment. The CPU proxy selects a preconnected
+    /// QP per message; captured GPU graphs and their memory remain unchanged.
+    pub(crate) fn set_small_packet_bytes_for_probe(&self,bytes:u32,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_ADAPTIVE_RDMA").as_deref()==Ok("1")
+            && self.cuda.owns_stream(stream)
+            && self.stream.get().is_none_or(|s|s==stream.raw()as usize)
+            && bytes as u64<=self.layout.slot_bytes && bytes%16==0,"isolated packet policy control");
+        let set=self.set_packet_threshold.ok_or_else(||anyhow::anyhow!("ABI4 packet policy missing"))?;
+        stream.synchronize()?;self.health()?;
+        self.check(unsafe{set(self.handle,bytes)})?;self.packet_threshold.set(bytes);Ok(())
+    }
+    pub(crate) fn packet_counts_for_probe(&self)->Result<[u64;2]> {
+        let stat=self.packet_stat.ok_or_else(||anyhow::anyhow!("ABI4 packet counters missing"))?;
+        Ok(unsafe{[stat(self.handle,0),stat(self.handle,1)]})
     }
     #[cfg(target_os="linux")]
     pub(crate) fn proxy_cpus_for_probe(&self)->Result<Vec<usize>> {
@@ -1134,6 +1210,22 @@ mod tests {
     }
 
     use super::ReductionRows;
+    #[test]
+    fn transport_policy_rejects_incompatible_proxy_before_device_work() {
+        use super::{Manifest,Layout,validate_manifest_policy};
+        let mut manifest=Manifest{proxy_abi:3,proxy_library_sha256:String::new(),
+            layout:Layout{slot_bytes:64*1024*1024,recv_off:0,flag_off:0,
+                send_off:0,ctrl_off:0,total_bytes:671090816,flag_stride:128,slots:2}};
+        assert!(validate_manifest_policy(&manifest,false,0).is_ok());
+        assert!(validate_manifest_policy(&manifest,true,327680).unwrap_err()
+            .to_string().contains("needs ABI4"));
+        manifest.proxy_abi=4;
+        assert!(validate_manifest_policy(&manifest,false,327680).is_err());
+        assert!(validate_manifest_policy(&manifest,true,327680).is_ok());
+        assert!(validate_manifest_policy(&manifest,true,0).is_ok());
+        manifest.layout.flag_stride=64;
+        assert!(validate_manifest_policy(&manifest,true,327680).is_err());
+    }
     #[test]
     fn reduction_count_tracks_accepted_rows_and_rejects_invalid_storage() {
         for capacity in [5usize, 6, 16, 32, 128] {

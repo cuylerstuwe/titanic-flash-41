@@ -5,6 +5,10 @@ use std::{env, fs::File, path::Path};
 fn main() -> Result<()> {
     let args: Vec<_> = env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("gpu-image-recycle") if args.len()==4=>{
+            let report=canada_engine::image_recycle_probe::run(Path::new(&args[2]))?;
+            serde_json::to_writer_pretty(std::fs::OpenOptions::new().write(true).create_new(true).open(&args[3])?,&report)?;
+        }
         Some("gpu-local-sampler-readout") if args.len()==4=>{
             let report=canada_engine::probe_local_sampler_readout(Path::new(&args[2]))?;
             serde_json::to_writer_pretty(std::fs::OpenOptions::new().write(true).create_new(true).open(&args[3])?,&report)?;
@@ -640,6 +644,12 @@ fn main() -> Result<()> {
             )?;
             serde_json::to_writer_pretty(File::create(&args[7])?, &result)?;
         }
+        Some("gpu-logit-gather-last-probe") if args.len() == 8 => {
+            let result = canada_engine::logit_gather_probe::run_last(
+                args[2].parse()?, &args[3], &std::fs::read(&args[4])?, Path::new(&args[5]),
+            )?;
+            serde_json::to_writer_pretty(File::create(&args[7])?, &result)?;
+        }
         Some("gpu-sharded-categorical-probe") if args.len() == 8 => {
             let result = canada_engine::sharded_categorical_probe::run(
                 args[2].parse()?, &args[3], &std::fs::read(&args[4])?,
@@ -669,6 +679,11 @@ fn main() -> Result<()> {
                 args[2].parse()?, &args[3], &std::fs::read(&args[4])?, Path::new(&args[5]),
             )?;
             serde_json::to_writer_pretty(File::create(&args[7])?, &result)?;
+        }
+        Some("gpu-posting-probe") if args.len() == 8 => {
+            let result=canada_engine::posting_probe::run(args[2].parse()?,&args[3],
+                &std::fs::read(&args[4])?,Path::new(&args[5]),Path::new(&args[6]))?;
+            serde_json::to_writer_pretty(File::create(&args[7])?,&result)?;
         }
         Some("gpu-sum-sequence-probe") if args.len() == 8 => {
             let result = canada_engine::sum_grid_probe::run_sequence(

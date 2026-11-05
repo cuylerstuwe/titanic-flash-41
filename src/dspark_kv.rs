@@ -167,7 +167,10 @@ impl State {
     }
     pub(crate) fn accepted_replay_digests(&self, root: Option<&Path>) -> Result<serde_json::Value> {
         use sha2::{Digest,Sha256};
-        ensure!(!self.poisoned && std::env::var("CANADA_SCRATCH_DRAFT_REPLAY_TRACE").as_deref()==Ok("1"),
+        ensure!(!self.poisoned && (std::env::var("CANADA_SCRATCH_DRAFT_REPLAY_TRACE").as_deref()==Ok("1")
+            || std::env::var("CANADA_SCRATCH_UNUSED_DRAFT_SCREEN").as_deref()==Ok("1")
+            || std::env::var("CANADA_SCRATCH_QUERY_REUSE_SCREEN").as_deref()==Ok("1")
+            || std::env::var("CANADA_SCRATCH_EXPERT_PREFETCH_SCREEN").as_deref()==Ok("1")),
             "accepted draft trace requires diagnostic admission");
         let mut records=Vec::new();
         for (stage,cache) in self.caches.iter().enumerate() {

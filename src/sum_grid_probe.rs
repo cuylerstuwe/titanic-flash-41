@@ -134,8 +134,10 @@ pub fn run_sequence(rank:usize,endpoint:&str,nonce:&[u8],root:&Path,core:&Path)-
     let mut comm=Roce::local(&cuda,&root.join("roce-v0"),rank)?;
     comm.attach_gather(&root.join("roce-gather-v1"))?;
     let all=crate::rendezvous::exchange_blob(rank,endpoint.parse()?,nonce,&comm.blob()?)?;comm.connect(&all)?;
-    let input=cuda.allocate::<u16>(6*5120)?;let mut output=cuda.allocate::<u16>(6*5120)?;
-    let gathered=cuda.allocate::<u16>(4*6*5120)?;
+    let adaptive=std::env::var("CANADA_SCRATCH_ADAPTIVE_RDMA_SCREEN").as_deref()==Ok("1");
+    let capacity=if adaptive{128*5120}else{6*5120};
+    let input=cuda.allocate::<u16>(capacity)?;let output=cuda.allocate::<u16>(capacity)?;
+    let gathered=cuda.allocate::<u16>(4*capacity)?;
     let mut epoch=cuda.allocate::<u32>(1)?;let mut stats=cuda.allocate::<u32>(7)?;
     let epoch_ptr=epoch.ptr();let stats_ptr=stats.ptr();
     let fill=|n:usize,pattern:i32,jitter:i32|->Result<()>{
@@ -157,17 +159,20 @@ pub fn run_sequence(rank:usize,endpoint:&str,nonce:&[u8],root:&Path,core:&Path)-
     // bytes must fail the next epoch's check. It does not feed later tests.
     epoch.upload(&[0])?;stats.upload(&[0,u32::MAX,u32::MAX,0,0,0,0])?;stream.join_default()?;
     comm.set_sum_grid_for_probe(4,&stream)?;fill(6*5120,0,0)?;
-    unsafe{comm.sum_bf16(&input,&mut output,&stream)?;}
+    {let x=unsafe{input.view(0,6*5120)}?;let mut y=unsafe{output.view(0,6*5120)}?;
+    unsafe{comm.sum_bf16(&x,&mut y,&stream)?;}}
     check(output.ptr(),6*5120,0,false)?;stream.synchronize()?;let correct=stats.download()?;
     advance()?;check(output.ptr(),6*5120,0,false)?;stream.synchronize()?;
     let stale=stats.download()?;ensure!(correct[0]==0&&stale[0]>0,"changing-payload oracle negative control");
     let mut results=Vec::new();
     for (variant,blocks,pattern,jitter,mixed)in [(0,4,0,0,false),(1,4,1,0,true),(2,4,1,1,true),(3,8,1,1,true)]{
         comm.set_sum_grid_for_probe(blocks,&stream)?;
+        if adaptive{comm.set_small_packet_bytes_for_probe(if variant==0{0}else{96*1024},&stream)?;}
         stats.upload(&[0,u32::MAX,u32::MAX,0,0,0,0])?;stream.join_default()?;
         let graph=stream.capture(||{
             for step in 0..64{
-                let n=if mixed&&step%4==1{3*5120}else{6*5120};fill(n,pattern,jitter)?;
+                let n=if adaptive&&mixed{[3,6,16,128][step%4]*5120}
+                    else if mixed&&step%4==1{3*5120}else{6*5120};fill(n,pattern,jitter)?;
                 let x=unsafe{input.view(0,n)}?;let mut y=unsafe{output.view(0,n)}?;
                 unsafe{comm.sum_bf16(&x,&mut y,&stream)?;}
                 check(output.ptr(),n,pattern,false)?;
@@ -191,7 +196,10 @@ pub fn run_sequence(rank:usize,endpoint:&str,nonce:&[u8],root:&Path,core:&Path)-
         eprintln!("rank{rank}: sequence variant{variant} mismatches={}",actual[0]);
     }
     stream.synchronize()?;comm.health()?;
+    let packet_counts=if adaptive{Some(comm.packet_counts_for_probe()?)}else{None};
+    if let Some(counts)=packet_counts{ensure!(counts.iter().all(|&n|n>0),"both packet banks must execute");}
     Ok(json!({"rank":rank,"all_exact":results.len()==4&&results.iter().all(|r|r["passed"]==true),
+        "adaptive_packets":adaptive,"packet_counts_bulk_small":packet_counts,
         "negative_control_detected_stale_payload":true,"negative_control_bad_elements":stale[0],"results":results,
-        "memory":cuda.admission_memory()?,"scope":"Changing GPU-generated canonical BF16 operands per operation. GPU fixed-rank FP32 sum then BF16 RN, exact raw gathers; M6/M3, both parities, asynchronous rank staggering, sums grids4/8. No model loaded and no CPU tensor arithmetic; isolates transport correctness, not full-model quality or serving speed."}))
+        "memory":cuda.admission_memory()?,"scope":"Changing GPU-generated canonical BF16 operands per operation. GPU fixed-rank FP32 sum then BF16 RN, exact raw gathers; M6/M3 (plus M16/M128 for adaptive packets), both parities, asynchronous rank staggering, sums grids4/8. No model loaded and no CPU tensor arithmetic; isolates transport correctness, not full-model quality or serving speed."}))
 }

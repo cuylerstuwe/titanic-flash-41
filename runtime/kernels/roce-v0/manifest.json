@@ -47,9 +47,23 @@
     "flag_stride": 128,
     "slots": 2
   },
-  "proxy_abi": 3,
-  "proxy_source_sha256": "606a15285d8c728748197e9057a87d7f843027f5d650ee9ff0f6da882333157e",
-  "proxy_library_sha256": "648db88e8886b2455da4bef0d7bd13336fffe72be77622e8b1d37b2d779ac0c0",
+  "proxy_abi": 4,
+  "proxy_source_sha256": "76cc1c826326bec7b456436d4c1f7dbed9510b7a9a027facce7f88b0a9220348",
+  "proxy_library_sha256": "e6c5cb8d843b1918ae59c3ffb51d4cdeb50388ee886c109eddf190690fda0e74",
+  "packet_policy_experiment": {
+    "base_source_sha256": "606a15285d8c728748197e9057a87d7f843027f5d650ee9ff0f6da882333157e",
+    "base_manifest_sha256": "36ce015ea3834d7cf703dd572fd8024315b427e06063b181c3233ebe6595c5c8",
+    "small_mtu": 1024,
+    "default_threshold_bytes": 0,
+    "bulk_mtu": "port_active_mtu",
+    "extra_mapped_bytes": 0,
+    "contract": "Two QP banks; same-QP payload/flag ordering; shared aggregate queue bound; explicit ABI4 blobs; no GPU/arithmetic changes."
+  },
+  "inline_payload": {
+    "maximum_stripe_bytes": 16,
+    "finite_selector": false,
+    "base_manifest_sha256": "de52e6597254af0091a653019c7862bdf55b4c51e81d537638c41696229b3edf"
+  },
   "traffic_class": 106,
   "proxy_compile_command": [
     "gcc",

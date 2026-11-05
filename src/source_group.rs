@@ -468,6 +468,21 @@ impl Group {
     pub fn engram(&self) -> Option<(&Engram, &Rows)> {
         self.engram.as_ref().zip(self.rows.as_ref())
     }
+    pub(crate) fn set_engram_projection_ahead_for_probe(&mut self,enabled:bool,kernels:&Path)->Result<()> {
+        ensure!(self.start==14,"only source14 has an early projection");
+        self.engram.as_mut().ok_or_else(||anyhow::anyhow!("Engram14 absent"))?
+            .set_projection_ahead_for_probe(enabled,kernels)
+    }
+    pub(crate) fn select_engram_projection_ahead(&mut self,selected:bool)->Result<()> {
+        ensure!(self.start==14,"only source14 has an early projection");
+        self.engram.as_mut().ok_or_else(||anyhow::anyhow!("Engram14 absent"))?
+            .select_projection_ahead(selected)
+    }
+    pub(crate) fn prepare_engram_projection_ahead(&mut self,comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(self.start==14,"only source14 has an early projection");
+        self.engram.as_mut().ok_or_else(||anyhow::anyhow!("Engram14 absent"))?
+            .prepare_projection_ahead(self.rows.as_mut().ok_or_else(||anyhow::anyhow!("Engram14 rows absent"))?,comm,stream)
+    }
     pub fn reset_swa(&mut self, seed: &[u8]) -> Result<()> {
         for cache in &mut self.caches {
             cache.upload(seed)?;

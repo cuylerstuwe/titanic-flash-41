@@ -20,7 +20,19 @@ impl Head {
             &&cuda.owns_buffer(&self.sign_mantissa)&&cuda.owns_buffer(&self.codes)&&cuda.owns_buffer(&self.bases)
     }
     pub(crate) fn new(cuda:&Cuda,canonical:u64,root:&Path,stream:&Stream)->Result<Self> {
-        let mut head=Self::new_profile(cuda,canonical,root,stream,6,"202cb25339a2d37fc231d7f5c46adb36d62101e3792d2a6e9489722b477ae6d9")?;
+        // Resolve the finite fallback once, before graph capture. run() keeps
+        // one selected operator and has no cache-policy dispatch or env read.
+        let weight_cg=match std::env::var("CANADA_SCRATCH_HEAD_WEIGHT_CG") {
+            Err(std::env::VarError::NotPresent)=>false,
+            Ok(value)if value=="0"=>false,
+            Ok(value)if value=="1"=>true,
+            _=>anyhow::bail!("invalid target-head weight cache policy"),
+        };
+        let selected=if weight_cg{root.with_file_name("target-head-lossless-weight-cg-v1")}else{root.to_path_buf()};
+        let pin=if weight_cg{"d0ff14ca7341e5489a1a252dd8f9e24205fe583118ead1810e501909ba244274"}
+            else{"202cb25339a2d37fc231d7f5c46adb36d62101e3792d2a6e9489722b477ae6d9"};
+        let mut head=Self::new_profile(cuda,canonical,&selected,stream,6,pin)?;
+        if weight_cg{eprintln!("lossless M6 target-head weight stream: global cache; metadata and all weight bits unchanged");}
         if std::env::var("CANADA_SCRATCH_PAIRED_TARGET_HEAD").as_deref()==Ok("1") {
             let extra=root.with_file_name("target-head-lossless-paired-v1");
             let raw=std::fs::read(extra.join("manifest.json"))?;

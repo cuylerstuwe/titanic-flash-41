@@ -38,14 +38,8 @@ impl Drop for WaitingInput {
     fn drop(&mut self) { assert!(self.0.waiting_inputs.fetch_sub(1,Ordering::AcqRel)>0); }
 }
 
-#[derive(Deserialize)]
-struct TransportMode {
-    #[serde(default)]
-    stream: Option<bool>,
-}
-
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn dispatch(shared:Arc<Shared>,body:Bytes,permit:OwnedSemaphorePermit,
+pub(super) async fn dispatch(shared:Arc<Shared>,body:context::Input,permit:OwnedSemaphorePermit,
     background_permit:Option<OwnedSemaphorePermit>,
     upload_workspace:Option<crate::memory::HostWorkspaceReservation>,background:bool,
     upload_execution:Option<OwnedSemaphorePermit>) -> Response {
@@ -64,8 +58,8 @@ pub(super) async fn dispatch(shared:Arc<Shared>,body:Bytes,permit:OwnedSemaphore
     }
     // Inspect only the transport flag. Serde skips message/image values rather
     // than allocating a second copy or invoking the tokenizer/image decoder.
-    let streaming=match serde_json::from_slice::<TransportMode>(&body) {
-        Ok(mode)=>mode.stream.unwrap_or(false),
+    let streaming=match body.streaming() {
+        Ok(streaming)=>streaming,
         Err(_)=>return error(StatusCode::BAD_REQUEST,"invalid_request","invalid JSON request or stream flag"),
     };
     let waiting=WaitingInput::new(&shared);

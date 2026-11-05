@@ -1052,6 +1052,9 @@ impl SwaLayer {
     pub(crate) fn swap_qkv_for_probe(&mut self,other:&mut crate::fp8_linear::Linear)->Result<()> {
         self.attention.swap_qkv_for_probe(other)
     }
+    pub(crate) fn swap_qkv_fence_for_probe(&mut self,other:&mut crate::fp8_linear::Linear)->Result<()> {
+        self.attention.swap_qkv_fence_for_probe(other)
+    }
     pub(crate) fn set_wo_b_pdl_for_probe(&mut self,mode:u8,other:&mut crate::fp8_linear::Linear)->Result<()> {
         self.attention.set_wo_b_pdl_for_probe(mode,other)
     }
@@ -1122,6 +1125,29 @@ impl SwaLayer {
     }
     pub fn ffn(&self) -> &LayerFfn {
         &self.ffn
+    }
+    pub(crate) fn set_ffn_prefetch_chunk_for_probe(&mut self,chunk:u32,stream:&Stream)->Result<()> {
+        self.ffn.set_prefetch_chunk_for_probe(chunk,stream)
+    }
+    pub(crate) fn set_wide_hints_for_probe(&mut self,mask:u8,stream:&Stream)->Result<()> {
+        ensure!(mask<=7&&!self.pair_deferred_ffn,"wide hint stage selection");
+        self.ffn.set_wide_hint_for_probe(mask&1!=0,stream)?;
+        self.attention.set_wide_hint_for_probe(mask&2!=0,stream)?;
+        if let Some(hint)=&mut self.next_input_prefetch {
+            hint.set_enabled_for_wide_probe(mask&4!=0,stream)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn set_ffn_prefetch_region_for_probe(&mut self,mode:u32,stream:&Stream)->Result<()> {
+        self.ffn.set_prefetch_region_for_probe(mode,stream)
+    }
+    pub(crate) fn set_ffn_prefetch_budget_for_probe(&mut self,budget:usize,stream:&Stream)->Result<()> {
+        self.ffn.set_prefetch_budget_for_probe(budget,stream)
+    }
+    pub(crate) fn set_expert_prefetch_for_probe(&mut self,module:&Module,stream:&Stream,
+        selected:Option<usize>)->Result<()> {
+        ensure!(!self.pair_deferred_ffn,"expert hint finite screen excludes paired FFN");
+        self.ffn.set_expert_prefetch_for_probe(module,stream,selected)
     }
     pub(crate) fn schedule_counts(&self)->[usize;4] {
         let(ffn,hint)=self.ffn.schedule_flags();

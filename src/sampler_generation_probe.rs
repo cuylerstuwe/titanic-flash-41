@@ -3,6 +3,7 @@ use super::*;
 use super::history32_generation_probe::{execute,state,restore};
 pub(super) fn run(w:&mut Worker,rank:usize,out:&Path)->Result<()> {
     ensure!(w.current.is_none(),"sampler generation starts idle");
+    let probability_fusion=std::env::var("CANADA_SCRATCH_FUSED_PROBABILITY_RESIDUAL_MODEL_SCREEN").as_deref()==Ok("1");
     let fixtures:Value=serde_json::from_slice(include_bytes!("../tests/fixtures/phase-frontiers-s591-v1.json"))?;
     w.cached_sessions.clear();w.session_cache_budget=0;w.prompt_checkpoint=false;
     w.encoder_prompt_checkpoint=false;w.prompt_cache_logits=false;
@@ -40,7 +41,7 @@ pub(super) fn run(w:&mut Worker,rank:usize,out:&Path)->Result<()> {
             if candidate!=active {w.session.as_mut().unwrap().swap_sampler_for_graph_probe(&mut alternate,&w.stream)?;active=candidate;}
             let seed=2026110280+ci as u64*10+(trial/2)as u64;
             w.session.as_mut().unwrap().configure_sampling(seed,Some(w.cfg.eos_token_id))?;
-            let maximum=192;let mut emitted=vec![anchor];let mut pending=anchor;let mut steps=Vec::new();
+            let maximum=if probability_fusion{64}else{192};let mut emitted=vec![anchor];let mut pending=anchor;let mut steps=Vec::new();
             let at=Instant::now();
             while emitted.len()<maximum&&pending!=w.cfg.eos_token_id {
                 let remaining=(maximum-emitted.len()).min(6);
@@ -73,6 +74,8 @@ pub(super) fn run(w:&mut Worker,rank:usize,out:&Path)->Result<()> {
         "parallel_block_finish_screen":std::env::var("CANADA_SCRATCH_BLOCK_FINISH_SCREEN").as_deref()==Ok("1"),
         "mapped_input_screen":std::env::var("CANADA_SCRATCH_SAMPLER_MAPPED_SCREEN").as_deref()==Ok("1"),
         "graph_readout_screen":std::env::var("CANADA_SCRATCH_SAMPLER_GRAPH_READOUT_SCREEN").as_deref()==Ok("1"),
-        "scope":"Three public reasoning/answer frontiers, reversed paired seeds at T1/P1. Identical full-session restores, generated tokens and accepted state. Capped192-token integration diagnostics; component timing carries the microsecond performance claim. Screen booleans identify the comparison, not the underlying kernel defaults."}))?)?;
+        "probability_residual_fusion_screen":probability_fusion,
+        "output_cap":if probability_fusion{64}else{192},
+        "scope":"Three public reasoning/answer frontiers, reversed paired seeds at T1/P1. Identical full-session restores, generated tokens and accepted state. Capped integration diagnostics; component timing carries the microsecond performance claim. Screen booleans identify the comparison, not the underlying kernel defaults."}))?)?;
     Ok(())
 }

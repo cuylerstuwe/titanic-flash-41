@@ -13,6 +13,7 @@ pub(crate) struct Policy {
     pub fused_draft_local: bool,
     pub warp_draft_q: bool,
     pub fused_residual_local: bool,
+    pub fused_probability_residual: bool,
 }
 
 impl Policy {
@@ -43,6 +44,7 @@ impl Policy {
             fused_draft_local: flag("CANADA_SCRATCH_FUSED_DRAFT_LOCAL", false)?,
             warp_draft_q: flag("CANADA_SCRATCH_WARP_DRAFT_Q", false)?,
             fused_residual_local: flag("CANADA_SCRATCH_FUSED_RESIDUAL_LOCAL", false)?,
+            fused_probability_residual: flag("CANADA_SCRATCH_FUSED_PROBABILITY_RESIDUAL", false)?,
         };
         ensure!(!policy.local_target || policy.hierarchical_draft,
             "local target transport requires hierarchical drafting");
@@ -60,6 +62,8 @@ impl Policy {
             "warp-shared draft quotient requires hierarchical drafting");
         ensure!(!policy.fused_residual_local || policy.bundled_ids,
             "fused local residual sampling requires bundled target/residual IDs");
+        ensure!(!policy.fused_probability_residual || (policy.bundled_ids && policy.fused_target_controls),
+            "fused probabilities/residuals require bundled IDs and prepared target factors");
         if policy.hierarchical_draft {
             ensure!(flag("CANADA_SCRATCH_STOCHASTIC_DRAFT", false)?
                 && flag("CANADA_SCRATCH_BLOCK_VERIFY", true)?,
@@ -89,6 +93,7 @@ mod tests {
         assert!(read(&[("CANADA_SCRATCH_LOCAL_TARGET", "1")]).is_err());
         assert!(read(&[("CANADA_SCRATCH_WARP_DRAFT_Q", "1")]).is_err());
         assert!(read(&[("CANADA_SCRATCH_FUSED_RESIDUAL_LOCAL", "1")]).is_err());
+        assert!(read(&[("CANADA_SCRATCH_FUSED_PROBABILITY_RESIDUAL", "1")]).is_err());
         assert!(read(&[("CANADA_SCRATCH_HIERARCHICAL_DRAFT", "yes")]).is_err());
     }
     #[test]

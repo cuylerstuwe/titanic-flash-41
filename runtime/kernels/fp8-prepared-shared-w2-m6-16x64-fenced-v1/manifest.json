@@ -1,0 +1,74 @@
+{
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/flashinfer-ai/flashinfer",
+  "source_commit": "Installed source in immutable Canada image82bb5857; exact SHA256 pins below",
+  "license": "BSD-3-Clause dense; Apache-2.0 quantizer",
+  "role": "Selected low-level GPU primitives only; no engine runtime",
+  "source_pins": {
+    "dense": {
+      "file": "/probe/16x64/dense-pipeline-fenced.py",
+      "sha256": "daefb1d751c683210b71aa4f663a8d315f4f864fb17be1353afac0d077f9a638"
+    },
+    "quant": {
+      "file": "/opt/sglang/lib/python3.12/site-packages/flashinfer/quantization/kernels/mxfp8_quantize.py",
+      "sha256": "271ec175cf3d0f71e7c9962d47c219c82f838cdb1b8704b135a980ced4020e21"
+    }
+  },
+  "geometry": {
+    "rows": 6,
+    "in_features": 640,
+    "out_features": 5120,
+    "scale_a_bytes": 2560,
+    "scale_b_bytes": 102400,
+    "mma_tiler_mn": [
+      16,
+      64
+    ],
+    "swap_ab": false,
+    "tile_k": 128,
+    "split_k_slices": 1,
+    "split_k_atomic_bf16": false,
+    "max_active_clusters": 48,
+    "use_prefetch": false,
+    "quantizer_2t": false,
+    "quantizer_grid": 11
+  },
+  "kernels": [
+    {
+      "name": "kernel_000",
+      "kernel_id": "flashinfer.mxfp8.quant.pdl0",
+      "enable_pdl": false,
+      "header_sha256": "5c26059ec5921385d8e4c34c60b9e9936ecc0d37e3727c1edb3075addf9eda2b",
+      "object_sha256": "8480d957882562a47d9b9ab58aced550a395b3f30ec59b276b51804b1d34479c"
+    },
+    {
+      "name": "kernel_001",
+      "kernel_id": "flashinfer.mxfp8.dense.pdl0",
+      "enable_pdl": false,
+      "header_sha256": "e091c7e74ac61129dca4986265abb8baf96121a2906c47e8c59629d748a53545",
+      "object_sha256": "e020ea77f773cfebd0e638af0e8c1ba6fa0a0d71c0b66323308d5ff92424d13a"
+    },
+    {
+      "name": "kernel_002",
+      "kernel_id": "flashinfer.mxfp8.quant.pdl1",
+      "enable_pdl": true,
+      "header_sha256": "6a3993b0331fb0613ed304206b482950d7171bc0ec96b0915ba87fc28de4f536",
+      "object_sha256": "08656bd39825be89b2016738d47569495a878f39f5756dc45992076a2e345c9a"
+    },
+    {
+      "name": "kernel_003",
+      "kernel_id": "flashinfer.mxfp8.dense.pdl1",
+      "enable_pdl": true,
+      "header_sha256": "6d973bf5a01596a70ca6411c9690991f6177d12af5a60f60fae860cb246a5a89",
+      "object_sha256": "b222f0aba5aa13819975bf756b668ef6270538ad2e291c677d8bbba4448bf3bf"
+    }
+  ],
+  "source_modifications": {
+    "original_sha256": "eee668e5c143f1c31690ad8a7b44f65050fee3232df1e1c484a3789c2ef0d960",
+    "derived_sha256": "daefb1d751c683210b71aa4f663a8d315f4f864fb17be1353afac0d077f9a638",
+    "patch_sha256": "2af1dc27e200f75fcdfbcab8a1205acb9909e4e784d739e50250a65c4385b4a1",
+    "change": "generic shared read fence and warp join before elected TMA consumer release",
+    "numerical_contract": "unchanged quantization, tiling, MMA arithmetic, PDL and output precision"
+  }
+}

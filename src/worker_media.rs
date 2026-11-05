@@ -224,7 +224,7 @@ impl Media {
                         if !control.all_admit(enough(&self.cuda)?)? {
                             eprintln!("image admission refused: {}",json!({"rank":self.rank,
                                 "needed_bytes":needed,"required_available_bytes":required,"reclamations":reclamations,
-                                "memory":self.cuda.admission_memory()?}));
+                                "memory":self.cuda.admission_memory()?,"percpu_free_bytes":crate::memory::percpu_free_bytes()}));
                             return Err(crate::memory::InputCapacityError(
                                 "image encoding cannot retain the UMA reserve",required).into());
                         }
@@ -233,7 +233,8 @@ impl Media {
                         Ok(span)=>break span,
                         Err(error) if attempt==0 && error.downcast_ref::<crate::memory::InputCapacityError>().is_some()=>{
                             eprintln!("image allocation retry: {}",json!({"rank":self.rank,
-                                "geometry":g,"reason":error.to_string(),"memory":self.cuda.admission_memory()?}));
+                                "geometry":g,"reason":error.to_string(),"memory":self.cuda.admission_memory()?,
+                                "percpu_free_bytes":crate::memory::percpu_free_bytes()}));
                             attempt+=1;
                         },
                         Err(error)=>return Err(error),

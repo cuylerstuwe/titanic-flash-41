@@ -28,6 +28,8 @@ pub(crate) struct DraftHead {
     integer_active: Cell<bool>,
     lossless: Option<crate::lossless_head::Head>,
     lossless_active: Cell<bool>,
+    nvfp4: Option<crate::nvfp4_head::Head>,
+    nvfp4_active: Cell<bool>,
     // Immutable after construction. Request owners may share these bytes,
     // while precision switches, operators and every activation stay private.
     weights: Rc<Buffer<u8>>,
@@ -200,12 +202,18 @@ impl DraftHead {
         self.lossless=Some(crate::lossless_head::Head::new_draft(&self.cuda,self.canonical.ptr("head.weight")?,root,stream)?);Ok(self)
     }
     pub(crate) fn lossless_enabled(&self)->bool {self.lossless_active.get()}
-    pub(crate) fn precision_kind(&self)->u8 {if self.lossless_active.get(){2}else{u8::from(self.integer_active.get())}}
+    pub(crate) fn precision_kind(&self)->u8 {if self.nvfp4_active.get(){3}else if self.lossless_active.get(){2}else{u8::from(self.integer_active.get())}}
     pub(crate) fn set_precision_for_probe(&self,kind:u8)->Result<()> {
-        ensure!(std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_INT8_SCREEN").as_deref()==Ok("1")
-            &&kind<=2&&!self.gemv_active.get()&&(kind!=1||self.integer.is_some())
-            &&(kind!=2||self.lossless.is_some()),"private head precision isolated switch");
-        self.integer_active.set(kind==1);self.lossless_active.set(kind==2);Ok(())
+        ensure!((std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_INT8_SCREEN").as_deref()==Ok("1")
+                ||std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_NVFP4_SCREEN").as_deref()==Ok("1"))
+            &&kind<=3&&!self.gemv_active.get()&&(kind!=1||self.integer.is_some())
+            &&(kind!=2||self.lossless.is_some())&&(kind!=3||self.nvfp4.is_some()),"private head precision isolated switch");
+        self.integer_active.set(kind==1);self.lossless_active.set(kind==2);self.nvfp4_active.set(kind==3);Ok(())
+    }
+    pub(crate) fn nvfp4_enabled(&self)->bool {self.nvfp4_active.get()}
+    pub(crate) fn with_nvfp4(mut self,root:&Path,stream:&Stream)->Result<Self> {
+        ensure!(self.stream==stream.raw()as usize&&self.nvfp4.is_none(),"private NVFP4 owner");
+        self.nvfp4=Some(crate::nvfp4_head::Head::new(&self.cuda,self.canonical.ptr("head.weight")?,root,stream)?);Ok(self)
     }
     pub(crate) fn with_int8(mut self,root:&Path,stream:&Stream)->Result<Self> {
         ensure!(std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_INT8_SCREEN").as_deref()==Ok("1")
@@ -312,6 +320,8 @@ impl DraftHead {
             integer_active:Cell::new(false),
             lossless:None,
             lossless_active:Cell::new(false),
+            nvfp4:None,
+            nvfp4_active:Cell::new(false),
             weights,
             scales,
             quantizer_sha256: quantizer.entry.artifact_sha256.clone(),
@@ -336,6 +346,7 @@ impl DraftHead {
                 && output.len() == M * N,
             "private draft-head input/output context or geometry"
         );
+        if self.nvfp4_active.get(){return self.nvfp4.as_ref().expect("active private NVFP4 loaded").run(input,output,stream);}
         if self.lossless_active.get(){return self.lossless.as_ref().expect("active lossless draft loaded").run(input.ptr(),output.ptr(),stream);}
         unsafe {
             if self.integer_active.get() {

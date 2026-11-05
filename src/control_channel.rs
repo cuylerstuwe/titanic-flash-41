@@ -24,6 +24,38 @@ pub(crate) const MAX_COMMAND: usize = 16 * crate::config::MODEL_CONTEXT + 4096;
 const MAX_AGREEMENT: usize = 4096;
 const MAX_NEXT_COMMAND: usize = 16;
 
+fn parse_kernel_poll(value:Option<&str>)->Result<i32> {
+    match value {
+        None|Some("0")=>Ok(0),Some("500")=>Ok(500),
+        _=>anyhow::bail!("CANADA_SCRATCH_CONTROL_BUSY_POLL_US must be0 or500"),
+    }
+}
+pub(crate) fn kernel_poll_us_requested()->Result<i32> {
+    match std::env::var("CANADA_SCRATCH_CONTROL_BUSY_POLL_US") {
+        Ok(value)=>parse_kernel_poll(Some(&value)),
+        Err(std::env::VarError::NotPresent)=>parse_kernel_poll(None),Err(error)=>Err(error.into()),
+    }
+}
+fn set_socket_poll(stream:&TcpStream,micros:i32)->Result<i32> {
+    ensure!([0,500].contains(&micros),"bounded control socket poll budget");
+    #[cfg(target_os="linux")]
+    {
+        use std::os::fd::AsRawFd;
+        ensure!(unsafe{libc::setsockopt(stream.as_raw_fd(),libc::SOL_SOCKET,libc::SO_BUSY_POLL,
+            (&micros as *const i32).cast(),std::mem::size_of_val(&micros)as libc::socklen_t)}==0,
+            "socket busy poll: {}",std::io::Error::last_os_error());
+        let mut value=0i32;let mut size=std::mem::size_of_val(&value)as libc::socklen_t;
+        ensure!(unsafe{libc::getsockopt(stream.as_raw_fd(),libc::SOL_SOCKET,libc::SO_BUSY_POLL,
+            (&mut value as *mut i32).cast(),&mut size)}==0&&value==micros,"socket poll readback");
+        let mut id=0i32;
+        ensure!(unsafe{libc::getsockopt(stream.as_raw_fd(),libc::SOL_SOCKET,libc::SO_INCOMING_NAPI_ID,
+            (&mut id as *mut i32).cast(),&mut size)}==0,"socket NAPI identity");
+        Ok(id)
+    }
+    #[cfg(not(target_os="linux"))]
+    {let _=stream;anyhow::bail!("control socket polling needs Linux")}
+}
+
 pub(crate) struct ControlChannel {
     rank: usize,
     // Rank zero owns peers1..3 in rank order; a follower owns only rank zero.
@@ -39,6 +71,8 @@ fn configure(stream: &TcpStream, timeout: Duration) -> Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
+    let poll=kernel_poll_us_requested()?;
+    if poll!=0 {set_socket_poll(stream,poll)?;}
     Ok(())
 }
 
@@ -75,6 +109,14 @@ fn read_frame(stream: &mut impl Read, kind: u8, sequence: u64, bound: usize) -> 
 }
 
 impl ControlChannel {
+    /// Finite experiment: preserve framing, sequence and failure semantics,
+    /// changing only the blocking receive's kernel polling budget.
+    pub(crate) fn set_busy_poll_for_probe(&self, micros:i32)->Result<Vec<i32>> {
+        ensure!(!self.poisoned && [0,500].contains(&micros)
+            &&std::env::var("CANADA_SCRATCH_CONTROL_KERNEL_POLL_SCREEN").as_deref()==Ok("1"),
+            "kernel polling requires the finite control screen");
+        self.peers.iter().map(|peer|set_socket_poll(peer,micros)).collect()
+    }
     pub(crate) fn observe_progress(&mut self, counter: Arc<AtomicU64>) {
         counter.store(self.sequence, Ordering::Release);
         self.progress = Some(counter);
@@ -333,6 +375,15 @@ impl ControlChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn kernel_poll_budget_is_explicit_and_bounded() {
+        assert_eq!(parse_kernel_poll(None).unwrap(),0);
+        assert_eq!(parse_kernel_poll(Some("0")).unwrap(),0);
+        assert_eq!(parse_kernel_poll(Some("500")).unwrap(),500);
+        for value in ["", "-1", "50", "1000", "true", " 500"] {
+            assert!(parse_kernel_poll(Some(value)).is_err());
+        }
+    }
     use std::io::Cursor;
 
     #[test]

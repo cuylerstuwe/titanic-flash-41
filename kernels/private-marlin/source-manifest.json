@@ -1,0 +1,27 @@
+{
+  "repository": "vllm-project/vllm",
+  "revision": "784d1fff0c491b9add10ecd732de8f707a7e7dbe",
+  "license": "Apache-2.0",
+  "purpose": "Private drafter-head component only, canonical BF16 target unchanged. Raw C ABI avoids adding an existing inference engine.",
+  "numerical_contract": "NVFP4 E2M1 weights, positive E4M3 scale/16 and FP32 global scale; BF16 activation and output; FP32 global reduction, no atomic add. Output converted to FP32 for existing q path.",
+  "changes": [
+    "Remove Torch host wrappers, retain CUDA arithmetic.",
+    "Replace scalar host assertion include with std::runtime_error.",
+    "Instantiate only upstream 128-thread N64 K128 M8/M16 BF16 NVFP4 kernel; upstream selector picks this for our unpadded shard."
+  ],
+  "upstream_sha256": {
+    "LICENSE": "c95bae1d1ce0235ecccd3560b772ec1efb97f348a79f0fbe0a634f0c2ccefe2c",
+    "core/scalar_type.hpp": "aca988335cce6a0a9e9e196bee151cf6e3dbda1c0c336467694facbdcf8c1321",
+    "dequant.h": "24cade79d62f7359b4c74e0c105693b18969a8548aa68050ad980901ce635189",
+    "generate_kernels.py": "c9ea2956dd499db32d137f6bfec3cd2106222eec9708f62f88f9dc95275c6363",
+    "gptq_marlin_repack.cu": "942432e45d694c8984ff45d8fb4b8b1c7fde942286a36ed72aa0906b3cf93179",
+    "kernel.h": "95f2b3ed23edcc21929818f8604ecb90ae4a68038280bc15aad900148e4bf1d2",
+    "marlin.cu": "26c7263fac63ba041d7972a31868978da802d5ebb5eb1e747b09fc741b59dc04",
+    "marlin.cuh": "7e6e6349adc0d51d67feb50242e8cf71b722e2fed07c9b872752ee0f8a5b2647",
+    "marlin_dtypes.cuh": "6ffab5a1b2ec2605d101b5932fac44fbf0fce79c3d350427406a305f13605d78",
+    "marlin_mma.h": "9596054f2614cec8f0b3910bd06416ee6946299b621d9d28c9e51f57175ee171",
+    "marlin_template.h": "c98665567189cc012f9ee5cb05ad2dd40d58aea5f6946f4b041b3375f5f2ac98",
+    "marlin_utils.py": "7013299440db56a51a0af0b2c3c14a71887f429fbd4798d940f88577ffaee266",
+    "marlin_utils_fp4.py": "c43e8644af9b6488e222a2cec60f6f9b02215d98228ec4467588619823c650f8"
+  }
+}

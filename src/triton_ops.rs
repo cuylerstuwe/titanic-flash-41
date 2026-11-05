@@ -95,9 +95,12 @@ impl Operator {
                 && entry.grid.y > 0
                 && entry.grid.z > 0
                 && (entry.grid.x_mul > 0 || entry.grid.x_add > 0)
-                && entry.grid.x_mul <= 128
+                // The finite FP64 WO-A diagnostic uses 256 output tiles per
+                // row. At the launch row cap this is 2^24 blocks, safely
+                // within both u32 arithmetic and CUDA's x-grid limit.
+                && entry.grid.x_mul <= 256
                 && entry.grid.x_add <= 256,
-            "invalid launch grid"
+            "invalid launch grid for {}: {:?}", entry.name, entry.grid
         );
         let artifact = std::fs::read(root.join(format!("{}.cubin", entry.name)))?;
         ensure!(

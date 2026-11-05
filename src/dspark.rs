@@ -27,6 +27,9 @@ use std::{path::Path, rc::Rc};
 
 #[path = "dspark_pair_query.rs"]
 mod pair_query;
+#[path="dspark_query_reuse_probe.rs"]
+mod query_reuse_probe;
+pub(crate) use query_reuse_probe::QueryOutputSnapshot;
 
 struct Stage {
     attention: Attention,
@@ -338,6 +341,9 @@ impl QueryNetwork {
                     head=head.with_lossless(&kernels.join("draft-head-lossless-m5-s817"),stream)?;
                 }
             }
+            if std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_NVFP4_SCREEN").as_deref()==Ok("1") {
+                head=head.with_nvfp4(&kernels.join("draft-head-nvfp4-marlin-m5-v1"),stream)?;
+            }
             Some(head)
         } else {
             None
@@ -466,6 +472,7 @@ impl QueryNetwork {
     }
     pub(crate) fn head_kind(&self) -> &'static str {
         if self.private_head_active {
+            if self.private_head.as_ref().is_some_and(|h|h.nvfp4_enabled()){return "private_nvfp4_marlin_bf16_operands_output_fp32_publication";}
             if self.private_head.as_ref().is_some_and(|h|h.lossless_enabled()){return "canonical_bf16_lossless_weights_fp32_output_m5";}
             if self.private_head.as_ref().is_some_and(|h|h.int8_enabled()){return "private_int8_group128_bf16_operands_fp32_output";}
             if self.private_head.as_ref().is_some_and(|h|h.gemv_enabled()) {
@@ -531,6 +538,7 @@ impl QueryNetwork {
     }
     pub(crate) fn warm_head_for_probe(&mut self, anchor:u32, comm:&Roce, stream:&Stream) -> Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_DRAFT_HEAD_SCREEN").as_deref()==Ok("1")
+            || std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_NVFP4_SCREEN").as_deref()==Ok("1")
             || std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_INT8_SCREEN").as_deref()==Ok("1")
             || std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_GEMV_SCREEN").as_deref()==Ok("1"),
             "direct head warmup requires the isolated screen");

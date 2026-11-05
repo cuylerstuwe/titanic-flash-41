@@ -116,6 +116,75 @@ pub(crate) fn shared_owner_profiles_requested() -> bool {
         || std::env::var("CANADA_SCRATCH_PAIRED_SERVING_PROFILE_SCREEN").as_deref()==Ok("1")
 }
 
+/// Optional retained17..32-token requests reuse the already admitted copy
+/// verifier. Absence of that owner falls back to the ordinary128-row append.
+pub(crate) fn resident_append32_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_RESIDENT_APPEND32") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid retained M32 append policy");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),
+        Err(e)=>Err(e.into()),
+    }
+}
+/// Resolve at startup/profile construction; graph replay never reads the environment.
+pub(crate) fn append_last_gather_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_APPEND_LAST_GATHER") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid retained append logit transport policy");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),
+        Err(e)=>Err(e.into()),
+    }
+}
+/// Final-only retained M16/M32 appends can borrow the existing lossless M6
+/// encoding. Resolve while constructing profiles, never during graph replay.
+pub(crate) fn append_encoded_head_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_APPEND_ENCODED_HEAD") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid retained append encoded head policy");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),
+        Err(e)=>Err(e.into()),
+    }
+}
+/// Final prefill projection uses the same canonical lossless encoding as M6.
+/// Selected before capture; the generated graph has no policy dispatch.
+pub(crate) fn prefill_encoded_head_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_PREFILL_ENCODED_HEAD") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid prefill encoded head policy");Ok(v=="1")},
+        // s1316: all-rank retained-input/state/following checks passed. Reuse
+        // only an already requested shared canonical encoding; other profiles
+        // retain the ordinary BF16 head without adding a weight allocation.
+        Err(std::env::VarError::NotPresent)=>Ok(
+            std::env::var("CANADA_SCRATCH_LOSSLESS_HEAD").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_SHARED_TARGET_HEAD").as_deref()==Ok("1")),
+        Err(e)=>Err(e.into()),
+    }
+}
+pub(crate) fn prefill_sparse_publish_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_PREFILL_SPARSE_PUBLISH") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid sparse prefill publication policy");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
+    }
+}
+pub(crate) fn prefill_row_head_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_PREFILL_ROW_HEAD") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid last-row head normalization policy");Ok(v=="1")},
+        // s1317: same normalized BF16 input, FP32 logits and retained state
+        // on all ranks. Carry alongside the qualified encoded prefill head.
+        Err(std::env::VarError::NotPresent)=>prefill_encoded_head_requested(),Err(e)=>Err(e.into()),
+    }
+}
+/// Immutable per-profile hint geometry. This never runs during graph replay.
+pub(crate) fn ffn_fine_hint_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_FFN_FINE_HINT") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid FFN fine hint policy");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),
+        Err(e)=>Err(e.into()),
+    }
+}
+pub(crate) fn append32_workspace_enabled() -> bool {
+    // Immutable launch policy: no repeated environment parsing in layer paths.
+    static ENABLED:std::sync::OnceLock<bool>=std::sync::OnceLock::new();
+    *ENABLED.get_or_init(||std::env::var("CANADA_SCRATCH_RESIDENT_APPEND32").as_deref()==Ok("1")
+        ||std::env::var("CANADA_SCRATCH_APPEND32_SCREEN").as_deref()==Ok("1"))
+}
+
 impl ModelConfig {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let c: Self = serde_json::from_slice(bytes)?;

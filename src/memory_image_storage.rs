@@ -30,6 +30,7 @@ pub(crate) fn allocate_image_storage<T>(bytes: usize, allocate: impl FnOnce() ->
     -> Result<(ImageStorageCharge<'static>, T)> {
     allocate_tracked(&IMAGE_BYTES, bytes, allocate)
 }
+pub(crate) fn retained_image_bytes()->usize { *IMAGE_BYTES.lock().unwrap() }
 pub(crate) fn with_unallocated_capacity<T>(budget: usize, sample_and_reserve: impl FnOnce(usize) -> Result<T>) -> Result<T> {
     let held = IMAGE_BYTES.lock().unwrap();
     sample_and_reserve(budget.saturating_sub(*held))

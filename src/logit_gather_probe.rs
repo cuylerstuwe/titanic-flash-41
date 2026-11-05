@@ -1,6 +1,6 @@
 //! Isolated raw FP32 logit transport screen. No model arithmetic or serving policy.
 use crate::{collective::Nccl, cuda::Cuda, roce::Roce};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{net::SocketAddr, path::Path};
@@ -13,6 +13,94 @@ fn pattern(index: usize, rank: usize, phase: usize) -> u32 {
     else { (index as u32).wrapping_mul(0x9e3779b9)
         .wrapping_add((rank as u32 + 1).wrapping_mul(0x6d2b79f5))
         .wrapping_add((phase as u32).wrapping_mul(0x85ebca6b)) }
+}
+
+/// Component screen for selecting the final live row from an unchanged head.
+pub fn run_last(rank:usize,endpoint:&str,nonce:&[u8],root:&Path)->Result<Value> {
+    let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;let stream=cuda.stream()?;
+    let mut comm=Roce::local(&cuda,&root.join("roce-v0"),rank)?;
+    comm.attach_gather(&root.join("roce-gather-v1"))?;
+    let mut address:SocketAddr=endpoint.parse()?;
+    let all=crate::rendezvous::exchange_blob(rank,address,nonce,&comm.blob()?)?;
+    comm.connect(&all)?;
+    address.set_port(address.port().checked_add(1).context("last gather ready port")?);
+    ensure!(crate::rendezvous::exchange_blob(rank,address,nonce,b"R")?==b"RRRR",
+        "last gather all peers connected");
+    let mut sum_input=cuda.allocate::<u16>(8)?;
+    sum_input.upload(&vec![half::bf16::from_f32((rank+1)as f32).to_bits();8])?;
+    let mut sum_output=cuda.allocate::<u16>(8)?;
+    let mut records=Vec::new();
+    for rows in [6usize,16,32] {
+        const COLS:usize=32320;
+        const GUARD:usize=16;
+        const CANARY:u32=0x7fc0abcd;
+        let mut input=cuda.allocate::<f32>(rows*COLS)?;
+        let full=cuda.allocate::<f32>(rows*COLS*4)?;
+        let mut guarded=cuda.allocate::<f32>(rows*COLS*4+GUARD*2)?;
+        guarded.upload(&vec![f32::from_bits(CANARY);guarded.len()])?;
+        // This view lives inside its guarded owner for the whole graph bank.
+        let mut last=unsafe{guarded.view(GUARD,rows*COLS*4)}?;
+        input.zero()?;stream.join_default()?;
+        let mut graphs=Vec::new();
+        for live in [1,rows/2+1,rows] {
+            let prefix=unsafe{input.view(0,live*COLS)}?;
+            let mut full_prefix=unsafe{full.view(0,live*COLS*4)}?;
+            unsafe {
+                comm.gather_f32(&prefix,&mut full_prefix,COLS,&stream)?;
+                comm.gather_f32_last(&input,&mut last,COLS,live,&stream)?;
+            }
+            stream.synchronize()?;
+            let baseline=stream.capture(|| {
+                for _ in 0..8 {unsafe{comm.gather_f32(&prefix,&mut full_prefix,COLS,&stream)?;}}
+                Ok(())
+            })?;
+            let selected=stream.capture(|| {
+                for _ in 0..8 {unsafe{comm.gather_f32_last(&input,&mut last,COLS,live,&stream)?;}}
+                Ok(())
+            })?;
+            graphs.push((live,[baseline,selected]));
+        }
+        for phase in 0..2 {
+            input.upload(&(0..input.len()).map(|i|f32::from_bits(pattern(i,rank,phase))).collect::<Vec<_>>())?;
+            stream.join_default()?;
+            for index in if phase==0{[0,1,2]}else{[2,1,0]} {
+                let(live,pair)=&graphs[index];
+                for g in pair {unsafe{g.launch(&stream)?;}}
+                unsafe {comm.sum_bf16(&sum_input,&mut sum_output,&stream)?;}
+                stream.synchronize()?;comm.health()?;
+                ensure!(sum_output.download()?.iter().all(|&x|x==half::bf16::from_f32(10.).to_bits()),
+                    "last gather mixed collective order");
+                let actual=guarded.download()?;let baseline=full.download()?;
+                ensure!(actual[..GUARD].iter().chain(&actual[actual.len()-GUARD..]).all(|x|x.to_bits()==CANARY),
+                    "last gather output canary");
+                for row in 0..rows {for source in 0..4 {for col in 0..COLS {
+                    let i=(row*4+source)*COLS+col;
+                    let expected=if row+1==*live{pattern(row*COLS+col,source,phase)}else{0};
+                    ensure!(actual[GUARD+i].to_bits()==expected,"last gather bit/zero contract");
+                    if row+1==*live {ensure!(baseline[i].to_bits()==expected,"last/full row mismatch");}
+                }}}
+                let mut timings=Vec::new();
+                for repeat in 0..2 {
+                    let order=if repeat==0{[0,1]}else{[1,0]};let mut milliseconds=[0f32;2];
+                    for variant in order {
+                        unsafe{comm.sum_bf16(&sum_input,&mut sum_output,&stream)?;}
+                        for _ in 0..2 {unsafe{pair[variant].launch(&stream)?;}}
+                        stream.synchronize()?;
+                        let start=cuda.event()?;let end=cuda.event()?;start.record(&stream)?;
+                        for _ in 0..8 {unsafe{pair[variant].launch(&stream)?;}}
+                        end.record(&stream)?;milliseconds[variant]=end.elapsed_since(&start)?/64.;
+                        comm.health()?;
+                    }
+                    timings.push(json!({"order":order,"milliseconds":milliseconds}));
+                }
+                records.push(json!({"rows":rows,"live":live,"phase":phase,"all_exact":true,
+                    "unused_rows_zero":true,"guards_intact":true,"timings":timings}));
+            }
+        }
+        eprintln!("rank{rank} last-row gather M{rows} exact");
+    }
+    Ok(json!({"rank":rank,"all_exact":true,"records":records,
+        "scope":"Existing raw FP32 head rows; same transport and precision. One-row gather plus full output zeroing versus live-prefix gather; changing live counts and source bytes, guarded output and mixed collective order. Component only."}))
 }
 
 /// Keep the identical primitive and protocol, varying only its launch grid.

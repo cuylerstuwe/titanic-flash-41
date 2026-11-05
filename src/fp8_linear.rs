@@ -17,6 +17,8 @@ pub use paired::native_probe as paired_shared_up_probe;
 mod paired_qkv;
 pub(crate) use paired_qkv::PairedQkv;
 pub use paired_qkv::native_probe as paired_qkv_probe;
+#[path = "fp8_prepared_dense.rs"]
+mod prepared_dense;
 #[derive(Clone,Copy)]
 struct PrefillRows { live:usize, capacity:usize, stream:usize, dense:bool, experts:bool }
 thread_local! {
@@ -32,7 +34,7 @@ impl LivePrefillRowsScope {
         LIVE_PREFILL_ROWS.with(|slot|->Result<()> {
             ensure!(slot.get().is_none(),"nested dense live-row scope");
             if dense || experts {
-                ensure!((capacity==128 && live<=64)
+                ensure!((capacity==128 && (17..128).contains(&live))
                     || (capacity==512 && (129..512).contains(&live))
                     || (capacity==1024 && (513..1024).contains(&live)),
                     "qualified short or partial prefill row geometry");
@@ -123,6 +125,7 @@ pub struct Linear {
     backend: Backend,
     quant: usize,
     dense: usize,
+    prepared_dense: Option<prepared_dense::PreparedDense>,
     values: Buffer<u8>,
     scale_rows: Option<Buffer<u8>>,
     scale_mma: Buffer<u8>,
@@ -183,6 +186,12 @@ fn pipeline_fenced_root(root: &Path) -> Result<Option<std::path::PathBuf>> {
     let enabled = enabled && (name != "fp8-shared-w13-r0-m6-v1"
         || pipeline_flag("CANADA_SCRATCH_SHARED_PIPELINE_FENCE")?);
     if !enabled { return Ok(None); }
+    // Qualified only for these two QKV schedules. Preserve the explicit
+    // consumer control for paired diagnostics; other dense fences stay put.
+    if matches!(name,"fp8-split-qkv-m6-v1"|"fp8-split-qkv-m16-v1")
+        &&!pipeline_flag("CANADA_SCRATCH_QKV_PRODUCER_FENCE")? {
+        return Ok(Some(root.with_file_name(format!("{name}-pipeline-fence-v1"))));
+    }
     static BUNDLES: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
     let bundles = BUNDLES.get_or_init(|| {
         serde_json::from_str(include_str!("dense_pipeline_fence_bundles.json"))
@@ -395,6 +404,40 @@ impl Linear {
         alpha.upload(&[1.])?;
         let mut output = cuda.allocate_rows::<bf16>(g.rows * matrix.n)?;
         output.zero()?;
+        // Only the dense consumer changes. Preserve native padding, quantizer
+        // buffers and fused producers. Resolve control at owner construction;
+        // replayed graphs contain no flag lookup or host dispatch.
+        let prepared_dense=if matches!(g.rows,6|16)
+            &&(matrix.n,matrix.k,matrix.padded_k)==(5120,576,640) {
+            let enabled=match std::env::var("CANADA_SCRATCH_SHARED_DOWN_FLASH") {
+                Ok(v)=>{ensure!(v=="0"||v=="1","prepared shared down flag");v=="1"},
+                // Native-producer M6 passed two all-rank screens: short-live
+                // verification improved, full-live was essentially flat.
+                // M16 showed no meaningful model gain and stays opt-in.
+                Err(std::env::VarError::NotPresent)=>g.rows==6&&matches!(m.backend,Backend::B12x),
+                Err(e)=>return Err(e.into()),
+            };
+            if enabled||std::env::var("CANADA_SCRATCH_SHARED_DOWN_FLASH_SCREEN").as_deref()==Ok("1") {
+                ensure!(matches!(m.backend,Backend::B12x)
+                    // The qualified legacy M6 bundle predates explicit policy
+                    // metadata; load_shared already admits its known shape.
+                    // Its exact padded operands/outputs passed the M6 screen.
+                    &&g.dense_policy.as_ref().map_or(g.rows==6,
+                        |p|p.split_k_slices==1&&!p.split_k_atomic_bf16&&!p.output_clear),
+                    "prepared shared down needs the unchanged native producer");
+                Some(prepared_dense::PreparedDense::open(cuda,root.parent().context("kernel parent")?,g.rows,enabled)?)
+            }else{None}
+        }else if g.rows==16&&(matrix.n,matrix.k,matrix.padded_k)==(4096,1280,1280)
+            &&root.file_name().and_then(|n|n.to_str()).is_some_and(|n|n.starts_with("fp8-index-q-m16-v1")) {
+            let enabled=match std::env::var("CANADA_SCRATCH_INDEX_QUERY_FLASH") {
+                Ok(v)=>{ensure!(v=="0"||v=="1","prepared index query flag");v=="1"},
+                Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
+            };
+            if enabled||std::env::var("CANADA_SCRATCH_INDEX_QUERY_FLASH_SCREEN").as_deref()==Ok("1") {
+                ensure!(matches!(m.backend,Backend::B12x),"index query needs its unchanged native producer");
+                Some(prepared_dense::PreparedDense::open_index_query(cuda,root.parent().context("kernel parent")?,enabled)?)
+            }else{None}
+        }else{None};
         Ok(Self {
             cuda: cuda.clone(),
             stream: Cell::new(0),
@@ -404,6 +447,7 @@ impl Linear {
             backend: m.backend,
             quant,
             dense,
+            prepared_dense,
             values,
             scale_rows,
             scale_mma,
@@ -429,6 +473,25 @@ impl Linear {
             && self.geometry.rows==16 && other.geometry.rows==16
             && (self.matrix.n,self.matrix.k)==(448,5120) && Rc::ptr_eq(&self.matrix,&other.matrix)
             && self.narrow_projection()!=other.narrow_projection(),"alternate QKV identity");
+        std::mem::swap(self,other);Ok(())
+    }
+    pub(crate) fn producer_qkv_for_probe(&self,kernels:&Path)->Result<Self> {
+        ensure!(std::env::var("CANADA_SCRATCH_QKV_FENCE_SCREEN").as_deref()==Ok("1")
+            && matches!(self.geometry.rows,6|16) && (self.matrix.n,self.matrix.k)==(448,5120)
+            && matches!(self.backend,Backend::B12x),"isolated QKV producer fence geometry");
+        let result=Self::load_shared(&self.cuda,&kernels.join(format!(
+            "fp8-split-qkv-m{}-v1-producer-fence-v1",self.geometry.rows)),self.matrix.clone())?;
+        ensure!(matches!(result.backend,Backend::B12x)&&result.geometry.rows==self.geometry.rows,
+            "QKV fence alternate changed backend/rows");Ok(result)
+    }
+    pub(crate) fn swap_qkv_fence_for_probe(&mut self,other:&mut Self)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_QKV_FENCE_SCREEN").as_deref()==Ok("1")
+            && matches!(self.geometry.rows,6|16)&&self.geometry.rows==other.geometry.rows
+            && matches!(self.backend,Backend::B12x)&&matches!(other.backend,Backend::B12x)
+            && (self.matrix.n,self.matrix.k)==(448,5120)&&Rc::ptr_eq(&self.matrix,&other.matrix),
+            "QKV fence alternate canonical identity");
+        // Caller synchronizes and destroys referencing graphs first. Keep the
+        // alternate alive so neither library nor workspace can be released early.
         std::mem::swap(self,other);Ok(())
     }
     pub(crate) fn legacy_shared_up_for_probe(&self,kernels:&Path)->Result<Self> {
@@ -623,6 +686,16 @@ impl Linear {
         self.stream.set(raw);
         Ok(())
     }
+    /// Share immutable WKV weights while keeping auxiliary-stream quantization
+    /// and output storage independent of the ordinary captured graph.
+    pub(crate) fn fork_engram_projection_for_probe(&self,kernels:&Path)->Result<Self> {
+        ensure!((std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_M3").as_deref()==Ok("1"))
+            &&matches!(self.geometry.rows,6|16)&&self.geometry.in_features==6144
+            &&self.geometry.out_features==6400,"isolated Engram WKV binding");
+        self.cuda.without_row_arena(||Self::load_shared(&self.cuda,
+            &kernels.join(format!("fp8-engram-wkv-m{}-v2",self.geometry.rows)),self.matrix.clone()))
+    }
     /// The isolated full-model schedule screen has synchronized its old parent
     /// (including joined auxiliary work) and destroyed every referencing graph.
     /// Only then may these same owned buffers be rebound for the next capture.
@@ -638,6 +711,10 @@ impl Linear {
     }
     unsafe fn launch_dense(&self, values: u64, scales: u64, stream: &Stream) -> Result<()> {
         self.guard_stream(stream)?;
+        if let Some(dense)=self.prepared_dense.as_ref().filter(|d|d.enabled()) {
+            return unsafe{dense.launch(values,self.matrix.values(),scales,self.matrix.scales(),
+                self.output.ptr(),self.alpha.ptr(),stream)};
+        }
         if self
             .geometry
             .dense_policy
@@ -680,6 +757,21 @@ impl Linear {
             LIVE_PREFILL_ROWS.with(|slot|slot.get().filter(|p|p.dense && p.capacity==self.geometry.rows
                 && p.stream==stream.raw()as usize).map_or(self.geometry.rows,|p|p.live))
         }else{self.geometry.rows}
+    }
+    pub(crate) fn set_shared_down_flash_for_probe(&self,enabled:bool)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_SHARED_DOWN_FLASH_SCREEN").as_deref()==Ok("1")
+            &&matches!(self.geometry.rows,6|16)
+            &&(self.matrix.n,self.matrix.k,self.matrix.padded_k)==(5120,576,640),
+            "isolated prepared shared down consumer");
+        self.prepared_dense.as_ref().context("prepared shared down was not loaded")?.set_for_probe(enabled);
+        Ok(())
+    }
+    pub(crate) fn set_index_query_flash_for_probe(&self,enabled:bool)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_INDEX_QUERY_FLASH_SCREEN").as_deref()==Ok("1")
+            &&self.geometry.rows==16&&(self.matrix.n,self.matrix.k,self.matrix.padded_k)==(4096,1280,1280),
+            "isolated prepared index query consumer");
+        self.prepared_dense.as_ref().context("prepared index query was not loaded")?.set_for_probe(enabled);
+        Ok(())
     }
     /// Safety: input addresses exactly rows*K BF16 values; keep them alive and
     /// unmodified until the stream/any captured graph completes.

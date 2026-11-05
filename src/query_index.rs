@@ -125,6 +125,9 @@ pub struct Branch {
     key_splits: u32,
 }
 impl Branch {
+    pub(crate) fn set_query_flash_for_probe(&self,enabled:bool)->Result<()> {
+        self.q.set_index_query_flash_for_probe(enabled)
+    }
     pub(crate) fn has_key_sharded(&self)->bool {self.key_sharded.is_some()}
     pub(crate) fn has_key_sharded_publisher(&self)->bool {self.key_sharded.as_ref().is_some_and(|p|p.block_ids().is_some())}
     pub(crate) fn key_sharded_active(&self)->bool {self.key_sharded_active.get()}

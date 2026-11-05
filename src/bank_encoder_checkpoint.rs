@@ -32,19 +32,26 @@ impl Target {
     /// Optional storage is voted on before allocation and before any snapshot
     /// copy. No model arithmetic or target frontier is changed.
     pub(crate) fn try_save_committed_bank_encoder(&self,budget:usize,reserve:usize,
+        recycled:Option<crate::state_image::Image>,
         comm:&Roce,stream:&Stream,admit:&mut impl FnMut(bool)->Result<bool>)
         ->Result<Option<EncoderPrefixImage>> {
         ensure!(crate::config::bank_encoder_checkpoint_requested()&&encoder_checkpoint_enabled()
             &&self.rows==128&&self.history.position>=256,"committed bank encoder snapshot admission");
         self.state_image_guard(comm,stream)?;
-        let required=reserve.checked_add(budget).ok_or_else(||anyhow::anyhow!("bank snapshot byte overflow"))?;
+        let reused=recycled.as_ref().map_or(0,crate::state_image::Image::bytes);
+        ensure!(recycled.is_none()||reused==budget,"bank snapshot recycled storage extent");
+        let required=reserve.checked_add(budget-reused).ok_or_else(||anyhow::anyhow!("bank snapshot byte overflow"))?;
         if !admit(self.cuda.admission_memory()?.admitted_available>=required)?{return Ok(None);}
         let regions=self.state_image_regions_for_layers_mode(self.history.position as usize,true,true,true)?;
-        let mut allocation=crate::state_image::Image::try_allocate(&self.cuda,&regions,budget,stream)?;
+        let mut allocation=match recycled {
+            Some(retired)=>retired.try_recycle(&regions,budget,stream)?,
+            None=>crate::state_image::Image::try_allocate(&self.cuda,&regions,budget,stream)?,
+        };
         if !admit(allocation.is_some()&&self.cuda.admission_memory()?.admitted_available>=reserve)? {
             return Ok(None);
         }
         let mut image=allocation.take().ok_or_else(||anyhow::anyhow!("all-rank bank snapshot admission differs"))?;
+        image.configure_copy_kernel(self.io.core_module())?;
         stream.synchronize()?;comm.health()?;self.lease.begin()?;
         ensure!(self.encoder_cache.as_ref().unwrap().error()?==0,"committed bank encoder snapshot fault");
         image.save(&regions,stream)?;comm.health()?;self.lease.finish_read()?;
@@ -65,6 +72,7 @@ impl Target {
             "bank encoder snapshot requires complete committed prefill");
         let regions=self.state_image_regions_for_layers_mode(self.history.position as usize,true,true,retained)?;
         let mut image=crate::state_image::Image::allocate(&self.cuda,&regions,budget,stream)?;
+        image.configure_copy_kernel(self.io.core_module())?;
         stream.synchronize()?;comm.health()?;self.lease.begin()?;
         ensure!(self.encoder_cache.as_ref().unwrap().error()?==0,"bank encoder snapshot fault");
         image.save(&regions,stream)?;comm.health()?;self.lease.finish_read()?;

@@ -1,7 +1,7 @@
 # Reproducing the published single-stream comparison
 
-The current source release and README benchmark are s1291 (November 4).
-Historical s1173 and s986 measurements remain separately labeled below.
+The current source release and README benchmark are s1329 (November 4).
+Historical native s1291, s1173 and s986 measurements remain separately labeled below.
 
 Run on the **head node**, against its direct loopback endpoint, with no other requests. Use a freshly started model process if measuring the first uncached long prompt. Do not route through a remote client or proxy.
 
@@ -23,7 +23,30 @@ The original decode formula is `(completion_tokens - 1) / (last_content_delta_ti
 
 The README's first-long-prompt TTFT is the initial 131K prose warmup, not the median of later cached requests. The later trials benefit from prefix reuse. Uncached TTFT includes work outside GPU prefill; report it separately from server prefill timing.
 
-## Current s1291 pass — November 4
+## Current s1329 portable pass — November 4
+
+All 24 requests completed on the first model load after a four-device reboot, against the head's loopback endpoint. The 2350 MHz cap and Spark APST policy remained active. Ordinary serving, cache/timing, synthetic-image and incremental-context checks preceded the benchmark; none populated its long prompt. Existing validated weight atlases were used. Bounded diagnostic container logs were enabled for this qualification run; normal serving defaults to logging disabled.
+
+| Context | Workload | Earlier native s1291 | Portable s1329 | Change |
+|---|---|---:|---:|---:|
+| Clean | Code | 118.1 | 121.0 | +2.4% |
+| Clean | Prose | 63.7 | 65.5 | +2.8% |
+| Clean | Prose 2 | 60.4 | 62.4 | +3.2% |
+| ~131K | Code | 109.2 | 111.9 | +2.4% |
+| ~131K | Prose | 61.0 | 62.8 | +2.9% |
+| ~131K | Prose 2 | 57.1 | 58.6 | +2.6% |
+
+All throughput values are median tokens/second from three 512-token trials. The first uncached ~131K TTFT was **20.99 s**, versus **21.27 s** in the earlier native s1291 pass. [Full results](../benchmarks/results-2026-11-04-s1329.json) include ranges, settings and measured-build hashes; [all 24 samples](../benchmarks/samples-2026-11-04-s1329.json) retain token counts, output hashes and timings without generated text. These historical differences mix build, continuation and boot differences; they are not an isolated estimate of optimization effects.
+
+Against the older s986 observations, long-context code remains 1.8% lower and prose 2 0.4% lower. Target attention precision, drafting policy and continuations differ from that older release, so these residual historical gaps are not a controlled regression measurement. The original s986 results remain below.
+
+Two earlier portable starts failed before serving because the package omitted a MoE kernel enabled by default in Rust. Two diagnostic logging-configuration attempts also failed before GPU startup. The missing unchanged dependency and a preflight check were added. All attempts were cleaned up, followed by a fresh four-device reboot before this complete pass. No benchmark request ran in the failed attempts, and no score-based retry or per-row best-of selection occurred.
+
+After this completed pass, the wrapper timed out stopping rank 0; fallback cleanup recovered all four devices without kernel or guard errors. Container init, concurrent rank stop and a longer GPU-teardown timeout corrected the lifecycle path, which passed a separate fresh-boot startup/request/shutdown check with normal logging disabled. The inference executable, kernels and profile are unchanged; the benchmark was not repeated for this correction.
+
+The separate native comparison at **temperature 1 / top-p 1 / high reasoning** is more directly relevant to recommended use: eight matching continuations were **3.59%** and **3.38%** faster in opposite fresh-boot launch orders, while ~131K prefill stayed within 0.12%. [Paired records](../benchmarks/release-comparison-s1329.json) preserve changed trajectories, including a copy outcome that took longer after emitting more tokens. Neither this small panel nor the greedy table establishes general task-time or quality superiority.
+
+## Historical native s1291 pass — November 4
 
 Measured 07:11–07:14 Pacific on the installed native s1291 release, using the first model load after all four GB10s rebooted. All 24 requests completed with no model restart, worker timeout, or concurrent inference traffic. The 2350 MHz maximum-clock policy and Spark APST policy stayed active. Startup warmup and two short operational requests preceded the benchmark.
 
@@ -42,7 +65,7 @@ All throughput values are medians in tokens/second, with three 512-token trials 
 
 The generation differences from s1173 are small (0.1–0.8%); this pass does not establish a general speed improvement. Long-context code and prose 2 remain 4.1% and 2.9% below the historical s986 observations. Those historical gaps remain unresolved; this run does not isolate their cause.
 
-[Full results](../benchmarks/results-2026-11-04.json) record hashes, all ranges, settings and run accounting. [All 24 completed samples](../benchmarks/samples-2026-11-04.json) include token counts, timing and output hashes without generated text. README scores all come from this one complete pass; lower results are retained. Historical runs were not repeated, and differences in implementation, continuations and host state prevent treating these changes as isolated optimization effects. This benchmark exercised the installed native engine; it does not requalify the portable Arm64 build or deployment wrapper.
+[Full results](../benchmarks/results-2026-11-04.json) record hashes, all ranges, settings and run accounting. [All 24 completed samples](../benchmarks/samples-2026-11-04.json) include token counts, timing and output hashes without generated text. The earlier s1291 table used this one complete pass; lower results are retained. Historical runs were not repeated, and differences in implementation, continuations and host state prevent treating these changes as isolated optimization effects. This benchmark exercised the installed native engine; it does not requalify the portable Arm64 build or deployment wrapper.
 
 ## Historical s1173 post-reboot pass — November 1
 

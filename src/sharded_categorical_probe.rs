@@ -27,6 +27,12 @@ pub(crate) struct CompactSampler {
     staged_inputs:Option<std::rc::Rc<crate::cuda::MetadataStaging>>,
 }
 struct LocalProbabilities { normalized:Buffer<f64>, selected:Buffer<f64> }
+pub(crate) struct DeferredProbabilities<'a> {
+    pub(crate) logits:&'a Buffer<f32>,
+    pub(crate) maxima:&'a Buffer<f32>,
+    pub(crate) normalized:&'a Buffer<f64>,
+    pub(crate) errors:&'a Buffer<u32>,
+}
 impl CompactSampler {
     pub(crate) fn bind_rank(&mut self,rank:usize)->Result<()> {
         ensure!(rank<4&&(self.rank==rank||self.graph.is_none()),"compact target rank binding");self.rank=rank;Ok(())
@@ -75,14 +81,27 @@ impl CompactSampler {
         ensure!(proposals.len()>=self.rows&&probabilities.len()>=self.rows*VOCAB
             &&self.cuda.owns_buffer(proposals)&&self.cuda.owns_buffer(probabilities)
             &&self.local_probabilities.is_some(),"compact local probability storage");
-        self.enqueue_inner(local,temperature,comm,stream,Some((proposals.ptr(),probabilities.ptr())),false)
+        self.enqueue_inner(local,temperature,comm,stream,Some((proposals.ptr(),probabilities.ptr())),false,false)
     }
     pub(crate) fn enqueue_deferred_probabilities(&mut self,local:&Buffer<f32>,proposals:&Buffer<i32>,
         probabilities:&Buffer<f64>,temperature:f32,comm:&Roce,stream:&Stream)->Result<()> {
         ensure!(proposals.len()>=self.rows&&probabilities.len()>=self.rows*VOCAB
             &&self.cuda.owns_buffer(proposals)&&self.cuda.owns_buffer(probabilities)
             &&self.local_probabilities.is_some(),"deferred compact probability storage");
-        self.enqueue_inner(local,temperature,comm,stream,Some((proposals.ptr(),probabilities.ptr())),true)
+        self.enqueue_inner(local,temperature,comm,stream,Some((proposals.ptr(),probabilities.ptr())),true,false)
+    }
+    pub(crate) fn enqueue_deferred_factors(&mut self,local:&Buffer<f32>,proposals:&Buffer<i32>,
+        probabilities:&Buffer<f64>,comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(self.fused_controls&&proposals.len()>=self.rows&&probabilities.len()>=self.rows*VOCAB
+            &&self.cuda.owns_buffer(proposals)&&self.cuda.owns_buffer(probabilities)
+            &&self.local_probabilities.is_some(),"deferred target factors storage");
+        self.enqueue_inner(local,1.,comm,stream,Some((proposals.ptr(),probabilities.ptr())),true,true)
+    }
+    pub(crate) fn deferred_probabilities<'a>(&'a self,logits:&'a Buffer<f32>)->Result<DeferredProbabilities<'a>> {
+        ensure!(self.fused_controls&&logits.len()==self.rows*COLS&&self.cuda.owns_buffer(logits),
+            "deferred probability input extent/context");
+        let local=self.local_probabilities.as_ref().ok_or_else(||anyhow::anyhow!("target factors not prepared"))?;
+        Ok(DeferredProbabilities{logits,maxima:&self.maxima,normalized:&local.normalized,errors:&self.errors})
     }
     pub(crate) fn captures(&self)->usize {self.captures}
     pub(crate) fn sample(&mut self,local:&Buffer<f32>,seed:u64,position:u64,comm:&Roce,stream:&Stream)->Result<Vec<u32>> {
@@ -105,10 +124,10 @@ impl CompactSampler {
         Ok(ids.into_iter().map(|id|id as u32).collect())
     }
     fn enqueue(&mut self,local:&Buffer<f32>,temperature:f32,comm:&Roce,stream:&Stream)->Result<()> {
-        self.enqueue_inner(local,temperature,comm,stream,None,false)
+        self.enqueue_inner(local,temperature,comm,stream,None,false,false)
     }
     fn enqueue_inner(&mut self,local:&Buffer<f32>,temperature:f32,comm:&Roce,stream:&Stream,
-        probabilities:Option<(u64,u64)>,defer_ids:bool)->Result<()> {
+        probabilities:Option<(u64,u64)>,defer_ids:bool,defer_probabilities:bool)->Result<()> {
         ensure!(local.len()==self.rows*COLS&&temperature.is_finite()&&temperature>0.
             &&self.cuda.owns_buffer(local)&&self.cuda.owns_stream(stream)&&comm.rank()==self.rank,"compact local logits");
         let (mut input,mut packed,mut rank,mut temp)=(local.ptr(),self.packed.ptr(),self.rank as i32,temperature);
@@ -155,8 +174,10 @@ impl CompactSampler {
             let(mut normalized,mut selected,mut rows)=(extra.normalized.ptr(),extra.selected.ptr(),self.rows as i32);
             if !fused{launch!(self.module,"ca_target_local_factors",[self.rows as u32,1,1],stream;
                 gathered,maxima,normalization,factors,proposals,errors,normalized,p,selected,temp)?;}
-            launch!(self.module,"ca_target_local_probabilities",[127,self.rows as u32,1],stream;
-                input,maxima,normalized,errors,p,rank,rows,temp)?;
+            if !defer_probabilities {
+                launch!(self.module,"ca_target_local_probabilities",[127,self.rows as u32,1],stream;
+                    input,maxima,normalized,errors,p,rank,rows,temp)?;
+            }
         }
         // The sharded block can carry these IDs/errors in its residual wire,
         // then resolve the original output buffers before final readout.

@@ -22,7 +22,7 @@ impl ActiveRowsScope {
             ensure!(slot.get().is_none(),"nested mHC live-row scope");
             if enabled {
                 ensure!(capacity==6&&(1..=6).contains(&live)
-                    ||capacity==128&&(17..=64).contains(&live)
+                    ||capacity==128&&(17..128).contains(&live)
                     ||capacity==512&&(129..512).contains(&live),"mHC live-row geometry");
                 ensure!(!normalize||capacity>=128,"live normalization is prefill-only");
                 slot.set(Some((live,capacity,stream.raw()as usize,normalize)));

@@ -18,6 +18,10 @@ pub(crate) struct Plan {
     pub limit: usize,
     pub previous: usize,
     pub reuse: bool,
+    /// The client replaces/regenerates a naturally completed output while
+    /// retaining its exact input. Only an optional displaced-output copy may
+    /// be skipped; this does not authorize any different GPU prefix reuse.
+    pub replaces_completed_output: bool,
     pub prompt: Vec<u32>,
     pub media: MediaIdentity,
 }
@@ -53,6 +57,7 @@ pub(crate) struct ResidentHistory {
     media: MediaIdentity,
     pending: Option<u32>,
     phase: Phase,
+    completed_prompt_tokens: Option<usize>,
 }
 
 impl ResidentHistory {
@@ -71,6 +76,7 @@ impl ResidentHistory {
             media: MediaIdentity::default(),
             pending: None,
             phase: Phase::Idle,
+            completed_prompt_tokens: None,
         })
     }
     pub fn prepare(&mut self, id: u64, prompt: Vec<u32>, limit: usize, seed: u64) -> Result<Plan> {
@@ -98,6 +104,9 @@ impl ResidentHistory {
         let previous = self.committed.len();
         let reuse = previous > 0 && prompt.len() > previous && prompt.starts_with(&self.committed)
             && media.matches_prefix(&self.media, previous);
+        let replaces_completed_output = !reuse && self.completed_prompt_tokens.is_some_and(|n|
+            n < previous && prompt.starts_with(&self.committed[..n])
+            && media.matches_prefix(&self.media,n));
         // The final emitted anchor was never in KV. The incoming prompt may
         // include it or replace it; only committed IDs govern reusable state.
         let plan = Plan {
@@ -106,6 +115,7 @@ impl ResidentHistory {
             limit,
             previous,
             reuse,
+            replaces_completed_output,
             prompt,
             media,
         };
@@ -116,6 +126,7 @@ impl ResidentHistory {
             limit,
         };
         self.last_id = id;
+        self.completed_prompt_tokens = None;
         Ok(plan)
     }
     /// Record a committed partial prompt without emitting its temporary anchor.
@@ -250,6 +261,10 @@ impl ResidentHistory {
             },
             "backend completion reason contradicts committed state"
         );
+        self.completed_prompt_tokens = if reason == Finish::Stop {
+            Some(self.committed.len().checked_sub(emitted - 1)
+                .ok_or_else(||anyhow::anyhow!("completed request input extent"))?)
+        } else { None };
         self.phase = Phase::Idle;
         Ok(())
     }
@@ -317,6 +332,42 @@ impl ResidentHistory {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_replaced_naturally_finished_output_is_an_optional_copy_hint() {
+        let finished=|reason| {
+            let mut h=ResidentHistory::new(128,1).unwrap();
+            h.prepare(1,vec![2,3],3,7).unwrap();h.prefilled(2,10).unwrap();
+            h.committed_step(&[10,11],if reason==Finish::Stop{1}else{12},4).unwrap();
+            h.finish(reason).unwrap();h
+        };
+        for prompt in [vec![2,3],vec![2,3,10,55,7]] {
+            let p=finished(Finish::Stop).prepare(2,prompt,3,8).unwrap();
+            assert!(!p.reuse&&p.replaces_completed_output);
+        }
+        let p=finished(Finish::Stop).prepare(2,vec![2,3,10,11,1,7],3,8).unwrap();
+        assert!(p.reuse&&!p.replaces_completed_output);
+        for reason in [Finish::Length,Finish::Cancelled] {
+            assert!(!finished(reason).prepare(2,vec![2,3,10,55,7],3,8).unwrap().replaces_completed_output);
+        }
+        assert!(!finished(Finish::Stop).prepare(2,vec![2,4,10,55],3,8).unwrap().replaces_completed_output);
+    }
+    #[test]
+    fn completed_output_hint_respects_media_identity_and_request_ownership() {
+        use crate::prompt_media::IMAGE_TOKEN as I;
+        let prompt=vec![2,I,I,I,3];let identity=media(&prompt,1);
+        let mut h=ResidentHistory::new(128,1).unwrap();
+        h.prepare_with_media(1,prompt.clone(),identity.clone(),3,7).unwrap();
+        h.prefilled(5,10).unwrap();h.committed_step(&[10,11],1,7).unwrap();
+        let saved=h.clone();h.suspend().unwrap();
+        assert!(!h.prepare_with_media(2,prompt.clone(),identity.clone(),3,8).unwrap().replaces_completed_output);
+        h.prefilled(5,15).unwrap();h.finish(Finish::Cancelled).unwrap();
+        h.resume(&saved).unwrap();h.finish(Finish::Stop).unwrap();
+        let mut different=h.clone();
+        assert!(!different.prepare_with_media(3,prompt.clone(),media(&prompt,2),3,9).unwrap().replaces_completed_output);
+        assert!(h.prepare_with_media(3,prompt.clone(),identity,3,9).unwrap().replaces_completed_output);
+        h.partial_prefilled(1,15).unwrap();h.finish(Finish::Cancelled).unwrap();
+        assert!(!h.prepare(4,vec![2,5],1,10).unwrap().replaces_completed_output);
+    }
     fn media(prompt: &[u32], key: u8) -> MediaIdentity {
         use crate::prompt_media::{ImageKey, Placement};
         MediaIdentity::new(vec![Placement { start:1, tokens:3,

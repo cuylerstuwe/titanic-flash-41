@@ -360,11 +360,14 @@ pub struct LayerFfn {
     shared_up: Linear,
     shared_down: Linear,
     shared_quant: Option<Module>,
+    fused_sum: Option<Module>,
+    fused_sum_enabled: Cell<bool>,
     activation: Buffer<bf16>,
     output: Buffer<bf16>,
     rows: usize,
     shared_branch: Option<SharedBranch>,
     prefetch: Option<crate::l2_prefetch::Window>,
+    expert_prefetch: Option<crate::l2_prefetch::Window>,
     row_transport: Option<RowTransport>,
     use_row_transport: bool,
 }
@@ -520,18 +523,27 @@ impl LayerFfn {
         } else {
             None
         };
-        let prefetch = if rows <= 8 && !id.is_draft() && crate::l2_prefetch::enabled() {
+        let prefetch = if !id.is_draft() && crate::l2_prefetch::enabled_for_rows(rows,1)? {
             let router_key = format!("{}.ffn.gate.weight", id.prefix());
+            let chunk=if rows==6&&crate::config::ffn_fine_hint_requested()? {2048}else{16384};
             Some(crate::l2_prefetch::Window::new(
                 cuda,
                 module,
                 stream,
                 vec![shared_up.immutable_matrix(), shared_down.immutable_matrix()],
                 Some((weights.clone(), &router_key)),
-            )?)
+            )?.with_chunk(chunk)?)
         } else {
             None
         };
+        let fused_sum_requested=match std::env::var("CANADA_SCRATCH_FFN_SUM_SHARED") {
+            Ok(v)=>{ensure!(v=="0"||v=="1","invalid fused FFN sum policy");v=="1"},
+            Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
+        };
+        let fused_sum=if !id.is_draft()&&matches!(rows,6|16|32)
+            &&(fused_sum_requested||std::env::var("CANADA_SCRATCH_FFN_SUM_SHARED_SCREEN").as_deref()==Ok("1")) {
+            module.function("ca_ffn_sum_shared")?;Some(module.clone())
+        }else{None};
         Ok(Self {
             cuda: cuda.clone(),
             native,
@@ -540,11 +552,14 @@ impl LayerFfn {
             shared_up,
             shared_down,
             shared_quant,
+            fused_sum,
+            fused_sum_enabled:Cell::new(fused_sum_requested),
             activation: cuda.allocate_rows(rows * 576)?,
             output: cuda.allocate_rows(rows * 5120)?,
             rows,
             shared_branch,
             prefetch,
+            expert_prefetch: None,
             row_transport: None,
             use_row_transport: false,
         })
@@ -630,13 +645,43 @@ impl LayerFfn {
         self.add_shared(workspace,stream)
     }
     pub(crate) fn prefetch_begin(&self, stream: &Stream) -> Result<()> {
+        // Queue the small expert hint first. Its early join must not wait for
+        // the existing dense-weight hint's deliberately later consumer.
+        if let Some(hint)=&self.expert_prefetch {hint.begin(stream)?;}
         if let Some(hint) = &self.prefetch {
             hint.begin(stream)?;
         }
         Ok(())
     }
+    pub(crate) fn set_expert_prefetch_for_probe(&mut self,module:&Module,stream:&Stream,
+        selected:Option<usize>)->Result<()> {
+        ensure!(self.rows==6&&!self.use_row_transport
+            &&std::env::var("CANADA_SCRATCH_EXPERT_PREFETCH_SCREEN").as_deref()==Ok("1"),
+            "expert hint requires finite ordinary M6 owner");
+        self.expert_prefetch=selected.map(|e|self.expert.prefetch_window_for_probe(&self.cuda,module,stream,e)).transpose()?;
+        Ok(())
+    }
     pub(crate) fn schedule_flags(&self)->(bool,bool) {
         (self.shared_branch.is_some(),self.prefetch.is_some())
+    }
+    pub(crate) fn prefetch_chunk(&self)->Option<u32> {
+        self.prefetch.as_ref().map(crate::l2_prefetch::Window::chunk)
+    }
+    pub(crate) fn set_wide_hint_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        self.prefetch.as_mut().context("wide FFN hint was not prepared")?
+            .set_enabled_for_wide_probe(enabled,stream)
+    }
+    pub(crate) fn set_prefetch_chunk_for_probe(&mut self,chunk:u32,stream:&Stream)->Result<()> {
+        self.prefetch.as_mut().ok_or_else(||anyhow::anyhow!("FFN hint is not installed"))?
+            .set_chunk_for_probe(chunk,stream)
+    }
+    pub(crate) fn set_prefetch_region_for_probe(&mut self,mode:u32,stream:&Stream)->Result<()> {
+        self.prefetch.as_mut().ok_or_else(||anyhow::anyhow!("FFN hint is not installed"))?
+            .set_region_plan_for_probe(mode,stream)
+    }
+    pub(crate) fn set_prefetch_budget_for_probe(&mut self,budget:usize,stream:&Stream)->Result<()> {
+        self.prefetch.as_mut().ok_or_else(||anyhow::anyhow!("FFN hint is not installed"))?
+            .set_budget_for_probe(budget,stream)
     }
     pub(crate) fn prefetch_join(&self, stream: &Stream) -> Result<()> {
         if let Some(hint) = &self.prefetch {
@@ -655,6 +700,9 @@ impl LayerFfn {
     }
     pub(crate) fn run_quantized_input(&self,workspace:&Workspace,input:&Buffer<bf16>,
         quantized:Option<(&Buffer<u8>,&Buffer<u8>)>,tokens:&TokenRows,stream:&Stream)->Result<()> {
+        // The measured overlap window is the real attention reduction and
+        // residual/normalization work. No hint can extend beyond this join.
+        if let Some(hint)=&self.expert_prefetch {hint.join(stream)?;}
         // DeepseekV2MoE.forward_normal_dual_stream: fork before routing, issue
         // routed work first, then issue the shared branch. CUDA graph issue
         // order matters even when the dependency DAG is mathematically equal.
@@ -666,12 +714,13 @@ impl LayerFfn {
             branch.input_ready.record(stream)?;
         }
         self.router.run(input, tokens, stream)?;
-        workspace.run_live(
+        let deferred=workspace.run_live_for_ffn(
             &self.expert,
             input,
             self.router.ids(),
             self.router.routing(),
             tokens.active_rows(),
+            self.fused_sum.is_some()&&self.fused_sum_enabled.get(),
             stream,
         )?;
         if let Some(branch) = &self.shared_branch {
@@ -682,7 +731,21 @@ impl LayerFfn {
         } else {
             self.run_shared_quantized_input(input,quantized,stream)?;
         }
-        self.add_shared(workspace,stream)
+        if let Some((mut routes,live))=deferred {
+            let module=self.fused_sum.as_ref().context("fused sum module absent")?;
+            let mut shared=self.shared_down.output().ptr();let mut routed=workspace.output().ptr();
+            let mut output=self.output.ptr();let mut n=(self.rows*5120)as i32;let mut live=live as i32;
+            unsafe{module.function("ca_ffn_sum_shared")?.launch([(n as u32).div_ceil(128),1,1],[128,1,1],0,stream,
+                &mut[(&mut routes as *mut u64).cast(),(&mut shared as *mut u64).cast(),
+                    (&mut routed as *mut u64).cast(),(&mut output as *mut u64).cast(),
+                    (&mut n as *mut i32).cast(),(&mut live as *mut i32).cast()])?;}
+            Ok(())
+        }else{self.add_shared(workspace,stream)}
+    }
+    pub(crate) fn set_fused_sum_for_probe(&self,enabled:bool)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_FFN_SUM_SHARED_SCREEN").as_deref()==Ok("1")
+            &&self.fused_sum.is_some(),"finite fused FFN sum control");
+        self.fused_sum_enabled.set(enabled);Ok(())
     }
     fn run_shared_quantized_input(&self,input:&Buffer<bf16>,
         quantized:Option<(&Buffer<u8>,&Buffer<u8>)>,stream:&Stream)->Result<()> {
@@ -933,6 +996,9 @@ impl LayerFfn {
 }
 
 impl LayerFfn {
+    pub(crate) fn set_shared_down_flash_for_probe(&self,enabled:bool)->Result<()> {
+        self.shared_down.set_shared_down_flash_for_probe(enabled)
+    }
     pub(crate) fn legacy_shared_up_for_probe(&self,kernels:&Path)->Result<Linear> {
         self.shared_up.legacy_shared_up_for_probe(kernels)
     }

@@ -13,7 +13,7 @@ use crate::{
     weights::Weights,
     woa::Grouped,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::{cell::{Cell, RefCell}, path::Path, rc::Rc};
 
@@ -164,6 +164,10 @@ impl Layer {
     pub(crate) fn set_cached_woa_for_probe(&self, enabled: bool) -> Result<()> {
         match &self.woa { WoA::Medium(v) => v.set_cached_for_probe(enabled),
             _ => anyhow::bail!("WO-A cache probe requires a medium profile") }
+    }
+    pub(crate) fn set_compact_woa_for_probe(&self,mode:u8)->Result<()> {
+        match &self.woa {WoA::Medium(v)=>v.set_compact_mode_for_probe(mode),
+            _=>anyhow::bail!("compact WO-A requires a medium profile")}
     }
     /// The fresh target profile owns this policy; call before any graph capture.
     pub(crate) fn set_query_overlap(&mut self, enabled: bool, stream: &Stream) -> Result<()> {
@@ -411,7 +415,8 @@ impl Layer {
         let small_bf16=!draft && rows==6
             && std::env::var("CANADA_SCRATCH_SMALL_BF16_ATTENTION").as_deref()==Ok("1");
         let append_bf16=!draft && (rows==6 || (rows==16
-            && std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1")))
+            && std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1"))
+            ||(rows==32&&crate::config::append32_workspace_enabled()))
             && std::env::var("CANADA_SCRATCH_APPEND_BF16_ONLY").as_deref()==Ok("1");
         ensure!(!(small_bf16 && append_bf16),"choose one small BF16 attention experiment");
         let precision32=!draft&&rows==32&&history32_fp32_attention_enabled()?;
@@ -502,10 +507,16 @@ impl Layer {
         if crate::woa_medium::cached_policy()? {
             if let WoA::Medium(v) = &mut woa { v.prepare_cached(stream)?; }
         }
+        if matches!(rows,16|32) {
+            let compact=crate::woa_medium::compact_policy()?;
+            if compact||std::env::var("CANADA_SCRATCH_WOA_MID_SCREEN").as_deref()==Ok("1") {
+                if let WoA::Medium(v)=&woa {v.prepare_compact(kernels,compact,stream)?;}
+            }
+        }
         let native =
             Native::open_with_rms(cuda, &kernels.join("prelude-v1"), &kernels.join("q-rms-v1"))?;
         let qb_prefetch =
-            if rows <= 8 && matches!(mode, InputMode::Split(_)) && crate::l2_prefetch::enabled() {
+            if matches!(mode, InputMode::Split(_)) && crate::l2_prefetch::enabled_for_rows(rows,2)? {
                 Some(crate::l2_prefetch::Window::new(
                     cuda,
                     module,
@@ -566,6 +577,8 @@ impl Layer {
     pub(crate) fn narrow_projection(&self) -> bool { self.qa.narrow_projection() }
     pub(crate) fn legacy_qkv_for_probe(&self,kernels:&Path)->Result<Linear> {self.qa.legacy_qkv_for_probe(kernels)}
     pub(crate) fn swap_qkv_for_probe(&mut self,other:&mut Linear)->Result<()> {self.qa.swap_qkv_for_probe(other)}
+    pub(crate) fn producer_qkv_for_probe(&self,kernels:&Path)->Result<Linear> {self.qa.producer_qkv_for_probe(kernels)}
+    pub(crate) fn swap_qkv_fence_for_probe(&mut self,other:&mut Linear)->Result<()> {self.qa.swap_qkv_fence_for_probe(other)}
     pub(crate) fn wo_b_pdl_for_probe(&self,kernels:&Path)->Result<Linear>{self.ob.wo_b_pdl_for_probe(kernels)}
     pub(crate) fn set_wo_b_pdl_for_probe(&mut self,mode:u8,other:&mut Linear)->Result<()> {
         ensure!(mode<=2,"WO-B mode");
@@ -788,7 +801,9 @@ impl Layer {
         &self.normalized
     }
     pub(crate) fn set_append_bf16_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
-        ensure!([6,16].contains(&self.rows) && self.cuda.owns_stream(stream) && self.append_decode.is_some()
+        ensure!(([6,16].contains(&self.rows)||(self.rows==32
+            &&crate::config::append32_workspace_enabled()))
+            && self.cuda.owns_stream(stream) && self.append_decode.is_some()
             && self.query_overlap.as_ref().is_none_or(|q|!q.pending.get())
             && std::env::var("CANADA_SCRATCH_APPEND_BF16_ONLY").as_deref()==Ok("1"),
             "append attention switch requires an idle admitted narrow layer");
@@ -837,6 +852,11 @@ impl Layer {
             &&std::env::var("CANADA_SCRATCH_WOA_PREFETCH_SCREEN").as_deref()==Ok("1"),
             "WO-A hint screen owner");
         self.woa_prefetch_active=enabled;Ok(())
+    }
+    pub(crate) fn set_wide_hint_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(matches!(self.rows,16|32),"wide Q-B hint profile");
+        self.qb_prefetch.as_mut().context("wide Q-B hint was not prepared")?
+            .set_enabled_for_wide_probe(enabled,stream)
     }
     pub fn finish(
         &mut self,

@@ -75,11 +75,11 @@
   "fp8-shared-w2-r0-m8192-v1": "fp8-shared-w2-r0-m8192-v1-pipeline-fence-v1",
   "fp8-split-qkv-m1024-v1": "fp8-split-qkv-m1024-v1-pipeline-fence-v1",
   "fp8-split-qkv-m128-v1": "fp8-split-qkv-m128-v1-pipeline-fence-v1",
-  "fp8-split-qkv-m16-v1": "fp8-split-qkv-m16-v1-pipeline-fence-v1",
+  "fp8-split-qkv-m16-v1": "fp8-split-qkv-m16-v1-producer-fence-v1",
   "fp8-split-qkv-m2048-v1": "fp8-split-qkv-m2048-v1-pipeline-fence-v1",
   "fp8-split-qkv-m32-v1": "fp8-split-qkv-m32-v1-pipeline-fence-v1",
   "fp8-split-qkv-m4096-v1": "fp8-split-qkv-m4096-v1-pipeline-fence-v1",
   "fp8-split-qkv-m512-v1": "fp8-split-qkv-m512-v1-pipeline-fence-v1",
-  "fp8-split-qkv-m6-v1": "fp8-split-qkv-m6-v1-pipeline-fence-v1",
+  "fp8-split-qkv-m6-v1": "fp8-split-qkv-m6-v1-producer-fence-v1",
   "fp8-split-qkv-m8192-v1": "fp8-split-qkv-m8192-v1-pipeline-fence-v1"
 }

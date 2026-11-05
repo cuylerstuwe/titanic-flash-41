@@ -4,7 +4,7 @@
 use crate::{
     blockscaled::Matrix,
     checkpoint::Dtype,
-    cuda::{Buffer, Cuda, MappedHost, Module, Stream},
+    cuda::{Buffer, Cuda, Event, MappedHost, Module, Stream},
     engram::{ROW_BYTES, RowStore},
     ffn::TokenRows,
     fp8_linear::Linear,
@@ -141,7 +141,12 @@ pub struct Layer {
     kv: Buffer<bf16>,
     output: Buffer<bf16>,
     stream: Cell<usize>,
+    projection_ahead: Option<ProjectionAhead>,
+    projection_ahead_enabled: bool,
+    projection_ahead_selected: bool,
+    projection_queued: bool,
 }
+struct ProjectionAhead { projection:Linear, stream:Stream, ready:Event, done:Event }
 impl Layer {
     pub fn new(
         cuda: &Cuda,
@@ -213,7 +218,57 @@ impl Layer {
             kv: cuda.allocate_rows(rows * 25600)?,
             output: cuda.allocate_rows(rows * 20480)?,
             stream: Cell::new(0),
+            projection_ahead: None,
+            projection_ahead_enabled: false,
+            projection_ahead_selected: false,
+            projection_queued: false,
         })
+    }
+    /// The caller drained the old owner and destroyed all referencing graphs.
+    pub(crate) fn set_projection_ahead_for_probe(&mut self,enabled:bool,kernels:&Path)->Result<()> {
+        ensure!((std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_M3").as_deref()==Ok("1"))
+            &&self.layer==14&&matches!(self.rows,6|16)&&!self.projection_queued,
+            "idle Engram14 projection experiment");
+        if let Some(ahead)=&self.projection_ahead {ahead.stream.synchronize()?;}
+        if enabled&&self.projection_ahead.is_none() {
+            self.projection_ahead=Some(ProjectionAhead{projection:self.projection.fork_engram_projection_for_probe(kernels)?,stream:self.cuda.stream()?,
+                ready:self.cuda.fence_event()?,done:self.cuda.fence_event()?});
+        }
+        self.projection_ahead_enabled=enabled;self.projection_ahead_selected=false;Ok(())
+    }
+    pub(crate) fn select_projection_ahead(&mut self,selected:bool)->Result<()> {
+        ensure!(!self.projection_queued&&(!selected||(self.projection_ahead_enabled&&self.projection_ahead.is_some())),
+            "Engram projection selection before its producer");
+        self.projection_ahead_selected=selected;Ok(())
+    }
+    fn prepare_embedding(&mut self,rows:&mut Rows,comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(rows.inputs.owned_by(&self.cuda)&&rows.cuda.owns_stream(stream)
+            &&self.cuda.owns_stream(stream)&&rows.rows==self.rows&&rows.prepared,
+            "Engram projection prepared rows");
+        let table=if self.layer==1{384006168}else{384016682};
+        ensure!(rows.interval.2==table,"Engram projection table identity");
+        let raw=stream.raw()as usize;
+        ensure!(self.stream.get()==0||self.stream.get()==raw,"Engram needs one ordered stream");
+        self.stream.set(raw);
+        unsafe{
+            self.dequant.launch(self.rows as u32,&[rows.inputs.pointers().0,rows.inputs.pointers().1,
+                rows.local.ptr(),rows.interval.0,rows.interval.1],stream)?;
+            comm.sum_bf16(&rows.local,&mut self.embedding,stream)?;
+        }
+        Ok(())
+    }
+    /// Transport remains on its single ordered stream. Only the independent
+    /// WKV projection runs ahead; its first reader joins the recorded event.
+    pub(crate) fn prepare_projection_ahead(&mut self,rows:&mut Rows,comm:&Roce,stream:&Stream)->Result<()> {
+        ensure!(self.projection_ahead_selected&&!self.projection_queued,
+            "Engram projection cannot be prepared twice");
+        self.prepare_embedding(rows,comm,stream)?;
+        let ahead=self.projection_ahead.as_ref().unwrap();
+        ahead.ready.record(stream)?;ahead.ready.wait(&ahead.stream)?;
+        ahead.projection.run(&self.embedding,&ahead.stream)?;
+        ahead.done.record(&ahead.stream)?;
+        self.projection_queued=true;Ok(())
     }
     pub fn run(
         &mut self,
@@ -251,23 +306,19 @@ impl Layer {
         );
         self.stream.set(raw);
         let p = format!("layers.{}.engram", self.layer);
+        let projection=if self.projection_ahead_selected {
+            ensure!(self.projection_queued,"Engram consumer ran before its projection producer");
+            self.projection_ahead.as_ref().unwrap().done.wait(stream)?;
+            self.projection_queued=false;
+            &self.projection_ahead.as_ref().unwrap().projection
+        }else{
+            ensure!(!self.projection_queued,"unexpected prepared Engram projection");
+            self.prepare_embedding(rows,comm,stream)?;
+            self.projection.run(&self.embedding, stream)?;
+            &self.projection
+        };
         unsafe {
-            self.dequant.launch(
-                self.rows as u32,
-                &[
-                    rows.inputs.pointers().0,
-                    rows.inputs.pointers().1,
-                    rows.local.ptr(),
-                    rows.interval.0,
-                    rows.interval.1,
-                ],
-                stream,
-            )?;
-            comm.sum_bf16(&rows.local, &mut self.embedding, stream)?;
-        }
-        self.projection.run(&self.embedding, stream)?;
-        unsafe {
-            comm.gather_bf16(self.projection.output(), &mut self.kv, 6400, stream)?;
+            comm.gather_bf16(projection.output(), &mut self.kv, 6400, stream)?;
             self.gate.launch(
                 self.rows as u32,
                 &[
@@ -290,7 +341,8 @@ impl Layer {
         &self.embedding
     }
     pub fn projected_local(&self) -> &Buffer<bf16> {
-        self.projection.output()
+        if self.projection_ahead_selected{self.projection_ahead.as_ref().unwrap().projection.output()}
+        else{self.projection.output()}
     }
     pub fn projected(&self) -> &Buffer<bf16> {
         &self.kv

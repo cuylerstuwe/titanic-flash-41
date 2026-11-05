@@ -12,7 +12,8 @@ pub(crate) struct RootFeedback {
 }
 impl RootFeedback {
     pub(crate) fn new(cuda:&Cuda,core:&[u8])->Result<Self> {
-        ensure!(std::env::var("CANADA_SCRATCH_ROOT_FEEDBACK_SCREEN").as_deref()==Ok("1"),
+        ensure!(std::env::var("CANADA_SCRATCH_ROOT_FEEDBACK_SCREEN").as_deref()==Ok("1")
+            ||std::env::var("CANADA_SCRATCH_QUERY_REUSE_SCREEN").as_deref()==Ok("1"),
             "root feedback requires isolated foreground admission");
         let mut alternate=Categorical::new(cuda,core,1)?;
         // Enqueue computes normalization as well as categorical scratch. Its
@@ -35,6 +36,33 @@ impl RootFeedback {
             "policy":"Past-root integrated overlap selects NEXT round root T.7 or T1; suffix T.7, actual-q block rejection unchanged."})
     }
     pub(crate) fn enabled(&self)->bool {self.enabled}
+    /// Read-only opportunity screen. Reuse the established GPU overlap
+    /// kernels; their policy choice is discarded and never affects a draw.
+    pub(crate) fn observe_pair_for_query_probe(&mut self,p:&Buffer<f64>,fresh:&Buffer<f64>,
+        reused:&Buffer<f64>,stream:&Stream)->Result<[f64;2]> {
+        ensure!(std::env::var("CANADA_SCRATCH_QUERY_REUSE_SCREEN").as_deref()==Ok("1")
+            &&[p.len(),fresh.len(),reused.len()].iter().all(|&n|n==VOCAB)
+            &&self.cuda.owns_buffer(p)&&self.cuda.owns_buffer(fresh)&&self.cuda.owns_buffer(reused),
+            "query root-pair diagnostic operands");
+        self.reset(false,stream)?;
+        unsafe{self.cuda.zero_device(self.errors.ptr(),self.errors.bytes(),stream)?;}
+        let mut pp=p.ptr();let mut errors=self.errors.ptr();let mut rows=1i32;
+        for(i,mut q)in [fresh.ptr(),reused.ptr()].into_iter().enumerate(){
+            let mut sums=self.sums.ptr()+(i*127*8)as u64;
+            unsafe{self.module.function("ca_acceptance_local_partials")?.launch([127,1,1],[256,1,1],0,stream,
+                &mut[(&mut pp as *mut u64).cast(),(&mut q as *mut u64).cast(),
+                    (&mut sums as *mut u64).cast(),(&mut errors as *mut u64).cast(),(&mut rows as *mut i32).cast()])?;}
+        }
+        let mut sums=self.sums.ptr();let mut metrics=self.metrics.ptr();let mut choice=self.choice.ptr();
+        unsafe{self.module.function("ca_root_feedback_finish")?.launch([1,1,1],[32,1,1],0,stream,
+            &mut[(&mut sums as *mut u64).cast(),(&mut metrics as *mut u64).cast(),
+                (&mut choice as *mut u64).cast(),(&mut errors as *mut u64).cast()])?;}
+        stream.synchronize()?;
+        ensure!(self.errors.download()?[0]==0,"query root-pair probability error");
+        let m=self.metrics.download()?;
+        ensure!(m[..2].iter().all(|x|x.is_finite()&&(0. ..=1.+1e-10).contains(x)),"query root-pair overlap range");
+        Ok([m[0],m[1]])
+    }
     pub(crate) fn observe(&mut self,p:&Buffer<f64>,actual_q:&Buffer<f64>,logits:&Buffer<f32>,
         schedule:usize,position:u64,stream:&Stream)->Result<Option<bool>> {
         ensure!(self.enabled && [0,3].contains(&schedule) && (schedule==3)==self.warmer

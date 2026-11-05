@@ -21,6 +21,7 @@ impl DraftHead {
             && !self.gemv_active.get()&&!other.gemv_active.get()
             && !self.integer_active.get()&&!other.integer_active.get()
             && !self.lossless_active.get()&&!other.lossless_active.get()
+            && !self.nvfp4_active.get()&&!other.nvfp4_active.get()
     }
 }
 impl Pair {

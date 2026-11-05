@@ -5,6 +5,7 @@ The resident Rust server owns scheduling, cache, cancellation and priorities.
 This controller admits one cohort and fails the whole cohort if a rank dies.
 """
 import argparse
+import concurrent.futures
 import fcntl
 import hashlib
 import ipaddress
@@ -202,18 +203,26 @@ class Fleet:
         if not state or state.get('stopped'):
             return
         errors = []
-        for rank, name in enumerate(state['containers']):
+        def stop_rank(rank, name):
             try:
                 c = self.inspect(rank, name)
                 if c is None:
-                    continue
+                    return None
                 labels = c['Config']['Labels']
                 assert labels.get('project') == PROJECT and labels.get('generation') == state['generation']
                 assert c['Config']['Entrypoint'] == ['/data/runtime/titanic-flash']
-                self.run(['docker', 'stop', '--time', '15', c['Id']], rank, timeout=25)
+                # Stop peers together: a blocked collective must not keep a
+                # later rank alive while an earlier GPU context is torn down.
+                # CUDA teardown can outlast Docker's signal grace period.
+                self.run(['docker', 'stop', '--time', '15', c['Id']], rank, timeout=90)
                 self.run(['docker', 'rm', c['Id']], rank)
             except Exception as e:
-                errors.append(f'rank {rank}: {e}')
+                return f'rank {rank}: {e}'
+            return None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            pending = [pool.submit(stop_rank, rank, name)
+                       for rank, name in enumerate(state['containers'])]
+            errors.extend(error for future in pending if (error := future.result()))
         try:
             self.host_policies('restore', state)
         except Exception as e:
@@ -266,7 +275,7 @@ class Fleet:
                                 cache_bytes=268435456),
                     http=dict(bind=self.cfg['http_bind'], allow_remote=self.cfg['allow_remote'],
                               tokenizer='/data/model/tokenizer.json', bearer_file='/state/http.key',
-                              priority_file='/state/priority.key', output_stall_seconds=60) if rank == 0 else None)
+                              priority_file='/state/priority.key', output_stall_seconds=60, context_cache_mib=64) if rank == 0 else None)
 
     def launch(self):
         self.stop(self.state())
@@ -306,7 +315,9 @@ class Fleet:
                            TITANIC_ROCE_IPV4=','.join(node['fabric_ipv4']),
                            TITANIC_ROCE_GID_INDEX=str(node['gid_index']), NCCL_IB_GID_INDEX=str(node['gid_index']),
                            NCCL_IB_HCA=','.join(node['hcas']), NCCL_SOCKET_IFNAME=node['socket_interface'])
-                cmd = ['docker', 'run', '-d', '--no-healthcheck', '--name', containers[rank],
+                # Rust does not install a PID-1 signal handler. Docker's init
+                # forwards SIGTERM and reaps the worker during coordinated stop.
+                cmd = ['docker', 'run', '-d', '--init', '--no-healthcheck', '--name', containers[rank],
                        '--label', 'project='+PROJECT, '--label', 'generation='+generation,
                        '--log-driver', 'none', '--gpus', 'all', '--network', 'host', '--ipc', 'host',
                        '--device', '/dev/infiniband', '--cap-add', 'IPC_LOCK', '--ulimit', 'memlock=-1',
