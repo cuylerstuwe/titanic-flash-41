@@ -1,5 +1,48 @@
 # Validation status
 
+## November 5 paired scheduling repair (s1332)
+
+A solo three-row verification could leave Engram's ahead-projection selection
+enabled after consuming its producer. The paired executor uses an inline
+producer. On a subsequent eager execution or new graph capture, inheriting the
+solo selection could fail with `Engram consumer ran before its projection producer`
+and terminate the worker group. Graph replay could hide the issue until a new
+execution shape was needed; overlap was a trigger, not a sufficient condition
+for every request to fail.
+
+The paired executor now selects its own inline schedule for both owners before
+eager execution or graph capture. Solo execution still selects its optimized
+schedule on entry. The producer/consumer safety assertion remains in place.
+No target arithmetic, sampling, weights, GPU kernel operations, clock policy,
+cache budget or admission policy changed.
+
+The finite four-device regression first reproduced the exact assertion in the
+unpatched control. The repaired engine passed all 48 paired trials (12 per
+device), including inherited and independent prefixes, both owners arriving
+from different solo row widths, graph capture/replay, full/partial/zero acceptance,
+full local logits, retained state and following verification. Native CPU tests
+passed (210); portable CPU tests passed (212, with 22 fixture-dependent checks
+ignored). Rebuilt core-kernel differences are confined to compiler-generated
+symbol names; every executable/data/header byte is unchanged. The vision kernel
+is byte-identical.
+
+After fresh boots and one daily load per device, the installed native repair
+passed solo-to-paired-to-solo serving, cancellation of one owner while its peer
+completed, paired execution at 129,553 prompt tokens, completion of a third
+queued request, exact prompt-cache reuse, image input and Pi timing accounting.
+One generation remained Ready throughout, with no GPU allocation/Xid errors.
+These were capped scheduling regressions, not new completed-task quality or
+performance measurements.
+
+Native source fingerprint:
+`8e39ac2f43b92b8c2b2af24969bc13596c9f0152bee99e1ac44baef6c3b54687`.
+Portable source fingerprint:
+`e392be37e005b67a375d436c5a7676c9408783f3b4d88a61f2fbee79e77a7774`.
+The existing portable deployment wrapper and kernel bundle are unchanged.
+The four-device regression used the native deployment; this repair has not
+repeated the portable provisioning or benchmark run. Published performance
+numbers retain their s1329 identity.
+
 ## November 4 accumulated engine update (s1329)
 
 This update carries the qualified s1291 correctness fix plus prompt/image

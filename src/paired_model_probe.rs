@@ -75,6 +75,15 @@ impl Target {
     fn enqueue_pair_features(&mut self,other:&mut Self,pooled:Option<&crate::ffn::Paired>,coalesce:bool,
         head:Option<&crate::model_io::PairedHead>,features:u8,comm:&Roce,stream:&Stream)->Result<()> {
         ensure!(features<=7,"paired dense feature mask");
+        // This executor runs Engram's producer inline at layer14. A preceding
+        // solo M3 can leave the ahead-projection selection enabled after its
+        // queued work has been consumed. Choose this executor's schedule before
+        // either eager execution or graph capture; never inherit a solo choice.
+        // Solo execution reselects its own schedule on the next entry.
+        for target in [&mut *self,&mut *other] {
+            target.group14.select_engram_projection_ahead(false)?;
+            target.engram_projection_active=false;
+        }
         self.pair_defer_ffn(true)?;other.pair_defer_ffn(true)?;
         let result=(||->Result<()>{
             for index in 0..40 {

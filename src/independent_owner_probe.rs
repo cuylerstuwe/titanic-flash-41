@@ -250,6 +250,19 @@ fn paired_actual(w:&mut Worker,other:&mut Target,verify:&mut Target,wides:&mut [
                 // checks state/metadata and commits, not generated-task quality.
                 let a:Vec<_>=cases[0].1.iter().copied().cycle().skip(index).take(a_live).collect();
                 let b:Vec<_>=cases[peer].1.iter().copied().cycle().skip(index+1).take(b_live).collect();
+                // Exercise a real solo->pair scheduling transition, including
+                // one owner retaining the M3 ahead-projection selection while
+                // its peer last used M6. Rejection preserves the tested frontier.
+                // Keep this outside forward timings and use the same primer
+                // for the separate and pooled controls.
+                if std::env::var("CANADA_SCRATCH_PAIR_SCHEDULE_TRANSITION_SCREEN").as_deref()==Ok("1") {
+                    let prior=if index%2==0 {[3usize,6]}else{[6usize,3]};
+                    for (target,teacher,live) in [(&mut w.verify,&cases[0].1,prior[0]),
+                        (&mut *verify,&cases[peer].1,prior[1])] {
+                        target.begin_verification(&teacher[..live],&w.comm,&w.stream)?;
+                        target.finish_verification(0,&w.comm,&w.stream)?;
+                    }
+                }
                 let started=std::time::Instant::now();
                 let mut timing=if arm==0 {
                     if index%2==0 {
