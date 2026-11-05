@@ -93,6 +93,9 @@ mod cache_admission_fault;
 #[path = "cache_retention_probe.rs"]
 mod cache_retention_probe;
 #[cfg(feature = "storage-fault-injection")]
+#[path = "prefill_admission_probe.rs"]
+mod prefill_admission_probe;
+#[cfg(feature = "storage-fault-injection")]
 #[path = "cache_pressure_probe.rs"]
 mod cache_pressure_probe;
 #[path = "active_encoder_checkpoint_probe.rs"]
@@ -742,7 +745,7 @@ impl Worker {
         }
         Ok(())
     }
-    /// Called only when media preparation refuses capacity, before any new
+    /// Called only when input preparation refuses capacity, before any new
     /// prompt tokens enter the model. A cache restore may have changed the
     /// retained owner, but its GPU state and committed history must still agree.
     fn refuse_media_input(&mut self,id:u64,error:anyhow::Error)->Result<Value> {
@@ -1671,6 +1674,31 @@ impl Worker {
         Ok(event)
     }
 
+    /// Admission at the committed request boundary, before resetting a live
+    /// owner or appending any tokens. Optional caches may have accumulated, or
+    /// host/driver memory may have grown since the preceding request. All ranks
+    /// make the same reclamation/refusal decision; a tight rank cannot strand
+    /// its peers inside prefill. No live or suspended request state is evicted.
+    fn admit_prefill_input(&mut self)->Result<Option<Value>> {
+        let required=self.cuda.allocation_reserve_bytes()+16*1024usize.pow(2);
+        let fits=self.cuda.admission_memory()?.admitted_available>required;
+        #[cfg(feature = "storage-fault-injection")]
+        let fits=!self.cache_save_fault.armed_for(cache_admission_fault::Point::PrefillAfterReclaim,self.comm.rank())
+            &&self.cache_save_fault.apply(cache_admission_fault::Point::PrefillBeforeReclaim,self.comm.rank(),fits);
+        if self.control.all_admit(fits)? {return Ok(None);}
+        // Return allocator-free host pages before sacrificing reusable model
+        // images. This is pressure-only work, never a decode-loop operation.
+        let trimmed=crate::memory::trim_free_host_pages();
+        let mut reclaimed=self.reclaim_input_space(required)?;
+        reclaimed["trimmed_free_host_pages"]=json!(trimmed);
+        let fits=self.cuda.admission_memory()?.admitted_available>required;
+        #[cfg(feature = "storage-fault-injection")]
+        let fits=self.cache_save_fault.apply(cache_admission_fault::Point::PrefillAfterReclaim,self.comm.rank(),fits);
+        ensure!(self.control.all_admit(fits)?,crate::memory::InputCapacityError(
+            "prefill cannot retain the UMA reserve after optional cache reclamation",required));
+        Ok(Some(reclaimed))
+    }
+
     fn retain_cached_prefix_reserved(&mut self,prefix:&[u32],pending:u32,media:crate::prompt_media::Identity,
         extra_bytes:usize,extra_count:usize)->Result<Value> {
         ensure!(!prefix.is_empty() && self.verify.position()==prefix.len()as u64,
@@ -2486,7 +2514,7 @@ impl Worker {
                 );
                 let media=self.prompt_identity(&images,&tokens)?;
                 let mut plan = self.history.prepare_with_media(id, tokens, media, limit, seed)?;
-                let (retained_session_cache,deferred_encoder)=self.reuse_cached_session(&mut plan,!greedy,true)?;
+                let (mut retained_session_cache,deferred_encoder)=self.reuse_cached_session(&mut plan,!greedy,true)?;
                 let media_frontier=deferred_encoder.as_ref().map_or(if plan.reuse{plan.previous}else{0},|c|c.prefix.len());
                 if let Err(error)=self.prepare_media(&images,&plan,media_frontier) {
                     return self.refuse_media_input(id,error);
@@ -2502,6 +2530,16 @@ impl Worker {
                         "prefill_phases":Value::Null,"prefix_prefill_phases":Value::Null,
                         "begin_phases_seconds":{"reset_and_handoff":started.elapsed().as_secs_f64()-sample_seconds,
                             "target_prefill":0.,"first_target_sample":sample_seconds,"draft_attach_and_history":0.}}));
+                }
+                match self.admit_prefill_input() {
+                    Ok(Some(reclaimed))=>{retained_session_cache["prefill_reclaim"]=reclaimed;},
+                    Ok(None)=>{},
+                    Err(error)=>{
+                        // A borrowed encoder parent is still unchanged and its
+                        // reservation remains charged; preserve it for retry.
+                        self.return_encoder_parent(deferred_encoder)?;
+                        return self.refuse_media_input(id,error);
+                    },
                 }
                 let encoder_previous=deferred_encoder.as_ref().map_or(if plan.reuse {plan.previous}else{0},|c|c.prefix.len());
                 let encoder_checkpoint=self.prompt_checkpoint_positions(plan.prompt.len())[0].max(encoder_previous);
@@ -3259,6 +3297,8 @@ pub fn validate_configuration(path:&Path,http:bool)->Result<Value> {
         "scope":"Known host-only flag and profile dependencies; no model/device work"}))
 }
 pub fn run_file(path: &Path) -> Result<()> {
+    ensure!(std::env::var("CANADA_SCRATCH_PREFILL_ADMISSION_SCREEN").as_deref()!=Ok("1")
+        || cfg!(feature="storage-fault-injection"),"prefill pressure screen requires a fault-injection build");
     let retention_probe=std::env::var("CANADA_SCRATCH_CACHE_RETENTION_SCREEN").as_deref()==Ok("1");
     ensure!(!retention_probe || cfg!(feature="storage-fault-injection"),
         "cache refusal screen requires a non-serving fault-injection build");
@@ -3581,6 +3621,10 @@ pub fn run_file(path: &Path) -> Result<()> {
         return Ok(());
     }
     #[cfg(feature = "storage-fault-injection")]
+    if std::env::var("CANADA_SCRATCH_PREFILL_ADMISSION_SCREEN").as_deref()==Ok("1") {
+        return prefill_admission_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    #[cfg(feature = "storage-fault-injection")]
     if std::env::var("CANADA_SCRATCH_CACHE_PRESSURE_SCREEN").as_deref()==Ok("1") {
         return cache_pressure_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
     }
@@ -3882,6 +3926,8 @@ pub fn run_file(path: &Path) -> Result<()> {
 /// ranks between committed steps. Idle heartbeats touch CPU sockets only.
 #[cfg(feature = "serving")]
 pub fn run_http(path: &Path) -> Result<()> {
+    ensure!(std::env::var("CANADA_SCRATCH_PREFILL_ADMISSION_SCREEN").as_deref()!=Ok("1"),
+        "prefill pressure probe is restricted to the finite file runner");
     ensure!(std::env::var("CANADA_SCRATCH_CACHE_RETENTION_SCREEN").as_deref()!=Ok("1"),
         "cache refusal probe is restricted to the finite file runner");
     use crate::{http_server, protocol::BackendEvent};

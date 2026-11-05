@@ -5,6 +5,14 @@ use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 static HOST_WORKSPACE_RESERVED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature="storage-fault-injection")]
+thread_local! { pub(crate) static PREFILL_PREVIEW_PRESSURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// The finite probe can exercise a late, rank-local memory decline without
+/// exhausting physical RAM. Absent from ordinary serving builds.
+#[cfg(feature="storage-fault-injection")]
+pub(crate) fn prefill_preview_available(actual:usize)->usize {
+    if PREFILL_PREVIEW_PRESSURE.get(){0}else{actual}
+}
 #[path = "memory_image_storage.rs"]
 mod image_storage;
 pub(crate) use image_storage::{ImageStorageCharge, allocate_image_storage,retained_image_bytes};

@@ -5,6 +5,8 @@ use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub(super) enum Point {
+    PrefillBeforeReclaim,
+    PrefillAfterReclaim,
     EncoderBeforeAllocate,
     EncoderAfterAllocate,
     ReconstructedAfterCopy,
@@ -26,6 +28,9 @@ pub(super) struct Fault {
 }
 
 impl Fault {
+    pub fn armed_for(&self,point:Point,rank:usize)->bool {
+        self.armed==Some((point,rank))
+    }
     pub fn arm(&mut self, point: Point, refusing_rank: usize) -> Result<()> {
         ensure!(refusing_rank < 4 && self.armed.is_none() && self.observation.is_none(),
             "cache fault must be a fresh, single-rank vote");

@@ -1,5 +1,60 @@
 # Validation status
 
+## November 5 prefill memory-pressure repair (s1334)
+
+An optional Engram lookahead check could terminate one worker when estimated
+available memory fell below the 8 GiB operating margin. Its peers then lost the
+worker group. This was a software guard failure; the incident did not establish
+a GPU allocation failure or that 8 GiB is a minimum required by the hardware.
+
+Serving now admits prefill at a committed request boundary using an all-device
+decision. Under pressure it first returns unused host allocator pages and reclaims
+optional caches. If the margin remains insufficient, it refuses that request
+without terminating the group. Live and suspended request state is preserved.
+Optional lookahead can also fall back to demand reads if memory availability
+changes later. Actual allocation guards remain: the 8 GiB operating margin and
+8.5 GiB allocation floor are unchanged. There are no weight, arithmetic, sampler,
+clock-policy, cache-budget or GPU-kernel operation changes.
+
+Qualification before activation:
+
+- A finite four-device fault-injection check exercised pressure on the head and
+  vision rank independently. Both refusal cases preserved committed model state
+  and allowed a subsequent healthy retry. Recoverable admission pressure also
+  continued successfully.
+- Four alternating normal/low-headroom prefill trials produced identical model
+  state and the next six verification-logit rows on all four devices. The late
+  pressure was injected only on the vision rank, covering rank-local fallback.
+- A normal serving build completed a 129,553-token prompt and a continuation
+  under real host-memory pressure. The continuation reused 129,408 tokens while
+  the constrained device began near 8.30 GiB available. Its existing cache-restore
+  path handled pressure before the new admission branch. Consequently, a test
+  assertion requiring the new branch's diagnostic did not pass: this is partial
+  physical-pressure coverage, not a completed full screen or a physical test of
+  the new refusal branch. All workers exited cleanly, without new GPU allocation,
+  Xid, thermal-guard or memory-guard errors.
+- Host native/advancing CPU checks passed (209 each); portable checks passed
+  (212), each excluding 22 fixture-dependent tests. The Linux Arm64 serving
+  build passed 210 tests with 24 ignored. Ten installation/rollback fixtures
+  passed. Core-kernel differences are limited to compiler-generated symbol names;
+  executable/data/header bytes are unchanged, and the vision kernel is identical.
+
+Native serving-source fingerprint:
+`fa619ddfb0ea9eeab06ac8d2e16d67be3824a54b6c18f389a31e92a8298dcb22`.
+Portable source fingerprint:
+`32a28b07d86efbbf15dccfcd6280ba4497af2156d9598a47209d6ae9d7715ee0`.
+Fault injection is excluded from the normal serving binary. The portable
+deployment wrapper and kernel bundle are unchanged; its provisioning and GPU
+benchmark have not been rerun for this repair. Published scores remain s1329.
+
+Native s1334 is installed after fresh boots and one daily model load per device,
+with s1332 as the failed-start fallback. Five head-local streaming requests
+passed text, exact prompt reuse, continuation, image input and text after image
+input. A synthetic image request through the external router also passed with
+Pi-compatible timing and unchanged router configuration. One generation stayed
+Ready throughout. Runtime hashes, 2350 MHz clocks, host-policy recovery guards
+and kernel-health checks passed; the maintenance reservation is released.
+
 ## November 5 paired scheduling repair (s1332)
 
 A solo three-row verification could leave Engram's ahead-projection selection

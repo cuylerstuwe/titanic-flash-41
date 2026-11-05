@@ -5077,9 +5077,15 @@ impl Target {
             // hashes (~9MiB); flat IDs and two4096-row byte buffers fit below
             // the16MiB allowance. Preserve the8GiB operating reserve.
             let memory=self.cuda.admission_memory()?;
-            ensure!(memory.admitted_available>=8*1024usize.pow(3),
-                "prefill is below reserved UMA headroom: {} bytes",memory.admitted_available);
-            let fits=memory.admitted_available>=8*1024usize.pow(3)+16*1024usize.pow(2);
+            // This is admission for optional host-side lookahead, not for the
+            // already allocated target state. A changing MemAvailable estimate
+            // must not kill one rank here (including between checkpoint prefix
+            // and suffix). Serving admits/reclaims at the committed boundary;
+            // every later allocation still enforces its own physical floor.
+            let available=memory.admitted_available;
+            #[cfg(feature="storage-fault-injection")]
+            let available=crate::memory::prefill_preview_available(available);
+            let fits=available>=8*1024usize.pow(3)+16*1024usize.pow(2);
             if !fits {
                 // This task warms immutable local row caches only. Every rank
                 // executes the same GPU work and collective sequence when it
