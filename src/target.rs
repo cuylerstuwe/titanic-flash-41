@@ -1058,6 +1058,14 @@ impl Target {
             && crate::config::verification_carry_rows() > rows), "shared execution row profile");
         self.fork_profile_in(core, core_bytes, stream, kernels, rows, phase, None, None)
     }
+    /// This arena holds only wide-prefill local/combined/expanded embeddings.
+    /// Terminal logits, causal state, narrow profiles and metadata are separate.
+    /// The caller must run image encoding between completed prefill chunks.
+    pub(crate) fn image_scratch_arena(&self,stream:&Stream)->Result<Option<Rc<crate::cuda::RowArena>>> {
+        ensure!(self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
+            "image scratch donor stream mismatch");
+        Ok(self.wide.as_ref().and_then(|w|w.input_arena()).cloned())
+    }
     /// All narrow profiles of one owner run sequentially. The two owners use
     /// different prefill parity arenas, so pairedM6 keeps disjoint transients.
     /// Causal/constant storage uses allocate(), outside allocate_rows() loans.

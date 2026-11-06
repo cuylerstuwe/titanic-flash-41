@@ -48,6 +48,12 @@ impl Geometry {
     pub(crate) fn workspace_bytes(self, include_patches: bool, compact:bool) -> Result<usize> {
         Ok(WorkspacePlan::new(self)?.admission_bytes(include_patches,compact))
     }
+    pub(crate) fn scratch_bytes(self, compact:bool)->Result<usize> {
+        Ok(WorkspacePlan::new(self)?.scratch_bytes(compact))
+    }
+    pub(crate) fn arena_admission_bytes(self, include_patches:bool)->Result<usize> {
+        Ok(WorkspacePlan::new(self)?.arena_admission_bytes(include_patches))
+    }
 }
 
 pub(crate) fn compact_workspace()->Result<bool> {
@@ -100,6 +106,20 @@ impl WorkspacePlan {
         // bias-free gate/up projection writes BF16 directly and never uses it.
         if compact {b[0]=self.bf16[2].max(self.bf16[11]);}
         b
+    }
+    fn scratch_bytes(&self,compact:bool)->usize {
+        // Every transient allocation starts at a 256-byte boundary. The final
+        // image span is independently owned and must survive arena reuse.
+        self.backings(compact)[..14].iter().map(|n|(n*2).next_multiple_of(256)).sum::<usize>()
+            + self.fp32_backings(compact).iter().map(|n|(n*4).next_multiple_of(256)).sum::<usize>()
+            + self.i32.iter().map(|n|(n*4).next_multiple_of(256)).sum::<usize>()
+    }
+    fn arena_admission_bytes(&self,include_patches:bool)->usize {
+        // Preserve the existing transient driver allowance. Only tensor bytes
+        // backed by an already resident scratch arena disappear from admission.
+        (self.bf16[14]*2).next_multiple_of(2<<20)
+            + if include_patches {(self.patches*2).next_multiple_of(2<<20)}else{0}
+            + (512<<20)
     }
     fn admission_bytes(&self, include_patches: bool,compact:bool) -> usize {
         // A live GB10 image allocation burst consumed up to ~430MiB more
@@ -310,14 +330,24 @@ impl Vision {
         stream: &Stream,
         tap: &mut Tap<'_>,
     ) -> Result<ImageSpan> {
-        self.encode_layout(patches,geometry,stream,compact_workspace()?,tap)
+        self.encode_layout(patches,geometry,stream,compact_workspace()?,false,tap)
     }
     pub(crate) fn encode_with_workspace(&self,patches:&Buffer<bf16>,geometry:Geometry,
         stream:&Stream,compact:bool)->Result<ImageSpan> {
-        self.encode_layout(patches,geometry,stream,compact,&mut |_,_,_,_,_|Ok(()))
+        self.encode_with_arena(patches,geometry,stream,compact,None)
+    }
+    pub(crate) fn encode_with_arena(&self,patches:&Buffer<bf16>,geometry:Geometry,
+        stream:&Stream,compact:bool,arena:Option<&std::rc::Rc<crate::cuda::RowArena>>)->Result<ImageSpan> {
+        if let Some(arena)=arena {
+            ensure!(geometry.scratch_bytes(compact)?<=arena.bytes(),"image scratch arena too small");
+            // The worker lends only completed prefill embedding storage. All
+            // owners execute serially; drain the prior use before overwriting.
+            stream.synchronize()?;
+            self.cuda.with_row_arena(arena,||self.encode_layout(patches,geometry,stream,compact,true,&mut |_,_,_,_,_|Ok(())))
+        }else {self.encode_layout(patches,geometry,stream,compact,false,&mut |_,_,_,_,_|Ok(()))}
     }
     fn encode_layout(&self,patches:&Buffer<bf16>,geometry:Geometry,stream:&Stream,
-        compact:bool,tap:&mut Tap<'_>)->Result<ImageSpan> {
+        compact:bool,borrowed:bool,tap:&mut Tap<'_>)->Result<ImageSpan> {
         let g = geometry.validate()?;
         let n = g.rows();
         let m = g.feature_rows();
@@ -329,7 +359,7 @@ impl Vision {
             "vision input extent/context"
         );
         let layout = WorkspacePlan::new(g)?;
-        let needed = layout.admission_bytes(false,compact); // patches are already resident
+        let needed = if borrowed {layout.arena_admission_bytes(false)}else{layout.admission_bytes(false,compact)}; // patches are resident
         let reserve = self.cuda.allocation_reserve_bytes();
         let memory_before = self.cuda.admission_memory()?;
         ensure!(
@@ -341,37 +371,41 @@ impl Vision {
         let [scratch, co, si] = layout.fp32_backings(compact);
         let [starts, lengths] = layout.i32;
         let backing=layout.backings(compact);
-        let x = self.cuda.allocate_input::<bf16>(x)?;
-        let gate_up = self.cuda.allocate_input::<bf16>(backing[8])?;
-        let gated = self.cuda.allocate_input::<bf16>(backing[9])?;
-        let q = self.cuda.allocate_input::<bf16>(backing[3])?;
-        let k = self.cuda.allocate_input::<bf16>(backing[4])?;
-        let v = self.cuda.allocate_input::<bf16>(backing[5])?;
+        macro_rules! scratch_buffer {
+            ($ty:ty,$len:expr)=>{if borrowed {self.cuda.allocate_rows::<$ty>($len)?}
+                else{self.cuda.allocate_input::<$ty>($len)?}};
+        }
+        let x = scratch_buffer!(bf16,x);
+        let gate_up = scratch_buffer!(bf16,backing[8]);
+        let gated = scratch_buffer!(bf16,backing[9]);
+        let q = scratch_buffer!(bf16,backing[3]);
+        let k = scratch_buffer!(bf16,backing[4]);
+        let v = scratch_buffer!(bf16,backing[5]);
         // SAFETY: all accesses below use the same stream, with these lifetimes:
         // norm -> QKV -> split/attention -> delta/residual -> norm -> gate/up
         // -> gated -> delta/residual. The aligner starts after the last block.
         // Taps may inspect only during their callback. Parents remain in this
         // scope through synchronization on success and on execution failure.
-        let norm = if compact {unsafe{gated.view(0,norm)?}}else{self.cuda.allocate_input::<bf16>(norm)?};
-        let qkv = if compact {unsafe{gate_up.view(0,qkv)?}}else{self.cuda.allocate_input::<bf16>(qkv)?};
-        let attn = self.cuda.allocate_input::<bf16>(attn)?;
-        let delta = if compact {unsafe{gate_up.view(0,delta)?}}else{self.cuda.allocate_input::<bf16>(delta)?};
-        let scratch = self.cuda.allocate_input::<f32>(scratch)?;
-        let co = self.cuda.allocate_input::<f32>(co)?;
-        let si = self.cuda.allocate_input::<f32>(si)?;
-        let unfolded = if compact {unsafe{gate_up.view(0,unfolded)?}}else{self.cuda.allocate_input::<bf16>(unfolded)?};
-        let align1 = if compact {unsafe{q.view(0,align1)?}}else{self.cuda.allocate_input::<bf16>(align1)?};
-        let gelu = if compact {unsafe{k.view(0,gelu)?}}else{self.cuda.allocate_input::<bf16>(gelu)?};
-        let features = if compact {unsafe{v.view(0,features)?}}else{self.cuda.allocate_input::<bf16>(features)?};
+        let norm = if compact {unsafe{gated.view(0,norm)?}}else{scratch_buffer!(bf16,norm)};
+        let qkv = if compact {unsafe{gate_up.view(0,qkv)?}}else{scratch_buffer!(bf16,qkv)};
+        let attn = scratch_buffer!(bf16,attn);
+        let delta = if compact {unsafe{gate_up.view(0,delta)?}}else{scratch_buffer!(bf16,delta)};
+        let scratch = scratch_buffer!(f32,scratch);
+        let co = scratch_buffer!(f32,co);
+        let si = scratch_buffer!(f32,si);
+        let unfolded = if compact {unsafe{gate_up.view(0,unfolded)?}}else{scratch_buffer!(bf16,unfolded)};
+        let align1 = if compact {unsafe{q.view(0,align1)?}}else{scratch_buffer!(bf16,align1)};
+        let gelu = if compact {unsafe{k.view(0,gelu)?}}else{scratch_buffer!(bf16,gelu)};
+        let features = if compact {unsafe{v.view(0,features)?}}else{scratch_buffer!(bf16,features)};
         let span = self.cuda.allocate_input::<bf16>(span)?;
-        let mut starts = self.cuda.allocate_input::<i32>(starts)?;
-        let mut lengths = self.cuda.allocate_input::<i32>(lengths)?;
+        let mut starts = scratch_buffer!(i32,starts);
+        let mut lengths = scratch_buffer!(i32,lengths);
         starts.upload(&[0])?;
         lengths.upload(&[n as i32])?;
         stream.join_default()?;
         let memory_allocated = self.cuda.admission_memory()?;
         eprintln!("vision workspace admission: {}", serde_json::json!({
-            "geometry":g,"compact_workspace":compact,"admission_bytes":needed,"reserve_bytes":reserve,"memory_before":memory_before,
+            "geometry":g,"compact_workspace":compact,"borrowed_prefill_scratch":borrowed,"admission_bytes":needed,"reserve_bytes":reserve,"memory_before":memory_before,
             "memory_allocated":memory_allocated
         }));
         ensure!(memory_allocated.admitted_available > reserve,
@@ -617,6 +651,8 @@ mod workspace_tests {
                 assert!(p.fp32_backings(true)[0]>=p.bf16[2]);
                 assert!(p.fp32_backings(true)[0]>=p.bf16[11]);
                 assert!(p.admission_bytes(true,true)<=p.admission_bytes(true,false));
+                assert!(p.scratch_bytes(true)<=8192*30720*2,"{g:?}: scratch exceeds prefill input arena");
+                assert!(p.arena_admission_bytes(true)<=p.admission_bytes(true,true));
                 geometries+=1;
             }
         }

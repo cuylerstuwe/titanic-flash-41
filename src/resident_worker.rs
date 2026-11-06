@@ -1208,7 +1208,12 @@ impl Worker {
         stream.synchronize()?;
         let session_prepare_seconds = prepare_started.elapsed().as_secs_f64();
         eprintln!("rank{} allocation boundary before vision: {}",p.rank,json!(cuda.admission_memory()?));
-        let media=p.vision.as_ref().map(|config|crate::worker_media::Media::load(&cuda,p.rank,&cfg,config)).transpose()?;
+        let mut media=p.vision.as_ref().map(|config|crate::worker_media::Media::load(&cuda,p.rank,&cfg,config)).transpose()?;
+        if let Some(media)=&mut media {
+            let arena=wides.iter().max_by_key(|t|t.physical_rows())
+                .map(|t|t.image_scratch_arena(&stream)).transpose()?.flatten();
+            media.lend_prefill_scratch(arena);
+        }
         eprintln!("rank{} allocation boundary after vision: {}",p.rank,json!(cuda.admission_memory()?));
         ensure!(
             cuda.admission_memory()?.admitted_available >= 8 * 1024usize.pow(3),

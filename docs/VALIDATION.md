@@ -1,5 +1,79 @@
 # Validation status
 
+## November 5 image-workspace repair (s1338)
+
+A long image conversation could receive `Image encoding cannot retain the UMA reserve`
+even with only one execution owner. In the observed incident, image admission
+remained 67.51 MiB short after reclaiming optional conversation-cache entries.
+The worker group stayed ready; this was a recoverable capacity refusal, with
+no accompanying GPU allocation or Xid error.
+
+The image encoder now borrows the existing wide-prefill embedding arena for
+temporary tensors between completed prefill chunks. It contains no KV cache,
+retained model state or terminal logits. The completed image representation
+remains independently owned, so subsequent image or text work cannot overwrite
+it. The same stream is synchronized around its use. Configurations without a
+sufficiently large donor arena retain the owned-workspace path.
+
+At the incident's 51 × 91 patch geometry, this avoids 190 MiB of additional
+workspace admission after patches are resident. Under pressure, image admission
+also returns unused host allocator pages before reclaiming useful caches. The
+8 GiB operating margin, 8.5 GiB allocation floor and full 512 MiB transient-driver
+allowance remain. Weights, image geometry, arithmetic, precision, sampling,
+cache budgets and the 2350 MHz clock policy are unchanged.
+
+Qualification:
+
+- Two four-device component panels compared owned and borrowed workspaces,
+  image placement, cache reuse after scratch overwrite, prefix skipping and
+  allocation-failure recovery. They covered canonical image fixtures, the
+  incident geometry and an 84 × 105 patch geometry near the image-token limit.
+  Each panel passed 12 comparison records and 8 fault/recovery records per
+  device. Completed image representations matched exactly.
+- A fresh-boot normal serving build passed all ten requests in a synthetic
+  conversation reaching 438,139 prompt tokens with 17 images, plus one separate
+  image request. Image encoding succeeded under actual host-memory pressure;
+  the machine was already below the pressure target, so the pressure helper
+  needed no artificial ballast. Optional older cache entries were reclaimed.
+  Seven encodings completed below the former workspace-admission requirement;
+  every post-allocation observation remained above the existing safety floor.
+  The pressured continuation reused 436,864 tokens, the repeat reused 437,888,
+  and the long prompt still reused 438,016 tokens after an overlapping image/text
+  pair. Both requests in that pair completed.
+- All four workers exited normally, with no new GPU allocation/Xid messages or
+  memory/thermal guard aborts. Pi-compatible timing accounting passed.
+- Frozen native host checks passed 209 tests; portable locked-dependency checks
+  passed 212, both excluding 22 fixture-dependent tests. Linux Arm64 normal and
+  diagnostic builds passed 210 and 211 tests, respectively, with 24 ignored.
+  Ten journaled install/interruption/rollback fixtures passed.
+- The encoder's operation sequence is unchanged. Core-kernel differences are
+  confined to compiler-generated symbol names; executable/data/header bytes
+  match, and the vision kernel is byte-identical.
+
+The first full-model attempt completed five requests through the pressured
+continuation, but an overly strict harness assertion rejected permitted optional
+cache eviction. It is retained as partial evidence. The complete fresh-boot
+repeat above instead checked preservation of the active continuation. These
+are capped correctness and memory checks, not new throughput or task-quality
+benchmarks.
+
+Native serving-source fingerprint:
+`c50a67973830b6779121e98d2e38143e1848f3f897a7117e80636449ca7e60ca`.
+Portable source fingerprint:
+`8b638de24c9397f13b48028dcc14e3ca358fc97a5335ec14cc80ab56bbdaae06`.
+Fault injection is excluded from the normal serving binary. The portable
+deployment wrapper and kernel bundle are unchanged; their provisioning and
+GPU deployment have not been rerun for this repair. Published scores remain
+identified as s1329.
+
+Native s1338 is installed after fresh boots and one daily model load per device,
+with s1334 as the failed-start fallback. Five head-local streaming requests
+passed text, exact prompt reuse, continuation, image input and text after image
+input. A synthetic image request through the external router also passed with
+Pi-compatible timing and unchanged router configuration. One generation stayed
+Ready throughout. Runtime hashes, 2350 MHz clocks, host-policy recovery guards
+and kernel-health checks passed; the maintenance reservation is released.
+
 ## November 5 prefill memory-pressure repair (s1334)
 
 An optional Engram lookahead check could terminate one worker when estimated

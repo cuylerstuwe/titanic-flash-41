@@ -6,7 +6,7 @@ A native Rust inference engine and OpenAI-compatible server for **DeepSeek-V4.1-
 
 The engine includes GPU model execution, speculative decoding, SSD-backed Engram lookup, prompt reuse, streaming tool calls, image input, and native foreground/background scheduling. It admits two requests, each with the full context capacity, and queues additional requests. Rust owns model execution and request scheduling; CUDA and compiled GPU operators perform model arithmetic. Python utilities handle installation and fleet lifecycle.
 
-This checkout carries the **November 5 memory-pressure repair (s1334)** on the accumulated s1329 engine: faster prompt/image preparation, optional incremental context transport, continuation-cache preparation, reduced drafting and transport overhead, and optimized projection kernels. Prefill now coordinates memory admission across devices, reclaims optional cached state when needed, and refuses only the affected request if capacity remains insufficient. Optional Engram prefetch no longer terminates a worker when headroom falls. The earlier paired-scheduling, image-memory and full-logit fixes remain. Canonical target weights, precision boundaries and recommended sampling settings are preserved. See [release validation](docs/VALIDATION.md) for details and deployment scope.
+This checkout carries the **November 5 image-workspace repair (s1338)** on the accumulated s1329 engine. Image encoding reuses idle prefill embedding storage, reducing additional memory demand during long image conversations. Pressure handling also returns unused host allocator pages before evicting optional cached state. The earlier prefill-admission, paired-scheduling and full-logit fixes remain, along with prompt/image reuse, optional incremental context transport, continuation-cache preparation and optimized drafting, transport and projection paths. Canonical target weights, precision boundaries, memory safety margins and recommended sampling settings are preserved. See [release validation](docs/VALIDATION.md) for details and deployment scope.
 
 At the recommended temperature 1 / top-p 1 settings, matched native continuations decoded **3.38–3.59% faster than s1291** across two fresh-boot launch orders. Cold prefill was effectively unchanged. These are scoped speed measurements; different sampled reasoning paths can still change total task time. The [paired comparison](benchmarks/release-comparison-s1329.json) retains the slower copy-task outcome as well.
 
@@ -14,7 +14,7 @@ At the recommended temperature 1 / top-p 1 settings, matched native continuation
 
 Single-stream measurements from **November 4, 2026 (s1329)**, using the published comparison's prompts, context file, request settings and timing function. The qualified portable build ran **on the head GB10 against loopback HTTP**, bypassing any external router or physical HTTP network hop. All 24 requests completed in one pass on the first model load after a four-device reboot. Only Titanic was measured again; competitor results below are the author's existing published numbers.
 
-These measurements predate the s1332 scheduling and s1334 memory-pressure repairs; they have not been relabeled or remeasured for either.
+These measurements predate the s1332 scheduling, s1334 prefill-admission and s1338 image-workspace repairs; they have not been relabeled or remeasured for those updates.
 
 Median generation speed in **tokens/second**, three repetitions with a 512-token output budget:
 

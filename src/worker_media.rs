@@ -123,6 +123,7 @@ pub(crate) struct Media {
     encoder_key: [u8;32],
     encoder: Option<Vision>,
     compact_workspace:bool,
+    scratch_arena:Option<Rc<crate::cuda::RowArena>>,
     cache: SpanCache,
     inputs: HashMap<[u8;32],Arc<PatchInput>>,
     encoded: u64,
@@ -152,12 +153,19 @@ impl Media {
             ensure!(encoder.source_sha256()==config.weights_sha256,"loaded vision identity differs");
             Some(encoder)
         }else{None};
-        Ok(Self {cuda:cuda.clone(),rank,encoder_rank,encoder_key,encoder,compact_workspace:crate::vision::compact_workspace()?,cache:SpanCache::new(config.cache_bytes)?,
+        Ok(Self {cuda:cuda.clone(),rank,encoder_rank,encoder_key,encoder,compact_workspace:crate::vision::compact_workspace()?,scratch_arena:None,cache:SpanCache::new(config.cache_bytes)?,
             inputs:HashMap::new(),encoded:0,skipped:0,transmitted:0,
             #[cfg(feature="storage-fault-injection")]
             capacity_fault:std::env::var("CANADA_SCRATCH_IMAGE_CAPACITY_FAULT").ok()
                 .map(|v|ImageCapacityFault::parse(&v)).transpose()?,
         })
+    }
+    pub(crate) fn lend_prefill_scratch(&mut self,arena:Option<Rc<crate::cuda::RowArena>>) {
+        self.scratch_arena=arena;
+    }
+    fn scratch_for(&self,g:Geometry)->Result<Option<&Rc<crate::cuda::RowArena>>> {
+        let needed=g.scratch_bytes(self.compact_workspace)?;
+        Ok(self.scratch_arena.as_ref().filter(|a|a.bytes()>=needed))
     }
     pub(crate) fn identity(&self, images:&[Descriptor], tokens:&[u32]) -> Result<Identity> {
         Descriptor::identity(images,self.encoder_key,tokens)
@@ -181,6 +189,7 @@ impl Media {
         let mut spans=Vec::with_capacity(images.len());
         let mut hashes=Vec::new();
         let mut reclamations=Vec::new();
+        let mut host_trims=Vec::new();
         for (image,placement) in images.iter().zip(identity.placements()) {
             ensure!(image.key(self.encoder_key)==placement.key && image.start==placement.start
                 && image.geometry.validate()?.tokens()==placement.tokens,"image binding identity differs");
@@ -200,7 +209,7 @@ impl Media {
                 let g=image.geometry;
                 let patch_bytes=g.rows()*588*2;
                 let needed=if self.rank==self.encoder_rank {
-                    g.workspace_bytes(true,self.compact_workspace)?
+                    if self.scratch_for(g)?.is_some(){g.arena_admission_bytes(true)?}else{g.workspace_bytes(true,self.compact_workspace)?}
                 }else{g.tokens()*5120*2+(16<<20)
                     +if self.encoder_rank!=0{patch_bytes.next_multiple_of(2<<20)}else{0}};
                 let base_required=self.cuda.allocation_reserve_bytes()+needed;
@@ -217,7 +226,19 @@ impl Media {
                         Ok(cuda.admission_memory()?.admitted_available > required)
                     };
                     if !control.all_admit(enough(&self.cuda)?)? || attempt>0 {
-                        stream.synchronize()?;self.cache.release_warm();
+                        stream.synchronize()?;
+                        // Image admission happens before the text-prefill
+                        // pressure path. Return allocator-free host pages here
+                        // too, before sacrificing useful conversation state.
+                        let trim_started=Instant::now();
+                        let before=self.cuda.admission_memory()?;
+                        let returned_pages=crate::memory::trim_free_host_pages();
+                        let trim=json!({"rank":self.rank,"returned_pages":returned_pages,
+                            "memory_before":before,"memory_after":self.cuda.admission_memory()?,
+                            "seconds":trim_started.elapsed().as_secs_f64()});
+                        eprintln!("image host allocator trim: {trim}");
+                        host_trims.push(trim);
+                        if !control.all_admit(enough(&self.cuda)?)? {self.cache.release_warm();}
                         if !control.all_admit(enough(&self.cuda)?)? {
                             reclamations.push(reclaim(control,required)?);
                         }
@@ -263,7 +284,7 @@ impl Media {
         let receipt=json!({"seconds":began.elapsed().as_secs_f64(),"encoder_rank":self.encoder_rank,"encoded_images":self.encoded-before.0,
             "prefix_images_skipped":self.skipped-before.1,"broadcast_images":self.transmitted-before.2,
             "cache":self.cache.stats(),"live_request_bytes":bindings.owned_bytes(),
-            "cache_reclamations":reclamations,"diagnostic_span_hashes":hashes});
+            "cache_reclamations":reclamations,"host_allocator_trims":host_trims,"prefill_scratch_bytes":self.scratch_arena.as_ref().map_or(0,|a|a.bytes()),"diagnostic_span_hashes":hashes});
         Ok((bindings,receipt))
     }
     fn encode_attempt(&self,image:&Descriptor,required:usize,control:&mut ControlChannel,
@@ -296,7 +317,7 @@ impl Media {
         stream.synchronize()?;comm.health()?;
         let span=(||->Result<_>{
             let span=if self.rank==self.encoder_rank {
-                self.encoder.as_ref().unwrap().encode_with_workspace(patches.as_ref().unwrap(),g,stream,self.compact_workspace)?
+                self.encoder.as_ref().unwrap().encode_with_arena(patches.as_ref().unwrap(),g,stream,self.compact_workspace,self.scratch_for(g)?)?
             }else{ImageSpan {data:self.cuda.allocate_input(g.tokens()*5120)?,geometry:g}};
             #[cfg(feature="storage-fault-injection")]
             if let Some(fault)=&self.capacity_fault {fault.check(self.rank,"span",required)?;}
@@ -329,6 +350,7 @@ pub fn placement_probe(path:&std::path::Path)->Result<Value> {
         fixtures:Vec<Fixture>, output:PathBuf,
         #[serde(default)] capacity_checks:bool,
         #[serde(default)] workspace_compare:bool,
+        #[serde(default)] arena_compare:bool,
     }
     let p:Probe=serde_json::from_slice(&std::fs::read(path)?)?;
     ensure!(!p.capacity_checks || cfg!(feature="storage-fault-injection"),"capacity probe requires diagnostic build");
@@ -349,12 +371,14 @@ pub fn placement_probe(path:&std::path::Path)->Result<Value> {
     let mut reference=Vec::new();let mut records=Vec::new();
     let mut capacity_records:Vec<Value>=Vec::new();
     let compact=crate::vision::compact_workspace()?;
-    let placements=if p.workspace_compare {vec![(0,false),(3,false),(3,true)]}else{vec![(0,compact),(3,compact)]};
+    let mut placements=if p.workspace_compare {vec![(0,false,false),(3,false,false),(3,true,false)]}else{vec![(0,compact,false),(3,compact,false)]};
+    if p.arena_compare {placements.push((3,true,true));}
     let mut workspace_records=Vec::new();
-    for (location,compact) in placements {
+    for (location,compact,borrowed) in placements {
         let before=cuda.admission_memory()?;
         let mut media=Media::load_at(&cuda,p.rank,&model,&p.vision,location)?;
         media.compact_workspace=compact;
+        if borrowed {media.lend_prefill_scratch(Some(cuda.row_arena(8192*30720*2)?));}
         let after=cuda.admission_memory()?;
         for (step,case,skip) in [(0,0,false),(1,1,false),(2,0,false),(3,1,true)] {
             let f=&p.fixtures[case];
@@ -373,7 +397,7 @@ pub fn placement_probe(path:&std::path::Path)->Result<Value> {
             control.agree(&serde_json::to_vec(hashes)?)?;
             ensure!(receipt["encoded_images"]==if step<2{1}else{0}
                 && receipt["prefix_images_skipped"]==usize::from(skip),"vision placement cache/skip contract");
-            records.push(json!({"encoder_rank":location,"compact_workspace":compact,"step":step,"case":case,"seconds":started.elapsed().as_secs_f64(),
+            records.push(json!({"encoder_rank":location,"compact_workspace":compact,"borrowed_prefill_scratch":borrowed,"step":step,"case":case,"seconds":started.elapsed().as_secs_f64(),
                 "receipt":receipt,"load_memory_before":before,"load_memory_after":after,
                 "encoder_weight_bytes":media.encoder.as_ref().map_or(0,Vision::weight_bytes),"all_peer_span_hashes_equal":true}));
             drop(bindings);
