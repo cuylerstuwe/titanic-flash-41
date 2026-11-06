@@ -50,6 +50,8 @@ mod moe_epilogue_probe;
 mod ffn_sum_append_probe;
 #[path = "ffn_hint_model_probe.rs"]
 mod ffn_hint_model_probe;
+#[path = "graph_retention_probe.rs"]
+mod graph_retention_probe;
 #[path = "append_last_gather_probe.rs"]
 mod append_last_gather_probe;
 #[path="gather_rows_probe.rs"]
@@ -954,8 +956,12 @@ impl Worker {
             Ok(value)=>value.parse::<usize>()?,
             Err(error)=>return Err(error.into()),
         };
-        ensure!((64*1024usize.pow(2)..=2*1024usize.pow(3)).contains(&shared_image_budget),
-            "shared inactive image budget must be64MiB..2GiB");
+        // One physical owner saves several GiB of permanently allocated state.
+        // Only unfinished requests may use the extra on-demand parking budget;
+        // optional completed caches retain their independent2GiB cap above.
+        let image_limit=if crate::config::single_bank_requested(){4}else{2}*1024usize.pow(3);
+        ensure!((64*1024usize.pow(2)..=image_limit).contains(&shared_image_budget),
+            "shared inactive image budget exceeds the selected owner layout");
         let session_cache_long_first=match std::env::var("CANADA_SCRATCH_SESSION_CACHE_POLICY") {
             Err(std::env::VarError::NotPresent)=>true,
             Ok(value)if value=="fifo"=>false,
@@ -2859,6 +2865,7 @@ impl Worker {
             if std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1") {
                 longer.set_tiny_extend_for_probe(true,&self.stream)?;
                 for live in 7..=16 {
+                    if crate::config::execution_graph_cache_rows()?>0 && ![7,16].contains(&live){continue;}
                     longer.begin_verification(&teacher[..live],&self.comm,&self.stream)?;
                     longer.warm_pending_append_sampler(&self.stream)?;
                     longer.finish_verification(0,&self.comm,&self.stream)?;
@@ -2876,6 +2883,7 @@ impl Worker {
             if self.retained_append32 {
                 longer.set_tiny_extend_for_probe(true,&self.stream)?;
                 for live in 17..=32 {
+                    if crate::config::execution_graph_cache_rows()?>0 && ![17,32].contains(&live){continue;}
                     longer.begin_verification(&teacher[..live],&self.comm,&self.stream)?;
                     longer.warm_pending_append_sampler(&self.stream)?;
                     longer.finish_verification(0,&self.comm,&self.stream)?;
@@ -3205,6 +3213,13 @@ fn validate_startup_config(p:&WorkerConfig,http:bool)->Result<()> {
         "finite cooperative epilogue screen is unavailable in HTTP serving");
     ensure!(!http||std::env::var("CANADA_SCRATCH_QUERY_REUSE_SCREEN").as_deref()!=Ok("1"),
         "query reuse observer is restricted to the finite file runner");
+    crate::config::execution_graph_cache_rows()?;
+    let single=std::env::var("CANADA_SCRATCH_SINGLE_BANK");
+    ensure!(single.is_err()||single.as_deref()==Ok("0")||single.as_deref()==Ok("1"),"invalid single-bank mode policy");
+    ensure!(!crate::config::single_bank_requested()||(!crate::config::resident_banks_requested()
+        &&!crate::config::paired_serving_requested()&&!crate::config::encoder_prefix_import_requested()
+        &&!crate::config::paired_draft_head_requested()),"single-bank mode excludes peer capabilities");
+    ensure!(!http||std::env::var("CANADA_SCRATCH_GRAPH_RETENTION_SCREEN").as_deref()!=Ok("1"),"graph retention probe is unavailable in HTTP serving");
     idle_anchor_enabled()?;
     ensure!(!idle_anchor_rolling()?||idle_anchor_enabled()?,"rolling anchors require idle preparation");
     encoder_duplicate_skip()?;
@@ -3493,6 +3508,10 @@ pub fn run_file(path: &Path) -> Result<()> {
     }
     if std::env::var("CANADA_SCRATCH_FFN_SUM_SHARED_SCREEN").as_deref()==Ok("1") {
         ffn_sum_append_probe::run(&mut worker,p.rank,p.events.parent().unwrap())?;
+        history32_generation_probe::execute(&mut worker,Command::Shutdown)?;return Ok(());
+    }
+    if std::env::var("CANADA_SCRATCH_GRAPH_RETENTION_SCREEN").as_deref()==Ok("1") {
+        graph_retention_probe::run(&mut worker,p.rank,p.events.parent().unwrap())?;
         history32_generation_probe::execute(&mut worker,Command::Shutdown)?;return Ok(());
     }
     if std::env::var("CANADA_SCRATCH_APPEND_LAST_GATHER_SCREEN").as_deref()==Ok("1") {
@@ -4019,7 +4038,9 @@ pub fn run_http(path: &Path) -> Result<()> {
         .transpose()?;
     let mut events = crate::event_log::EventLog::from_env(&p.events)?;
     let mut worker = Worker::load(&p)?;
+    worker.control.agree(&crate::config::execution_graph_cache_rows()?.to_le_bytes())?;
     let resident_banks=worker.initialize_resident_banks(&p.kernels)?;
+    worker.cuda.report_allocation_sites("resident banks constructed")?;
     ensure!(!http_interleave || (!post_http_causal && !post_http_capture && !post_http_control
         && !post_http_verify_profile && !post_http_long_quality),
         "HTTP interleave experiment needs an isolated worker");
@@ -4035,6 +4056,7 @@ pub fn run_http(path: &Path) -> Result<()> {
         Err(std::env::VarError::NotPresent) => None,
         Err(error) => return Err(error.into()),
     };
+    worker.cuda.report_allocation_sites("startup warmup complete")?;
     worker.progress_next = progress_next;
     let mut ready = json!({"type":"ready","rank":p.rank,"identity":worker.identity,
         "session_cache_budget_bytes":worker.session_cache_budget,"prompt_checkpoint":worker.prompt_checkpoint,
@@ -4100,6 +4122,8 @@ pub fn run_http(path: &Path) -> Result<()> {
     ready["bank_encoder_checkpoint"]=json!(crate::config::bank_encoder_checkpoint_requested());
     ready["resident_banks"]=resident_banks;
     ready["parking_extra_slots"]=json!(worker.parking_extra_slots);
+    ready["physical_execution_banks"]=json!(if worker.peer_bank.is_some(){2}else{1});
+    ready["execution_graph_cache_rows"]=json!(crate::config::execution_graph_cache_rows()?);
     events.record(&ready)?;
     if let Some(queue) = &queue {
         if http_interleave {

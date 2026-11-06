@@ -1,5 +1,85 @@
 # Validation status
 
+## November 6 forward-stream memory repair (s1345)
+
+A later long-session incident still reached the physical admission floor after
+all optional checkpoints had been reclaimed. The previous scratch loan was
+working; the remaining fixed footprint included two full-context execution
+banks and warmed graph variants for both, even during solo use.
+
+The default profile now keeps one physical execution bank. It preserves the
+active conversation's forward-prefix checkpoints and fully warms/retains the
+primary append and decode graphs. Two logical lifetime admissions remain;
+overlapping requests use complete RAM snapshots only when switching is needed.
+Optional completed checkpoints remain capped at 2 GiB. Shared snapshot/cache
+storage may use 4 GiB per rank on demand, subject to the unchanged physical floor;
+optional rewind/ancestor acceleration yields to unfinished requests. There is
+no SSD parking, weight/precision/sampling change or reduction of image resolution.
+Same-class requests can finish serially if switching is too expensive in memory.
+Incoming foreground work that cannot safely pause a background owner receives a
+capacity error instead of being stranded behind a global priority hold.
+
+The exploratory comparison used the same source, 2350 MHz and recommended sampler
+on fresh boots. Both exploratory layouts used a four-variant graph-retention
+budget; the final profile uses full primary warmup. 108 matched capped requests
+covered cached appends, growing image
+history, context resets and fresh images at the end. The vision rank ended with
+17.182 GiB available in one-bank mode versus 9.125 GiB with two physical banks.
+Prefill totals were 71.663 s versus 71.534 s for the growing long image conversation;
+short cached-turn totals were 30.368 s versus 30.459 s. These single-order mechanism
+screens do not establish a general speedup or task-quality result. Three further
+one-bank requests exercised 438K background pause/resume, foreground image input
+and subsequent prefix reuse. See the [sanitized comparison](../validation/memory-layout-2026-11-06.json).
+
+A separate graph-retention component screen passed 56 paired records per device,
+including exact logits, target/drafter/lookup state and following-six-position
+rollback. Limiting graph variants saved memory but introduced recapture cost.
+The release therefore retains full primary warmup; the optional graph-retention
+control remains disabled in the supplied profile.
+
+The native qualification fleet contains three ASUS GX10s and one DGX Spark,
+all GB10. The final fully warmed build completed 69 requests reaching 974,076 prompt
+tokens, with a 28-image conversation, two context resets, 16 subsequent fresh
+images, foreground image preemption of a long background request, and two
+974K-token foreground peers. The latter held 3,273,868,840 bytes of temporary
+snapshot storage. The minimum observed available memory was 14.644 GiB on the
+vision rank. The panel did not fully pass: its external thermal guard stopped
+the head at 90.2°C during the final cancellation fixture, after several cold
+near-million-token prefills. That interruption is retained as a limitation;
+there was no memory-guard abort or new GPU allocation/Xid message. The 90°C
+cutoff belongs only to the temporary test observer. Production has no request-
+error rule at that temperature; its 2350 MHz policy and hardware protections remain. The cancellation/retry case is qualified
+separately below, without weakening the temperature guard or changing clocks.
+
+A focused fresh-boot follow-up completed a 974,039-token/28-image prefill,
+cancelled a forward continuation after output began, and retried it using all
+974,056 cached prompt tokens (zero prompt work). A new image then succeeded at
+975,018 prompt tokens, reusing 973,824. All four workers exited normally, with
+no memory/thermal guard abort or new GPU allocation/Xid messages. The vision
+device finished with 16.812 GiB available. These are capped state and memory
+checks, not completed-task quality measurements.
+
+Native s1345 is installed after fresh boots and one production model load per
+device, with s1338 as the failed-start fallback. Five installed head-local
+streaming requests passed text, prompt reuse, continuation, image input and
+text after image input. A synthetic image request through the external router
+passed with Pi-compatible timing and unchanged router configuration. One
+production generation stayed Ready. All-rank runtime hashes, 2350 MHz clocks,
+clock/APST recovery guards and kernel-health checks passed; the reservation is
+released. See the [sanitized qualification record](../validation/memory-repair-2026-11-06.json).
+
+Native serving-source fingerprint:
+`703d9e69d3c279c0e7a0ea846158bc44d89f9c0cd8d0e730001308ea6faf1221`.
+Portable source fingerprint:
+`3badeddbc48d994e61245b7754901a7c27b81a73e77e6eb46216b20d2b0cf6d4`.
+Portable checks passed 215 Rust tests (22 fixture-dependent tests ignored) and 42
+Python deployment checks; Linux Arm64 serving checks passed 213 (24 ignored).
+Ten installation interruption/rollback fixtures passed. The core and vision
+kernel operations are unchanged; no storage fault injection is compiled in.
+This repair does not remeasure the published throughput table, which remains
+s1329. The portable GPU deployment/provisioning wrapper was not rerun.
+
+
 ## November 5 image-workspace repair (s1338)
 
 A long image conversation could receive `Image encoding cannot retain the UMA reserve`

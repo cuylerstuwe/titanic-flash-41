@@ -1,3 +1,4 @@
+mod graph_retention;
 mod launch_flags;
 pub mod attention;
 mod prefill_exchange;

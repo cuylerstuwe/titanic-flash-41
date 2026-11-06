@@ -527,6 +527,8 @@ struct TinyAppendGraphs {
     decoder: Option<Step>,
 }
 pub struct Target {
+    graph_retention: crate::graph_retention::Policy,
+    graph_evictions: usize,
     rows: usize,
     source_phase: Phase,
     tiny_native_reduce: bool,
@@ -936,6 +938,8 @@ impl Target {
                 && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1"),
             tiny_prefix_gather: source_phase==Phase::Verify && [6,16].contains(&rows)
                 && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1"),
+            graph_retention: crate::graph_retention::Policy::new(rows,crate::config::execution_graph_cache_rows()?),
+            graph_evictions: 0,
             graphs: (0..=rows).map(|_| None).collect(),
             engram_graphs: (0..=rows).map(|_| None).collect(),
             alternate_index_graphs: (0..=rows).map(|_| None).collect(),
@@ -1538,6 +1542,8 @@ impl Target {
                 && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1"),
             tiny_prefix_gather: phase==Phase::Verify && [6,16].contains(&rows)
                 && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1"),
+            graph_retention: crate::graph_retention::Policy::new(rows,crate::config::execution_graph_cache_rows()?),
+            graph_evictions: 0,
             graphs: (0..=rows).map(|_| None).collect(),
             engram_graphs: (0..=rows).map(|_| None).collect(),
             alternate_index_graphs: (0..=rows).map(|_| None).collect(),
@@ -3792,6 +3798,44 @@ impl Target {
         Ok(())
     }
 
+    /// Reclaim plans only. Causal buffers, decoder metadata, logits and
+    /// sampler/drafter state keep their storage and contents. Row ages are
+    /// shared across phase/index banks; their capture identities remain separate.
+    fn bound_execution_graphs(&mut self,live:usize,stream:&Stream)->Result<()> {
+        if self.graph_retention.limit()==0 {return Ok(());}
+        self.graph_retention.touch(live);
+        if self.graphs[live].is_some()||self.engram_graphs[live].is_some(){return Ok(());}
+        let mut present=(1..=self.rows).filter(|&i|self.graphs[i].is_some()||self.engram_graphs[i].is_some()).collect::<Vec<_>>();
+        if self.graph_retention.victim(&present,live).is_none(){return Ok(());}
+        stream.synchronize()?;
+        while let Some(victim)=self.graph_retention.victim(&present,live) {
+            self.graphs[victim]=None;self.engram_graphs[victim]=None;
+            present.retain(|&i|i!=victim);self.graph_evictions+=1;
+        }
+        Ok(())
+    }
+    pub(crate) fn graph_retention_report(&self)->serde_json::Value {
+        let count=|a:&Vec<Option<Graph>>,b:&Vec<Option<Vec<Graph>>>|a.iter().zip(b).filter(|(a,b)|a.is_some()||b.is_some()).count();
+        serde_json::json!({"row_limit":self.graph_retention.limit(),"evictions":self.graph_evictions,
+            "current":count(&self.graphs,&self.engram_graphs),"alternate":count(&self.alternate_index_graphs,&self.alternate_index_engram_graphs),
+            "other_phase":self.tiny_append_graphs.as_ref().map(|b|[count(&b.graphs,&b.engram_graphs),count(&b.alternate_index_graphs,&b.alternate_index_engram_graphs)])})
+    }
+    pub(crate) fn set_graph_retention_for_probe(&mut self,limit:usize,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_GRAPH_RETENTION_SCREEN").as_deref()==Ok("1")
+            &&limit<=32&&self.pending.is_none()&&self.cuda.owns_stream(stream),"finite graph retention control");
+        if self.graph_retention.limit()==limit {return Ok(());}
+        stream.synchronize()?;
+        // Start each control/candidate arm with the same cold executable bank.
+        // Preserve every buffer and the alternate-phase metadata ownership.
+        for g in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*g=None;}
+        for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*g=None;}
+        if let Some(b)=&mut self.tiny_append_graphs {
+            for g in b.graphs.iter_mut().chain(&mut b.alternate_index_graphs){*g=None;}
+            for g in b.engram_graphs.iter_mut().chain(&mut b.alternate_index_engram_graphs){*g=None;}
+        }
+        self.graph_retention=crate::graph_retention::Policy::new(self.rows,limit);
+        Ok(())
+    }
     pub(crate) fn append_last_gather_enabled(&self)->bool {self.append_last_gather}
     pub(crate) fn append_encoded_head_enabled(&self)->bool {self.append_encoded_head}
     pub(crate) fn set_append_encoded_head_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
@@ -4249,6 +4293,7 @@ impl Target {
             self.group14.select_engram_projection_ahead(self.engram_projection_active)?;
         }
         self.select_index_graph_bank(stream)?;
+        if self.graph_replay {self.bound_execution_graphs(ids.len(),stream)?;}
         let mut marks = vec![("begin", begin)];
         let mut captured_new_graph = false;
         let mut split_engram14=self.engram_split14 && (!self.engram_split14_m3_only || ids.len()==3);

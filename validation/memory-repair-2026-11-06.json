@@ -1,0 +1,200 @@
+{
+  "completed_stress_portion": {
+    "runtime": "s1345",
+    "completed_portion_passed": true,
+    "full_panel_passed": false,
+    "completed_requests": 69,
+    "max_prompt_tokens": 974076,
+    "peak_snapshot_bytes": 3273868840,
+    "foreground_preempted_background": true,
+    "thermal_guard_interruption": true,
+    "cancellation_test_completed": false,
+    "kernel_allocation_or_xid_messages": 0,
+    "ranks": [
+      {
+        "rank": 0,
+        "min_available_bytes": 16162328576,
+        "max_temperature_milliC": 90200,
+        "thermal_abort": true
+      },
+      {
+        "rank": 1,
+        "min_available_bytes": 16687321088,
+        "max_temperature_milliC": 89000,
+        "thermal_abort": false
+      },
+      {
+        "rank": 2,
+        "min_available_bytes": 16631054336,
+        "max_temperature_milliC": 89700,
+        "thermal_abort": false
+      },
+      {
+        "rank": 3,
+        "min_available_bytes": 15723712512,
+        "max_temperature_milliC": 89300,
+        "thermal_abort": false
+      }
+    ],
+    "scope": "Synthetic capped serving checks. Complete part only; the cancellation fixture was interrupted by the temporary thermal guard. This is not a task-quality or throughput benchmark.",
+    "max_images_in_growing_conversation": 28,
+    "context_reset_phases": 2,
+    "fresh_images_after_resets": 16,
+    "temperature_cutoff_is_test_only": true
+  },
+  "focused_followup": {
+    "passed": true,
+    "cancelled": true,
+    "completed_requests": 3,
+    "max_prompt_tokens": 975018,
+    "ranks": [
+      {
+        "rank": 0,
+        "memory_abort": false,
+        "thermal_abort": false,
+        "min_available_bytes": 18424639488,
+        "max_temperature_milliC": 83400
+      },
+      {
+        "rank": 1,
+        "memory_abort": false,
+        "thermal_abort": false,
+        "min_available_bytes": 18998251520,
+        "max_temperature_milliC": 85600
+      },
+      {
+        "rank": 2,
+        "memory_abort": false,
+        "thermal_abort": false,
+        "min_available_bytes": 18950955008,
+        "max_temperature_milliC": 83100
+      },
+      {
+        "rank": 3,
+        "memory_abort": false,
+        "thermal_abort": false,
+        "min_available_bytes": 18050891776,
+        "max_temperature_milliC": 87700
+      }
+    ],
+    "requests": [
+      {
+        "name": "near-full-cancel-baseline",
+        "usage": {
+          "prompt_tokens": 974039,
+          "completion_tokens": 16,
+          "total_tokens": 974055,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 16
+          },
+          "prompt_cache_hit_tokens": 0,
+          "prompt_cache_miss_tokens": 974039
+        },
+        "timings": {
+          "prompt_n": 974039,
+          "cache_n": 0,
+          "prompt_ms": 169876.23802699998,
+          "prompt_per_second": 5733.815460671945,
+          "scope": "server_prefill_phase"
+        },
+        "seconds": 178.57856985899997,
+        "finish_reason": "length"
+      },
+      {
+        "name": "rewind-after-cancel",
+        "usage": {
+          "prompt_tokens": 974056,
+          "completion_tokens": 16,
+          "total_tokens": 974072,
+          "prompt_tokens_details": {
+            "cached_tokens": 974056
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 16
+          },
+          "prompt_cache_hit_tokens": 974056,
+          "prompt_cache_miss_tokens": 0
+        },
+        "timings": {
+          "prompt_n": 0,
+          "cache_n": 974056,
+          "prompt_ms": 0.0,
+          "scope": "server_prefill_phase"
+        },
+        "seconds": 0.353532113999961,
+        "finish_reason": "length"
+      },
+      {
+        "name": "new-image-after-cancel",
+        "usage": {
+          "prompt_tokens": 975018,
+          "completion_tokens": 16,
+          "total_tokens": 975034,
+          "prompt_tokens_details": {
+            "cached_tokens": 973824
+          },
+          "completion_tokens_details": {
+            "reasoning_tokens": 16
+          },
+          "prompt_cache_hit_tokens": 973824,
+          "prompt_cache_miss_tokens": 1194
+        },
+        "timings": {
+          "prompt_n": 1194,
+          "cache_n": 973824,
+          "prompt_ms": 494.21779300000003,
+          "prompt_per_second": 2415.9389178446677,
+          "scope": "server_prefill_phase"
+        },
+        "seconds": 1.1687896810000211,
+        "finish_reason": "length"
+      }
+    ],
+    "all_four_exit_zero": true,
+    "kernel_allocation_or_xid_messages": 0
+  },
+  "installed_checks": {
+    "passed": true,
+    "runtime": "s1345",
+    "fresh_boots_and_one_daily_load_per_device": true,
+    "head_local_requests": 5,
+    "text": true,
+    "prompt_reuse": true,
+    "continuation": true,
+    "image": true,
+    "pi_timing": true,
+    "one_generation_stayed_ready": true,
+    "routed_image": true,
+    "router_configuration_unchanged": true,
+    "runtime_hashes_verified": true,
+    "cap_mhz": 2350,
+    "clock_and_apst_recovery_guards_active": true,
+    "kernel_allocation_or_xid_messages": 0,
+    "reservation_released": true
+  },
+  "source_manifest_sha256": "3badeddbc48d994e61245b7754901a7c27b81a73e77e6eb46216b20d2b0cf6d4",
+  "cpu_checks": {
+    "portable_rust_passed": 215,
+    "portable_rust_ignored": 22,
+    "native_arm64_passed": 213,
+    "native_arm64_ignored": 24,
+    "portable_python_passed": 42,
+    "install_rollback_fixtures_passed": 10
+  },
+  "benchmark_scores_remeasured": false,
+  "kernel_identity": {
+    "core_code_data_headers_exact": true,
+    "core_difference": "NVCC internal symbol build identifier only",
+    "vision_byte_identical": true
+  },
+  "precision_or_sampling_changed": false,
+  "memory_floors_changed": false,
+  "physical_bank_count": 1,
+  "logical_lifetime_admissions": 2,
+  "shared_snapshot_cache_ceiling_bytes": 4294967296,
+  "optional_completed_cache_ceiling_bytes": 2147483648,
+  "temperature_cutoff_is_test_only": true
+}

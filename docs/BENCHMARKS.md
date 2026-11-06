@@ -1,6 +1,6 @@
 # Reproducing the published single-stream comparison
 
-The current source release and README benchmark are s1329 (November 4).
+The README benchmark measures s1329 (November 4). The current source includes later reliability repairs through s1345; those scores have not been relabeled as new measurements.
 Historical native s1291, s1173 and s986 measurements remain separately labeled below.
 
 Run on the **head node**, against its direct loopback endpoint, with no other requests. Use a freshly started model process if measuring the first uncached long prompt. Do not route through a remote client or proxy.

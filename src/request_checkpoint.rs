@@ -83,10 +83,11 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
     let working_room=if exchange && other_count==0 {256}else{16}*1024usize.pow(2);
     let reserve = 8*1024usize.pow(3)+working_room;
     let mut host_allocator_trim = None;
-    if exchange {
-        // Once two lifetime owners use exchange storage, cache borrows unused
-        // room. Prefer the protected set, but their full-context state must
-        // take priority when even the first park needs that room.
+    if exchange || crate::config::single_bank_requested() {
+        // Optional completed checkpoints may borrow unused parking capacity.
+        // Retaining unfinished owners takes precedence over rewind/ancestor
+        // acceleration, whether parking uses copies or in-place exchange.
+        // No live or suspended request state is an eviction target.
         if evictions.is_none(){evictions=cache_evictions(&entries,(usize::MAX,charge),budget,true,slots);}
         if !w.control.all_admit(evictions.is_some())?{return Ok(None);}
         let indices=evictions.as_mut().unwrap();

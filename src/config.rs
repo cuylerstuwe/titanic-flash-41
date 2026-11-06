@@ -111,8 +111,13 @@ pub(crate) fn encoder_prefix_import_requested() -> bool {
 pub(crate) fn bank_encoder_checkpoint_requested() -> bool {
     std::env::var("CANADA_SCRATCH_BANK_ENCODER_CHECKPOINT").as_deref()==Ok("1")
 }
+/// One physical owner retains optimized arenas and same-bank forward checkpoints.
+/// HTTP admission is separate; overlapping work parks complete state on demand.
+pub(crate) fn single_bank_requested() -> bool {
+    std::env::var("CANADA_SCRATCH_SINGLE_BANK").as_deref()==Ok("1")
+}
 pub(crate) fn shared_owner_profiles_requested() -> bool {
-    resident_banks_requested()
+    resident_banks_requested() || single_bank_requested()
         || std::env::var("CANADA_SCRATCH_PAIRED_SERVING_PROFILE_SCREEN").as_deref()==Ok("1")
 }
 
@@ -508,4 +513,14 @@ pub(crate) fn history32_generation_enabled() -> anyhow::Result<bool> {
 pub(crate) fn verification_carry_rows() -> usize {
     if history32_enabled() { 64 }
     else if std::env::var("CANADA_SCRATCH_LONG_HISTORY_VERIFY").as_deref() == Ok("1") { 32 } else { 8 }
+}
+
+/// Optional bound for expensive executable variants; zero retains full warmup.
+/// Read during construction, not per token.
+pub(crate) fn execution_graph_cache_rows()->anyhow::Result<usize> {
+    match std::env::var("CANADA_SCRATCH_GRAPH_CACHE_ROWS") {
+        Err(std::env::VarError::NotPresent)=>Ok(0),
+        Ok(v)=>{let n:usize=v.parse()?;anyhow::ensure!(n<=32,"graph cache row budget must be0..32");Ok(n)},
+        Err(e)=>Err(e.into()),
+    }
 }

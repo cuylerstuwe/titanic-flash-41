@@ -1197,6 +1197,9 @@ impl Stream {
         }
     }
     pub fn capture(&self, f: impl FnOnce() -> Result<()>) -> Result<Graph> {
+        static DIAGNOSTIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let diagnostic = *DIAGNOSTIC.get_or_init(||std::env::var("CANADA_SCRATCH_GRAPH_MEMORY_SCREEN").as_deref()==Ok("1"));
+        let before = diagnostic.then(||crate::memory::Available::gb10(usize::MAX,usize::MAX)).transpose()?;
         self.owner.current()?;
         self.owner.api.check(
             unsafe { (self.owner.api.capture_begin)(self.raw, 0) },
@@ -1250,6 +1253,14 @@ impl Stream {
             (self.owner.api.graph_destroy)(graph);
         }
         built?;
+        if let Some(before) = before {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let after=crate::memory::Available::gb10(usize::MAX,usize::MAX)?;
+            let rss=std::fs::read_to_string("/proc/self/status").unwrap_or_default().lines()
+                .find(|l|l.starts_with("VmRSS:")).unwrap_or_default().to_owned();
+            eprintln!("graph_memory {}",serde_json::json!({"capture":NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed),
+                "before":before,"after":after,"rss":rss}));
+        }
         Ok(Graph {
             owner: self.owner.clone(),
             exec,

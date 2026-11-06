@@ -274,10 +274,12 @@ impl Worker {
             Ok(v)=>{ensure!(v=="0"||v=="1","bank encoder checkpoint flag");v=="1"},
             Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
         };
-        ensure!(!bank_checkpoint||(enabled&&import&&self.encoder_prompt_checkpoint
+        let single=crate::config::single_bank_requested();
+        ensure!(!single||(!enabled&&!import&&!paired),"single-bank mode excludes physical peer capabilities");
+        ensure!(!bank_checkpoint||(((enabled&&import)||single)&&self.encoder_prompt_checkpoint
             &&self.retain_restored_checkpoint
             &&std::env::var("CANADA_SCRATCH_STATE_EXCHANGE").as_deref()!=Ok("1")),
-            "bank checkpoints require retained independent resident owners and explicit import support");
+            "bank checkpoints require retained owner storage and an admitted ownership mode");
         let head=match std::env::var("CANADA_SCRATCH_PAIRED_DRAFT_HEAD") {
             Ok(v)=>{ensure!(v=="0"||v=="1","paired draft head flag");v=="1"},
             Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
@@ -290,7 +292,7 @@ impl Worker {
         };
         ensure!(!shared_head||enabled||std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1"),
             "shared draft encoding requires independent query owners");
-        self.control.agree(&[0x68,u8::from(enabled),u8::from(import),u8::from(head),u8::from(shared_head),u8::from(bank_checkpoint)])?;
+        self.control.agree(&[0x68,u8::from(enabled),u8::from(import),u8::from(head),u8::from(shared_head),u8::from(bank_checkpoint),u8::from(single)])?;
         if !enabled{return Ok(json!({"enabled":false}));}
         ensure!(!import||(self.encoder_prompt_checkpoint&&self.retain_restored_checkpoint),
             "encoder imports require retained immutable parents");

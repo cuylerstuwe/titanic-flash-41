@@ -90,6 +90,20 @@ pub(super) fn choose(w:&mut Worker, queue:&Queue, active:&mut Option<Job>,
             }else{Scheduled::Native(w.active_command(job.cancelled()||queue.stopping())?)};
             let work=matches!(next,Scheduled::Native(Command::Step)|Scheduled::Prefill);
             let held=job.background&&queue.router_hold();
+            if work && refused && job.background {
+                // A global foreground hold must not strand both the retained
+                // background owner and a newcomer when parking was refused.
+                // Only unstarted foreground jobs may fail admission; existing
+                // paused owners always retain their complete state and permit.
+                let mut removed=false;
+                ready.retain(|(id,peer)| {
+                    if id.is_none() && !peer.background {
+                        peer.emit(BackendEvent::Failed("foreground capacity unavailable: background progress could not be retained".into()));
+                        removed=true;false
+                    }else{true}
+                });
+                if removed {turns.retired();continue;}
+            }
             if work&&!prefill&&!held&&!blocked {
                 if let Some((Some(id),peer))=ready.iter().find(|(_,p)|p.background==job.background
                     &&!p.cancelled()&&!p.output_backpressured()) {

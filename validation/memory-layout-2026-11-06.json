@@ -1,0 +1,145 @@
+{
+  "scope": "Fresh boot per layout, same source and synthetic serving fixtures. 108 matched capped requests; three extra priority/reuse requests on the one-bank arm. Single order, not a general speed or task-quality benchmark.",
+  "physical_floor_unchanged": true,
+  "target_precision_unchanged": true,
+  "runs": [
+    {
+      "layout": "two_physical_banks",
+      "build": "s1341",
+      "requests": 108,
+      "sampler": {
+        "temperature": 1,
+        "top_p": 1,
+        "top_k": -1
+      },
+      "clock_mhz": 2350,
+      "available_gib": {
+        "ready": [
+          12.121,
+          12.187,
+          12.156,
+          11.338
+        ],
+        "short-varied-complete": [
+          11.559,
+          11.665,
+          11.652,
+          10.819
+        ],
+        "long-image-3": [
+          9.776,
+          9.939,
+          9.904,
+          9.097
+        ],
+        "reset-1": [
+          9.935,
+          10.089,
+          10.078,
+          9.237
+        ],
+        "final-images-complete": [
+          9.794,
+          9.984,
+          9.987,
+          9.125
+        ]
+      },
+      "phases": [
+        {
+          "phase": "append-",
+          "requests": 64,
+          "wall_seconds": 30.459330182000144,
+          "server_prefill_seconds": 16.556180358000002
+        },
+        {
+          "phase": "long-image-",
+          "requests": 4,
+          "wall_seconds": 73.56223021,
+          "server_prefill_seconds": 71.53400828
+        },
+        {
+          "phase": "reset-",
+          "requests": 32,
+          "wall_seconds": 27.10619708199988,
+          "server_prefill_seconds": 20.746517431
+        },
+        {
+          "phase": "final-image-",
+          "requests": 8,
+          "wall_seconds": 6.9356082299999,
+          "server_prefill_seconds": 2.873679102
+        }
+      ]
+    },
+    {
+      "layout": "one_physical_bank",
+      "build": "s1341",
+      "requests": 111,
+      "sampler": {
+        "temperature": 1,
+        "top_p": 1,
+        "top_k": -1
+      },
+      "clock_mhz": 2350,
+      "available_gib": {
+        "ready": [
+          20.225,
+          20.304,
+          20.214,
+          19.477
+        ],
+        "short-varied-complete": [
+          19.692,
+          19.797,
+          19.732,
+          18.92
+        ],
+        "long-image-3": [
+          18.314,
+          18.502,
+          18.425,
+          17.556
+        ],
+        "reset-1": [
+          17.989,
+          18.163,
+          18.098,
+          17.263
+        ],
+        "final-images-complete": [
+          17.816,
+          18.066,
+          18.024,
+          17.182
+        ]
+      },
+      "phases": [
+        {
+          "phase": "append-",
+          "requests": 64,
+          "wall_seconds": 30.36805099700007,
+          "server_prefill_seconds": 16.546670618
+        },
+        {
+          "phase": "long-image-",
+          "requests": 4,
+          "wall_seconds": 73.74392194699999,
+          "server_prefill_seconds": 71.662890305
+        },
+        {
+          "phase": "reset-",
+          "requests": 32,
+          "wall_seconds": 27.04948446100002,
+          "server_prefill_seconds": 20.722977825
+        },
+        {
+          "phase": "final-image-",
+          "requests": 8,
+          "wall_seconds": 6.9776892720000205,
+          "server_prefill_seconds": 2.889354704
+        }
+      ]
+    }
+  ]
+}
