@@ -1,0 +1,248 @@
+{
+  "date": "2026-11-08",
+  "date_timezone": "America/Los_Angeles",
+  "engine_release": "s1387",
+  "build_variant": "portable s1387: this repository's build, kernel bundle, derived matrices and profile",
+  "single_stream": true,
+  "started_at": "2026-11-08T23:33:10-08:00",
+  "finished_at": "2026-11-08T23:35:40-08:00",
+  "client": "head GB10, head-local loopback endpoint; no external router or physical HTTP network hop",
+  "model_parallelism": "TP4",
+  "hardware": "three ASUS GX10 and one DGX Spark (GB10), two 100 Gb/s switched RoCE rails per node",
+  "compiler_source_sha256": "fc05cf642937cd042a31fbf639bb40271a562fc4217036ba42624f1971a55cfa",
+  "profile": "deploy/profile.json (the native production s1387 environment apart from host-specific network settings)",
+  "runtime_sha256": {
+    "provenance.json": "f9c6ba7a72df686f15609d3a0a50310883278753032c3827074d6a67b165ba34",
+    "core.cubin": "e7771542ba20af17f3e09e3f02fc70ae8322e97584e276c43ad0e7461909c82e",
+    "vision.cubin": "761a8c6c33e85c4e4ef91d4bc63acf62b6f91a65f127c38877ef3e5d08f28deb",
+    "engine": "0c502030e1f0c790166b531f60687ce098274a27312af3ba3260a3b6d8f679a5"
+  },
+  "source_url": "https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa",
+  "source_revision": "7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2",
+  "settings": {
+    "temperature": 0,
+    "top_p": 1,
+    "thinking": false,
+    "max_tokens": 512,
+    "repetitions": 3
+  },
+  "benchmark_wrapper": "benchmarks/run_published.py",
+  "external_client_sha256": "76a078842a0dd50b8345a6feb4455b890517eac51513f030701cd4a65d0a23ee",
+  "context_sha256": "6b4b21a0ed3ae0eefe2b0aab0b9555eb1332334347c8bda80a83a2eaee168457",
+  "host_profile": {
+    "gpu_clock_cap_mhz": 2350,
+    "driver": "580.178.04",
+    "kernel": "7.0.0-1019-nvidia",
+    "nvme_apst": "disabled on the DGX Spark by the portable host policy"
+  },
+  "measurement_conditions": "First model load after rebooting all four devices. Three serving checks, one synthetic image request and four incremental-context checks preceded the benchmark; none populated its long prompt. Existing canonical weight atlases; derived matrices built by tools/stage_full_matrices.py.",
+  "run_accounting": {
+    "completed_passes": 1,
+    "requests_in_completed_pass": 24,
+    "interrupted_attempts": 0,
+    "prior_failed_gpu_startups": 0
+  },
+  "rows": [
+    {
+      "context": "clean",
+      "workload": "code",
+      "titanic_decode_tps": {
+        "median": 121.13079059590132,
+        "min": 119.95888902295151,
+        "max": 121.3107045507685,
+        "stdev": 0.734067157359748,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.14273954699996239,
+        "min": 0.1405428630000074,
+        "max": 0.14408146099998476,
+        "stdev": 0.0017864223830773248,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 117.45480657226324,
+        "min": 116.2967063140305,
+        "max": 117.52808526703868,
+        "stdev": 0.6907556371030967,
+        "n": 3
+      }
+    },
+    {
+      "context": "clean",
+      "workload": "prose",
+      "titanic_decode_tps": {
+        "median": 65.34105591575506,
+        "min": 64.92951625599997,
+        "max": 65.7768460998267,
+        "stdev": 0.4237227553333968,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.13649275900002067,
+        "min": 0.13077938200001427,
+        "max": 0.13965685400000893,
+        "stdev": 0.00449932741314081,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 64.34588385868958,
+        "min": 63.92225975324902,
+        "max": 64.81447080089904,
+        "stdev": 0.4462943084759726,
+        "n": 3
+      }
+    },
+    {
+      "context": "clean",
+      "workload": "prose2",
+      "titanic_decode_tps": {
+        "median": 62.591803772183674,
+        "min": 61.90850144709066,
+        "max": 62.73765800632815,
+        "stdev": 0.44265790493750096,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.118306715000017,
+        "min": 0.11816752800001495,
+        "max": 0.12218035099999724,
+        "stdev": 0.0022776880570181774,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 61.81846555132798,
+        "min": 61.154158384505365,
+        "max": 61.93142347703288,
+        "stdev": 0.41996121426731203,
+        "n": 3
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "code",
+      "titanic_decode_tps": {
+        "median": 111.55267436260415,
+        "min": 110.75786440003823,
+        "max": 111.67132472274376,
+        "stdev": 0.49669080685952494,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.226032809000003,
+        "min": 0.2229588769999964,
+        "max": 0.24065455300001304,
+        "stdev": 0.009454993430634589,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 106.29942262413849,
+        "min": 105.85890272288499,
+        "max": 106.5151397821588,
+        "stdev": 0.3344744020173248,
+        "n": 3
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "prose",
+      "titanic_decode_tps": {
+        "median": 62.649294525518435,
+        "min": 62.256866741488984,
+        "max": 62.650199531616686,
+        "stdev": 0.2268299908536293,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.32387409500000786,
+        "min": 0.30480987000004234,
+        "max": 0.3330236000000468,
+        "stdev": 0.014394285191863481,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 60.37541694388846,
+        "min": 59.946468281522996,
+        "max": 60.51060814437805,
+        "stdev": 0.29454128191054746,
+        "n": 3
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "prose2",
+      "titanic_decode_tps": {
+        "median": 61.7260879576627,
+        "min": 61.236593271309104,
+        "max": 61.7998378751036,
+        "stdev": 0.3061286717472902,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.2925756349999915,
+        "min": 0.29133960899997646,
+        "max": 0.30955088199999636,
+        "stdev": 0.010176256967938824,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 59.68631353386419,
+        "min": 59.286546983545534,
+        "max": 59.735727426794995,
+        "stdev": 0.24631216581336876,
+        "n": 3
+      }
+    }
+  ],
+  "cold_131k_first_token_seconds": {
+    "portable_s1387": 16.25703709999999,
+    "native_s1387": 16.314056787000027
+  },
+  "outputs_identical_to_native_s1387": "24/24 (text SHA-256 prefixes of every request, same request order)",
+  "comparison_to_native_s1387": [
+    {
+      "context": "clean",
+      "workload": "code",
+      "native_s1387_decode_tps": 120.32299296078534,
+      "portable_s1387_decode_tps": 121.13079059590132,
+      "change_percent": 0.6713576642655816
+    },
+    {
+      "context": "clean",
+      "workload": "prose",
+      "native_s1387_decode_tps": 65.20188119257958,
+      "portable_s1387_decode_tps": 65.34105591575506,
+      "change_percent": 0.21345200572422396
+    },
+    {
+      "context": "clean",
+      "workload": "prose2",
+      "native_s1387_decode_tps": 62.03405111901181,
+      "portable_s1387_decode_tps": 62.591803772183674,
+      "change_percent": 0.8991072533725442
+    },
+    {
+      "context": "131k",
+      "workload": "code",
+      "native_s1387_decode_tps": 110.9992377332616,
+      "portable_s1387_decode_tps": 111.55267436260415,
+      "change_percent": 0.49859498195159446
+    },
+    {
+      "context": "131k",
+      "workload": "prose",
+      "native_s1387_decode_tps": 62.13648809289749,
+      "portable_s1387_decode_tps": 62.649294525518435,
+      "change_percent": 0.8252903380285614
+    },
+    {
+      "context": "131k",
+      "workload": "prose2",
+      "native_s1387_decode_tps": 61.3718863064755,
+      "portable_s1387_decode_tps": 61.7260879576627,
+      "change_percent": 0.5771399129210542
+    }
+  ],
+  "attribution_limit": "Same compiled source and outputs as native s1387 on a different fresh boot; decode differences are run-to-run timing variation.",
+  "scope": "Short capped throughput diagnostics at temperature 0. No task-quality or recommended-sampler claim."
+}

@@ -48,6 +48,7 @@ def validate_fenced_bundles(inventory):
     optional = {
         'CANADA_SCRATCH_HEAD_WEIGHT_CG': ['target-head-lossless-weight-cg-v1'],
         'CANADA_SCRATCH_MARKOV_HEAD_CG': ['draft-markov-gemv-cg-v1'],
+        'CANADA_SCRATCH_VISION_SPLIT': ['vision-attention-split-v1'],
     }
     for flag, directories in optional.items():
         if profile.get(flag) == '1':

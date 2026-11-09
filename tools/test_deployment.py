@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 import sys
@@ -98,6 +99,48 @@ class DeploymentChecks(unittest.TestCase):
         for invalid in ('-1', '4', '3.0', '', 3, True):
             with self.assertRaises(AssertionError):
                 fleet.vision_encoder_rank(dict(CANADA_SCRATCH_VISION_ENCODER_RANK=invalid))
+
+    def test_split_vision_places_the_canonical_atlas_on_every_rank(self):
+        profile = json.loads((ROOT/'deploy/profile.json').read_text())
+        self.assertTrue(fleet.vision_split(profile))
+        self.assertFalse(fleet.vision_split({}))
+        with self.assertRaises(AssertionError):
+            fleet.vision_split(dict(CANADA_SCRATCH_VISION_SPLIT='2'))
+        for rank in range(4):
+            paths = fleet.rank_data_paths(rank, 3, True)
+            self.assertEqual([p for p in paths if '/vision-' in p], ['staged/vision-v1/r0/'])
+        inventory = json.loads((ROOT/'runtime/artifacts.json').read_text())
+        missing = copy.deepcopy(inventory)
+        del missing['files']['kernels/vision-attention-split-v1/vision_split_attention.cubin']
+        with self.assertRaisesRegex(AssertionError, 'missing or mismatched enabled kernel artifact'):
+            prepare.validate_fenced_bundles(missing)
+
+    def test_enabled_prefill_options_require_matching_derived_matrices(self):
+        profile = json.loads((ROOT/'deploy/profile.json').read_text())
+        self.assertEqual(fleet.derived_matrices(profile),
+                         ['claude-engram-wkv-full-v1', 'claude-shared-full-v1', 'claude-wob-full-v1'])
+        self.assertEqual(fleet.derived_matrices(dict(CANADA_SCRATCH_PREFILL_WOB8='0')), [])
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            for rank in (0, 1):
+                atlas = data/f'staged/layer2-v1/r{rank}'
+                atlas.mkdir(parents=True)
+                (atlas/'atlas.json').write_text(json.dumps(dict(atlas_sha256=str(rank)*64)))
+            root = data/'kernels/claude-wob-full-v1'
+            root.mkdir(parents=True)
+            (root/'l2-weight.bin').write_bytes(b'\0'*8)
+            manifest = dict(layers={'2': dict(weight_sha256='0'*64, weight_bytes=8)},
+                            sources={'0': {'2': '0'*64}, '1': {'2': '1'*64}})
+            (root/'manifest.json').write_text(json.dumps(manifest))
+            def check(rank):
+                return subprocess.run([sys.executable, '-c', fleet.DERIVED_CHECK, str(data), str(rank),
+                                       'claude-wob-full-v1'], capture_output=True, text=True)
+            self.assertEqual(check(0).returncode, 0)
+            self.assertEqual(json.loads(check(0).stdout), json.loads(check(1).stdout))
+            (data/'staged/layer2-v1/r1/atlas.json').write_text(json.dumps(dict(atlas_sha256='2'*64)))
+            self.assertIn('derived from different layer 2 atlases', check(1).stderr)
+            (root/'l2-weight.bin').write_bytes(b'\0'*7)
+            self.assertIn('l2-weight.bin', check(0).stderr)
 
     def test_inventory_rejects_wrong_rank_count_or_ambiguous_rails(self):
         original = json.loads((ROOT/'deploy/fleet.example.json').read_text())

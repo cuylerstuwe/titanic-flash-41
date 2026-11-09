@@ -150,7 +150,19 @@ docker run --rm --gpus all --ipc=host --memory=96g --memory-swap=96g \
   /project/tools/stage_weights.py --rank all
 ```
 
-This writes 40 layer atlases per rank, model-I/O and MTP atlases per rank, the canonical `vision-v1/r0` atlas, and a checkpoint manifest. **Rank 3 owns image encoding in the current profile.** Distribution places that unchanged canonical vision atlas on rank 3; its `r0` metadata describes the atlas, not the serving host. Each output records its rank, tensor selection, byte count and SHA-256. Existing complete outputs are verified before reuse. A partial staging directory is preserved for inspection; do not rename it into place or edit hashes to bypass a failed check.
+This writes 40 layer atlases per rank, model-I/O and MTP atlases per rank, the canonical `vision-v1/r0` atlas, and a checkpoint manifest. **Rank 3 owns image placement in the current profile, and its split vision encoder (`CANADA_SCRATCH_VISION_SPLIT=1`) encodes each image on all four ranks.** Distribution therefore places that unchanged canonical vision atlas on every rank; its `r0` metadata describes the atlas, not the serving host. Each output records its rank, tensor selection, byte count and SHA-256. Existing complete outputs are verified before reuse. A partial staging directory is preserved for inspection; do not rename it into place or edit hashes to bypass a failed check.
+
+Then derive the full projection matrices that the profile's [prefill options](PREFILL.md) load. This CPU-only step reads the four ranks' staged atlases on the head and copies their shard bytes, in rank order, into `data/kernels/claude-{wob,shared,engram-wkv}-full-v1` (about 1.9 GB). It converts no values, records each source atlas's digest, and verifies existing outputs before reuse:
+
+```sh
+docker run --rm --cpus=2 --memory=4g --memory-swap=4g \
+  -v /srv/titanic-flash-41/source:/project:ro \
+  -v /srv/titanic-flash-41/data:/data \
+  --entrypoint /opt/sglang/bin/python titanic-flash-41:toolchain \
+  /project/tools/stage_full_matrices.py
+```
+
+At load, each rank checks every derived file's digest and that its own part equals the shard it serves, so a wrong or stale file stops startup rather than changing outputs. Rerun this step whenever the atlases are re-staged. If the head no longer holds every rank's atlases, run `stage_full_matrices.py --data /data extract --rank R --parts DIR` on each node, gather the four `DIR/rR` folders on the head and run `stage_full_matrices.py --data /data assemble --parts DIR` there.
 
 Copy only the correct rank's data to each worker:
 
@@ -158,7 +170,7 @@ Copy only the correct rank's data to each worker:
 python3 tools/sync_fleet.py /srv/titanic-flash-41/state/fleet.json
 ```
 
-The worker deployment roots must be writable by the SSH account. Generated container files can be root-owned; they only need to be readable for distribution/runtime. If administrative ownership adjustment is needed, scope it to this new deployment directory. Keep the original checkpoint until staging, distribution and a full startup have succeeded. Engram backing and the rank's staged atlases must stay on each node's local SSD during serving.
+This copies the runtime, kernels (including the derived matrices) and model metadata to every worker, plus each rank's own shards. The controller's startup checks confirm that every rank holds the same derived matrices, built from the atlases it serves. The worker deployment roots must be writable by the SSH account. Generated container files can be root-owned; they only need to be readable for distribution/runtime. If administrative ownership adjustment is needed, scope it to this new deployment directory. Keep the original checkpoint until staging, distribution and a full startup have succeeded. Engram backing and the rank's staged atlases must stay on each node's local SSD during serving.
 
 ## 6. Start and validate
 

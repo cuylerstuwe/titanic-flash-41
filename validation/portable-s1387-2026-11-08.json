@@ -1,0 +1,78 @@
+{
+  "package": "portable s1387",
+  "date": "2026-11-08",
+  "portable_source_fingerprint": "fc05cf642937cd042a31fbf639bb40271a562fc4217036ba42624f1971a55cfa",
+  "hardware": "three ASUS GX10 and one DGX Spark (GB10), two 100 Gb/s switched RoCE rails per node",
+  "profile": "native production s1387 environment, except host-specific NCCL device settings (from the private inventory) and in-memory event logging",
+  "weights": "existing canonical staged atlases and Engram backing; not empty-fleet provisioning",
+  "build": {
+    "environment": "pinned Arm64 container, CPU only",
+    "seconds": 175,
+    "verify_runtime": {
+      "bundle_files": 2495,
+      "external_operators": 18,
+      "dynamic_libraries": 312,
+      "nccl_version": "2.30.7"
+    },
+    "python_deployment_checks": 48,
+    "rust_tests": {
+      "passed": 222,
+      "failed": 0,
+      "ignored": 25
+    }
+  },
+  "derived_matrices": {
+    "tool": "tools/stage_full_matrices.py: extract on each node, assemble on the head",
+    "files": 133,
+    "weight_and_scale_files_identical_to_native_production": "130/130",
+    "assemble_seconds": 3.2,
+    "identical_on_all_ranks": true
+  },
+  "fresh_boot_run": {
+    "all_four_devices_rebooted": true,
+    "first_model_load": true,
+    "ready_seconds_after_launch": 145,
+    "serving_checks": [
+      "fresh_stream",
+      "cached_stream",
+      "cached_complete"
+    ],
+    "incremental_context_checks": [
+      "full",
+      "extend",
+      "rewind",
+      "missing reference refused"
+    ],
+    "image_check": {
+      "passed": true,
+      "fixture": "synthetic solid red 256x256 PNG",
+      "split_vision_encoder": true
+    },
+    "published_client_requests": 24,
+    "published_outputs_identical_to_native_s1387": "24/24",
+    "first_uncached_131k_ttft_seconds": {
+      "portable": 16.26,
+      "native": 16.31
+    },
+    "lowest_available_gib": [
+      14.78,
+      14.97,
+      14.96,
+      15.09
+    ],
+    "max_temperature_c": [
+      75.9,
+      76.3,
+      75.7,
+      79.2
+    ],
+    "memory_or_thermal_guard_stops": 0,
+    "gpu_allocation_or_xid_kernel_messages": 0,
+    "gpus_idle_after_coordinated_stop": true
+  },
+  "limitations": [
+    "Existing atlases were reused; checkpoint download, Engram packing and GPU weight staging were not repeated.",
+    "Short serving, image and benchmark checks; the native s1387 stress and cancellation panels were not repeated on the portable package.",
+    "Temperature-0 output identity covers the 24 published-client requests."
+  ]
+}

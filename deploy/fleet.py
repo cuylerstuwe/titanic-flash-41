@@ -30,7 +30,43 @@ def vision_encoder_rank(profile):
     assert value in ('0', '1', '2', '3'), 'vision encoder rank must be an explicit TP4 rank'
     return int(value)
 
-def rank_data_paths(rank, vision_rank):
+def vision_split(profile):
+    """CANADA_SCRATCH_VISION_SPLIT=1 encodes each image across all four ranks."""
+    value = profile.get('CANADA_SCRATCH_VISION_SPLIT', '0')
+    assert value in ('0', '1'), 'vision split must be 0 or 1'
+    return value == '1'
+
+# Prefill options that load full matrices derived by tools/stage_full_matrices.py.
+DERIVED_MATRICES = {
+    'CANADA_SCRATCH_PREFILL_SP_EARLY': 'claude-engram-wkv-full-v1',
+    'CANADA_SCRATCH_PREFILL_LOCAL_SHARED': 'claude-shared-full-v1',
+    'CANADA_SCRATCH_PREFILL_WOB8': 'claude-wob-full-v1',
+    'CANADA_SCRATCH_PREFILL_WOB_EXCHANGE': 'claude-wob-full-v1',
+}
+
+def derived_matrices(profile):
+    """Derived artifact directories under data/kernels that the enabled options load."""
+    return sorted({name for flag, name in DERIVED_MATRICES.items() if profile.get(flag) == '1'})
+
+# Runs on each rank: every derived file the loader opens is present at its recorded size and was
+# derived from the atlases this rank serves. The loader itself also checks each file's digest and
+# that its own part equals its qualified shard; this catches a stale copy before a long startup.
+DERIVED_CHECK = '''import hashlib,json,sys
+from pathlib import Path
+data=Path(sys.argv[1]);rank=sys.argv[2];out={}
+for name in sys.argv[3:]:
+    root=data/'kernels'/name;raw=(root/'manifest.json').read_bytes();m=json.loads(raw)
+    for layer,entry in m['layers'].items():
+        for key,size in entry.items():
+            if key.endswith('_bytes'):
+                p=root/f"l{layer}-{key[:-6]}.bin";assert p.is_file() and p.stat().st_size==size,str(p)
+    for layer,atlas in m['sources'][rank].items():
+        meta=json.loads((data/'staged'/f'layer{layer}-v1'/f'r{rank}'/'atlas.json').read_text())
+        assert meta['atlas_sha256']==atlas,f'{name} was derived from different layer {layer} atlases'
+    out[name]=hashlib.sha256(raw).hexdigest()
+print(json.dumps(out))'''
+
+def rank_data_paths(rank, vision_rank, split=False):
     """Relative immutable shard paths; atlas rank is distinct from its host."""
     assert type(rank) is int and 0 <= rank < 4
     assert type(vision_rank) is int and 0 <= vision_rank < 4
@@ -38,9 +74,10 @@ def rank_data_paths(rank, vision_rank):
     paths += [f'staged/model-io-v1/r{rank}/', f'staged/dspark-mtp-v1/r{rank}/']
     paths += [f'engram/engram-l{layer}-r{rank}of4.{ext}'
               for layer in (1, 14) for ext in ('bin', 'json')]
-    if rank == vision_rank:
+    if rank == vision_rank or split:
         # Vision is replicated, not TP-sharded: preserve the canonical r0 atlas
-        # bytes/metadata even when another device owns image encoding.
+        # bytes/metadata even when another device owns image encoding. A split
+        # vision encoder loads it on every rank.
         paths.append('staged/vision-v1/r0/')
     return paths
 
@@ -82,6 +119,8 @@ class Fleet:
         self.cfg = validate(json.loads(inventory.read_text()))
         self.profile = json.loads((SOURCE/'deploy/profile.json').read_text())
         self.vision_rank = vision_encoder_rank(self.profile)
+        self.vision_split = vision_split(self.profile)
+        self.derived = derived_matrices(self.profile)
         self.root = Path(self.cfg['root'])
         self.state_dir = self.root/'state'
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -249,12 +288,18 @@ class Fleet:
                 local = hashlib.sha256((self.root/'data/runtime'/name).read_bytes()).hexdigest()
                 assert self.run(['sha256sum', self.root/'data/runtime'/name], rank).stdout.split()[0] == local
             paths = []
-            for name in rank_data_paths(rank, self.vision_rank):
+            for name in rank_data_paths(rank, self.vision_rank, self.vision_split):
                 base = self.root/'data'/name
                 paths.extend([base/'atlas.json', base/'atlas.bin'] if name.endswith('/') else [base])
             self.run(['python3', '-c', 'from pathlib import Path; import sys; '
                       'missing=[p for p in sys.argv[1:] if not Path(p).is_file()]; '
                       'assert not missing, missing', *paths], rank)
+            if self.derived:
+                digests = json.loads(self.run(['python3', '-c', DERIVED_CHECK, self.root/'data', rank,
+                                               *self.derived], rank).stdout)
+                if rank == 0:
+                    derived = digests
+                assert digests == derived, 'derived prefill matrices differ between ranks; rerun sync_fleet.py'
         provenance = json.loads((self.root/'data/runtime/provenance.json').read_text())
         assert provenance['serving'] and not provenance['storage_fault_injection']
         return image_id
@@ -270,7 +315,9 @@ class Fleet:
                     ticket='/state/rendezvous.ticket', context=1048576,
                     wide_widths=[512, 1024, 2048, 4096, 8192], events=f'/state/events-r{rank}.jsonl', requests=None,
                     vision=dict(checkpoint='/data/model/checkpoint.json', stage='/data/staged/vision-v1/r0',
-                                kernel='/data/runtime/vision.cubin', attention='/data/kernels/vision-attention-v1',
+                                kernel='/data/runtime/vision.cubin',
+                                attention='/data/kernels/vision-attention-split-v1' if self.vision_split
+                                else '/data/kernels/vision-attention-v1',
                                 weights_sha256='36f12e6a6f4e5ec63bbf0a8e27d22cadbd582856e4d1ac77414647def761b259',
                                 cache_bytes=268435456),
                     http=dict(bind=self.cfg['http_bind'], allow_remote=self.cfg['allow_remote'],

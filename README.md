@@ -14,7 +14,7 @@ At the recommended temperature 1 / top-p 1 settings on fresh boots, a 129,955-to
 
 Single-stream measurements from **November 8, 2026 (s1387)**, using the published comparison's prompts, context file, request settings and timing function. The installed native production service ran **on the head GB10 against its head-local endpoint**, bypassing any external router or physical HTTP network hop. All 24 requests completed in one pass on the first model load after a four-device reboot; six short installed-service checks preceded it, none with a long prompt. Only Titanic was measured again; competitor results below are the author's existing published numbers.
 
-The measured deployment enables the [prefill and vision options](docs/PREFILL.md). The portable profile supplied in this repository does not enable them yet, so a portable installation measures like the s1345 base for long-prompt prefill.
+The measured deployment enables the [prefill and vision options](docs/PREFILL.md), and so does the portable profile in this repository: a portable installation built from this tree reproduced all 24 benchmark outputs of the native pass byte for byte, at the same speed (see [benchmarks](docs/BENCHMARKS.md)).
 
 Median generation speed in **tokens/second**, three repetitions with a 512-token output budget:
 
@@ -49,7 +49,7 @@ The target retains the checkpoint's BF16 LM-head weights and produces FP32 logit
 
 ## Setup
 
-Follow **[the complete four-Spark setup recipe](docs/SETUP.md)**. It covers driver and network checks, the pinned build environment, checkpoint download verification, lossless Engram packing, GPU weight staging, per-rank distribution, authentication, service startup and rollback.
+Follow **[the complete four-Spark setup recipe](docs/SETUP.md)**. It covers driver and network checks, the pinned build environment, checkpoint download verification, lossless Engram packing, GPU weight staging, derived prefill matrices, per-rank distribution, authentication, service startup and rollback.
 
 The release contains Rust source, CUDA source, a hash-checked Arm64/SM121 kernel bundle, deployment utilities, benchmark inputs and third-party notices. The recipe separately fetches and compiles the required AGPL-3.0 WO-A component, including its compact wider-row variants. Read [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before deploying or redistributing a combined build.
 

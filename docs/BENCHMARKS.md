@@ -1,7 +1,7 @@
 # Reproducing the published single-stream comparison
 
 The README benchmark measures native production s1387 (November 8) with the [prefill and vision options](PREFILL.md) enabled.
-The portable profile in this repository leaves those options off. Historical s1329, s1291, s1173 and s986 measurements remain separately labeled below.
+The portable profile in this repository enables the same options; a portable s1387 pass reproduced the native outputs exactly. Historical s1329, s1291, s1173 and s986 measurements remain separately labeled below.
 
 Run on the **head node**, against its direct loopback endpoint, with no other requests. Use a freshly started model process if measuring the first uncached long prompt. Do not route through a remote client or proxy.
 
@@ -37,6 +37,28 @@ All 24 requests completed on the first production model load after a four-device
 | ~131K | Prose 2 | 58.6 | 61.4 | +4.7% |
 
 All throughput values are median tokens/second from three 512-token trials. The first uncached ~131K TTFT was **16.31 s**, versus **20.99 s** for s1329. [Full results](../benchmarks/results-2026-11-08-s1387.json) include ranges, settings and measured-build hashes; [all 24 samples](../benchmarks/samples-2026-11-08-s1387.json) omit generated text. The run used a wrapper equivalent to `run_published.py` that reads the production endpoint and key on the head. Decode differences are within run-to-run variation for different generated continuations; the release's speed change is in prefill (see [validation](VALIDATION.md)).
+
+## Portable s1387 pass — November 8
+
+A portable build of this repository (its kernel bundle, derived matrices from
+`tools/stage_full_matrices.py` and `deploy/profile.json`) ran the same 24 requests on the first model
+load after a four-device reboot, against the head's loopback endpoint. The 2350 MHz cap and the
+portable host policies were active. Serving, synthetic-image and incremental-context checks preceded
+the benchmark; none populated its long prompt. Existing validated weight atlases were used.
+
+| Context | Workload | Native s1387 | Portable s1387 | Change |
+|---|---|---:|---:|---:|
+| Clean | Code | 120.3 | 121.1 | +0.7% |
+| Clean | Prose | 65.2 | 65.3 | +0.2% |
+| Clean | Prose 2 | 62.0 | 62.6 | +0.9% |
+| ~131K | Code | 111.0 | 111.6 | +0.5% |
+| ~131K | Prose | 62.1 | 62.6 | +0.8% |
+| ~131K | Prose 2 | 61.4 | 61.7 | +0.6% |
+
+All 24 generated outputs were byte-identical to the native pass (temperature 0), so these
+differences are run-to-run timing variation. The first uncached ~131K TTFT was **16.26 s** (native:
+16.31 s). [Full results](../benchmarks/results-2026-11-08-portable-s1387.json) and
+[all 24 samples](../benchmarks/samples-2026-11-08-portable-s1387.json) omit generated text.
 
 ## Historical s1329 portable pass — November 4
 

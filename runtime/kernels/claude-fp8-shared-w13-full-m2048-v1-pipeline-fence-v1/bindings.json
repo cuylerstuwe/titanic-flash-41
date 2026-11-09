@@ -1,0 +1,95 @@
+{
+  "abi": 2,
+  "architecture": 121,
+  "physical_sms": 48,
+  "source": "https://github.com/local-inference-lab/b12x",
+  "source_commit": "a7d7d29b2ef8869086e0ceaa787321f17544e3c9",
+  "license": "Apache-2.0",
+  "entries": [
+    {
+      "index": 0,
+      "name": "kernel_000",
+      "kernel_id": "gemm.mxfp8_quant_cute",
+      "arguments": [
+        {
+          "name": "source_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "values_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "scale_rows_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "scale_mma_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "m",
+          "kind": "i32"
+        },
+        {
+          "name": "source_k",
+          "kind": "i32"
+        },
+        {
+          "name": "grid_x",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "665e66a1d1127a3790113b69e5b9b07b882a5b81516cae364e1af51deb46d48a"
+    },
+    {
+      "index": 1,
+      "name": "kernel_001",
+      "kernel_id": "gemm.dense",
+      "arguments": [
+        {
+          "name": "a_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "b_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "sfa_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "sfb_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "c_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "quant_c_values_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "quant_c_scale_rows_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "quant_c_scale_mma_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "alpha_ptr",
+          "kind": "pointer"
+        },
+        {
+          "name": "m",
+          "kind": "i32"
+        }
+      ],
+      "header_sha256": "e0c076fc07cbf22ca3e68c301a059bf0e11d6bfdbf178a13092a5d928564e560"
+    }
+  ],
+  "library_sha256": "c3fa72b4381b3e83e9b17907eeb05479861ecf1471ce35f49f58acdf78378689"
+}

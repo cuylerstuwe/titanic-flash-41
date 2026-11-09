@@ -1,5 +1,45 @@
 # Validation status
 
+## November 8 portable package with the s1387 options
+
+The portable profile now enables the [s1387 prefill and vision options](PREFILL.md), matching the
+native production environment apart from host-specific network settings. The checked kernel
+bundle adds the dense FP8 operators those options load (byte-identical to the native production
+deployment's, with their pipeline-fence variants) and the split vision attention kernel.
+`tools/stage_full_matrices.py` derives the full prefill matrices from the staged atlases. The
+controller places the canonical vision atlas on every rank for split image encoding and, before
+launch, checks that every rank holds the same derived matrices, built from the atlases it serves.
+The previous public tree listed the new fenced operators in the compiled registry without bundling
+them, so `prepare_runtime.py` and `verify_runtime.py` stopped at their first check; this package
+restores both.
+
+A portable build of this tree was qualified on the same four GB10s under a reservation, from the
+existing canonical atlases (not empty-fleet provisioning):
+
+- CPU-only Arm64 build in the pinned container: release build, kernel preparation including the
+  external WO-A operators, `verify_runtime.py` (2,495 bundle files, 18 external operators, NCCL
+  2.30.7), 48 Python deployment checks and 222 Rust tests (25 fixture-dependent tests ignored).
+- `stage_full_matrices.py`, run as documented for split hosts (`extract` on each node, `assemble`
+  on the head), produced 130 weight and scale files byte-identical to the production-qualified
+  s1387 copies; assembly took 3.2 s.
+- After rebooting all four devices, the first model load was Ready about 145 s after launch. Three
+  streaming, cache and timing checks, a synthetic image request through the split vision encoder,
+  four incremental-context checks (full history, extension, rewind and missing-reference
+  rejection) and the complete 24-request head-local published-client benchmark passed.
+- At temperature 0, all **24 published-client outputs were byte-identical to native production
+  s1387** (same requests and order, including the three ~131K-token contexts). Decode medians were
+  within 0.2–0.9% of the native pass and the first uncached ~131K-token request took 16.26 s
+  (native: 16.31 s); see [benchmarks](BENCHMARKS.md).
+- Lowest available memory 14.78–15.09 GiB per device; hottest device 79.2°C. There was no memory
+  or thermal guard stop and no GPU allocation or Xid kernel message, and all four GPUs were idle
+  after the coordinated stop.
+
+These short checks do not repeat the native stress and cancellation panels. Production s1387 was
+restored afterwards through the stationary fresh-boot path. See the
+[sanitized qualification record](../validation/portable-s1387-2026-11-08.json). Portable source
+fingerprint (unchanged; this package changes deployment tooling, bundle and profile):
+`fc05cf642937cd042a31fbf639bb40271a562fc4217036ba42624f1971a55cfa`.
+
 ## November 8 prefill and vision release (s1387)
 
 s1387 keeps the s1345 reliability base: one physical execution bank, the 8 GiB operating and
@@ -60,9 +100,10 @@ Native serving-source fingerprint:
 Portable source fingerprint: `fc05cf642937cd042a31fbf639bb40271a562fc4217036ba42624f1971a55cfa`.
 Native Arm64 CPU checks passed 219 tests (25 ignored). Ten installation interruption/rollback
 fixtures passed. The portable tree's compiled sources equal native s1387 except for the existing
-public-tree edits (comments and configurable RoCE device names); portable Rust and deployment
-checks and the portable GPU deployment wrapper were not rerun, and the portable profile is
-unchanged. The native build and production profile received the checks above.
+public-tree edits (comments and configurable RoCE device names). Portable Rust and deployment
+checks and the portable GPU deployment wrapper were not rerun for this release, and its portable
+profile was unchanged; the [portable package above](#november-8-portable-package-with-the-s1387-options)
+adds both. The native build and production profile received the checks above.
 
 ## November 6 forward-stream memory repair (s1345)
 
