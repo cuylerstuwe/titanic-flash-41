@@ -36,7 +36,8 @@ impl LivePrefillRowsScope {
             if dense || experts {
                 ensure!((capacity==128 && (17..128).contains(&live))
                     || (capacity==512 && (129..512).contains(&live))
-                    || (capacity==1024 && (513..1024).contains(&live)),
+                    || (capacity==1024 && (513..1024).contains(&live))
+                    || (capacity==2048 && (1025..2048).contains(&live)),
                     "qualified short or partial prefill row geometry");
                 slot.set(Some(PrefillRows{live,capacity,stream:stream.raw()as usize,dense,experts}));
             }
@@ -202,6 +203,10 @@ fn pipeline_fenced_root(root: &Path) -> Result<Option<std::path::PathBuf>> {
 impl Linear {
     pub fn new(cuda: &Cuda, root: &Path, matrix: Matrix) -> Result<Self> {
         Self::new_shared(cuda, root, Rc::new(matrix))
+    }
+    /// Several profiles may share one immutable matrix (e.g. a full staged projection).
+    pub(crate) fn new_rc(cuda: &Cuda, root: &Path, matrix: Rc<Matrix>) -> Result<Self> {
+        Self::new_shared(cuda, root, matrix)
     }
     fn new_shared(cuda: &Cuda, root: &Path, matrix: Rc<Matrix>) -> Result<Self> {
         // s589: the same canonical M16 matrices with smaller, exact-output
@@ -633,6 +638,16 @@ impl Linear {
             "fused query quantization requires the qualified FlashInfer Q-B profile");
         Ok((&self.values,&self.scale_mma))
     }
+    /// Run only this projection's own MXFP8 quantizer on `input` into its operand
+    /// buffers (exactly what `run` consumes); `quantized_input` then exposes them.
+    pub(crate) fn quantize_only(&self, input: &Buffer<bf16>, stream: &Stream) -> Result<()> {
+        self.guard_stream(stream)?;
+        ensure!(matches!(self.backend, Backend::B12x) && self.matrix.padded_k == self.matrix.k
+            && input.len() == self.geometry.rows * self.matrix.k && self.cuda.owns_buffer(input),
+            "quantize-only projection geometry");
+        let rows = self.scale_rows.as_ref().context("legacy row scales absent")?;
+        self.quantize_legacy(input.ptr(), self.geometry.rows, self.values.ptr(), rows.ptr(), self.scale_mma.ptr(), stream)
+    }
     pub(crate) fn immutable_matrix(&self) -> Rc<Matrix> {
         self.matrix.clone()
     }
@@ -752,7 +767,7 @@ impl Linear {
         unsafe { self.primitives.launch_words(self.dense as i32, &da, stream) }
     }
     fn effective_rows(&self,stream:&Stream)->usize {
-        if [128,512,1024].contains(&self.geometry.rows) && matches!(self.backend,Backend::B12x)
+        if [128,512,1024,2048].contains(&self.geometry.rows) && matches!(self.backend,Backend::B12x)
             && self.geometry.dense_policy.as_ref().is_some_and(|p|p.split_k_slices==1 && !p.output_clear) {
             LIVE_PREFILL_ROWS.with(|slot|slot.get().filter(|p|p.dense && p.capacity==self.geometry.rows
                 && p.stream==stream.raw()as usize).map_or(self.geometry.rows,|p|p.live))

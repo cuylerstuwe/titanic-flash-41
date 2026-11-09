@@ -268,6 +268,8 @@ pub(crate) struct Job {
     pub tokens: Vec<u32>,
     pub images: Vec<crate::image_cache::Descriptor>,
     pub image_inputs: Vec<Arc<crate::worker_media::PatchInput>>,
+    #[cfg(feature = "vision-protocol")]
+    pub deferred_image_inputs: Vec<crate::image_input_cache::DeferredInput>,
     pub seed: u64,
     pub greedy: bool,
     pub limit: usize,
@@ -1074,6 +1076,8 @@ async fn finish_chat(shared: Arc<Shared>, body: context::Input, permit: OwnedSem
         tokens: prepared.tokens.clone(),
         images: std::mem::take(&mut prepared.images),
         image_inputs: std::mem::take(&mut prepared.image_inputs),
+        #[cfg(feature = "vision-protocol")]
+        deferred_image_inputs: std::mem::take(&mut prepared.deferred_image_inputs),
         seed,
         greedy: prepared.converted.inference_options.temperature == Some(0.),
         limit: prepared.max_new_tokens as usize,

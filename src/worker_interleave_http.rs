@@ -339,7 +339,7 @@ fn choose(w:&mut Worker,queue:&Queue,active:&mut Option<Job>,ready:&mut VecDeque
                     .ok_or_else(||anyhow::anyhow!("HTTP request counter exhausted"))?;
                 if !job.images.is_empty() {
                     w.media.as_mut().ok_or_else(|| anyhow::anyhow!("image request without native vision"))?
-                        .set_inputs(&std::mem::take(&mut job.image_inputs))?;
+                        .set_job_inputs(&mut job)?;
                 }
                 let command=Command::Begin{images: std::mem::take(&mut job.images),id,seed:job.seed,greedy:job.greedy,
                     limit:job.limit,tokens:std::mem::take(&mut job.tokens)};

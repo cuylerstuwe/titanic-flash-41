@@ -16,6 +16,7 @@ use anyhow::{Result, ensure};
 use half::bf16;
 use std::{cell::Cell, path::Path, rc::Rc, sync::atomic::{fence, Ordering}};
 
+
 enum RowInputs {
     Copied { packed: Buffer<u8>, ids: Buffer<i64>, staging: Vec<u8> },
     Mapped { packed: MappedHost, ids: MappedHost },
@@ -138,9 +139,13 @@ pub struct Layer {
     image: Operator,
     projection: Linear,
     embedding: Buffer<bf16>,
-    kv: Buffer<bf16>,
+    /// Full-row column gather target; None when sequence-parallel (the full
+    /// projection writes this rank's rows of every column directly).
+    kv: Option<Buffer<bf16>>,
     output: Buffer<bf16>,
     stream: Cell<usize>,
+    /// Some(rank): this layer owns rows [rank*rows/4, (rank+1)*rows/4).
+    sp: Option<usize>,
     projection_ahead: Option<ProjectionAhead>,
     projection_ahead_enabled: bool,
     projection_ahead_selected: bool,
@@ -156,11 +161,15 @@ impl Layer {
         layer: usize,
         rows: usize,
         kernels: &Path,
+        sp: Option<usize>,
     ) -> Result<Self> {
         ensure!(
             [1, 14].contains(&layer) && (1..=crate::config::MAX_WIDE_ROWS).contains(&rows),
             "canonical Engram layer/capacity"
         );
+        ensure!(sp.is_none_or(|r| r < 4 && rows % 4 == 0 && crate::config::wide_rows(rows)),
+            "sequence-parallel Engram geometry");
+        let local = if sp.is_some() { rows / 4 } else { rows };
         let p = format!("layers.{layer}.engram");
         for name in ["q_weight", "k_weight"] {
             let v = weights.view(&format!("{p}.{name}"))?;
@@ -174,11 +183,19 @@ impl Layer {
             (matrix.n, matrix.k) == (6400, 6144),
             "Engram WKV must use the qualified TP4 row split"
         );
-        let projection = Linear::new(
-            cuda,
-            &kernels.join(format!("fp8-engram-wkv-m{rows}-v2")),
-            matrix,
-        )?;
+        let projection = match sp {
+            Some(rank) => Linear::new_rc(
+                cuda,
+                &kernels.join(format!("claude-fp8-engram-wkv-full-m{local}-v1")),
+                crate::staged_full::load(cuda, module, stream, &weights, kernels, "claude-engram-wkv-full-v1",
+                    &format!("{p}.wkv"), layer, rank, 25600, 6144, crate::staged_full::Split::Rows)?,
+            )?,
+            None => Linear::new(
+                cuda,
+                &kernels.join(format!("fp8-engram-wkv-m{rows}-v2")),
+                matrix,
+            )?,
+        };
         let dequant = Operator::load(cuda, &kernels.join("engram-v3"), "engram_packed")?;
         let gate = Operator::load(cuda, &kernels.join("engram-v3"), "engram_gate")?;
         let image = Operator::load(
@@ -214,10 +231,11 @@ impl Layer {
             gate,
             image,
             projection,
-            embedding: cuda.allocate_rows(rows * 6144)?,
-            kv: cuda.allocate_rows(rows * 25600)?,
-            output: cuda.allocate_rows(rows * 20480)?,
+            embedding: cuda.allocate_rows(local * 6144)?,
+            kv: if sp.is_some() { None } else { Some(cuda.allocate_rows(rows * 25600)?) },
+            output: cuda.allocate_rows(local * 20480)?,
             stream: Cell::new(0),
+            sp,
             projection_ahead: None,
             projection_ahead_enabled: false,
             projection_ahead_selected: false,
@@ -228,7 +246,7 @@ impl Layer {
     pub(crate) fn set_projection_ahead_for_probe(&mut self,enabled:bool,kernels:&Path)->Result<()> {
         ensure!((std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_M3").as_deref()==Ok("1"))
-            &&self.layer==14&&matches!(self.rows,6|16)&&!self.projection_queued,
+            &&self.layer==14&&matches!(self.rows,6|16)&&!self.projection_queued&&self.sp.is_none(),
             "idle Engram14 projection experiment");
         if let Some(ahead)=&self.projection_ahead {ahead.stream.synchronize()?;}
         if enabled&&self.projection_ahead.is_none() {
@@ -254,7 +272,9 @@ impl Layer {
         unsafe{
             self.dequant.launch(self.rows as u32,&[rows.inputs.pointers().0,rows.inputs.pointers().1,
                 rows.local.ptr(),rows.interval.0,rows.interval.1],stream)?;
-            comm.sum_bf16(&rows.local,&mut self.embedding,stream)?;
+            // Each table row has exactly one owning rank, so either sum is exact.
+            if self.sp.is_some() {comm.scatter_sum_bf16(&rows.local,&mut self.embedding,stream)?;}
+            else {comm.sum_bf16(&rows.local,&mut self.embedding,stream)?;}
         }
         Ok(())
     }
@@ -285,11 +305,12 @@ impl Layer {
                 && self.cuda.owns_stream(stream)
                 && self.cuda.owns_buffer(tokens.ids())
                 && tokens.ids().len() == self.rows
-                && residual.len() == self.rows * 20480
+                && residual.len() == self.local_rows() * 20480
                 && rows.rows == self.rows
                 && rows.prepared,
             "Engram prepared row/input context/shape mismatch"
         );
+        let local = self.local_rows();
         let table = if self.layer == 1 {
             384006168
         } else {
@@ -318,21 +339,28 @@ impl Layer {
             &self.projection
         };
         unsafe {
-            comm.gather_bf16(projection.output(), &mut self.kv, 6400, stream)?;
+            let kv = match self.kv.as_mut() {
+                Some(kv) => {
+                    comm.gather_bf16(projection.output(), kv, 6400, stream)?;
+                    kv.ptr()
+                }
+                None => projection.output().ptr(),
+            };
             self.gate.launch(
-                self.rows as u32,
+                local as u32,
                 &[
                     residual.ptr(),
-                    self.kv.ptr(),
+                    kv,
                     self.weights.ptr(&format!("{p}.q_weight"))?,
                     self.weights.ptr(&format!("{p}.k_weight"))?,
                     self.output.ptr(),
                 ],
                 stream,
             )?;
+            let first = self.sp.map_or(0, |rank| rank * local);
             self.image.launch(
-                self.rows as u32,
-                &[residual.ptr(), self.output.ptr(), tokens.ids().ptr()],
+                local as u32,
+                &[residual.ptr(), self.output.ptr(), tokens.ids().ptr() + (first * 8) as u64],
                 stream,
             )
         }
@@ -345,7 +373,11 @@ impl Layer {
         else{self.projection.output()}
     }
     pub fn projected(&self) -> &Buffer<bf16> {
-        &self.kv
+        match &self.kv { Some(kv) => kv, None => self.projection.output() }
+    }
+    /// Rows of residual/output owned by this rank (all rows unless sequence-parallel).
+    pub fn local_rows(&self) -> usize {
+        if self.sp.is_some() { self.rows / 4 } else { self.rows }
     }
     pub fn output(&self) -> &Buffer<bf16> {
         &self.output

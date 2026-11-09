@@ -37,6 +37,20 @@ pub(crate) fn cached_policy() -> Result<bool> {
         Err(e) => Err(e.into()),
     }
 }
+/// Direct token-major per-group WO-A GEMMs for full (non-bounded) medium launches.
+/// Resolved once from CANADA_SCRATCH_WOA_TOKEN_MAJOR; the Claude A/B probe may override.
+static TOKEN_MAJOR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+pub(crate) fn token_major_enabled()->bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match TOKEN_MAJOR.load(Relaxed) {
+        0=>false,1=>true,
+        _=>{let on=std::env::var("CANADA_SCRATCH_WOA_TOKEN_MAJOR").as_deref()==Ok("1");
+            TOKEN_MAJOR.store(u8::from(on),Relaxed);on}
+    }
+}
+pub(crate) fn set_token_major_for_probe(enabled:bool) {
+    TOKEN_MAJOR.store(u8::from(enabled),std::sync::atomic::Ordering::Relaxed);
+}
 pub(crate) fn compact_policy()->Result<bool> {
     match std::env::var("CANADA_SCRATCH_WOA_MID_COMPACT") {
         Ok(v)=>{ensure!(v=="0"||v=="1","invalid compact medium WO-A policy");Ok(v=="1")},
@@ -309,6 +323,10 @@ impl Grouped {
         let compute=PREFILL_ROWS.with(|slot|slot.get()
             .filter(|(_,owner)|self.rows==128&&*owner==stream.raw()as usize)
             .map_or(self.rows,|(rows,_)|rows));
+        // Measured on wide prefill only; narrow (graph-captured verify/extend) profiles keep the qualified path.
+        if compute==self.rows && self.rows >= 512 && crate::config::wide_rows(self.rows) && token_major_enabled() {
+            return blas.grouped_woa_token_major(input,operand,&mut self.output,self.rows,stream);
+        }
         blas.grouped_woa_bounded(input, operand, grouped, self.rows, compute, stream)?;
         let mut source = s.grouped.ptr();
         let mut dest = self.output.ptr();

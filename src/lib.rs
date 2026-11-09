@@ -5,6 +5,8 @@ mod prefill_exchange;
 mod event_log;
 pub mod vision;
 pub mod vision_probe;
+#[cfg(feature = "vision-input")]
+pub mod vision_norm_probe;
 pub mod prompt_media;
 pub mod prompt_media_probe;
 pub mod image_cache;
@@ -89,6 +91,7 @@ pub mod engram;
 #[cfg(target_os = "linux")]
 mod engram_io;
 pub mod engram_gpu;
+pub(crate) mod staged_full;
 pub mod engram_probe;
 mod engram_prefetch_probe;
 mod engram_cold_probe;

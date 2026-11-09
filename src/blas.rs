@@ -392,6 +392,28 @@ impl Blas {
             "medium WO-A strided BF16 GEMM",
         )
     }
+    /// Medium WO-A as one GemmEx per head group, each writing its 1024 columns of the
+    /// token-major [rows, 2048] output directly (no group-major buffer or layout copy).
+    /// Same operands, FP32 accumulation and BF16 output as grouped_woa.
+    pub(crate) fn grouped_woa_token_major(&self,x:&Buffer<half::bf16>,weight:&Buffer<half::bf16>,
+        output:&mut Buffer<half::bf16>,rows:usize,stream:&Stream)->Result<()> {
+        self.guard_stream(stream)?;
+        ensure!(((9..=384).contains(&rows)||crate::config::wide_rows(rows))
+            &&x.len()==rows*8192&&weight.len()==2*1024*4096&&output.len()==rows*2048
+            &&self._context.owns_buffer(x)&&self._context.owns_buffer(weight)&&self._context.owns_buffer(output),
+            "token-major WO-A GEMM buffers/context");
+        check(unsafe{(self.set_stream)(self.handle,stream.raw())},"set token-major WO-A stream")?;
+        check(unsafe{(self.set_workspace)(self.handle,self.workspace.ptr() as _,self.workspace.bytes())},
+            "set token-major WO-A workspace")?;
+        let alpha=1f32;let beta=0f32;
+        for group in 0..2u64 {
+            check(unsafe{(self.gemm)(self.handle,1,0,1024,rows as i32,4096,(&alpha as *const f32).cast(),
+                (weight.ptr()+group*1024*4096*2) as *const c_void,14,4096,
+                (x.ptr()+group*4096*2) as *const c_void,14,8192,(&beta as *const f32).cast(),
+                (output.ptr()+group*1024*2) as *mut c_void,14,2048,68,99)},"token-major WO-A GEMM")?;
+        }
+        Ok(())
+    }
     pub fn new(context: &Cuda) -> Result<Self> {
         Self::with_workspace(context, Rc::new(Workspace {
             buffer: context.allocate::<u8>(32 * 1024 * 1024)?, stream_identity: None,

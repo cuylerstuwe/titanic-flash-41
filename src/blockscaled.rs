@@ -271,6 +271,38 @@ impl Matrix {
             n:1280,k:15360,padded_k:15360,
         })
     }
+    /// A full (unsplit) canonical matrix owned outside the weight atlas, e.g. a
+    /// staged copy of every TP4 shard. Values are the canonical FP8 bytes; the
+    /// canonical 32x32 UE8M0 scales are converted to the MMA layout on GPU. The
+    /// caller synchronizes before releasing `canonical_scales`.
+    pub(crate) fn from_owned(
+        cuda: &Cuda,
+        module: &Module,
+        stream: &Stream,
+        owner: &Rc<Weights>,
+        values: Rc<Buffer<u8>>,
+        canonical_scales: &Buffer<u8>,
+        n: usize,
+        k: usize,
+    ) -> Result<Self> {
+        ensure!(
+            n % 32 == 0 && k % 128 == 0 && values.len() == n * k
+                && canonical_scales.len() == n / 32 * (k / 32)
+                && cuda.owns_buffer(&values) && cuda.owns_buffer(canonical_scales),
+            "owned canonical FP8 matrix geometry/context"
+        );
+        let scales = Rc::new(launch_scales(cuda, module, stream, canonical_scales.ptr(), n, k)?);
+        Ok(Self {
+            _source_owner: owner.clone(),
+            source_pointer: values.ptr(),
+            source_scales: canonical_scales.ptr(),
+            values: Some(values),
+            scales,
+            n,
+            k,
+            padded_k: k,
+        })
+    }
     /// The source atlas must outlive this view and all captured GPU work.
     pub fn prepare(
         cuda: &Cuda,

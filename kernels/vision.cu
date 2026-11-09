@@ -135,3 +135,46 @@ extern "C" __global__ void vision_span(const B* features, const B* start,
         out[i] = x == width ? newline[col] : features[(y * width + x) * 5120 + col];
     }
 }
+
+// Reference-order packed rows and fused BF16 residual; see vision-gpu-contract.
+template <bool Residual>
+__device__ void norm_rows_body(B* x, const B* delta, const B* weight, B* y,
+                              unsigned rows) {
+    const unsigned row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const unsigned lane = threadIdx.x % 32;
+    if (row >= rows) return; // Whole warp; all participating lanes remain active.
+    float accum[4] = {0.f, 0.f, 0.f, 0.f};
+    for (unsigned c = lane * 4; c < 1024; c += 128) {
+        #pragma unroll
+        for (unsigned j = 0; j < 4; ++j) {
+            const unsigned i = row * 1024 + c + j;
+            B value = x[i];
+            if constexpr (Residual) {
+                // Preserve the original residual's BF16 rounding boundary.
+                value = __float2bfloat16_rn(__bfloat162float(value) + __bfloat162float(delta[i]));
+                x[i] = value;
+            }
+            const float v = __bfloat162float(value);
+            accum[j] += v * v;
+        }
+    }
+    float sum = ((accum[0] + accum[1]) + accum[2]) + accum[3];
+    for (int d = 16; d; d >>= 1) sum += __shfl_down_sync(0xffffffff, sum, d);
+    const float inv = rsqrtf(__shfl_sync(0xffffffff, sum, 0) * (1.f / 1024.f) + 1.e-6f);
+    // In the fused case, lanes read values written by other lanes in their
+    // warp. Explicit ordering is needed on independently scheduled hardware.
+    if constexpr (Residual) __syncwarp();
+    for (unsigned c = lane; c < 1024; c += 32) {
+        const float v = __bfloat162float(x[row * 1024 + c]) * inv;
+        y[row * 1024 + c] = __float2bfloat16_rn(v * __bfloat162float(weight[c]));
+    }
+}
+
+extern "C" __global__ void vision_norm_rows(B* x, const B* weight, B* y, unsigned rows) {
+    norm_rows_body<false>(x, nullptr, weight, y, rows);
+}
+
+extern "C" __global__ void vision_residual_norm_rows(B* x, const B* delta,
+                                                     const B* weight, B* y, unsigned rows) {
+    norm_rows_body<true>(x, delta, weight, y, rows);
+}

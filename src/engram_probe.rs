@@ -105,6 +105,7 @@ pub fn run(path: &Path) -> Result<Value> {
             lc.layer,
             6,
             &p.kernels,
+            None,
         )?;
         let store = RowStore::new(
             PackedShard::open(

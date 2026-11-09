@@ -423,6 +423,14 @@ pub(crate) fn plan_encoder_chunks(len: usize, widths: &[usize]) -> Vec<usize> {
     }
     plan
 }
+/// Narrow measured crossover after the partial-M2048 live-row optimization.
+/// The caller admits this only for retained appends with those kernels active.
+/// Preserve the general planner for cold prefill and every other range/profile.
+pub(crate) fn plan_encoder_append(len:usize,widths:&[usize],merge_short:bool)->Vec<usize> {
+    if merge_short&&(1153..=1536).contains(&len)&&widths.contains(&2048) {
+        vec![2048]
+    }else{plan_encoder_chunks(len,widths)}
+}
 /// A suspended prefill keeps its original physical row sequence. Replanning
 /// the remaining token count can move a small chunk between larger chunks,
 /// changing model arithmetic despite using the same accepted token history.
@@ -444,7 +452,24 @@ pub(crate) fn validate_encoder_chunks(len: usize, chunks: &[usize], widths: &[us
 
 #[cfg(test)]
 mod resumed_encoder_tests {
-    use super::validate_encoder_chunks;
+    use super::{validate_encoder_chunks,plan_encoder_append,plan_encoder_chunks};
+    #[test]
+    fn narrow_append_crossover_preserves_other_ranges_and_admission() {
+        let widths=[128,512,1024,2048,8192];
+        for n in 1..=2200 {
+            let merged=plan_encoder_append(n,&widths,true);
+            validate_encoder_chunks(n,&merged,&widths).unwrap();
+            assert_eq!(plan_encoder_append(n,&widths,false),plan_encoder_chunks(n,&widths));
+            if (1153..=1536).contains(&n) {assert_eq!(merged,vec![2048]);}
+            else {assert_eq!(merged,plan_encoder_chunks(n,&widths));}
+        }
+        let limited=[128,512,1024,8192];
+        assert_eq!(plan_encoder_append(1278,&limited,true),plan_encoder_chunks(1278,&limited));
+        assert_eq!(plan_encoder_append(1025,&widths,true),vec![1024,128]);
+        // A suspended request's saved plan is still valid; it is not replanned
+        // under a changed remainder or another caller's policy.
+        validate_encoder_chunks(129,&[512],&widths).unwrap();
+    }
     #[test]
     fn preserves_interior_small_chunk_and_ragged_final_width() {
         let widths=[128,8192];

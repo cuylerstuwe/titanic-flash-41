@@ -35,7 +35,9 @@ pub struct Frontend {
     region_cache: crate::prompt_regions::RegionCache,
     use_region_cache: bool,
     #[cfg(feature = "vision-protocol")]
-    image_cache: Option<crate::image_input_cache::ImageInputCache>,
+    image_cache: Option<Arc<crate::image_input_cache::ImageInputCache>>,
+    #[cfg(feature = "vision-protocol")]
+    defer_image_pixels: bool,
 }
 /// Already processed immutable image input for the experimental compact-context
 /// path. These handles are supplied by trusted Rust cache ownership, never
@@ -72,6 +74,8 @@ pub struct PreparedChat {
     pub rendered_sha256: String,
     pub images: Vec<crate::image_cache::Descriptor>,
     pub image_inputs: Vec<Arc<crate::worker_media::PatchInput>>,
+    #[cfg(feature = "vision-protocol")]
+    pub deferred_image_inputs: Vec<crate::image_input_cache::DeferredInput>,
     pub image_aliases: Vec<ImageAlias>,
 }
 
@@ -343,7 +347,13 @@ impl Frontend {
             },
             tokenizer: Arc::new(tokenizer),
             #[cfg(feature = "vision-protocol")]
-            image_cache: images.then(crate::image_input_cache::ImageInputCache::new),
+            image_cache: images.then(|| Arc::new(crate::image_input_cache::ImageInputCache::new())),
+            #[cfg(feature = "vision-protocol")]
+            defer_image_pixels: match std::env::var("CANADA_SCRATCH_IMAGE_METADATA_DEFER") {
+                Ok(value) => { ensure!(value == "0" || value == "1", "invalid image metadata policy"); value == "1" },
+                Err(std::env::VarError::NotPresent) => false,
+                Err(error) => return Err(error.into()),
+            },
         })
     }
     pub fn prepare_chat(&self, body: &[u8], context_capacity: usize) -> Result<PreparedChat> {
@@ -361,7 +371,7 @@ impl Frontend {
         self.image_cache.as_ref().ok_or(ContextImageMiss)?.pin_references(keys)
     }
     #[cfg(all(test, feature = "vision-protocol"))]
-    pub(crate) fn enable_test_images(&mut self) {self.image_cache=Some(crate::image_input_cache::ImageInputCache::for_test());}
+    pub(crate) fn enable_test_images(&mut self) {self.image_cache=Some(Arc::new(crate::image_input_cache::ImageInputCache::for_test()));}
     #[cfg(all(test, feature = "vision-protocol"))]
     pub(crate) fn forget_context_images_for_test(&self) {
         if let Some(cache)=&self.image_cache {cache.forget_for_test();}
@@ -436,17 +446,27 @@ impl Frontend {
             !tokens.is_empty() && tokens.iter().all(|&id| id < 129280),
             "encoded prompt token domain"
         );
+        #[cfg(feature = "vision-protocol")]
+        let mut deferred_image_inputs = Vec::new();
         let (tokens, images, image_inputs, image_aliases) = if rendered.image_sources.is_empty() {
             (tokens, Vec::new(), Vec::new(), Vec::new())
         } else {
             #[cfg(feature = "vision-protocol")]
             {
                 let cache = self.image_cache.as_ref().ok_or_else(|| anyhow::anyhow!("native vision is not enabled"))?;
-                let expanded = match _references {
-                    None => cache.expand_cancellable(tokens, &rendered.image_sources, context_capacity, cancelled)?,
-                    Some(references) => cache.expand_referenced(tokens, &rendered.image_sources, context_capacity, cancelled, references)?,
-                };
-                (expanded.tokens, expanded.images, expanded.inputs, expanded.aliases)
+                // Compact-context references retain their existing pinning and
+                // miss behavior. Only immutable full-source requests may defer.
+                if self.defer_image_pixels && _references.is_none() {
+                    let planned = cache.plan_cancellable(tokens, &rendered.image_sources, context_capacity, cancelled)?;
+                    deferred_image_inputs = planned.deferred;
+                    (planned.tokens, planned.images, planned.inputs, planned.aliases)
+                } else {
+                    let expanded = match _references {
+                        None => cache.expand_cancellable(tokens, &rendered.image_sources, context_capacity, cancelled)?,
+                        Some(references) => cache.expand_referenced(tokens, &rendered.image_sources, context_capacity, cancelled, references)?,
+                    };
+                    (expanded.tokens, expanded.images, expanded.inputs, expanded.aliases)
+                }
             }
             #[cfg(not(feature = "vision-protocol"))]
             { anyhow::bail!("vision inputs await native vision qualification"); }
@@ -464,6 +484,8 @@ impl Frontend {
             max_new_tokens,
             images,
             image_inputs,
+            #[cfg(feature = "vision-protocol")]
+            deferred_image_inputs,
             image_aliases,
             rendered_sha256: format!("{:x}", Sha256::digest(rendered.prompt.as_bytes())),
         })
@@ -1033,7 +1055,7 @@ mod tests {
         use base64::Engine as _;
         let path=std::env::var("CANADA_TEST_TOKENIZER").unwrap();
         let mut f=Frontend::load_with_images(Path::new(&path),true).unwrap();
-        f.image_cache=Some(crate::image_input_cache::ImageInputCache::for_test());
+        f.image_cache=Some(Arc::new(crate::image_input_cache::ImageInputCache::for_test()));
         let body=|color:u8| {
             let image=image::RgbImage::from_pixel(16,16,image::Rgb([color,10,240]));
             let mut output=std::io::Cursor::new(Vec::new());
@@ -1053,6 +1075,49 @@ mod tests {
         assert_eq!(a.tokens.len()+a.max_new_tokens as usize,4096);
         assert!(Frontend::load(Path::new(&path)).unwrap().prepare_chat(&body(40),4096).is_err());
         assert!(f.prepare_chat_cancellable(&body(40),4096,&||true).is_err());
+    }
+    #[cfg(feature = "vision-protocol")]
+    #[test]
+    #[ignore = "requires CANADA_TEST_TOKENIZER pointing to the pinned public1017 tokenizer"]
+    fn image_metadata_plan_preserves_prompt_and_exact_cold_fallback() {
+        use base64::Engine as _;
+        let path=std::env::var("CANADA_TEST_TOKENIZER").unwrap();
+        let mut f=Frontend::load_with_images(Path::new(&path),true).unwrap();
+        f.enable_test_images();
+        f.defer_image_pixels=true;
+        let image=image::RgbImage::from_pixel(16,24,image::Rgb([40,10,240]));
+        let mut output=std::io::Cursor::new(Vec::new());
+        image.write_to(&mut output,image::ImageFormat::Png).unwrap();
+        let url=format!("data:image/png;base64,{}",base64::engine::general_purpose::STANDARD.encode(output.into_inner()));
+        let body=serde_json::to_vec(&json!({"messages":[{"role":"user","content":[
+            {"type":"text","text":"Describe the picture."},
+            {"type":"image_url","image_url":{"url":url,"detail":"high"}}]}],"top_k":-1})).unwrap();
+        let cold=f.prepare_chat(&body,4096).unwrap();
+        assert_eq!(cold.image_inputs.len(),1);assert!(cold.deferred_image_inputs.is_empty());
+        let tokens=cold.tokens.clone();let identity=cold.images[0].input;
+        let pixels=cold.image_inputs[0].patches.clone();let aliases=cold.image_aliases.clone();
+        drop(cold);f.image_cache.as_ref().unwrap().forget_for_test();
+        let planned=f.prepare_chat(&body,4096).unwrap();
+        assert_eq!(planned.tokens,tokens);assert_eq!(planned.images[0].input,identity);
+        assert!(planned.image_inputs.is_empty());assert_eq!(planned.deferred_image_inputs.len(),1);
+        assert_eq!(planned.image_aliases.iter().map(|a|(a.source_hash,a.identity)).collect::<Vec<_>>(),
+            aliases.iter().map(|a|(a.source_hash,a.identity)).collect::<Vec<_>>());
+        assert_eq!(planned.deferred_image_inputs[0].materialize(&||false).unwrap().patches,pixels);
+        assert!(f.prepare_chat_cancellable(&body,4096,&||true).is_err());
+        assert!(f.prepare_chat(&body,1).is_err());
+        // Explicitly disabled serving retains eager input ownership even with
+        // learned metadata. No environment mutation or global test race.
+        drop(planned);f.image_cache.as_ref().unwrap().forget_for_test();f.defer_image_pixels=false;
+        let eager=f.prepare_chat(&body,4096).unwrap();
+        assert_eq!(eager.tokens,tokens);assert_eq!(eager.image_inputs[0].patches,pixels);
+        assert!(eager.deferred_image_inputs.is_empty());
+        // Even a full initial compact-transport request uses the referenced
+        // route. Keep pixels pinned so its later compact image keys work.
+        drop(eager);f.image_cache.as_ref().unwrap().forget_for_test();f.defer_image_pixels=true;
+        let referenced=f.prepare_chat_referenced(&body,4096,&[],&||false).unwrap();
+        assert_eq!(referenced.tokens,tokens);assert_eq!(referenced.image_inputs[0].patches,pixels);
+        assert!(referenced.deferred_image_inputs.is_empty());assert_eq!(referenced.image_aliases.len(),1);
+        assert_eq!(f.pin_context_images(&[identity]).unwrap()[0].input.patches,pixels);
     }
     #[test]
     #[ignore = "requires CANADA_TEST_TOKENIZER pointing to the pinned public1017 tokenizer"]

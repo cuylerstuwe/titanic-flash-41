@@ -40,6 +40,15 @@ pub(crate) struct Replay {
     begin: Buffer<i32>,
     end: usize,
 }
+/// Bounded publication copies only the newest 128 live rows (default on).
+pub(crate) fn bounded_copy_enabled() -> Result<bool> {
+    Ok(match std::env::var("CANADA_SCRATCH_BOUNDED_ENCODER_TAIL") {
+        Err(std::env::VarError::NotPresent) => true,
+        Ok(value) if value == "1" => true,
+        Ok(value) if value == "0" => false,
+        _ => anyhow::bail!("CANADA_SCRATCH_BOUNDED_ENCODER_TAIL must be0or1"),
+    })
+}
 impl Cache {
     pub(crate) fn validate_capacity(context: usize, kv_capacity: usize) -> Result<()> {
         ensure!(
@@ -51,12 +60,7 @@ impl Cache {
     }
     pub fn new(cuda: &Cuda, core: &[u8], context: usize, kv_capacity: usize) -> Result<Self> {
         Self::validate_capacity(context, kv_capacity)?;
-        let bounded_copy = match std::env::var("CANADA_SCRATCH_BOUNDED_ENCODER_TAIL") {
-            Err(std::env::VarError::NotPresent) => true,
-            Ok(value) if value == "1" => true,
-            Ok(value) if value == "0" => false,
-            _ => anyhow::bail!("CANADA_SCRATCH_BOUNDED_ENCODER_TAIL must be0or1"),
-        };
+        let bounded_copy = bounded_copy_enabled()?;
         let mut tags = cuda.allocate(128)?;
         tags.upload(&[-1i32; 128])?;
         let mut error = cuda.allocate(1)?;

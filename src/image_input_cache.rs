@@ -24,6 +24,7 @@ const SOURCE_ENTRIES: usize = 1024;
 #[derive(Clone, Copy)]
 struct SourceMemo {
     identity: [u8; 32],
+    geometry: Geometry,
     encoded_bytes: usize,
 }
 fn available_host_memory() -> Result<usize> {
@@ -65,6 +66,7 @@ struct State {
     hits: u64,
     misses: u64,
     source_hits: u64,
+    metadata_deferrals: u64,
 }
 impl State {
     fn remember_source(&mut self, key: [u8; 32], input: &PatchInput, encoded_bytes: usize) {
@@ -73,7 +75,7 @@ impl State {
             let expired = self.source_oldest.pop_front().unwrap();
             self.sources.remove(&expired);
         }
-        self.sources.insert(key, SourceMemo { identity: input.identity, encoded_bytes });
+        self.sources.insert(key, SourceMemo { identity: input.identity, geometry: input.geometry, encoded_bytes });
         self.source_oldest.push_back(key);
     }
     fn clear_warm(&mut self) {
@@ -114,6 +116,39 @@ pub struct Expanded {
     pub images: Vec<Descriptor>,
     pub inputs: Vec<Arc<PatchInput>>,
     pub aliases: Vec<crate::protocol::ImageAlias>,
+}
+/// A separate planning result: metadata alone must never masquerade as prepared
+/// pixels. A consumer must establish the real reusable model frontier/cache hit
+/// before omitting a deferred image, or materialize it through the same cache.
+pub struct Planned {
+    pub tokens: Vec<u32>,
+    pub images: Vec<Descriptor>,
+    pub inputs: Vec<Arc<PatchInput>>,
+    pub deferred: Vec<DeferredInput>,
+    pub aliases: Vec<crate::protocol::ImageAlias>,
+}
+pub struct DeferredInput {
+    identity: [u8; 32],
+    geometry: Geometry,
+    source: ImageSource,
+    cache: Arc<ImageInputCache>,
+}
+impl DeferredInput {
+    pub fn identity(&self) -> [u8; 32] { self.identity }
+    pub fn geometry(&self) -> Geometry { self.geometry }
+    pub fn materialize(&self, cancelled: &dyn Fn() -> bool) -> Result<Arc<PatchInput>> {
+        ensure!(!cancelled(), "request cancelled during image processing");
+        // No mutable URL can enter this path. The owned source is the exact
+        // immutable input from which this process previously learned metadata.
+        ensure!(matches!(self.source, ImageSource::DataUrl { .. }), "deferred source is mutable");
+        let (bytes, detail) = self.cache.resolve(&self.source)?;
+        ensure!(!cancelled(), "request cancelled during image processing");
+        let input = self.cache.prepare(&bytes, detail)?;
+        ensure!(input.identity == self.identity && input.geometry == self.geometry,
+            "deferred image identity or geometry differs");
+        ensure!(!cancelled(), "request cancelled during image processing");
+        Ok(input)
+    }
 }
 impl ImageInputCache {
     pub fn new() -> Self {
@@ -201,8 +236,8 @@ impl ImageInputCache {
         let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?;
         let Some(memo) = state.sources.get(key).copied() else { return Ok(None); };
         let Some(input) = state.live.get(&memo.identity).and_then(Weak::upgrade) else {
-            state.sources.remove(key);
-            state.source_oldest.retain(|entry| entry != key);
+            // Keep bounded metadata after pixels are evicted. The eager path
+            // still resolves and admits the original source on this miss.
             return Ok(None);
         };
         // A memoized image still consumes its original request byte allowance.
@@ -211,6 +246,30 @@ impl ImageInputCache {
         state.source_hits += 1;
         state.retain(input.clone());
         Ok(Some((input, memo.encoded_bytes)))
+    }
+    fn pin_source_hits(&self, keys: &[Option<[u8; 32]>]) -> Result<Vec<Arc<PatchInput>>> {
+        if keys.iter().all(Option::is_none) { return Ok(Vec::new()); }
+        let state = self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?;
+        // Preserve this request's existing hits before an earlier miss can
+        // evict them. These are temporary owners, not a larger warm cache.
+        // Do not update LRU order, admission accounting or hit statistics here.
+        Ok(keys.iter().flatten().filter_map(|key| state.sources.get(key))
+            .filter_map(|memo| state.live.get(&memo.identity).and_then(Weak::upgrade)).collect())
+    }
+    fn prepare_with_optional_pins(&self, bytes: &[u8], detail: Detail,
+        pins: &mut Vec<Arc<PatchInput>>) -> Result<Arc<PatchInput>> {
+        match self.prepare(bytes, detail) {
+            Err(error) if !pins.is_empty()
+                && error.downcast_ref::<crate::memory::InputCapacityError>().is_some() => {
+                // Future hits are expendable under physical/live-input
+                // pressure. The first attempt already reclaims warm owners;
+                // release these optional owners before retrying the same
+                // admission once. Already prepared request inputs stay live.
+                pins.clear();
+                self.prepare(bytes, detail)
+            }
+            result => result,
+        }
     }
     fn prepare(&self, bytes: &[u8], detail: Detail) -> Result<Arc<PatchInput>> {
         let identity = vision_input::identity(bytes, detail);
@@ -227,11 +286,6 @@ impl ImageInputCache {
         }
         state.live.retain(|_, p| p.strong_count() > 0);
         { let State {live,source_info,..}=&mut *state;source_info.retain(|key,_|live.contains_key(key)); }
-        {
-            let State {live,sources,source_oldest,..} = &mut *state;
-            sources.retain(|_, memo| live.contains_key(&memo.identity));
-            source_oldest.retain(|key| sources.contains_key(key));
-        }
         let reader = image::ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|_| anyhow::anyhow!(INVALID_IMAGE))?;
@@ -332,27 +386,69 @@ impl ImageInputCache {
     }
     fn expand_with_references(&self, tokens: Vec<u32>, sources: &[ImageSource],
         capacity: usize, cancelled: &dyn Fn() -> bool, references: Option<&[crate::protocol::ImageReference]>) -> Result<Expanded> {
+        let plan = self.expand_plan(tokens, sources, capacity, cancelled, references, None)?;
+        ensure!(plan.deferred.is_empty(), "eager expansion deferred an image");
+        Ok(Expanded { tokens: plan.tokens, images: plan.images, inputs: plan.inputs, aliases: plan.aliases })
+    }
+    /// Opt-in frontend planning. The worker must resolve its actual prefix and
+    /// embedding-cache outcome before omitting or materializing deferred input.
+    pub fn plan_cancellable(self: &Arc<Self>, tokens: Vec<u32>, sources: &[ImageSource],
+        capacity: usize, cancelled: &dyn Fn() -> bool) -> Result<Planned> {
+        self.expand_plan(tokens, sources, capacity, cancelled, None, Some(self))
+    }
+    fn expand_plan(&self, tokens: Vec<u32>, sources: &[ImageSource], capacity: usize,
+        cancelled: &dyn Fn() -> bool, references: Option<&[crate::protocol::ImageReference]>,
+        deferred_cache: Option<&Arc<Self>>) -> Result<Planned> {
         ensure!(!cancelled(), "request cancelled during image processing");
         ensure!(
             tokens.iter().filter(|&&t| t == IMAGE_TOKEN).count() == sources.len(),
             "image placeholder count differs"
         );
+        let source_keys = sources.iter().map(|source| -> Result<_> {
+            ensure!(!cancelled(), "request cancelled during image processing");
+            Ok(match source {
+                ImageSource::DataUrl { data_url, detail, .. } =>
+                    Some(crate::protocol::image_source_hash(data_url, *detail)),
+                _ => None, // Mutable HTTP sources must still be fetched.
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        let mut pins = self.pin_source_hits(&source_keys)?;
         let mut output = Vec::with_capacity(tokens.len());
         let mut images = Vec::new();
         let mut inputs = Vec::new();
+        let mut deferred = Vec::new();
         let mut aliases = Vec::new();
-        let mut sources = sources.iter();
+        let mut sources = sources.iter().zip(source_keys);
         let mut encoded_bytes = 0usize;
         for token in tokens {
             if token != IMAGE_TOKEN {
                 output.push(token);
             } else {
                 ensure!(!cancelled(), "request cancelled during image processing");
-                let source = sources.next().unwrap();
-                let source_key = match source {
-                    ImageSource::DataUrl { data_url, detail, .. } => Some(crate::protocol::image_source_hash(data_url, *detail)),
-                    _ => None,
-                };
+                let (source, source_key) = sources.next().unwrap();
+                // Only a successfully prepared exact source/detail can supply
+                // geometry. Metadata does not bypass encoded or token budgets.
+                // Keep already-live patches on the ordinary fast path.
+                if let (Some(cache), Some(key)) = (deferred_cache, source_key) {
+                    let memo = {
+                        let state = self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?;
+                        state.sources.get(&key).copied().filter(|memo|
+                            state.live.get(&memo.identity).and_then(Weak::upgrade).is_none())
+                    };
+                    if let Some(memo) = memo {
+                        ensure!((1..=MAX_ENCODED_BYTES).contains(&memo.encoded_bytes), "invalid deferred image byte count");
+                        encoded_bytes = encoded_bytes.checked_add(memo.encoded_bytes)
+                            .ok_or_else(|| anyhow::anyhow!("request encoded image byte capacity exceeded"))?;
+                        ensure!(encoded_bytes <= 128 << 20, "request encoded image byte capacity exceeded");
+                        let count = memo.geometry.validate()?.tokens();
+                        ensure!(output.len().checked_add(count).is_some_and(|n| n <= capacity), "image prompt exceeds context capacity");
+                        images.push(Descriptor { start: output.len(), geometry: memo.geometry, input: memo.identity });
+                        output.extend(std::iter::repeat_n(IMAGE_TOKEN, count));
+                        deferred.push(DeferredInput { identity: memo.identity, geometry: memo.geometry,
+                            source: source.clone(), cache: cache.clone() });
+                        continue;
+                    }
+                }
                 let internal = match source {
                     ImageSource::Url { url, .. } if references.is_some() && url.starts_with("http://titanic-context.invalid/") => Some(url),
                     _ => None,
@@ -373,7 +469,7 @@ impl ImageInputCache {
                         ensure!(!cancelled(), "request cancelled during image processing");
                         ensure!(encoded_bytes.saturating_add(bytes.len()) <= 128 << 20,
                             "request encoded image byte capacity exceeded");
-                        let input = self.prepare(&bytes, detail)?;
+                        let input = self.prepare_with_optional_pins(&bytes, detail, &mut pins)?;
                         if let Some(key) = source_key {
                             self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?
                                 .remember_source(key, &input, bytes.len());
@@ -413,10 +509,15 @@ impl ImageInputCache {
             );
         }
         ensure!(!cancelled(), "request cancelled during image processing");
-        Ok(Expanded {
+        if !deferred.is_empty() {
+            self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?
+                .metadata_deferrals += deferred.len() as u64;
+        }
+        Ok(Planned {
             tokens: output,
             images,
             inputs,
+            deferred,
             aliases,
         })
     }
@@ -431,7 +532,8 @@ impl ImageInputCache {
         Ok(
             serde_json::json!({"hits":state.hits,"misses":state.misses,"warm_bytes":state.retained,
             "live_bytes":state.live_bytes(),"warm_budget_bytes":WARM_BYTES,"live_budget_bytes":LIVE_BYTES,
-            "source_hits":state.source_hits,"source_entries":state.sources.len(),"source_entry_limit":SOURCE_ENTRIES}),
+            "source_hits":state.source_hits,"source_entries":state.sources.len(),"source_entry_limit":SOURCE_ENTRIES,
+            "metadata_deferrals":state.metadata_deferrals}),
         )
     }
 }
@@ -460,6 +562,109 @@ mod tests {
             detail,
             path: String::new(),
         }
+    }
+    #[test]
+    fn deferred_metadata_survives_patch_eviction_and_materializes_exactly() {
+        let cache = Arc::new(ImageInputCache::for_test());
+        let sources = [data_source(&png(61), ImageDetail::Auto, ""),
+            data_source(&png(62), ImageDetail::Auto, "")];
+        let tokens = vec![17, IMAGE_TOKEN, 18, IMAGE_TOKEN, 19];
+        let cold = cache.expand(tokens.clone(), &sources, 4096).unwrap();
+        let expected_tokens = cold.tokens.clone(); let expected_images = cold.images.clone();
+        let expected_patches: Vec<_> = cold.inputs.iter().map(|i| i.patches.clone()).collect();
+        let weak: Vec<_> = cold.inputs.iter().map(Arc::downgrade).collect();
+        drop(cold); cache.forget_for_test();
+        assert!(weak.iter().all(|p| p.upgrade().is_none()));
+        let plan = cache.plan_cancellable(tokens, &sources, 4096, &|| false).unwrap();
+        assert_eq!(plan.tokens, expected_tokens); assert_eq!(plan.images, expected_images);
+        assert!(plan.inputs.is_empty()); assert_eq!(plan.deferred.len(), 2);
+        assert_eq!(cache.metadata().unwrap()["live_bytes"], 0);
+        assert_eq!(cache.metadata().unwrap()["misses"], 2);
+        for (i, deferred) in plan.deferred.iter().enumerate() {
+            let input = deferred.materialize(&|| false).unwrap();
+            assert_eq!(input.identity, expected_images[i].input);
+            assert_eq!(input.geometry, expected_images[i].geometry);
+            assert_eq!(input.patches, expected_patches[i]);
+        }
+        assert_eq!(cache.metadata().unwrap()["misses"], 4);
+    }
+    #[test]
+    fn deferred_materialization_preserves_physical_admission_and_cancellation() {
+        let mut cache = ImageInputCache::for_test();
+        let source = data_source(&png(63), ImageDetail::Auto, "");
+        drop(cache.expand(vec![IMAGE_TOKEN], std::slice::from_ref(&source), 4096).unwrap());
+        cache.forget_for_test(); cache.available_memory = || Ok(8usize << 30);
+        let cache = Arc::new(cache);
+        let plan = cache.plan_cancellable(vec![IMAGE_TOKEN], &[source], 4096, &|| false).unwrap();
+        assert_eq!(plan.deferred.len(), 1); assert!(plan.inputs.is_empty());
+        assert!(plan.deferred[0].materialize(&|| true).err().unwrap().to_string().contains("cancelled"));
+        assert!(plan.deferred[0].materialize(&|| false).err().unwrap()
+            .downcast_ref::<crate::memory::InputCapacityError>().is_some());
+        assert_eq!(cache.metadata().unwrap()["live_bytes"], 0);
+    }
+    #[test]
+    fn deferred_hits_preserve_detail_encoded_budget_and_context_limits() {
+        let cache = Arc::new(ImageInputCache::for_test());
+        let bytes = png(64); let original = data_source(&bytes, ImageDetail::Auto, "");
+        let cold = cache.expand(vec![IMAGE_TOKEN], std::slice::from_ref(&original), 4096).unwrap();
+        let identity = cold.images[0].input; drop(cold); cache.forget_for_test();
+        assert!(cache.plan_cancellable(vec![IMAGE_TOKEN], std::slice::from_ref(&original), 1, &|| false).is_err());
+        assert!(cache.plan_cancellable(vec![IMAGE_TOKEN], std::slice::from_ref(&original), 4096, &|| true).is_err());
+        let changed = cache.plan_cancellable(vec![IMAGE_TOKEN], &[data_source(&bytes, ImageDetail::High, "")], 4096, &|| false).unwrap();
+        assert!(changed.deferred.is_empty()); assert_ne!(changed.images[0].input, identity);
+        let ImageSource::DataUrl {data_url, detail, ..} = &original else { unreachable!() };
+        let key = crate::protocol::image_source_hash(data_url, *detail);
+        cache.state.lock().unwrap().sources.get_mut(&key).unwrap().encoded_bytes = MAX_ENCODED_BYTES;
+        let count = (128usize << 20) / MAX_ENCODED_BYTES + 1;
+        let sources = vec![original; count];
+        let error = cache.plan_cancellable(vec![IMAGE_TOKEN; count], &sources, 1048576, &|| false).err().unwrap();
+        assert!(error.to_string().contains("encoded image byte capacity"));
+        assert_eq!(cache.metadata().unwrap()["misses"], 2);
+    }
+    #[test]
+    fn request_pins_preserve_later_hits_without_expanding_warm_retention() {
+        let cache = ImageInputCache::for_test();
+        let sources: Vec<_> = [51, 52, 53].iter()
+            .map(|&color| data_source(&png(color), ImageDetail::Auto, "")).collect();
+        let first = cache.expand(vec![IMAGE_TOKEN; 3], &sources, 4096).unwrap();
+        let expected: Vec<_> = first.inputs.iter().map(|input| input.identity).collect();
+        let weak: Vec<_> = first.inputs.iter().map(Arc::downgrade).collect();
+        let keys: Vec<_> = sources.iter().map(|source| match source {
+            ImageSource::DataUrl { data_url, detail, .. } =>
+                Some(crate::protocol::image_source_hash(data_url, *detail)),
+            _ => unreachable!(),
+        }).collect();
+        drop(first);
+        let pins = cache.pin_source_hits(&keys).unwrap();
+        cache.forget_for_test();
+        assert_eq!(cache.metadata().unwrap()["warm_bytes"], 0);
+        assert_eq!(cache.metadata().unwrap()["hits"], 0);
+        let repeat = cache.expand(vec![IMAGE_TOKEN; 3], &sources, 4096).unwrap();
+        assert_eq!(repeat.inputs.iter().map(|p| p.identity).collect::<Vec<_>>(), expected);
+        assert_eq!(cache.metadata().unwrap()["misses"], 3);
+        assert_eq!(cache.metadata().unwrap()["source_hits"], 3);
+        drop(repeat);
+        cache.forget_for_test();
+        assert!(weak.iter().all(|input| input.upgrade().is_some()));
+        drop(pins);
+        assert!(weak.iter().all(|input| input.upgrade().is_none()));
+    }
+    #[test]
+    fn optional_request_pins_do_not_survive_failed_physical_admission() {
+        let mut cache = ImageInputCache::for_test();
+        let source = data_source(&png(54), ImageDetail::Auto, "");
+        let first = cache.expand(vec![IMAGE_TOKEN], std::slice::from_ref(&source), 4096).unwrap();
+        let weak = Arc::downgrade(&first.inputs[0]);
+        let ImageSource::DataUrl { data_url, detail, .. } = &source else { unreachable!() };
+        let mut pins = cache.pin_source_hits(&[Some(crate::protocol::image_source_hash(data_url, *detail))]).unwrap();
+        drop(first);
+        cache.available_memory = || Ok(8usize << 30);
+        let error = cache.prepare_with_optional_pins(&png(55), Detail::Auto, &mut pins).err().unwrap();
+        assert!(error.downcast_ref::<crate::memory::InputCapacityError>().is_some());
+        assert!(pins.is_empty());
+        assert!(weak.upgrade().is_none());
+        assert_eq!(cache.metadata().unwrap()["live_bytes"], 0);
+        assert_eq!(cache.metadata().unwrap()["misses"], 1);
     }
     #[test]
     fn exact_source_reuse_preserves_identity_detail_aliases_and_admission() {

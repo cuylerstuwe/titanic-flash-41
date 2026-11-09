@@ -1,0 +1,248 @@
+{
+  "date": "2026-11-08",
+  "date_timezone": "America/Los_Angeles",
+  "engine_release": "s1387",
+  "build_variant": "native production s1387",
+  "single_stream": true,
+  "started_at": "2026-11-08T22:33:23-08:00",
+  "finished_at": "2026-11-08T22:35:55-08:00",
+  "client": "head GB10, head-local endpoint (route via lo); no external router or physical HTTP network hop",
+  "model_parallelism": "TP4",
+  "hardware": "3 ASUS GX10 + 1 NVIDIA DGX Spark, dual 100 Gb/s switched RoCE",
+  "compiler_source_sha256": "73ac5ceece161bb3d558326f0d080fcf57bc6b9bb53d3c7fe842a88103b2deb5",
+  "profile": "native production profile: the s1345 portable profile plus the options in docs/PREFILL.md",
+  "runtime_sha256": {
+    "provenance.json": "60c316066770ae460a2242d2b5e5385ed8a896c2816145f7bee29141c294a1a7",
+    "core.cubin": "5dd2def056cebb4f1e241cf085ab2550c6ac3432f915df75956d9912239cc63a",
+    "vision.cubin": "761a8c6c33e85c4e4ef91d4bc63acf62b6f91a65f127c38877ef3e5d08f28deb",
+    "engine": "3276ec5fe5633229b8c17ae94ce6120e0c55fe3b533693b7a26e6da7fd71cfce"
+  },
+  "source_url": "https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa",
+  "source_revision": "7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2",
+  "settings": {
+    "temperature": 0,
+    "top_p": 1,
+    "thinking": false,
+    "max_tokens": 512,
+    "repetitions": 3
+  },
+  "benchmark_wrapper": "equivalent to benchmarks/run_published.py (same client, contexts, request order and timing function), reading the production endpoint and key on the head",
+  "external_client_sha256": "76a078842a0dd50b8345a6feb4455b890517eac51513f030701cd4a65d0a23ee",
+  "context_sha256": "6b4b21a0ed3ae0eefe2b0aab0b9555eb1332334347c8bda80a83a2eaee168457",
+  "host_profile": {
+    "gpu_clock_cap_mhz": 2350,
+    "driver": "580.178.04",
+    "kernel": "7.0.0-1019-nvidia",
+    "nvme_apst": "production policy unchanged"
+  },
+  "measurement_conditions": "First production s1387 model load after rebooting all four devices for activation. The built-in startup warmup, five installed head-local checks (text, prompt reuse, continuation, image input, text after image) and one routed synthetic image request preceded the benchmark; no reusable long benchmark prompt. Same generation throughout, no reloads, no other inference traffic.",
+  "run_accounting": {
+    "completed_passes": 1,
+    "requests_in_completed_pass": 24,
+    "interrupted_attempts": 0,
+    "prior_failed_gpu_startups": 0
+  },
+  "rows": [
+    {
+      "context": "clean",
+      "workload": "code",
+      "titanic_decode_tps": {
+        "median": 120.32299296078534,
+        "min": 119.07930794790174,
+        "max": 120.58432863463257,
+        "stdev": 0.6566020283909689,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.14144618800003173,
+        "min": 0.13788614700001744,
+        "max": 0.14555260300005557,
+        "stdev": 0.003132465902531885,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 116.67259268109073,
+        "min": 115.59796089541062,
+        "max": 116.80828126253931,
+        "stdev": 0.5414097090021437,
+        "n": 3
+      }
+    },
+    {
+      "context": "clean",
+      "workload": "prose",
+      "titanic_decode_tps": {
+        "median": 65.20188119257958,
+        "min": 64.67793618638284,
+        "max": 65.21458268822275,
+        "stdev": 0.2500375894956351,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.1353244030000269,
+        "min": 0.13073087499998337,
+        "max": 0.13762618999999177,
+        "stdev": 0.002866358352213406,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 64.23288287665235,
+        "min": 63.69497126358213,
+        "max": 64.25760823736245,
+        "stdev": 0.2595981105912073,
+        "n": 3
+      }
+    },
+    {
+      "context": "clean",
+      "workload": "prose2",
+      "titanic_decode_tps": {
+        "median": 62.03405111901181,
+        "min": 61.60352353184136,
+        "max": 62.110737664459364,
+        "stdev": 0.22323405900407634,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.11883062599997629,
+        "min": 0.11692415300001358,
+        "max": 0.12426551899989136,
+        "stdev": 0.0031103475326413658,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 61.27156181982241,
+        "min": 60.86612333735515,
+        "max": 61.30630517882484,
+        "stdev": 0.19981867269540457,
+        "n": 3
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "code",
+      "titanic_decode_tps": {
+        "median": 110.9992377332616,
+        "min": 110.30691505707486,
+        "max": 111.69410113135129,
+        "stdev": 0.5663166600089826,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.2251856579999867,
+        "min": 0.22404227900005935,
+        "max": 0.24209925100001328,
+        "stdev": 0.008255847634758607,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 105.65993726553823,
+        "min": 105.4241674312828,
+        "max": 106.66264308511477,
+        "stdev": 0.536949027219945,
+        "n": 3
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "prose",
+      "titanic_decode_tps": {
+        "median": 62.13648809289749,
+        "min": 61.71287951553819,
+        "max": 62.14381052793774,
+        "stdev": 0.20143909537651664,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.3246311500000729,
+        "min": 0.30148460700002033,
+        "max": 0.33646625699998367,
+        "stdev": 0.014527934957914528,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 59.89381117389485,
+        "min": 59.41917164825807,
+        "max": 60.06325205468437,
+        "stdev": 0.2726072594863047,
+        "n": 3
+      }
+    },
+    {
+      "context": "131k",
+      "workload": "prose2",
+      "titanic_decode_tps": {
+        "median": 61.3718863064755,
+        "min": 60.787475146297055,
+        "max": 61.62226056992546,
+        "stdev": 0.34977617913963216,
+        "n": 3
+      },
+      "titanic_ttft_seconds": {
+        "median": 0.2950095799999417,
+        "min": 0.29254383899990444,
+        "max": 0.3122776459999841,
+        "stdev": 0.008779326225586746,
+        "n": 3
+      },
+      "titanic_e2e_tps": {
+        "median": 59.40480218658556,
+        "min": 58.84146743321614,
+        "max": 59.502119349392764,
+        "stdev": 0.29121920512037386,
+        "n": 3
+      }
+    }
+  ],
+  "cold_131k_first_token_seconds": {
+    "titanic": 16.314056787000027,
+    "sglang_tuned": 32.44752314499965,
+    "tensorfold": 56.01667726300366
+  },
+  "comparison_to_s1329": [
+    {
+      "context": "clean",
+      "workload": "code",
+      "s1329_decode_tps": 120.95762908624867,
+      "s1387_decode_tps": 120.32299296078534,
+      "change_percent": -0.5246763930953136
+    },
+    {
+      "context": "clean",
+      "workload": "prose",
+      "s1329_decode_tps": 65.49259962230839,
+      "s1387_decode_tps": 65.20188119257958,
+      "change_percent": -0.44389508342219663
+    },
+    {
+      "context": "clean",
+      "workload": "prose2",
+      "s1329_decode_tps": 62.40024158247455,
+      "s1387_decode_tps": 62.03405111901181,
+      "change_percent": -0.5868414194819205
+    },
+    {
+      "context": "131k",
+      "workload": "code",
+      "s1329_decode_tps": 111.85522425711002,
+      "s1387_decode_tps": 110.9992377332616,
+      "change_percent": -0.7652628918617732
+    },
+    {
+      "context": "131k",
+      "workload": "prose",
+      "s1329_decode_tps": 62.807105621299755,
+      "s1387_decode_tps": 62.13648809289749,
+      "change_percent": -1.0677414948012554
+    },
+    {
+      "context": "131k",
+      "workload": "prose2",
+      "s1329_decode_tps": 58.60964095871026,
+      "s1387_decode_tps": 61.3718863064755,
+      "change_percent": 4.712953880251902
+    }
+  ],
+  "attribution_limit": "s1329 was a portable build on a different fresh boot with different generated continuations; this table is not an isolated causal estimate.",
+  "scope": "Short capped throughput diagnostics. Competitor values are previously published measurements on a different four-Spark system. No task-quality or recommended-sampler claim."
+}

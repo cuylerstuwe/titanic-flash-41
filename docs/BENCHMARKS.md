@@ -1,7 +1,7 @@
 # Reproducing the published single-stream comparison
 
-The README benchmark measures s1329 (November 4). The current source includes later reliability repairs through s1345; those scores have not been relabeled as new measurements.
-Historical native s1291, s1173 and s986 measurements remain separately labeled below.
+The README benchmark measures native production s1387 (November 8) with the [prefill and vision options](PREFILL.md) enabled.
+The portable profile in this repository leaves those options off. Historical s1329, s1291, s1173 and s986 measurements remain separately labeled below.
 
 Run on the **head node**, against its direct loopback endpoint, with no other requests. Use a freshly started model process if measuring the first uncached long prompt. Do not route through a remote client or proxy.
 
@@ -23,7 +23,22 @@ The original decode formula is `(completion_tokens - 1) / (last_content_delta_ti
 
 The README's first-long-prompt TTFT is the initial 131K prose warmup, not the median of later cached requests. The later trials benefit from prefix reuse. Uncached TTFT includes work outside GPU prefill; report it separately from server prefill timing.
 
-## Current s1329 portable pass — November 4
+## Current s1387 native production pass — November 8
+
+All 24 requests completed on the first production model load after a four-device reboot, against the head's local endpoint (route via `lo`). The 2350 MHz cap and production APST policy remained active. Five installed head-local checks and one routed synthetic image request preceded the benchmark; none populated its long prompt.
+
+| Context | Workload | Portable s1329 | Native s1387 | Change |
+|---|---|---:|---:|---:|
+| Clean | Code | 121.0 | 120.3 | −0.5% |
+| Clean | Prose | 65.5 | 65.2 | −0.4% |
+| Clean | Prose 2 | 62.4 | 62.0 | −0.6% |
+| ~131K | Code | 111.9 | 111.0 | −0.8% |
+| ~131K | Prose | 62.8 | 62.1 | −1.1% |
+| ~131K | Prose 2 | 58.6 | 61.4 | +4.7% |
+
+All throughput values are median tokens/second from three 512-token trials. The first uncached ~131K TTFT was **16.31 s**, versus **20.99 s** for s1329. [Full results](../benchmarks/results-2026-11-08-s1387.json) include ranges, settings and measured-build hashes; [all 24 samples](../benchmarks/samples-2026-11-08-s1387.json) omit generated text. The run used a wrapper equivalent to `run_published.py` that reads the production endpoint and key on the head. Decode differences are within run-to-run variation for different generated continuations; the release's speed change is in prefill (see [validation](VALIDATION.md)).
+
+## Historical s1329 portable pass — November 4
 
 All 24 requests completed on the first model load after a four-device reboot, against the head's loopback endpoint. The 2350 MHz cap and Spark APST policy remained active. Ordinary serving, cache/timing, synthetic-image and incremental-context checks preceded the benchmark; none populated its long prompt. Existing validated weight atlases were used. Bounded diagnostic container logs were enabled for this qualification run; normal serving defaults to logging disabled.
 

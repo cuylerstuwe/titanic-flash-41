@@ -23,7 +23,9 @@ impl ActiveRowsScope {
             if enabled {
                 ensure!(capacity==6&&(1..=6).contains(&live)
                     ||capacity==128&&(17..128).contains(&live)
-                    ||capacity==512&&(129..512).contains(&live),"mHC live-row geometry");
+                    ||capacity==512&&(129..512).contains(&live)
+                    ||capacity==1024&&(513..1024).contains(&live)
+                    ||capacity==2048&&(1025..2048).contains(&live),"mHC live-row geometry");
                 ensure!(!normalize||capacity>=128,"live normalization is prefill-only");
                 slot.set(Some((live,capacity,stream.raw()as usize,normalize)));
             }
@@ -185,6 +187,17 @@ impl Boundary {
             "uncaptured M16 FFN coefficient overlap admission");
         self.deferred_stats=Some(DeferredStats {side:self.cuda.coefficient_stream(stream)?,
             parent:stream.raw()as usize,ready:self.cuda.fence_event()?,done:self.cuda.fence_event()?});
+        Ok(())
+    }
+    /// Wide sequence-parallel boundaries: run the coefficient statistics on the shared
+    /// coefficient stream, joined before the post (same kernels/inputs; schedule only).
+    pub(crate) fn set_wide_stats_overlap(&mut self, enabled: bool, stream: &Stream) -> Result<()> {
+        ensure!(!self.stats_pending.get() && self.cuda.owns_stream(stream), "idle wide coefficient overlap");
+        if enabled && self.deferred_stats.is_none() {
+            self.deferred_stats=Some(DeferredStats { side:self.cuda.coefficient_stream(stream)?,
+                parent:stream.raw()as usize,ready:self.cuda.fence_event()?,done:self.cuda.fence_event()? });
+        }
+        if !enabled { self.deferred_stats=None; }
         Ok(())
     }
     pub(crate) fn set_two_mma_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
@@ -672,7 +685,7 @@ impl Boundary {
         // partial stride. The fixed-M two-MMA and full-K paths stay unchanged.
         // A wide profile's M/4 sequence-parallel boundaries do not match its
         // capacity and deliberately keep their existing complete row shard.
-        let (live,live_norm)=if [6,128,512].contains(&self.rows)&&!self.use_two_mma&&!self.use_full_stats {
+        let (live,live_norm)=if [6,128,512,1024,2048].contains(&self.rows)&&!self.use_two_mma&&!self.use_full_stats {
             ACTIVE_ROWS.with(|s|s.get().filter(|(_,capacity,owner,_)|*capacity==self.rows&&*owner==stream.raw()as usize)
                 .map_or((self.rows,false),|(rows,_,_,normalize)|(rows,normalize)))
         }else{(self.rows,false)};

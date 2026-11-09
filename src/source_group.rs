@@ -182,6 +182,7 @@ impl Group {
                         14,
                         num_rows,
                         kernels,
+                        None,
                     )?);
                 }
                 source = Some(Source::new_rows(
@@ -288,6 +289,7 @@ impl Group {
                         14,
                         num_rows,
                         kernels,
+                        sp,
                     )?)
                 } else {
                     None
@@ -422,6 +424,10 @@ impl Group {
     /// The group's output is this rank's sequence-parallel row shard.
     pub(crate) fn sequence_parallel(&self) -> bool {
         self.layers[5].sp_rank().is_some()
+    }
+    /// The group's first (source/Engram) layer holds only this rank's rows.
+    pub(crate) fn first_sequence_parallel(&self) -> bool {
+        self.layers[0].sp_rank().is_some()
     }
     pub fn output(&self) -> &Buffer<bf16> {
         self.layers[5].output()

@@ -41,8 +41,22 @@ pub(crate) struct WideBuild {
 }
 /// Engram layers 1/14 and the embedding-fed layer0 keep full rows; every
 /// other encoder layer may run its mHC boundaries sequence-parallel.
+/// CANADA_SCRATCH_PREFILL_SP_EARLY=1 also runs layers 0, 1 and 14 sequence-parallel:
+/// layer 0 takes its rank's rows of the embedding, and both Engram layers reduce-
+/// scatter their ownership sum and project only local rows with the full WKV.
 pub(crate) fn sequence_parallel_layer(layer: usize) -> bool {
-    (2..=20).contains(&layer) && layer != 14
+    if sp_early_enabled() { layer <= 20 } else { (2..=20).contains(&layer) && layer != 14 }
+}
+/// CANADA_SCRATCH_PREFILL_MHC_OVERLAP=1: SP boundaries compute coefficients on the side stream.
+pub(crate) fn wide_stats_overlap_requested() -> bool {
+    std::env::var("CANADA_SCRATCH_PREFILL_MHC_OVERLAP").as_deref() == Ok("1")
+}
+pub(crate) fn sp_early_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| match std::env::var("CANADA_SCRATCH_PREFILL_SP_EARLY") {
+        Ok(v) => { assert!(v == "0" || v == "1", "invalid early sequence-parallel policy"); v == "1" }
+        Err(_) => false,
+    })
 }
 impl WideBuild {
     pub(crate) fn transient_arena_for_probe(&self,slot:usize)->Result<Rc<crate::cuda::RowArena>> {
@@ -148,10 +162,37 @@ impl WideBuild {
 struct Sp {
     rank: usize,
     gathered: Buffer<bf16>,
+    /// Narrow attention exchange (CANADA_SCRATCH_PREFILL_WOB_EXCHANGE).
+    wob: Option<WobExchange>,
+    /// MXFP8 WO-A exchange with per-shard WO-B (CANADA_SCRATCH_PREFILL_WOB8).
+    wob8: Option<Wob8>,
     quantized: Option<crate::fp8_linear::RowShard>,
     use_quantized: bool,
     local_qkv_prepared: bool,
     use_local_qkv: bool,
+}
+/// All-to-all of the token-major WO-A rows (rank-major quarters), reassembled to
+/// this rank's rows with all 8192 K columns, then one full-K WO-B on local rows.
+struct WobExchange {
+    full: crate::fp8_linear::Linear,
+    scratch: Buffer<u16>,
+    local: Buffer<bf16>,
+    module: Module,
+    local_rows: usize,
+}
+/// spark-ds41f 0737-style: WO-B's own MXFP8 operands for every row are exchanged so each
+/// rank holds all four ranks' WO-A columns for its rows; each rank's WO-B shard is then
+/// applied on local rows (same quantized inputs and shard GEMMs as the full-row path)
+/// and the four BF16 parts are summed in rank-rotation order.
+struct Wob8 {
+    module: Module,
+    shards: Vec<crate::fp8_linear::Linear>,
+    recv_values: Buffer<u8>,
+    recv_scales: Buffer<u8>,
+    side: Rc<Stream>,
+    ready: crate::cuda::Event,
+    done: crate::cuda::Event,
+    local_rows: usize,
 }
 pub struct SwaLayer {
     sp: Option<Sp>,
@@ -181,6 +222,12 @@ impl SwaLayer {
     pub(crate) fn enable_verify16_ffn_before_capture(&mut self,stream:&Stream)->Result<()> {
         self.ffn.enable_verify16_overlap_before_capture(stream)?;
         self.ffn_boundary.enable_verify16_overlap_before_capture(stream)
+    }
+    /// Probe-only: toggle the side-stream coefficient schedule on this SP layer's boundaries.
+    pub(crate) fn set_wide_stats_overlap(&mut self, enabled: bool, stream: &Stream) -> Result<()> {
+        if self.sp.is_none() { return Ok(()); }
+        self.attn_boundary.set_wide_stats_overlap(enabled, stream)?;
+        self.ffn_boundary.set_wide_stats_overlap(enabled, stream)
     }
     pub(crate) fn ffn_overlap_flags(&self)->(bool,bool) {
         (self.ffn.schedule_flags().0,self.ffn_boundary.overlap_active())
@@ -381,6 +428,7 @@ impl SwaLayer {
                 layer,
                 rows,
                 kernels,
+                sp_rank,
             )?)
         } else {
             None
@@ -410,6 +458,14 @@ impl SwaLayer {
                 };
                 if coalesced {ffn.set_coalesced_codec(true,kernels)?;}
             }
+        }
+        if rows>=512 && crate::ffn::prefill_shared_overlap_requested()? {
+            ffn.enable_prefill_shared_overlap(stream)?;
+        }
+        // Measured flat at 512/1024 rows (full-weight reads offset the saving).
+        if let Some(rank) = sp_rank && crate::ffn::local_shared_constructed()
+            && crate::config::wide_rows(rows) && rows >= 2048 {
+            ffn.enable_local_shared(cuda, module, stream, &shared_weights, kernels, layer, rank)?;
         }
         let micro_moe = rows==6
             && std::env::var("CANADA_SCRATCH_MOE_MICRO_FP32").as_deref()==Ok("1");
@@ -462,18 +518,58 @@ impl SwaLayer {
         let local_qkv_ab = std::env::var("CANADA_SCRATCH_PREFILL_LOCAL_QKV_AB").as_deref() == Ok("1");
         ensure!(!(local_qkv || local_qkv_ab) || (quant_gather && !quant_ab),
             "local QKV requires the current quantized gather control");
-        Ok(Self {
-            sp: sp_rank
+        let mut attention = attention;
+        let (mut attn_boundary, mut ffn_boundary) = (attn_boundary, ffn_boundary);
+        if sp_rank.is_some() && wide_stats_overlap_requested() {
+            attn_boundary.set_wide_stats_overlap(true, stream)?;
+            ffn_boundary.set_wide_stats_overlap(true, stream)?;
+        }
+        let sp = sp_rank
                 .map(|rank| -> Result<Sp> {
                     // Source layers also feed BF16 hidden states to their
                     // compressor/indexer. Only shared-source attention can
                     // eliminate this gather without changing another input.
-                    let eligible = (3..=19).contains(&layer) && ![8, 14].contains(&layer);
+                    // Early SP layers 0/1 have no compressor/indexer, so their attention
+                    // input may use the same quantized row gather (and local QKV).
+                    let eligible = ((3..=19).contains(&layer) && ![8, 14].contains(&layer))
+                        || (layer < 2 && sp_early_enabled());
                     let local_qkv_prepared = eligible && [8192,16384].contains(&rows) && (local_qkv || local_qkv_ab);
                     let local_root = kernels.join(format!("fp8-canonical-wqkv_a-r0-m{}-v0",rows/4));
+                    let wob = if crate::layer_attention::wob_exchange_constructed()
+                        && crate::config::wide_rows(rows) && rows % 512 == 0 {
+                        let local = rows / 4;
+                        let full = crate::staged_full::load(cuda, module, stream, &shared_weights, kernels,
+                            "claude-wob-full-v1", &format!("layers.{layer}.attn.wo_b"), layer, rank, 5120, 8192,
+                            crate::staged_full::Split::Columns)?;
+                        Some(WobExchange {
+                            full: crate::fp8_linear::Linear::new_rc(cuda,
+                                &kernels.join(format!("claude-fp8-wob-full-m{local}-v1")), full)?,
+                            scratch: cuda.allocate_rows(rows * 2048)?,
+                            local: cuda.allocate_rows(local * 8192)?,
+                            module: module.clone(),
+                            local_rows: local,
+                        })
+                    } else { None };
+                    let wob8 = if crate::layer_attention::wob8_constructed() && wob.is_none()
+                        && crate::config::wide_rows(rows) && rows >= 2048 && rows % 512 == 0 {
+                        let local = rows / 4;
+                        let root = kernels.join(format!("fp8-canonical-wo_b-r0-m{local}-v0"));
+                        let mut shards = Vec::with_capacity(4);
+                        for peer in 0..4 {
+                            let matrix = if peer == rank { attention.wob_matrix() } else {
+                                crate::staged_full::load_column_shard(cuda, module, stream, &shared_weights, kernels,
+                                    "claude-wob-full-v1", &format!("layers.{layer}.attn.wo_b"), layer, rank, peer, 5120, 8192)? };
+                            shards.push(crate::fp8_linear::Linear::new_rc(cuda, &root, matrix)?);
+                        }
+                        Some(Wob8 { module: module.clone(), shards, recv_values: cuda.allocate_rows(4 * local * 2048)?,
+                            recv_scales: cuda.allocate_rows(4 * local * 64)?, side: cuda.auxiliary_stream(stream)?,
+                            ready: cuda.fence_event()?, done: cuda.fence_event()?, local_rows: local })
+                    } else { None };
                     Ok(Sp {
                         rank,
                         gathered: cuda.allocate_rows(rows * 5120)?,
+                        wob,
+                        wob8,
                         quantized: (eligible && (quant_gather || quant_ab))
                             .then(|| attention.prepare_row_shard(local_qkv_prepared.then_some(local_root.as_path()))).transpose()?,
                         use_quantized: eligible && quant_gather && !quant_ab,
@@ -481,7 +577,10 @@ impl SwaLayer {
                         use_local_qkv: local_qkv_prepared && local_qkv && !local_qkv_ab,
                     })
                 })
-                .transpose()?,
+                .transpose()?;
+        if sp.as_ref().is_some_and(|sp| sp.wob.is_some() || sp.wob8.is_some()) { attention.set_wob_deferrable()?; }
+        Ok(Self {
+            sp,
             weights: shared_weights,
             prepared: prepared_copy,
             layer,
@@ -572,22 +671,31 @@ impl SwaLayer {
             residual
         };
         self.attn_boundary.prepare(residual, previous_pre, stream)?;
-        Self::gather_input(&mut self.sp, &self.attn_boundary, comm, stream)?;
-        self.attention.run_distributed_quantized(
-            match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
-            self.attn_boundary.quantized_input(),
-            positions,
-            locations,
-            cache,
-            candidates,
-            &self.sink,
-            Some(comm),
-            stream,
-        )?;
+        if let Some(sp) = self.sp.as_mut().filter(|sp| sp.use_quantized) {
+            self.attention.project_row_shard(self.attn_boundary.input(), positions, locations, cache, comm,
+                sp.quantized.as_mut().ok_or_else(|| anyhow::anyhow!("quantized shard absent"))?, sp.use_local_qkv, stream)?;
+            self.attention.finish(positions, cache, candidates, &self.sink, None, stream)?;
+        } else {
+            Self::gather_input(&mut self.sp, &self.attn_boundary, comm, stream)?;
+            self.attention.run_distributed_quantized(
+                match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
+                self.attn_boundary.quantized_input(),
+                positions,
+                locations,
+                cache,
+                candidates,
+                &self.sink,
+                Some(comm),
+                stream,
+            )?;
+        }
         self.ffn.prefetch_begin(stream)?;
-        unsafe { Self::reduce(self.sp.is_some(), comm, self.attention.output(), &mut self.attn_reduced, stream) }?;
-        self.attn_boundary
-            .finish(&self.attn_reduced, residual, stream)?;
+        let exchanged = unsafe { Self::reduce_attention(&mut self.sp, &self.attention, &mut self.attn_reduced, &self.ffn, comm, stream) }?;
+        let reduced = match self.sp.as_ref().and_then(|sp| sp.wob.as_ref()) {
+            Some(x) if exchanged => x.full.output(),
+            _ => &self.attn_reduced,
+        };
+        self.attn_boundary.finish(reduced, residual, stream)?;
         self.ffn_boundary.prepare(
             self.attn_boundary.output(),
             Some(self.attn_boundary.pre()),
@@ -643,6 +751,65 @@ impl SwaLayer {
             unsafe { comm.gather_rows(boundary.input(), &mut sp.gathered, stream) }?;
         }
         Ok(())
+    }
+    /// Attention sum into this rank's rows: reduce-scatter of the WO-B partials, or
+    /// (exchange) all-to-all of the narrow WO-A rows plus one full-K WO-B. Returns
+    /// whether the exchange output (not `attn_reduced`) holds the result.
+    unsafe fn reduce_attention(sp: &mut Option<Sp>, attention: &Attention, attn_reduced: &mut Buffer<bf16>,
+        ffn: &LayerFfn, comm: &Roce, stream: &Stream) -> Result<bool> {
+        if let Some(spr) = sp.as_mut().filter(|s| s.wob8.is_some() && crate::layer_attention::wob8_active()) {
+            let rank = spr.rank;
+            let x = spr.wob8.as_mut().unwrap();
+            let l = x.local_rows;
+            ensure!(attn_reduced.len() == l * 5120, "MXFP8 WO exchange output extent");
+            attention.quantize_wob_input(stream)?;
+            let (values, scales) = attention.wob_quantized();
+            ensure!(values.len() == 4 * l * 2048 && scales.len() == 4 * l * 64, "MXFP8 WO exchange operand extent");
+            // This rank's own shard needs only local data: overlap it with the exchange.
+            x.ready.record(stream)?;
+            x.ready.wait(&x.side)?;
+            let (own_v, own_s) = unsafe { (values.view(rank * l * 2048, l * 2048)?, scales.view(rank * l * 64, l * 64)?) };
+            x.shards[rank].run_quantized(&own_v, &own_s, &x.side)?;
+            x.done.record(&x.side)?;
+            unsafe { comm.exchange_quarters_bytes(&mut [(values, &mut x.recv_values), (scales, &mut x.recv_scales)], stream) }?;
+            for peer in (0..4).filter(|&p| p != rank) {
+                let (v, s) = unsafe { (x.recv_values.view(peer * l * 2048, l * 2048)?, x.recv_scales.view(peer * l * 64, l * 64)?) };
+                x.shards[peer].run_quantized(&v, &s, stream)?;
+            }
+            x.done.wait(stream)?;
+            // Rank-rotation order (ring-like): ((p[r+1] + p[r+2]) + p[r+3]) + p[r], BF16 adds.
+            let order: Vec<usize> = (1..=4).map(|i| (rank + i) % 4).collect();
+            if crate::layer_attention::wob8_sum4_active() {
+                let (mut a, mut b, mut c, mut d) = (x.shards[order[0]].output().ptr(), x.shards[order[1]].output().ptr(),
+                    x.shards[order[2]].output().ptr(), x.shards[order[3]].output().ptr());
+                let (mut o, mut n) = (attn_reduced.ptr(), (l * 5120) as i32);
+                ensure!(l * 5120 % 8 == 0 && x.shards.iter().all(|s| s.output().len() >= l * 5120), "WOB8 four-part sum extent");
+                let mut args = [(&mut a as *mut u64).cast(), (&mut b as *mut u64).cast(), (&mut c as *mut u64).cast(),
+                    (&mut d as *mut u64).cast(), (&mut o as *mut u64).cast(), (&mut n as *mut i32).cast()];
+                unsafe { x.module.function("ca_wob8_sum4")?.launch(
+                    [((l * 5120 / 8) as u32).div_ceil(256), 1, 1], [256, 1, 1], 0, stream, &mut args) }?;
+            } else {
+                ffn.add_rows_bf16(x.shards[order[0]].output(), x.shards[order[1]].output(), attn_reduced, l, stream)?;
+                for &p in &order[2..] { ffn.add_rows_bf16(attn_reduced, x.shards[p].output(), attn_reduced, l, stream)?; }
+            }
+            return Ok(false);
+        }
+        if let Some(x) = sp.as_mut().and_then(|sp| sp.wob.as_mut())
+            .filter(|_| crate::layer_attention::wob_exchange_active()) {
+            let woa = attention.woa_output()?;
+            ensure!(woa.len() == x.local_rows * 4 * 2048 && x.scratch.len() == woa.len(), "WO-A exchange extent");
+            unsafe { comm.exchange_quarters_bf16(woa, &mut x.scratch, stream) }?;
+            // [peer][local][2048] -> [local][4 * 2048], in 16-byte chunks.
+            let (mut src, mut dst, mut r, mut c) = (x.scratch.ptr(), x.local.ptr(), x.local_rows as i32, (2048 / 8) as i32);
+            let mut args = [(&mut src as *mut u64).cast(), (&mut dst as *mut u64).cast(),
+                (&mut r as *mut i32).cast(), (&mut c as *mut i32).cast()];
+            unsafe { x.module.function("ca_transpose_rank_columns")?.launch(
+                [(x.local_rows * 2048 * 4 / 8).div_ceil(256) as u32, 1, 1], [256, 1, 1], 0, stream, &mut args) }?;
+            x.full.run(&x.local, stream)?;
+            return Ok(true);
+        }
+        unsafe { Self::reduce(sp.is_some(), comm, attention.output(), attn_reduced, stream) }?;
+        Ok(false)
     }
     /// Sum a TP partial: all rows (all-reduce), or this rank's rows (SP).
     unsafe fn reduce(
@@ -957,9 +1124,12 @@ impl SwaLayer {
             stream,
         )?;
         self.ffn.prefetch_begin(stream)?;
-        unsafe { Self::reduce(self.sp.is_some(), comm, self.attention.output(), &mut self.attn_reduced, stream) }?;
-        self.attn_boundary
-            .finish(&self.attn_reduced, residual, stream)?;
+        let exchanged = unsafe { Self::reduce_attention(&mut self.sp, &self.attention, &mut self.attn_reduced, &self.ffn, comm, stream) }?;
+        let reduced = match self.sp.as_ref().and_then(|sp| sp.wob.as_ref()) {
+            Some(x) if exchanged => x.full.output(),
+            _ => &self.attn_reduced,
+        };
+        self.attn_boundary.finish(reduced, residual, stream)?;
         self.ffn_boundary.prepare(
             self.attn_boundary.output(),
             Some(self.attn_boundary.pre()),
@@ -999,7 +1169,18 @@ impl SwaLayer {
         if let Some(hint) = &self.next_input_prefetch {
             hint.begin(stream)?;
         }
-        unsafe { Self::reduce(self.sp.is_some(), comm, self.ffn.output(), &mut self.ffn_reduced, stream) }?;
+        if self.ffn.local_shared_active() {
+            // Late start: the shared branch reads the unchanged local FFN rows beside the
+            // routed reduce-scatter; add_local_shared joins it before the addition.
+            if self.ffn.local_shared_late() {
+                self.ffn.begin_local_shared(self.ffn_boundary.input(), stream)?;
+            }
+            // Routed partial only; this rank's shared rows are added after the sum.
+            unsafe { Self::reduce(self.sp.is_some(), comm, self.moe_workspace.output(), &mut self.ffn_reduced, stream) }?;
+            self.ffn.add_local_shared(&mut self.ffn_reduced, stream)?;
+        } else {
+            unsafe { Self::reduce(self.sp.is_some(), comm, self.ffn.output(), &mut self.ffn_reduced, stream) }?;
+        }
         self.ffn_boundary
             .finish(&self.ffn_reduced, self.attn_boundary.output(), stream)?;
         if let Some(hint) = &self.next_input_prefetch {
@@ -1089,6 +1270,9 @@ impl SwaLayer {
         self.ffn_boundary.set_fullk(enabled)
     }
     fn run_ffn(&mut self, tokens: &TokenRows, comm: &Roce, stream: &Stream) -> Result<()> {
+        if self.ffn.local_shared_active() && !self.ffn.local_shared_late() {
+            self.ffn.begin_local_shared(self.ffn_boundary.input(), stream)?;
+        }
         if self.ffn.row_transport_active() {
             let sp = self.sp.as_ref().ok_or_else(|| anyhow::anyhow!("packed FFN requires SP rows"))?;
             if comm.moe_pipeline_active()&&self.ffn.pipeline_eligible() {

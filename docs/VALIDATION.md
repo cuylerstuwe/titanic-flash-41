@@ -1,5 +1,69 @@
 # Validation status
 
+## November 8 prefill and vision release (s1387)
+
+s1387 keeps the s1345 reliability base: one physical execution bank, the 8 GiB operating and
+8.5 GiB allocation floors, the 4 GiB shared snapshot ceiling, the 2350 MHz cap, canonical
+checkpoint weights, target precision boundaries and the recommended sampler. It adds the
+qualified image line (fused vision normalization, image-input cache hits during history
+resolution, bounded image metadata deferral with pressure-releasable span pins, short-prefill
+live-row bounds and a 2048-row plan for 1153–1536-token retained appends) and the runtime
+options described in [prefill and vision options](PREFILL.md).
+
+Most options are bit-identical. Sequence-parallel layers 0/1/14 and the row-local shared expert
+change BF16 reduction order. A teacher-forced check scored 384 ground-truth tokens after a cold
+131,071-token prefill: mean NLL 0.22508 for the s1345 configuration, 0.22450 for the candidate
+and 0.22244 for an FP32-sum reference. Candidate-versus-baseline total variation averaged 0.0111
+with 381/384 argmax agreement, comparable to baseline versus FP32 sums (0.0081, 382/384).
+Rank-0 logits after the same cold prefill are bit-identical between that candidate configuration
+and s1387, so the later options do not change outputs. These are next-token checks, not
+completed-task quality scores.
+
+Fresh-boot comparison, same 15-request head-local panel (temperature 1, top-p 1, high
+reasoning), first model load after rebooting all four devices:
+
+| Measurement | s1345 | s1387 options* |
+|---|---:|---:|
+| 129,955-token cold prefill | 20.59 s (6.31K tok/s) | 16.06 s (8.09K tok/s) |
+| 93-image turn: prefill / time to first token | 7.94 s / 17.16 s | 6.15 s / 9.50 s |
+| Plain-code decode (2,940 sampled tokens) | 92.7 tok/s | 92.8 tok/s |
+| Lowest available memory, any device | 17.80 GiB | 14.18 GiB |
+
+\*Measured on a build without the fused WO-B sum, which is bit-identical and 0.6% faster per
+8K-row chunk in paired same-process timing. A probe that prefilled 262,143 tokens took 42.4 s
+with the new prefill options off and 33.0 s with them on (same binary). Decode is unchanged.
+
+The qualification fleet contains three ASUS GX10s and one DGX Spark (all GB10). The s1345 stress
+panel completed 69 requests reaching 974,076 prompt tokens: a 28-image conversation, two context
+resets, 16 later fresh images, foreground image preemption of a long background request and two
+974K-token foreground peers holding 3,273,868,820 bytes of temporary snapshots. The lowest
+available memory was 10.996 GiB (s1345: 14.644 GiB), above both floors. As in the s1345
+qualification, the temporary test observer's 90°C guard stopped the panel during the final
+cancellation fixture (Spark 90.0°C; other devices 87.8–89.5°C). There was no memory-guard abort
+or GPU allocation/Xid message. Production has no request-error rule at that temperature; the
+2350 MHz policy and hardware protections are unchanged.
+
+The separate cancellation check passed: a 974,039-token, 28-image prefill completed in 139 s, a
+forward continuation was cancelled after output began, the retry reused all 974,056 prompt tokens,
+and a new image succeeded at 975,018 tokens with 973,824 cached. All four workers exited normally;
+the lowest available memory was 13.19 GiB and the hottest device reached 87.8°C.
+
+s1387 is installed through a journaled transaction with s1345 as the failed-start fallback, after
+fresh boots and one production model load per device. Five head-local streaming requests passed
+text, prompt reuse, continuation, image input and text after an image; a routed synthetic image
+request passed with unchanged router configuration. Runtime hashes, clocks, clock/APST recovery
+guards and kernel-health checks passed, and the reservation was released. See the
+[sanitized qualification record](../validation/prefill-release-2026-11-08.json).
+
+Native serving-source fingerprint:
+`73ac5ceece161bb3d558326f0d080fcf57bc6b9bb53d3c7fe842a88103b2deb5`.
+Portable source fingerprint: `fc05cf642937cd042a31fbf639bb40271a562fc4217036ba42624f1971a55cfa`.
+Native Arm64 CPU checks passed 219 tests (25 ignored). Ten installation interruption/rollback
+fixtures passed. The portable tree's compiled sources equal native s1387 except for the existing
+public-tree edits (comments and configurable RoCE device names); portable Rust and deployment
+checks and the portable GPU deployment wrapper were not rerun, and the portable profile is
+unchanged. The native build and production profile received the checks above.
+
 ## November 6 forward-stream memory repair (s1345)
 
 A later long-session incident still reached the physical admission floor after

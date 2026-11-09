@@ -5,6 +5,11 @@ use std::{env, fs::File, path::Path};
 fn main() -> Result<()> {
     let args: Vec<_> = env::args().collect();
     match args.get(1).map(String::as_str) {
+        #[cfg(feature = "vision-input")]
+        Some("gpu-vision-norm") if args.len()==4 => {
+            let report=canada_engine::vision_norm_probe::run(Path::new(&args[2]))?;
+            serde_json::to_writer_pretty(std::fs::OpenOptions::new().write(true).create_new(true).open(&args[3])?,&report)?;
+        }
         Some("gpu-image-recycle") if args.len()==4=>{
             let report=canada_engine::image_recycle_probe::run(Path::new(&args[2]))?;
             serde_json::to_writer_pretty(std::fs::OpenOptions::new().write(true).create_new(true).open(&args[3])?,&report)?;
@@ -695,6 +700,12 @@ fn main() -> Result<()> {
         Some("gpu-vision-placement-probe") if args.len() == 3 => {
             let report=canada_engine::worker_media::placement_probe(Path::new(&args[2]))?;
             println!("{}",serde_json::json!({"rank":report["rank"],"placement_exact":report["placement_exact"]}));
+        }
+        Some("gpu-image-span-cache-probe") if args.len() == 3 => {
+            anyhow::ensure!(!Path::new(&args[2]).exists(),"immutable image-cache probe output exists");
+            let report=canada_engine::image_cache::ownership_probe()?;
+            serde_json::to_writer_pretty(File::create(&args[2])?,&report)?;
+            println!("{}",serde_json::json!({"passed":report["passed"]}));
         }
         Some("gpu-transport-probe") if args.len() == 8 => {
             let result = canada_engine::collective_probe::run(

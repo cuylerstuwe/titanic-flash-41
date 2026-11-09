@@ -549,6 +549,64 @@ impl Roce {
         }
         result
     }
+    /// Exact window sum for single-owner rows (zeros elsewhere): plain NCCL BF16 sum of
+    /// the whole view, bypassing the capacity row-prefix rule of `sum_bf16`.
+    pub(crate) unsafe fn sum_window_bf16<T: DeviceElement>(
+        &self,
+        input: &Buffer<T>,
+        output: &mut Buffer<T>,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.health()?;
+        let nccl = self
+            .prefill_sum
+            .as_ref()
+            .filter(|_| !self.native_sum_selected.get())
+            .ok_or_else(|| anyhow::anyhow!("tail window sum needs NCCL prefill sums"))?;
+        self.bind_prefill_stream(stream)?;
+        let result = unsafe { nccl.sum_bf16_to(input, output, stream) };
+        if result.is_err() {
+            self.poisoned.set(true);
+        }
+        result
+    }
+    /// Sequence-parallel byte all-to-all over several buffers in one NCCL group.
+    pub(crate) unsafe fn exchange_quarters_bytes(&self, pairs: &mut [(&Buffer<u8>, &mut Buffer<u8>)],
+        stream: &Stream) -> Result<()> {
+        self.health()?;
+        let nccl = self
+            .prefill_sum
+            .as_ref()
+            .filter(|_| !self.native_sum_selected.get())
+            .ok_or_else(|| anyhow::anyhow!("sequence-parallel prefill needs NCCL prefill sums"))?;
+        self.bind_prefill_stream(stream)?;
+        let result = unsafe { nccl.exchange_byte_quarters(pairs, stream) };
+        if result.is_err() {
+            self.poisoned.set(true);
+        }
+        result
+    }
+    /// Sequence-parallel prefill all-to-all: rank s receives row-quarter s of every
+    /// rank's [M, width] input, rank-major in `scratch` (NCCL grouped send/recv; bit copy).
+    pub(crate) unsafe fn exchange_quarters_bf16<T: DeviceElement>(
+        &self,
+        input: &Buffer<T>,
+        scratch: &mut Buffer<u16>,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.health()?;
+        let nccl = self
+            .prefill_sum
+            .as_ref()
+            .filter(|_| !self.native_sum_selected.get())
+            .ok_or_else(|| anyhow::anyhow!("sequence-parallel prefill needs NCCL prefill sums"))?;
+        self.bind_prefill_stream(stream)?;
+        let result = unsafe { nccl.exchange_bf16_quarters(input, scratch, input.len(), stream) };
+        if result.is_err() {
+            self.poisoned.set(true);
+        }
+        result
+    }
     /// Sequence-parallel prefill: gather every rank's row shard, rank-major
     /// (BF16 activations or FP32 mHC coefficients, bit copy).
     pub(crate) unsafe fn gather_rows<T: DeviceElement>(
@@ -594,6 +652,7 @@ impl Roce {
     /// Select the reduction used by subsequent eager enqueue/capture. Already
     /// captured graphs retain their recorded transport. Drain the ordered
     /// stream at a policy transition so two execution profiles cannot overlap.
+    pub(crate) fn decode_reduction_selected(&self) -> bool { self.native_sum_selected.get() }
     pub(crate) fn select_decode_reduction(&self, decode: bool, stream: &Stream) -> Result<()> {
         ensure!(
             self.cuda.owns_stream(stream)

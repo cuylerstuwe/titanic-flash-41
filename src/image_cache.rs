@@ -3,7 +3,7 @@
 use crate::{prompt_media::{Identity, ImageKey, Placement}, vision::{Geometry, ImageSpan}};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, VecDeque}, rc::{Rc, Weak}};
+use std::{collections::{HashMap, HashSet, VecDeque}, rc::{Rc, Weak}};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +81,14 @@ impl SpanCache {
             self.hits+=1;self.retain(key,span.clone());Some(span)
         }else{self.misses+=1;self.live.remove(&key);None}
     }
+    /// Temporary request owners only: do not touch the LRU, change its budget,
+    /// count hits, or copy GPU storage. The caller must exclude the reusable
+    /// prefix and release these optional owners before pressure reclamation.
+    pub(crate) fn pin_requested(&self,keys:impl IntoIterator<Item=ImageKey>)->Vec<Rc<ImageSpan>> {
+        let mut seen=HashSet::new();
+        keys.into_iter().filter(|key|seen.insert(*key))
+            .filter_map(|key|self.live.get(&key).and_then(Weak::upgrade)).collect()
+    }
     pub fn insert(&mut self,key:ImageKey,span:Rc<ImageSpan>) -> Result<()> {
         let geometry=span.geometry.validate()?;
         ensure!(span.data.len()==geometry.tokens()*5120, "image cache span geometry");
@@ -101,6 +109,46 @@ impl SpanCache {
             "live_bytes":self.live.values().filter_map(Weak::upgrade).map(|s|s.data.bytes()).sum::<usize>(),
             "warm_images":self.warm.len()})
     }
+}
+
+/// Small real-CUDA ownership screen, not an alternate vision implementation.
+/// Buffers are never interpreted as model data; full serving checks separately
+/// compare canonical encoded spans. This tests eviction and prompt ownership.
+pub fn ownership_probe()->Result<serde_json::Value> {
+    let cuda=crate::cuda::Cuda::open(0)?;cuda.qualify_gb10()?;
+    let geometry=Geometry{height:3,width:3}.validate()?;
+    let bytes=geometry.tokens()*5120*2;
+    let make=||->Result<Rc<ImageSpan>> {Ok(Rc::new(ImageSpan{
+        data:cuda.allocate::<half::bf16>(geometry.tokens()*5120)?,geometry}))};
+    let keys=[0,1,2].map(|n|ImageKey{input:[n;32],encoder:[7;32]});
+    let mut records=Vec::new();
+    for enabled in [false,true] {
+        let mut cache=SpanCache::new(2*bytes)?;
+        for key in &keys[..2] {cache.insert(*key,make()?)?;}
+        let mut pins=if enabled {cache.pin_requested([keys[0],keys[1],keys[0]])}else{Vec::new()};
+        ensure!(pins.len()==if enabled{2}else{0},"duplicate pin ownership");
+        let c=make()?;cache.insert(keys[2],c.clone())?;let mut live=vec![c];
+        let mut rebuilt=0;
+        for key in &keys[..2] {
+            let span=if let Some(span)=cache.get(*key) {span}else{
+                rebuilt+=1;let span=make()?;cache.insert(*key,span.clone())?;span
+            };live.push(span);
+        }
+        ensure!(rebuilt==if enabled{0}else{2},"future-hit preservation");
+        ensure!(cache.retained==2*bytes && cache.stats()["live_bytes"]==3*bytes,
+            "pinning changed fixed retention or mandatory request extent");
+        cache.release_warm();drop(live);pins.clear();
+        ensure!(cache.stats()["live_bytes"]==0,"completed request leaked spans");
+        records.push(serde_json::json!({"pins":enabled,"avoidable_reencodes":rebuilt,
+            "warm_budget_bytes":2*bytes,"mandatory_live_bytes":3*bytes,"released":true}));
+    }
+    let mut cache=SpanCache::new(2*bytes)?;
+    for key in &keys[..2] {cache.insert(*key,make()?)?;}
+    let mut pins=cache.pin_requested(keys);ensure!(pins.len()==2,"a miss became a pin");
+    cache.release_warm();ensure!(cache.stats()["live_bytes"]==2*bytes,"pin ownership absent");
+    pins.clear();ensure!(cache.stats()["live_bytes"]==0,"pressure release retained optional spans");
+    Ok(serde_json::json!({"passed":true,"records":records,"pressure_release":true,
+        "scope":"CUDA allocation and Rust ownership only; no vision arithmetic or throughput claim."}))
 }
 
 #[cfg(test)]

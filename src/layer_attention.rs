@@ -109,6 +109,8 @@ pub struct Layer {
     normalized: Buffer<bf16>,
     q_stride: usize,
     qstore: Query,
+    /// The owning SP layer exchanges WO-A rows and runs full-K WO-B itself.
+    wob_deferrable: bool,
     wide_qrope: Option<crate::triton_ops::Operator>,
     kstore: Store,
     decode: Execution,
@@ -136,6 +138,67 @@ struct QueryOverlap {
 enum Query {
     Small(QStore),
     Medium(Buffer<bf16>),
+}
+/// Wide prefill may apply RoPE in place on the Q-B output and feed it to attention,
+/// skipping the full Q copy (identical values; wide profiles run eagerly).
+/// 2 = unresolved (CANADA_SCRATCH_PREFILL_Q_INPLACE), else 0/1.
+static Q_INPLACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+pub(crate) fn q_inplace_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match Q_INPLACE.load(Relaxed) {
+        2 => { let on = std::env::var("CANADA_SCRATCH_PREFILL_Q_INPLACE").as_deref() == Ok("1");
+            Q_INPLACE.store(on as u8, Relaxed); on }
+        v => v == 1,
+    }
+}
+/// Sequence-parallel WO-B exchange: construction (CANADA_SCRATCH_PREFILL_WOB_EXCHANGE=1)
+/// stages full WO-B and buffers; this runtime selection (default on) lets one
+/// allocation compare it with the reduce-scatter path. 2 = unresolved.
+static WOB_EXCHANGE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+pub(crate) fn wob_exchange_constructed() -> bool {
+    std::env::var("CANADA_SCRATCH_PREFILL_WOB_EXCHANGE").as_deref() == Ok("1")
+}
+pub(crate) fn wob_exchange_active() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match WOB_EXCHANGE.load(Relaxed) {
+        2 => { let on = wob_exchange_constructed(); WOB_EXCHANGE.store(on as u8, Relaxed); on }
+        v => v == 1,
+    }
+}
+pub(crate) fn set_wob_exchange_for_probe(enabled: bool) {
+    WOB_EXCHANGE.store(enabled as u8, std::sync::atomic::Ordering::Relaxed);
+}
+/// MXFP8 WO-A exchange with per-shard WO-B (CANADA_SCRATCH_PREFILL_WOB8=1 constructs;
+/// this runtime selection defaults on when constructed). 2 = unresolved.
+static WOB8: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+pub(crate) fn wob8_constructed() -> bool {
+    std::env::var("CANADA_SCRATCH_PREFILL_WOB8").as_deref() == Ok("1")
+}
+pub(crate) fn wob8_active() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match WOB8.load(Relaxed) {
+        2 => { let on = wob8_constructed(); WOB8.store(on as u8, Relaxed); on }
+        v => v == 1,
+    }
+}
+/// WOB8 rotation sum as one ordered four-part kernel (ca_wob8_sum4, same per-step arithmetic as
+/// the three ca_ffn_add launches). 2 = unresolved (CANADA_SCRATCH_PREFILL_WOB8_SUM4).
+static WOB8_SUM4: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+pub(crate) fn wob8_sum4_active() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match WOB8_SUM4.load(Relaxed) {
+        2 => { let on = std::env::var("CANADA_SCRATCH_PREFILL_WOB8_SUM4").as_deref() == Ok("1"); WOB8_SUM4.store(on as u8, Relaxed); on }
+        v => v == 1,
+    }
+}
+pub(crate) fn set_wob8_sum4_for_probe(enabled: bool) {
+    WOB8_SUM4.store(enabled as u8, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn set_wob8_for_probe(enabled: bool) {
+    WOB8.store(enabled as u8, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn set_q_inplace_for_probe(enabled: bool) {
+    Q_INPLACE.store(enabled as u8, std::sync::atomic::Ordering::Relaxed);
 }
 impl Query {
     fn output(&self) -> &Buffer<bf16> {
@@ -547,6 +610,7 @@ impl Layer {
             normalized,
             q_stride,
             qstore,
+            wob_deferrable: false,
             wide_qrope:if [16,32].contains(&rows)&&!draft&&wide_epilogues_enabled()? {
                 Some(crate::triton_ops::Operator::load(cuda,&kernels.join("q-rope-cuda-v1"),"q_rope_small")?)
             }else{None},
@@ -572,6 +636,22 @@ impl Layer {
     }
     pub fn output(&self) -> &Buffer<bf16> {
         self.ob.output()
+    }
+    /// Token-major WO-A rows [rows, 2048] (this rank's two head groups).
+    pub(crate) fn woa_output(&self) -> Result<&Buffer<bf16>> {
+        match &self.woa { WoA::Medium(w) => Ok(w.output()), WoA::Small(_) => anyhow::bail!("WO-A exchange requires a medium profile") }
+    }
+    /// Quantize the token-major WO-A rows with WO-B's own MXFP8 quantizer (all rows).
+    pub(crate) fn quantize_wob_input(&self, stream: &Stream) -> Result<()> {
+        match &self.woa { WoA::Medium(w) => self.ob.quantize_only(w.output(), stream),
+            WoA::Small(_) => anyhow::bail!("WO-B quantization requires a medium profile") }
+    }
+    /// WO-B's MXFP8 operands for all rows: (values [rows, 2048], MMA scales).
+    pub(crate) fn wob_quantized(&self) -> (&Buffer<u8>, &Buffer<u8>) { self.ob.quantized_input() }
+    pub(crate) fn wob_matrix(&self) -> std::rc::Rc<crate::blockscaled::Matrix> { self.ob.immutable_matrix() }
+    pub(crate) fn set_wob_deferrable(&mut self) -> Result<()> {
+        ensure!(matches!(self.woa, WoA::Medium(_)) && crate::config::wide_rows(self.rows), "WO-B exchange profile");
+        self.wob_deferrable = true; Ok(())
     }
     pub(crate) fn projection_quantized_input(&self) -> (&Buffer<u8>,&Buffer<u8>) { self.qa.quantized_input() }
     pub(crate) fn narrow_projection(&self) -> bool { self.qa.narrow_projection() }
@@ -755,6 +835,10 @@ impl Layer {
                 positions,
                 query_stream,
             )?,
+            Query::Medium(q) if crate::config::wide_rows(self.rows) && self.rows >= 512 && q_inplace_enabled() => {
+                let mut rotated = unsafe { self.qb.output().view(0, q.len()) }?;
+                self.native.rope(&mut rotated, self.rows, self.frequencies.values(), positions, false, query_stream)?;
+            }
             Query::Medium(q) => {
                 if let Some(op)=&self.wide_qrope {
                     unsafe{op.launch(self.rows as u32,&[self.qb.output().ptr(),q.ptr(),
@@ -874,8 +958,10 @@ impl Layer {
             q.pending.set(false);
         }
         if self.woa_prefetch_active {self.woa_prefetch.as_ref().unwrap().begin(stream)?;}
+        let query = if matches!(self.qstore, Query::Medium(_)) && crate::config::wide_rows(self.rows)
+            && self.rows >= 512 && q_inplace_enabled() { self.qb.output() } else { self.qstore.output() };
         self.decode.run(
-            self.qstore.output(),
+            query,
             cache,
             candidates,
             Some(sink),
@@ -898,7 +984,7 @@ impl Layer {
             }
             WoA::Medium(w) => {
                 w.run(self.decode.output(), stream)?;
-                self.ob.run(w.output(), stream)
+                if self.wob_deferrable && (wob_exchange_active() || wob8_active()) { Ok(()) } else { self.ob.run(w.output(), stream) }
             }
         }?;
         // No data dependency: immutable prefetch can finish after its consumer.

@@ -166,6 +166,31 @@ impl Communicator {
         let closed=self.api.check(unsafe{(self.api.group_end)()},"exchange group end");
         enqueue.and(closed)
     }
+    /// Grouped byte all-to-all: for every (send, recv) pair, quarter p of `send` goes to
+    /// rank p and quarter p of `recv` receives from rank p (own quarter untouched).
+    /// NCCL grouped send/recv; byte copies only.
+    pub(crate) unsafe fn exchange_byte_quarters(&self, pairs: &mut [(&Buffer<u8>, &mut Buffer<u8>)],
+        stream: &Stream) -> Result<()> {
+        ensure!(self.world == 4 && self._context.owns_stream(stream) && pairs.iter().all(|(s, r)|
+            s.len() % 4 == 0 && s.len() == r.len() && self._context.owns_buffer(s) && self._context.owns_buffer(r)),
+            "byte quarter exchange geometry/owner");
+        self.check_async()?;
+        self.api.check(unsafe{(self.api.group_start)()},"byte exchange group start")?;
+        let enqueue=(||->Result<()>{
+            for (send, recv) in pairs.iter_mut() {
+                let n = send.len() / 4;
+                for peer in (0..4).filter(|&r| r != self.rank) {
+                    self.api.check(unsafe{(self.api.send)((send.ptr()+(peer*n) as u64) as *const c_void,
+                        n,1,peer as i32,self.raw,stream.raw())},"byte quarter send")?;
+                    self.api.check(unsafe{(self.api.recv)((recv.ptr()+(peer*n) as u64) as *mut c_void,
+                        n,1,peer as i32,self.raw,stream.raw())},"byte quarter receive")?;
+                }
+            }
+            Ok(())
+        })();
+        let closed=self.api.check(unsafe{(self.api.group_end)()},"byte exchange group end");
+        enqueue.and(closed)
+    }
     /// Aggregate three independent rank-major gathers without repacking their
     /// payloads. Uses NVIDIA's public group ABI (NCCL user-guide, Group Calls).
     /// Safety: every rank uses the same order and sizes; all six nonoverlapping

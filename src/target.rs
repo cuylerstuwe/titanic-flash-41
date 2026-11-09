@@ -174,6 +174,12 @@ fn encoder_checkpoint_enabled()->bool {
     std::env::var("CANADA_SCRATCH_ENCODER_CHECKPOINT_SCREEN").as_deref()==Ok("1")
         ||std::env::var("CANADA_SCRATCH_ENCODER_PROMPT_CHECKPOINT").as_deref()==Ok("1")
 }
+fn experimental_prefill_flag(name:&str,default:bool)->Result<bool> {
+    match std::env::var(name) {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid {name}");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(default),Err(e)=>Err(e.into()),
+    }
+}
 fn short_prefill_rows_enabled(name:&str)->Result<bool> {
     match std::env::var(name) {
         Ok(v)if v=="0"=>Ok(false),Ok(v)if v=="1"=>Ok(true),
@@ -225,6 +231,40 @@ impl StateImage {
 // Sequence-parallel profiles retain the same offsets and lifetimes with a
 // smaller unused tail. Every allocation still checks the actual arena bound;
 // a future layer-layout increase fails construction before any model work.
+/// Encoder-tail publication reads only rows [live-128, live): gather just that window
+/// (single-owner rows summed exactly) instead of every SP row. 2 = unresolved.
+static TAIL_WINDOW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+pub(crate) fn tail_window_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match TAIL_WINDOW.load(Relaxed) {
+        2 => { let on = std::env::var("CANADA_SCRATCH_PREFILL_TAIL_WINDOW").as_deref() == Ok("1");
+            TAIL_WINDOW.store(on as u8, Relaxed); on }
+        v => v == 1,
+    }
+}
+/// Eager wide encoder chunks: hash and stage this chunk's Engram rows on the host while the
+/// GPU runs the embedding and layer 0 (which read no Engram input), instead of before them.
+/// Same rows, kernels and GPU order. 2 = unresolved (CANADA_SCRATCH_PREFILL_ENGRAM_BEHIND_L0).
+static ENGRAM_BEHIND_L0: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+/// With ENGRAM_BEHIND_L0: stage layer-1 rows behind layer 0 and layer-14 rows behind layers
+/// 1-13 (their only consumer is layer 14). 2 = unresolved (CANADA_SCRATCH_PREFILL_ENGRAM_SPLIT14).
+static ENGRAM_SPLIT14: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+pub(crate) fn engram_split14_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match ENGRAM_SPLIT14.load(Relaxed) {
+        2 => { let on = std::env::var("CANADA_SCRATCH_PREFILL_ENGRAM_SPLIT14").as_deref() == Ok("1");
+            ENGRAM_SPLIT14.store(on as u8, Relaxed); on }
+        v => v == 1,
+    }
+}
+pub(crate) fn engram_behind_l0_enabled() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match ENGRAM_BEHIND_L0.load(Relaxed) {
+        2 => { let on = std::env::var("CANADA_SCRATCH_PREFILL_ENGRAM_BEHIND_L0").as_deref() == Ok("1");
+            ENGRAM_BEHIND_L0.store(on as u8, Relaxed); on }
+        v => v == 1,
+    }
+}
 fn wide_arena_bytes_per_row(sequence_parallel: bool) -> usize {
     (if sequence_parallel { 384 } else { 448 }) * 1024
 }
@@ -542,6 +582,10 @@ pub struct Target {
     prefill_partial_moe_rows: bool,
     // 1: qualified dense bounds; 2 also enables the experimental expert bound.
     prefill_partial1024_rows: u8,
+    prefill_partial2048_dense: bool,
+    prefill_wide_mhc_rows: bool,
+    prefill_wide_mhc_norm: bool,
+    prefill_short_merge: bool,
     prefill_mhc_live_rows: bool,
     prefill_mhc_live_norm: bool,
     prefill_blocking_wait: bool,
@@ -926,6 +970,10 @@ impl Target {
                 Err(std::env::VarError::NotPresent)|Ok("1")=>1,Ok("0")=>0,Ok("2")=>2,
                 _=>anyhow::bail!("M1024 partial rows must be 0,1 or2"),
             },
+            prefill_partial2048_dense: experimental_prefill_flag("CANADA_SCRATCH_PREFILL_PARTIAL2048_DENSE",true)?,
+            prefill_wide_mhc_rows: experimental_prefill_flag("CANADA_SCRATCH_PREFILL_WIDE_MHC_ROWS",true)?,
+            prefill_wide_mhc_norm: experimental_prefill_flag("CANADA_SCRATCH_PREFILL_WIDE_MHC_NORM",true)?,
+            prefill_short_merge: experimental_prefill_flag("CANADA_SCRATCH_PREFILL_SHORT_MERGE",true)?,
             prefill_mhc_live_rows: short_prefill_rows_enabled("CANADA_SCRATCH_PREFILL_MHC_LIVE_ROWS")?,
             prefill_mhc_live_norm: short_prefill_rows_enabled("CANADA_SCRATCH_PREFILL_MHC_LIVE_NORM")?,
             prefill_blocking_wait: match std::env::var("CANADA_SCRATCH_PREFILL_BLOCKING_WAIT").as_deref() {
@@ -1533,6 +1581,10 @@ impl Target {
             prefill_partial_dense_rows: self.prefill_partial_dense_rows,
             prefill_partial_moe_rows: self.prefill_partial_moe_rows,
             prefill_partial1024_rows: self.prefill_partial1024_rows,
+            prefill_partial2048_dense: self.prefill_partial2048_dense,
+            prefill_wide_mhc_rows: self.prefill_wide_mhc_rows,
+            prefill_wide_mhc_norm: self.prefill_wide_mhc_norm,
+            prefill_short_merge: self.prefill_short_merge,
             prefill_mhc_live_rows: self.prefill_mhc_live_rows,
             prefill_mhc_live_norm: self.prefill_mhc_live_norm,
             prefill_blocking_wait: self.prefill_blocking_wait,
@@ -3665,6 +3717,53 @@ impl Target {
     }
     /// Use distinct layer0, layers1..13, and layers14..39 captures so the
     /// second immutable Engram read can overlap the middle graph.
+    /// Claude same-allocation A/B screen switch (mode 0 = control). Unknown names fail.
+    pub(crate) fn set_claude_experiment_for_probe(&mut self,name:&str,mode:u8,stream:&Stream)->Result<()> {
+        match name {
+            // Ordering-only toggle for profiles built with the prefill shared branch.
+            "prefill_shared_overlap" => {
+                ensure!(mode<=1 && crate::ffn::prefill_shared_overlap_requested()?, "prefill shared overlap A/B admission");
+                stream.synchronize()?;
+                crate::ffn::set_prefill_shared_concurrent_for_probe(mode==1);
+                Ok(())
+            }
+            // Identical-value toggle: wide RoPE in place on the Q-B output (no Q copy).
+"early_quant" => {
+                ensure!(mode<=1,"early quantized gather A/B mode"); stream.synchronize()?;
+                for layer in self.early.iter_mut().take(2) { layer.set_quant_gather(mode==1); }
+                Ok(())
+            }
+            "wob_exchange" => { ensure!(mode<=1,"WO-B exchange A/B mode"); stream.synchronize()?; crate::layer_attention::set_wob_exchange_for_probe(mode==1); Ok(()) }
+            "local_shared" => { ensure!(mode<=1,"row-local shared A/B mode"); stream.synchronize()?; crate::ffn::set_local_shared_for_probe(mode==1); Ok(()) }
+            "local_shared_overlap" => { ensure!(mode<=1,"row-local shared overlap A/B mode"); stream.synchronize()?; crate::ffn::set_local_shared_overlap_for_probe(mode==1); Ok(()) }
+            "local_shared_late" => { ensure!(mode<=1,"row-local shared late-start A/B mode"); stream.synchronize()?; crate::ffn::set_local_shared_late_for_probe(mode==1); Ok(()) }
+            "tail_window" => { ensure!(mode<=1,"tail window A/B mode"); stream.synchronize()?;
+                TAIL_WINDOW.store((mode==1) as u8, std::sync::atomic::Ordering::Relaxed); Ok(()) }
+"mhc_overlap" => {
+                ensure!(mode<=1,"wide coefficient overlap A/B mode"); stream.synchronize()?;
+                for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+                    .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+                    layer.set_wide_stats_overlap(mode==1, stream)?;
+                }
+                Ok(())
+            }
+            "wob8" => { ensure!(mode<=1,"MXFP8 WO exchange A/B mode"); stream.synchronize()?; crate::layer_attention::set_wob8_for_probe(mode==1); Ok(()) }
+            "wob8_sum4" => { ensure!(mode<=1,"WOB8 four-part sum A/B mode"); stream.synchronize()?; crate::layer_attention::set_wob8_sum4_for_probe(mode==1); Ok(()) }
+            "engram_behind_l0" => { ensure!(mode<=1,"Engram staging behind layer 0 A/B mode"); stream.synchronize()?;
+                ENGRAM_BEHIND_L0.store((mode==1) as u8, std::sync::atomic::Ordering::Relaxed); Ok(()) }
+            "engram_split14" => { ensure!(mode<=1,"split Engram staging A/B mode"); stream.synchronize()?;
+                ENGRAM_SPLIT14.store((mode==1) as u8, std::sync::atomic::Ordering::Relaxed); Ok(()) }
+                        "q_inplace" => { ensure!(mode<=1,"Q in-place A/B mode"); stream.synchronize()?; crate::layer_attention::set_q_inplace_for_probe(mode==1); Ok(()) }
+            // Ordering/layout-only toggle: per-group GemmEx writing token-major WO-A output.
+            "woa_token_major" => {
+                ensure!(mode<=1,"WO-A token-major A/B admission");
+                stream.synchronize()?;
+                crate::woa_medium::set_token_major_for_probe(mode==1);
+                Ok(())
+            }
+            _ => anyhow::bail!("unknown Claude experiment {name} (mode {mode})"),
+        }
+    }
     pub(crate) fn set_engram_split14_for_probe(&mut self,enabled:bool)->Result<()> {
         ensure!((std::env::var("CANADA_SCRATCH_ENGRAM_SPLIT14_SCREEN").as_deref()==Ok("1")
             || std::env::var("CANADA_SCRATCH_VERIFICATION_FUSION_SCREEN").as_deref()==Ok("1"))
@@ -3918,6 +4017,17 @@ impl Target {
         // Only partial eager encoder chunks are affected. Full-width captured
         // graphs and their allocation/collective identities are unchanged.
         stream.synchronize()?;self.prefill_partial_moe_rows=enabled;Ok(())
+    }
+    pub(crate) fn set_short_wide_rows_for_probe(&mut self,dense:bool,mhc:bool,norm:bool,stream:&Stream)->Result<(bool,bool,bool)> {
+        ensure!(std::env::var("CANADA_SCRATCH_SHORT_WIDE_ROWS_SCREEN").as_deref()==Ok("1")
+            &&[512,1024,2048,8192].contains(&self.rows)&&self.wide.is_some()&&self.pending.is_none()
+            &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
+            "short wide-row comparison requires an isolated encoder profile");
+        // Affects only eager partial encoder chunks. Full-width captures and
+        // the separate decoder-tail profile retain their complete row extent.
+        stream.synchronize()?;
+        let previous=(self.prefill_partial2048_dense,self.prefill_wide_mhc_rows,self.prefill_wide_mhc_norm);
+        self.prefill_partial2048_dense=dense;self.prefill_wide_mhc_rows=mhc;self.prefill_wide_mhc_norm=norm;Ok(previous)
     }
     pub(crate) fn set_partial1024_rows_for_probe(&mut self,mode:u8,stream:&Stream)->Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_PARTIAL1024_SCREEN").as_deref()==Ok("1")
@@ -5155,7 +5265,11 @@ impl Target {
             "bounded encoder profile requires the current eager path at131072");
         let chunks=if let Some(chunks)=resume_chunks {
             crate::config::validate_encoder_chunks(ids.len(),&chunks,&available)?;chunks
-        }else{crate::config::plan_encoder_chunks(ids.len(), &available)};
+        }else{
+            let merge=previous>0&&self.prefill_short_merge&&wides.iter().any(|w|
+                w.rows==2048&&w.prefill_partial2048_dense&&w.prefill_wide_mhc_rows&&w.prefill_wide_mhc_norm);
+            crate::config::plan_encoder_append(ids.len(),&available,merge)
+        };
         for (chunk_index, &rows) in chunks.iter().enumerate() {
             let profile = wides.iter().position(|w| w.rows == rows);
             let remaining = ids.len() - done;
@@ -5308,6 +5422,23 @@ impl Target {
         self.rows1.upload_staged(&flat1)?;
         self.group14.engram_rows()?.0.upload_staged(&flat14)
     }
+    /// Layer-1 half of prepare_engram_rows (non-paired wide path): same lookup and publication.
+    fn prepare_engram_rows1(&mut self, hashes: &[[[u64; 24]; 2]]) -> Result<()> {
+        ensure!(!self.paired_engram_io_enabled(), "split Engram staging is for wide chunks");
+        let first: Vec<[u64; 24]> = hashes.iter().map(|r| r[0]).collect();
+        let (flat1, staging1) = self.rows1.stage(&first, &self.row_store1)?;
+        self.row_store1.lookup_into(&flat1, staging1, 8)?;
+        self.rows1.upload_staged(&flat1)
+    }
+    /// Layer-14 half of prepare_engram_rows (non-paired wide path): same lookup and publication.
+    fn prepare_engram_rows14(&mut self, hashes: &[[[u64; 24]; 2]]) -> Result<()> {
+        ensure!(!self.paired_engram_io_enabled(), "split Engram staging is for wide chunks");
+        let second: Vec<[u64; 24]> = hashes.iter().map(|r| r[1]).collect();
+        let (rows14, store14) = self.group14.engram_rows()?;
+        let (flat14, staging14) = rows14.stage(&second, store14)?;
+        store14.lookup_into(&flat14, staging14, 8)?;
+        self.group14.engram_rows()?.0.upload_staged(&flat14)
+    }
     /// Diagnostic cache reset only: invalidate immutable weight-row cache tags,
     /// never KV/model state. Every lookahead task is scoped and already joined.
     pub(crate) fn clear_engram_cache_for_probe(&self, stream: &Stream) -> Result<()> {
@@ -5356,8 +5487,17 @@ impl Target {
         let p = Plan::append_with_layout(previous as u64, chunk.len(), rows, self.context, self.swa_layout)?;
         let mut padded = vec![2u32; rows];
         padded[..chunk.len()].copy_from_slice(chunk);
-        let batch = self.history.prepare_padded(&padded, chunk.len(), &self.hashes)?;
-        self.prepare_engram_rows(&batch.rows)?;
+        // Diagnostic split of the serial host preparation (CANADA_SCRATCH_CLAUDE_HOST_TIMING=1).
+        let host_timing=std::env::var("CANADA_SCRATCH_CLAUDE_HOST_TIMING").as_deref()==Ok("1");
+        let behind_l0 = engram_behind_l0_enabled() && !(graph && !captured);
+        let mut batch = None;
+        let host_started=Instant::now();
+        if !behind_l0 {
+            let prepared_batch = self.history.prepare_padded(&padded, chunk.len(), &self.hashes)?;
+            self.prepare_engram_rows(&prepared_batch.rows)?;
+            batch = Some(prepared_batch);
+        }
+        let host_engram=Instant::now();
         self.io.update_tokens(&mut self.tokens, self.history.position as usize,
             &padded.iter().copied().map(i64::from).collect::<Vec<_>>(),
             chunk.len(),
@@ -5369,14 +5509,22 @@ impl Target {
         if let Some(wide)=&self.wide {wide.prepare_moe_scratch(stream)?;}
         let _partial_rows=crate::fp8_linear::LivePrefillRowsScope::new(
             self.prefill_partial_dense_rows && rows==512 && (129..512).contains(&chunk.len())
-                ||self.prefill_partial1024_rows>0&&rows==1024&&(513..1024).contains(&chunk.len()),
+                ||self.prefill_partial1024_rows>0&&rows==1024&&(513..1024).contains(&chunk.len())
+                ||self.prefill_partial2048_dense&&rows==2048&&(1025..2048).contains(&chunk.len()),
             self.prefill_partial_moe_rows && rows==512 && (129..512).contains(&chunk.len())
                 ||self.prefill_partial1024_rows>1&&rows==1024&&(513..1024).contains(&chunk.len()),
             chunk.len(),rows,stream)?;
         let _mhc_rows=crate::mhc::ActiveRowsScope::new(
-            self.prefill_mhc_live_rows&&rows==512&&(129..512).contains(&chunk.len()),
-            chunk.len(),rows,stream,self.prefill_mhc_live_norm)?;
+            self.prefill_mhc_live_rows&&rows==512&&(129..512).contains(&chunk.len())
+                ||self.prefill_wide_mhc_rows&&((rows==1024&&(513..1024).contains(&chunk.len()))
+                    ||(rows==2048&&(1025..2048).contains(&chunk.len()))),
+            // Normalization still reduces every channel of each live token.
+            // Sequence-parallel shards, full graphs and decoder replay retain
+            // their original extent because their capacity/phase do not match.
+            chunk.len(),rows,stream,self.prefill_mhc_live_norm&&rows==512
+                ||self.prefill_wide_mhc_norm&&[1024,2048].contains(&rows))?;
         let prepared = Instant::now();
+        let mut behind_ms = 0.0;
         #[cfg(feature="storage-fault-injection")]
         let layer0_trace=end==16896&&std::env::var("CANADA_SCRATCH_PREFILL_LAYER0_TRACE").as_deref()==Ok("1");
         #[cfg(not(feature="storage-fault-injection"))]
@@ -5385,14 +5533,45 @@ impl Target {
             // A bounded eager diagnostic captures row-arena values before
             // layer1 can overwrite them. Later compare final logits with the
             // ordinary captured path to detect diagnostic perturbation.
+            if batch.is_none() {
+                let prepared_batch = self.history.prepare_padded(&padded, chunk.len(), &self.hashes)?;
+                self.prepare_engram_rows(&prepared_batch.rows)?;
+                batch = Some(prepared_batch);
+            }
             self.enqueue_initial(comm,stream)?;
             #[cfg(feature="storage-fault-injection")]
             self.dump_prefill_layer0_trace(previous,chunk,stream)?;
             self.enqueue_encoder_after_initial(comm,stream)?;
         }else if graph && !captured {
             unsafe { self.encoder_graph.as_ref().unwrap().launch(stream) }?;
+        } else if behind_l0 {
+            // Embedding and layer 0 read no Engram input; the host stages this chunk's rows
+            // (mapped inputs, published before any consumer launch) while they execute.
+            self.enqueue_initial(comm, stream)?;
+            let behind_started = Instant::now();
+            let prepared_batch = self.history.prepare_padded(&padded, chunk.len(), &self.hashes)?;
+            if engram_split14_enabled() && !self.engram_projection_active {
+                // Layer-14 rows have no consumer before layer 14: stage them behind layers 1-13.
+                self.prepare_engram_rows1(&prepared_batch.rows)?;
+                behind_ms = behind_started.elapsed().as_secs_f64()*1000.;
+                self.enqueue_before_engram14(comm, stream)?;
+                self.prepare_engram_rows14(&prepared_batch.rows)?;
+                batch = Some(prepared_batch);
+                self.enqueue_encoder_from_engram14(comm, stream)?;
+            } else {
+                self.prepare_engram_rows(&prepared_batch.rows)?;
+                batch = Some(prepared_batch);
+                behind_ms = behind_started.elapsed().as_secs_f64()*1000.;
+                self.enqueue_encoder_after_initial(comm, stream)?;
+            }
         } else {
             self.enqueue_encoder(comm, stream)?;
+        }
+        let batch = batch.context("encoder chunk Engram batch")?;
+        if host_timing && self.rank==0 {
+            eprintln!("claude host rank0 rows={rows} live={} serial_engram_ms={:.3} rest_ms={:.3} behind_l0_engram_ms={:.3}",
+                chunk.len(), host_engram.duration_since(host_started).as_secs_f64()*1000.,
+                prepared.duration_since(host_engram).as_secs_f64()*1000., behind_ms);
         }
         let lookahead_metrics=if let Some(next) = lookahead {
             // Clone only handles on the CUDA thread. Worker closures borrow
@@ -5855,8 +6034,18 @@ impl Target {
 
     fn enqueue_initial(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
         self.io.run_input(&self.tokens, comm, stream)?;
+        // A sequence-parallel layer 0 takes its rank's rows of the full embedding.
+        let shard;
+        let input = match self.early[0].sp_rank() {
+            Some(rank) => {
+                let local = self.io.input().len() / (4 * 20480);
+                shard = unsafe { self.io.input().view(rank * local * 20480, local * 20480) }?;
+                &shard
+            }
+            None => self.io.input(),
+        };
         self.early[0].run(
-            self.io.input(),
+            input,
             &self.step.positions,
             &self.step.locations,
             &mut self.early_caches[0],
@@ -5954,7 +6143,8 @@ impl Target {
     fn enqueue_encoder_from_engram14(&mut self,comm:&Roce,stream:&Stream)->Result<()> {
         // Layer 14 (Engram14 and source14) runs on full rows.
         let (input14, pre14) = match self.sp_full.as_mut() {
-            Some((residual, pre)) if self.group8.sequence_parallel() => {
+            Some((residual, pre)) if self.group8.sequence_parallel()
+                && !self.group14.first_sequence_parallel() => {
                 unsafe {
                     comm.gather_rows(self.group8.output(), residual, stream)?;
                     comm.gather_rows(self.group8.pre(), pre, stream)?;
@@ -5985,7 +6175,33 @@ impl Target {
             comm,
             stream,
         )?;
+        let publishing = self.encoder_cache.is_some() && self.source_phase != Phase::Verify;
         let (output20, pre20) = match self.sp_full.as_mut() {
+            Some((residual, pre)) if self.late.encoder_sequence_parallel() && tail_window_enabled() => {
+                // The bounded publication reads x rows [live-128, live) only; pre is small.
+                let rows = residual.len() / 20480;
+                let live = self.tokens.active_rows();
+                ensure!(rows % 4 == 0 && live <= rows && pre.len() == rows * 4
+                    && crate::decoder_tail::bounded_copy_enabled()?, "tail window publication geometry");
+                if publishing && live > 0 {
+                    let (w0, w1) = (live.saturating_sub(128), live);
+                    let local = rows / 4;
+                    let rank = comm.rank();
+                    let (a, b) = (w0.max(rank * local), w1.min((rank + 1) * local));
+                    unsafe {
+                        self.cuda.zero_device(residual.ptr() + (w0 * 40960) as u64, (w1 - w0) * 40960, stream)?;
+                        if a < b {
+                            self.cuda.copy_device(residual.ptr() + (a * 40960) as u64,
+                                self.late.encoder_output().ptr() + ((a - rank * local) * 40960) as u64, (b - a) * 40960, stream)?;
+                        }
+                        let window = residual.view(w0 * 20480, (w1 - w0) * 20480)?;
+                        let mut summed = residual.view(w0 * 20480, (w1 - w0) * 20480)?;
+                        comm.sum_window_bf16(&window, &mut summed, stream)?;
+                        comm.gather_rows(self.late.encoder_pre(), pre, stream)?;
+                    }
+                }
+                (&*residual, &*pre)
+            }
             Some((residual, pre)) if self.late.encoder_sequence_parallel() => {
                 unsafe {
                     comm.gather_rows(self.late.encoder_output(), residual, stream)?;
@@ -5996,7 +6212,7 @@ impl Target {
             _ => (self.late.encoder_output(), self.late.encoder_pre()),
         };
         if let Some(cache) = &self.encoder_cache
-            && self.source_phase != Phase::Verify
+            && publishing
         {
             cache.publish(
                 output20,

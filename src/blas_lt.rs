@@ -115,7 +115,7 @@ pub struct BlasLt {
     api: Rc<Api>,
     handle: Handle,
     workspace: Buffer<u8>,
-    plans: RefCell<BTreeMap<(usize, usize, usize), Plan>>,
+    plans: RefCell<BTreeMap<(usize, usize, usize, bool), Plan>>,
 }
 impl BlasLt {
     pub fn new(context: &Cuda) -> Result<Self> {
@@ -132,6 +132,14 @@ impl BlasLt {
         })
     }
     pub fn prepare(&self, m: usize, n: usize, k: usize) -> Result<()> {
+        self.prepare_epilogue(m, n, k, false)
+    }
+    /// BF16 bias epilogue in FP32 compute: D = bf16(acc + bias). Split-K, if any,
+    /// may reduce only in the FP32 compute type, never in the BF16 output type.
+    pub fn prepare_bias(&self, m: usize, n: usize, k: usize) -> Result<()> {
+        self.prepare_epilogue(m, n, k, true)
+    }
+    fn prepare_epilogue(&self, m: usize, n: usize, k: usize, bias: bool) -> Result<()> {
         ensure!(
             m > 0
                 && n > 0
@@ -141,7 +149,7 @@ impl BlasLt {
                 && k <= i32::MAX as usize,
             "Lt GEMM dimension range"
         );
-        if self.plans.borrow().contains_key(&(m, n, k)) {
+        if self.plans.borrow().contains_key(&(m, n, k, bias)) {
             return Ok(());
         }
         let (mut desc, mut a, mut b, mut c, mut pref) = (
@@ -169,6 +177,15 @@ impl BlasLt {
             unsafe { (self.api.desc_attr)(desc, 3, (&transa as *const i32).cast(), 4) },
             "Lt transpose weight",
         )?;
+        if bias {
+            // cublasLt.h (CUDA 13): CUBLASLT_MATMUL_DESC_EPILOGUE=7, CUBLASLT_EPILOGUE_BIAS=4.
+            // The bias type defaults to the BF16 output type; the pointer is set per call.
+            let epilogue = 4i32;
+            check(
+                unsafe { (self.api.desc_attr)(desc, 7, (&epilogue as *const i32).cast(), 4) },
+                "Lt bias epilogue",
+            )?;
+        }
         check(
             unsafe { (self.api.layout_create)(&mut a, 14, k as u64, n as u64, k as i64) },
             "Lt weight layout",
@@ -200,6 +217,11 @@ impl BlasLt {
             },
             "Lt workspace preference",
         );
+        // CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK=3; COMPUTE_TYPE=2 only (no output-type reduction).
+        let scheme = 2u32;
+        let configured = configured.and_then(|_| if bias { check(
+            unsafe { (self.api.preference_attr)(pref, 3, (&scheme as *const u32).cast(), 4) },
+            "Lt reduction scheme preference") } else { Ok(()) });
         if let Err(e) = configured {
             unsafe {
                 (self.api.preference_destroy)(pref);
@@ -233,7 +255,7 @@ impl BlasLt {
             .iter()
             .find(|a| a.state == 0 && a.workspace <= workspace)
             .context("no admitted Lt GEMM algorithm")?;
-        self.plans.borrow_mut().insert((m, n, k), plan);
+        self.plans.borrow_mut().insert((m, n, k, bias), plan);
         Ok(())
     }
     /// Safety: buffers and stream share the owning CUDA context. Call prepare()
@@ -275,7 +297,7 @@ impl BlasLt {
         );
         let plans = self.plans.borrow();
         let p = plans
-            .get(&(m, n, k))
+            .get(&(m, n, k, false))
             .context("Lt shape was not prepared before execution")?;
         let alpha = 1f32;
         let beta = 0f32;
@@ -301,6 +323,28 @@ impl BlasLt {
                 )
             },
             "Lt BF16 linear",
+        )
+    }
+}
+impl BlasLt {
+    /// Safety: as linear_bf16_raw; bias is a live BF16 [N] vector. Eager use only:
+    /// the per-call bias pointer is a descriptor attribute, so no graph capture.
+    pub(crate) unsafe fn linear_bias_bf16_raw(&self, x: u64, weight: u64, bias: u64, y: u64,
+        m: usize, n: usize, k: usize, stream: &Stream) -> Result<()> {
+        ensure!(self.context.owns_stream(stream)
+            && [x, weight, bias, y].iter().all(|p| *p != 0 && *p % 16 == 0), "Lt bias linear context/alignment");
+        let plans = self.plans.borrow();
+        let p = plans.get(&(m, n, k, true)).context("Lt bias shape was not prepared before execution")?;
+        check(unsafe { (self.api.desc_attr)(p.desc, 8, (&bias as *const u64).cast(), 8) }, "Lt bias pointer")?;
+        let alpha = 1f32;
+        let beta = 0f32;
+        check(
+            unsafe {
+                (self.api.matmul)(self.handle, p.desc, (&alpha as *const f32).cast(), weight as *const c_void, p.a,
+                    x as *const c_void, p.b, (&beta as *const f32).cast(), y as *const c_void, p.c, y as *mut c_void, p.c,
+                    p.heuristic.algo.as_ptr(), self.workspace.ptr() as *mut c_void, self.workspace.bytes(), stream.raw())
+            },
+            "Lt BF16 bias linear",
         )
     }
 }

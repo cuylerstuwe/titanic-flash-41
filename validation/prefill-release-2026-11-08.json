@@ -1,0 +1,143 @@
+{
+  "release": "s1387",
+  "date": "2026-11-08",
+  "base_release": "s1345",
+  "failed_start_fallback": "s1345",
+  "native_serving_source_fingerprint": "73ac5ceece161bb3d558326f0d080fcf57bc6b9bb53d3c7fe842a88103b2deb5",
+  "hardware": "three ASUS GX10 and one DGX Spark (GB10), two 100 Gb/s switched RoCE rails per node",
+  "unchanged": [
+    "checkpoint weights",
+    "target precision boundaries",
+    "recommended sampler",
+    "2350 MHz cap",
+    "8 GiB operating / 8.5 GiB allocation floors",
+    "4 GiB shared snapshot ceiling",
+    "one physical execution bank"
+  ],
+  "numerics": {
+    "bit_identical": [
+      "token-major WO-A",
+      "in-place Q RoPE",
+      "encoder-tail window",
+      "Engram staging behind layer 0",
+      "MXFP8 WO-B exchange and four-part sum",
+      "late row-local shared expert",
+      "vision bias epilogue",
+      "vision split/image-parallel encoding (image spans)"
+    ],
+    "reduction_order_only": [
+      "sequence-parallel layers 0/1/14 with row-local Engram",
+      "row-local shared expert"
+    ],
+    "teacher_forced_384_tokens_after_131071": {
+      "mean_nll": {
+        "s1345_configuration": 0.22508,
+        "candidate": 0.2245,
+        "fp32_sum_reference": 0.22244
+      },
+      "tv_mean": {
+        "candidate_vs_baseline": 0.0111,
+        "baseline_vs_fp32": 0.0081,
+        "candidate_vs_fp32": 0.0115
+      },
+      "argmax_agreement": {
+        "candidate_vs_baseline": "381/384",
+        "baseline_vs_fp32": "382/384",
+        "candidate_vs_fp32": "381/384"
+      }
+    },
+    "candidate_configuration_vs_s1387_logits_after_cold_131k": "identical"
+  },
+  "fresh_boot_panel": {
+    "requests": 15,
+    "settings": "temperature 1, top-p 1, high reasoning",
+    "cold_prefill_129955_tokens_seconds": {
+      "s1345": 20.588,
+      "s1387_options": 16.058
+    },
+    "image_turn_93_images": {
+      "prefill_seconds": {
+        "s1345": 7.944,
+        "s1387_options": 6.15
+      },
+      "ttft_seconds": {
+        "s1345": 17.155,
+        "s1387_options": 9.497
+      }
+    },
+    "plain_code_decode_tok_s": {
+      "s1345": 92.7,
+      "s1387_options": 92.8
+    },
+    "lowest_available_gib": {
+      "s1345": 17.8,
+      "s1387_options": 14.18
+    },
+    "note": "s1387 options measured on a build without the bit-identical fused WO-B sum (0.6% faster per 8K chunk in paired timing)"
+  },
+  "probe_262143_token_cold_prefill_seconds": {
+    "new_options_off": 42.405,
+    "new_options_on": 33.013
+  },
+  "stress_panel": {
+    "completed_requests": 69,
+    "max_prompt_tokens": 974076,
+    "images_in_conversation": 28,
+    "context_resets": 2,
+    "later_fresh_images": 16,
+    "foreground_preempted_background": true,
+    "long_peers": 2,
+    "peak_snapshot_bytes": 3273868820,
+    "lowest_available_gib": 10.996,
+    "s1345_lowest_available_gib": 14.644,
+    "full_panel_passed": false,
+    "interruption": "temporary test observer 90 C guard on the DGX Spark during the final cancellation fixture (as in the s1345 qualification)",
+    "max_temperature_c": [
+      87.8,
+      89.5,
+      88.7,
+      90.0
+    ],
+    "memory_guard_abort": false,
+    "gpu_allocation_or_xid_messages": 0
+  },
+  "cancellation_check": {
+    "passed": true,
+    "prompt_tokens": 974039,
+    "images": 28,
+    "prefill_seconds": 139.1,
+    "retry_cached_tokens": 974056,
+    "new_image_prompt_tokens": 975018,
+    "new_image_cached_tokens": 973824,
+    "lowest_available_gib": 13.188,
+    "max_temperature_c": 87.8
+  },
+  "activation": {
+    "journaled_install": true,
+    "fresh_boots": 4,
+    "production_loads_per_device": 1,
+    "live_checks": [
+      "text",
+      "prompt reuse",
+      "continuation",
+      "image input",
+      "text after image"
+    ],
+    "routed_synthetic_image": true,
+    "router_configuration_unchanged": true,
+    "runtime_hashes": true,
+    "clock_and_apst_guards": true,
+    "kernel_health": true,
+    "reservation_released": true
+  },
+  "tests": {
+    "native_cpu_passed": 219,
+    "native_cpu_ignored": 25,
+    "install_rollback_fixtures": 10
+  },
+  "limitations": [
+    "portable profile unchanged; staged-artifact options require derived files the portable installer does not produce",
+    "portable GPU deployment wrapper not rerun",
+    "next-token checks are not completed-task quality scores"
+  ]
+}

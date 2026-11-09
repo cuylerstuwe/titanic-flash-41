@@ -6,38 +6,38 @@ A native Rust inference engine and OpenAI-compatible server for **DeepSeek-V4.1-
 
 The engine includes GPU model execution, speculative decoding, SSD-backed Engram lookup, prompt reuse, streaming tool calls, image input, and native foreground/background scheduling. It admits two requests, each with the full context capacity, and queues additional requests. The default layout keeps one physical execution bank; overlapping requests use bounded, lossless RAM snapshots rather than a permanently allocated second bank. Rust owns model execution and request scheduling; CUDA and compiled GPU operators perform model arithmetic. Python utilities handle installation and fleet lifecycle.
 
-This checkout carries the **November 6 memory-layout repair (s1345)** on the accumulated s1329 engine. Long image conversations previously exhausted input headroom even after every optional checkpoint was reclaimed. The default now allocates one full-context execution bank, retains fully warmed primary graphs and preserves forward-prefix reuse. Unfinished requests take priority over optional rewind checkpoints. Optional completed caches remain capped at 2 GiB; overlaps may use up to 4 GiB of shared snapshot storage on demand, subject to the unchanged physical-memory reserve. Canonical target weights, precision, image processing and recommended sampling settings are preserved. See [release validation](docs/VALIDATION.md) for evidence and tradeoffs.
+This checkout carries the **November 8 prefill and vision release (s1387)** on the s1345 reliability base. Long prompts prefill in about 22% less time (28% higher throughput): sequence-parallel early layers with row-local Engram, a row-local shared expert overlapped with communication, an MXFP8 exchange of the WO-B input, and host-side Engram staging overlapped with GPU work. Image turns get split and image-parallel vision encoding. The features are runtime options described in [prefill and vision options](docs/PREFILL.md); most are bit-identical, and two change only BF16 reduction order. Canonical target weights, precision boundaries, memory floors, the one-bank layout, image processing and recommended sampling settings are preserved. See [release validation](docs/VALIDATION.md) for evidence and tradeoffs.
 
-For s1329 at the recommended temperature 1 / top-p 1 settings, matched native continuations decoded **3.38–3.59% faster than s1291** across two fresh-boot launch orders. Cold prefill was effectively unchanged. These are scoped speed measurements; different sampled reasoning paths can still change total task time. The [paired comparison](benchmarks/release-comparison-s1329.json) retains the slower copy-task outcome as well.
+At the recommended temperature 1 / top-p 1 settings on fresh boots, a 129,955-token cold prefill took **16.06 s versus 20.59 s for s1345** (8.09K versus 6.31K tokens/s), and a 93-image turn's time to first token fell from 17.16 s to 9.50 s. Decode was unchanged (92.8 versus 92.7 tokens/s on the same 2,940-token sampled completion). The added staged weights use about 3.5–4 GiB more memory per device.
 
 ## Performance
 
-Single-stream measurements from **November 4, 2026 (s1329)**, using the published comparison's prompts, context file, request settings and timing function. The qualified portable build ran **on the head GB10 against loopback HTTP**, bypassing any external router or physical HTTP network hop. All 24 requests completed in one pass on the first model load after a four-device reboot. Only Titanic was measured again; competitor results below are the author's existing published numbers.
+Single-stream measurements from **November 8, 2026 (s1387)**, using the published comparison's prompts, context file, request settings and timing function. The installed native production service ran **on the head GB10 against its head-local endpoint**, bypassing any external router or physical HTTP network hop. All 24 requests completed in one pass on the first model load after a four-device reboot; six short installed-service checks preceded it, none with a long prompt. Only Titanic was measured again; competitor results below are the author's existing published numbers.
 
-These measurements predate the s1332 scheduling, s1334 prefill-admission, s1338 image-workspace and s1345 memory-layout repairs; they have not been relabeled or remeasured for those updates.
+The measured deployment enables the [prefill and vision options](docs/PREFILL.md). The portable profile supplied in this repository does not enable them yet, so a portable installation measures like the s1345 base for long-prompt prefill.
 
 Median generation speed in **tokens/second**, three repetitions with a 512-token output budget:
 
-| Starting context | Workload | SGLang stock, published | SGLang tuned, published | TensorFold, published | Titanic s1329 |
+| Starting context | Workload | SGLang stock, published | SGLang tuned, published | TensorFold, published | Titanic s1387 |
 |---|---|---:|---:|---:|---:|
-| Clean | Code | 71.6 | 103.1 | 110.9 | 121.0 |
-| Clean | Prose | 32.9 | 46.3 | 57.7 | 65.5 |
-| Clean | Prose 2 | 26.8 | 43.7 | 56.3 | 62.4 |
-| ~131K tokens | Code | 57.4 | 86.0 | 94.7 | 111.9 |
-| ~131K tokens | Prose | 32.0 | 45.8 | 57.7 | 62.8 |
-| ~131K tokens | Prose 2 | 28.1 | 44.1 | 53.7 | 58.6 |
+| Clean | Code | 71.6 | 103.1 | 110.9 | 120.3 |
+| Clean | Prose | 32.9 | 46.3 | 57.7 | 65.2 |
+| Clean | Prose 2 | 26.8 | 43.7 | 56.3 | 62.0 |
+| ~131K tokens | Code | 57.4 | 86.0 | 94.7 | 111.0 |
+| ~131K tokens | Prose | 32.0 | 45.8 | 57.7 | 62.1 |
+| ~131K tokens | Prose 2 | 28.1 | 44.1 | 53.7 | 61.4 |
 
-| Uncached ~131K prompt, time to first generated content | SGLang tuned, published | TensorFold, published | Titanic s1329 |
+| Uncached ~131K prompt, time to first generated content | SGLang tuned, published | TensorFold, published | Titanic s1387 |
 |---|---:|---:|---:|
-| First long-context request | 32.45 s | 56.02 s | 20.99 s |
+| First long-context request | 32.45 s | 56.02 s | 16.31 s |
 
 The comparison uses **temperature 0, top-p 1, thinking disabled**. These are benchmark settings, not the server's recommended-use defaults. “Prose 2” is the published fishing-village story workload, not the separate sampled-chat workload. Uncached timing means no reusable prompt state; it does not mean an empty operating-system file cache. Generation trials follow warmups and can reuse prompt state.
 
 These are **cross-system comparisons**: Titanic ran on three ASUS GX10s and one DGX Spark, with two switched 100 Gb/s fabrics. The published runs used four DGX Sparks and a different network arrangement. These short throughput measurements do not establish completed-task quality or which system solves arbitrary agentic tasks fastest. Multi-stream results are deliberately omitted.
 
-Titanic used the 2350 MHz cap. Every row comes from the complete s1329 pass, including lower results, rather than historical best scores. Failed package-startup attempts preceded the fresh reboot and produced no benchmark samples. [Historical comparisons and run accounting](docs/BENCHMARKS.md) retain earlier native-build results separately.
+Titanic used the 2350 MHz cap. Every row comes from the complete s1387 pass, including lower results, rather than historical best scores. Decode rows are within about 1% of the earlier s1329 pass (prose 2 at ~131K is 4.7% higher); the first long-context request is 22% faster (20.99 s for s1329). [Historical comparisons and run accounting](docs/BENCHMARKS.md) retain earlier results separately.
 
-Source: [published comparison and benchmark client](https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa), pinned revision `7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2`. [Full results](benchmarks/results-2026-11-04-s1329.json) include ranges, timing details, hardware and measured-build identity; [individual samples](benchmarks/samples-2026-11-04-s1329.json) omit generated text. [Reproduction instructions](docs/BENCHMARKS.md) use the original external timing function.
+Source: [published comparison and benchmark client](https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa), pinned revision `7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2`. [Full results](benchmarks/results-2026-11-08-s1387.json) include ranges, timing details, hardware and measured-build identity; [individual samples](benchmarks/samples-2026-11-08-s1387.json) omit generated text. [Reproduction instructions](docs/BENCHMARKS.md) use the original external timing function.
 
 ## Model and quality
 

@@ -24,6 +24,12 @@ fn coordinate_input_stage<T>(local:Result<T>, required:usize, phase:&'static str
         };
     }
     if !vote(local.is_ok())? {
+        // Preserve a larger host-preprocessing requirement on the failing
+        // ingress rank. Its bounded retry must reclaim for the actual request,
+        // not just for a potentially smaller GPU patch/span allocation.
+        let required=local.as_ref().err()
+            .and_then(|e|e.downcast_ref::<crate::memory::InputCapacityError>())
+            .map_or(required,|e|required.max(e.1));
         drop(local);
         return Err(crate::memory::InputCapacityError(phase,required).into());
     }
@@ -120,12 +126,17 @@ pub(crate) struct Media {
     cuda: Cuda,
     rank: usize,
     encoder_rank: usize,
+    /// Row-split encoding on all four ranks (encoder_rank remains the aligner/broadcast root).
+    split: bool,
     encoder_key: [u8;32],
     encoder: Option<Vision>,
     compact_workspace:bool,
     scratch_arena:Option<Rc<crate::cuda::RowArena>>,
     cache: SpanCache,
+    future_pins: bool,
     inputs: HashMap<[u8;32],Arc<PatchInput>>,
+    #[cfg(feature="vision-protocol")]
+    deferred_inputs: HashMap<[u8;32],crate::image_input_cache::DeferredInput>,
     encoded: u64,
     skipped: u64,
     transmitted: u64,
@@ -138,12 +149,16 @@ impl Media {
         // CANADA_SCRATCH identity. The atlas and arithmetic stay canonical;
         // rank zero remains the HTTP/input owner.
         let encoder_rank=encoder_rank(std::env::var("CANADA_SCRATCH_VISION_ENCODER_RANK").ok().as_deref())?;
-        Self::load_at(cuda,rank,model,config,encoder_rank)
+        let split=match std::env::var("CANADA_SCRATCH_VISION_SPLIT").as_deref() {
+            Err(std::env::VarError::NotPresent)|Ok("0")=>false,Ok("1")=>true,
+            _=>anyhow::bail!("vision split policy must be0or1"),
+        };
+        Self::load_at(cuda,rank,model,config,encoder_rank,split)
     }
-    fn load_at(cuda:&Cuda,rank:usize,model:&ModelConfig,config:&Config,encoder_rank:usize)->Result<Self> {
+    fn load_at(cuda:&Cuda,rank:usize,model:&ModelConfig,config:&Config,encoder_rank:usize,split:bool)->Result<Self> {
         ensure!(rank<4 && encoder_rank<4,"vision physical placement extent");
         let encoder_key=config.fingerprint()?;
-        let encoder=if rank==encoder_rank {
+        let encoder=if rank==encoder_rank || split {
             let cp=Checkpoint::from_manifest(&config.checkpoint)?;
             // The vision-only atlas is the original logical rank-zero atlas.
             // Its tensors are replicated, independently of physical placement.
@@ -151,10 +166,17 @@ impl Media {
             let encoder=Vision::new_staged(cuda,&std::fs::read(&config.kernel)?,&config.attention,
                 &cp,&plan,&config.stage)?;
             ensure!(encoder.source_sha256()==config.weights_sha256,"loaded vision identity differs");
+            ensure!(!split||encoder.split_capable(),"vision split requires the split attention artifact");
             Some(encoder)
         }else{None};
-        Ok(Self {cuda:cuda.clone(),rank,encoder_rank,encoder_key,encoder,compact_workspace:crate::vision::compact_workspace()?,scratch_arena:None,cache:SpanCache::new(config.cache_bytes)?,
+        Ok(Self {cuda:cuda.clone(),rank,encoder_rank,split,encoder_key,encoder,compact_workspace:crate::vision::compact_workspace()?,scratch_arena:None,cache:SpanCache::new(config.cache_bytes)?,
+            future_pins:match std::env::var("CANADA_SCRATCH_IMAGE_FUTURE_PINS").as_deref() {
+                Err(std::env::VarError::NotPresent)|Ok("0")=>false,Ok("1")=>true,
+                _=>anyhow::bail!("image future pins must be0or1"),
+            },
             inputs:HashMap::new(),encoded:0,skipped:0,transmitted:0,
+            #[cfg(feature="vision-protocol")]
+            deferred_inputs:HashMap::new(),
             #[cfg(feature="storage-fault-injection")]
             capacity_fault:std::env::var("CANADA_SCRATCH_IMAGE_CAPACITY_FAULT").ok()
                 .map(|v|ImageCapacityFault::parse(&v)).transpose()?,
@@ -172,7 +194,7 @@ impl Media {
     }
     pub(crate) fn set_inputs(&mut self, inputs:&[Arc<PatchInput>]) -> Result<()> {
         ensure!(self.rank==0,"only the ingress rank receives host patch input");
-        self.inputs.clear();
+        self.clear_inputs();
         for input in inputs {
             input.validate()?;
             if let Some(previous)=self.inputs.insert(input.identity,input.clone()) {
@@ -180,6 +202,44 @@ impl Media {
             }
         }
         Ok(())
+    }
+    #[cfg(feature="serving")]
+    pub(crate) fn set_job_inputs(&mut self, job:&mut crate::http_server::Job) -> Result<()> {
+        self.set_inputs(&std::mem::take(&mut job.image_inputs))?;
+        #[cfg(feature="vision-protocol")]
+        for input in std::mem::take(&mut job.deferred_image_inputs) {
+            input.geometry().validate()?;
+            if let Some(prepared)=self.inputs.get(&input.identity()) {
+                ensure!(prepared.geometry==input.geometry(),"deferred image geometry differs");
+                continue;
+            }
+            if let Some(previous)=self.deferred_inputs.insert(input.identity(),input) {
+                ensure!(self.deferred_inputs[&previous.identity()].geometry()==previous.geometry(),
+                    "one deferred image identity has two geometries");
+            }
+        }
+        Ok(())
+    }
+    fn resolve_input(&self,image:&Descriptor)->Result<Arc<PatchInput>> {
+        let input=if let Some(input)=self.inputs.get(&image.input) {input.clone()} else {
+            #[cfg(feature="vision-protocol")]
+            {
+                let source=self.deferred_inputs.get(&image.input)
+                    .ok_or_else(||anyhow::anyhow!("missing image input on the ingress rank"))?;
+                // Invoked only after the real model frontier and distributed
+                // embedding-cache miss are known. No CPU inference or alternate
+                // pixel path: canonical preparation retains its memory guards.
+                // Cancellation is handled at the existing worker boundary;
+                // never turn a mid-stage cancellation into a fatal peer error.
+                source.materialize(&||false)?
+            }
+            #[cfg(not(feature="vision-protocol"))]
+            { anyhow::bail!("missing image input on the ingress rank"); }
+        };
+        ensure!(input.identity==image.input && input.geometry==image.geometry,
+            "request image input identity or geometry differs");
+        input.validate()?;
+        Ok(input)
     }
     pub(crate) fn prepare(&mut self, identity:Identity, images:&[Descriptor], frontier:usize,
         control:&mut ControlChannel, comm:&Roce, stream:&Stream,
@@ -190,6 +250,89 @@ impl Media {
         let mut hashes=Vec::new();
         let mut reclamations=Vec::new();
         let mut host_trims=Vec::new();
+        // Ordered/disjoint placements permit a cheap frontier lookup. Normal
+        // forward turns needing at most the final image take no pin/map path.
+        // These are already-allocated spans required later in this same input,
+        // not extra branch retention. A genuine miss still encodes canonically.
+        let mut future_pins=if self.future_pins {
+            let placements=identity.placements();
+            let begin=placements.partition_point(|p|p.start+p.tokens<=frontier);
+            if placements.len()-begin>1 {
+                self.cache.pin_requested(placements[begin..].iter().map(|p|p.key))
+            }else{Vec::new()}
+        }else{Vec::new()};
+        let pinned_count=future_pins.len();let mut pressure_released_pins=0;
+        // Image-parallel batch (split mode loads the encoder on every rank): two or
+        // more new images are encoded whole and concurrently, one per rank, in groups
+        // of four, then each span is broadcast from its owner exactly as a single
+        // encoder rank would. The ordinary loop below then finds them as cache hits.
+        // A refused vote leaves the remaining images to that loop on every rank.
+        let mut prepass_owners:Vec<Rc<ImageSpan>>=Vec::new();
+        if self.split {
+            let mut seen=std::collections::HashSet::new();
+            let pending:Vec<(&Descriptor,crate::prompt_media::ImageKey)>=images.iter().zip(identity.placements())
+                .filter(|(image,_)|image.start+image.geometry.tokens()>frontier)
+                .map(|(image,p)|(image,p.key))
+                .filter(|(_,key)|seen.insert(*key)&&self.cache.pin_requested(std::iter::once(*key)).is_empty())
+                .collect();
+            control.agree(&(pending.len() as u32).to_le_bytes())?;
+            if pending.len()>=2 {
+                for group in pending.chunks(4) {
+                    let inputs:Option<Vec<Arc<PatchInput>>>=if self.rank==0 {
+                        group.iter().map(|(image,_)|self.resolve_input(image)).collect::<Result<Vec<_>>>().ok()
+                    }else{None};
+                    let mut need=0usize;
+                    for (j,(image,_)) in group.iter().enumerate() {
+                        let g=image.geometry.validate()?;
+                        need+=(g.rows()*588*2).next_multiple_of(2<<20)+(g.tokens()*5120*2).next_multiple_of(2<<20);
+                        if j==self.rank {
+                            need+=if self.scratch_for(g)?.is_some(){g.arena_admission_bytes(false)?}
+                                else{g.workspace_bytes(false,self.compact_workspace)?};
+                        }
+                    }
+                    let local_ok=(self.rank!=0||inputs.is_some())
+                        &&self.cuda.admission_memory()?.admitted_available>self.cuda.allocation_reserve_bytes()+need;
+                    if !control.all_admit(local_ok)? {break;}
+                    let mut patches=Vec::with_capacity(group.len());
+                    for (j,(image,_)) in group.iter().enumerate() {
+                        let mut buffer=self.cuda.allocate_input::<bf16>(image.geometry.rows()*588)?;
+                        if let Some(inputs)=&inputs {buffer.upload(inputs[j].patches.reinterpret_cast())?;}
+                        stream.join_default()?;
+                        unsafe {comm.broadcast_image_patches(&buffer,0,stream)?;}
+                        patches.push(buffer);
+                    }
+                    stream.synchronize()?;comm.health()?;
+                    let mut spans:Vec<ImageSpan>=Vec::with_capacity(group.len());
+                    let mut encoded_ok=true;
+                    for (j,(image,_)) in group.iter().enumerate() {
+                        let g=image.geometry;
+                        if j==self.rank {
+                            match self.encoder.as_ref().unwrap().encode_with_arena(&patches[j],g,stream,
+                                self.compact_workspace,self.scratch_for(g)?) {
+                                Ok(span)=>spans.push(span),
+                                Err(error)=>{eprintln!("image-parallel encode refused: {error}");encoded_ok=false;break;}
+                            }
+                        }else{
+                            match self.cuda.allocate_input(g.tokens()*5120) {
+                                Ok(data)=>spans.push(ImageSpan{data,geometry:g}),
+                                Err(_)=>{encoded_ok=false;break;}
+                            }
+                        }
+                    }
+                    drop(patches);
+                    if !control.all_admit(encoded_ok)? {break;}
+                    for (j,span) in spans.iter().enumerate() {
+                        unsafe {comm.broadcast_image_span(&span.data,j,stream)?;}
+                    }
+                    stream.synchronize()?;comm.health()?;
+                    for ((_,key),span) in group.iter().zip(spans) {
+                        let span=Rc::new(span);self.cache.insert(*key,span.clone())?;prepass_owners.push(span);
+                        self.encoded+=1;self.transmitted+=1;
+                    }
+                }
+            }
+        }
+        let image_parallel=prepass_owners.len();
         for (image,placement) in images.iter().zip(identity.placements()) {
             ensure!(image.key(self.encoder_key)==placement.key && image.start==placement.start
                 && image.geometry.validate()?.tokens()==placement.tokens,"image binding identity differs");
@@ -208,11 +351,15 @@ impl Media {
             }else{
                 let g=image.geometry;
                 let patch_bytes=g.rows()*588*2;
-                let needed=if self.rank==self.encoder_rank {
+                let split_image=self.split&&Vision::split_rows(g).is_some();
+                let needed=if split_image {
+                    Vision::split_admission_bytes(g,self.rank==self.encoder_rank)?+patch_bytes.next_multiple_of(2<<20)
+                }else if self.rank==self.encoder_rank {
                     if self.scratch_for(g)?.is_some(){g.arena_admission_bytes(true)?}else{g.workspace_bytes(true,self.compact_workspace)?}
                 }else{g.tokens()*5120*2+(16<<20)
                     +if self.encoder_rank!=0{patch_bytes.next_multiple_of(2<<20)}else{0}};
                 let base_required=self.cuda.allocation_reserve_bytes()+needed;
+                let mut retry_required=base_required;
                 let mut attempt=0;
                 let span=loop {
                     // One bounded retry can reclaim optional completed caches;
@@ -221,12 +368,16 @@ impl Media {
                     // allowance. Do not double that allowance on retry: doing
                     // so needlessly evicts valid prefixes and can refuse an
                     // allocation that just succeeded before a local refusal.
-                    let required=base_required;
+                    let required=retry_required;
                     let enough=|cuda:&Cuda|->Result<bool>{
                         Ok(cuda.admission_memory()?.admitted_available > required)
                     };
                     if !control.all_admit(enough(&self.cuda)?)? || attempt>0 {
                         stream.synchronize()?;
+                        // All ranks enter this branch together. Optional pins
+                        // must yield before the existing warm-cache/conversation
+                        // reclamation, with no lower reserve or extra retry.
+                        pressure_released_pins+=future_pins.len();future_pins.clear();
                         // Image admission happens before the text-prefill
                         // pressure path. Return allocator-free host pages here
                         // too, before sacrificing useful conversation state.
@@ -253,6 +404,7 @@ impl Media {
                     match self.encode_attempt(image,required,control,comm,stream) {
                         Ok(span)=>break span,
                         Err(error) if attempt==0 && error.downcast_ref::<crate::memory::InputCapacityError>().is_some()=>{
+                            retry_required=retry_required.max(error.downcast_ref::<crate::memory::InputCapacityError>().unwrap().1);
                             eprintln!("image allocation retry: {}",json!({"rank":self.rank,
                                 "geometry":g,"reason":error.to_string(),"memory":self.cuda.admission_memory()?,
                                 "percpu_free_bytes":crate::memory::percpu_free_bytes()}));
@@ -279,11 +431,14 @@ impl Media {
             }
             spans.push(Some(span));
         }
-        self.inputs.clear();
+        self.clear_inputs();
         let bindings=Rc::new(Bindings::suffix(&self.cuda,identity,spans,frontier)?);
-        let receipt=json!({"seconds":began.elapsed().as_secs_f64(),"encoder_rank":self.encoder_rank,"encoded_images":self.encoded-before.0,
+        drop(prepass_owners);
+        let receipt=json!({"seconds":began.elapsed().as_secs_f64(),"encoder_rank":self.encoder_rank,"split":self.split,
+            "image_parallel":image_parallel,"encoded_images":self.encoded-before.0,
             "prefix_images_skipped":self.skipped-before.1,"broadcast_images":self.transmitted-before.2,
             "cache":self.cache.stats(),"live_request_bytes":bindings.owned_bytes(),
+            "future_image_pins":pinned_count,"pressure_released_image_pins":pressure_released_pins,
             "cache_reclamations":reclamations,"host_allocator_trims":host_trims,"prefill_scratch_bytes":self.scratch_arena.as_ref().map_or(0,|a|a.bytes()),"diagnostic_span_hashes":hashes});
         Ok((bindings,receipt))
     }
@@ -291,12 +446,13 @@ impl Media {
         comm:&Roce,stream:&Stream)->Result<ImageSpan> {
         let g=image.geometry;
         let patches=(||->Result<_>{
-            let patches=if self.encoder_rank!=0 || self.rank==0 {
+            // Resolve before allocating GPU patches. Refusals still participate
+            // in the same two all-rank votes, then the bounded cache reclaim
+            // and retry above. Rank zero must never leave peers in a broadcast.
+            let input=if self.rank==0 {Some(self.resolve_input(image)?)}else{None};
+            let patches=if self.split || self.encoder_rank!=0 || self.rank==0 {
                 let mut patches=self.cuda.allocate_input::<bf16>(g.rows()*588)?;
-                if self.rank==0 {
-                    let input=self.inputs.get(&image.input)
-                        .ok_or_else(||anyhow::anyhow!("missing image input on the ingress rank"))?;
-                    ensure!(input.geometry==g,"request image input geometry differs");
+                if let Some(input)=input {
                     patches.upload(input.patches.reinterpret_cast())?;
                 }
                 stream.join_default()?;
@@ -310,13 +466,17 @@ impl Media {
         })();
         let patches=coordinate_input_stage(patches,required,"image patch allocation unavailable",
             &mut |v|control.all_admit(v))?;
-        if self.encoder_rank!=0 {
+        if self.split || self.encoder_rank!=0 {
             unsafe {comm.broadcast_image_patches(patches.as_ref().unwrap(),0,stream)?;}
         }
         // Complete transport before any rank can free input after a refusal.
         stream.synchronize()?;comm.health()?;
         let span=(||->Result<_>{
-            let span=if self.rank==self.encoder_rank {
+            let span=if self.split&&Vision::split_rows(g).is_some() {
+                // Every rank computes its row slice; only the root's span is complete
+                // and the caller's ordinary broadcast distributes it.
+                self.encoder.as_ref().unwrap().encode_split(patches.as_ref().unwrap(),g,comm,self.rank,self.encoder_rank,stream)?
+            }else if self.rank==self.encoder_rank {
                 self.encoder.as_ref().unwrap().encode_with_arena(patches.as_ref().unwrap(),g,stream,self.compact_workspace,self.scratch_for(g)?)?
             }else{ImageSpan {data:self.cuda.allocate_input(g.tokens()*5120)?,geometry:g}};
             #[cfg(feature="storage-fault-injection")]
@@ -329,7 +489,11 @@ impl Media {
             &mut |v|control.all_admit(v))
     }
     pub(crate) fn release_warm(&mut self) { self.cache.release_warm(); }
-    pub(crate) fn clear_inputs(&mut self) { self.inputs.clear(); }
+    pub(crate) fn clear_inputs(&mut self) {
+        self.inputs.clear();
+        #[cfg(feature="vision-protocol")]
+        self.deferred_inputs.clear();
+    }
 }
 
 fn encoder_rank(value:Option<&str>)->Result<usize> {
@@ -351,6 +515,7 @@ pub fn placement_probe(path:&std::path::Path)->Result<Value> {
         #[serde(default)] capacity_checks:bool,
         #[serde(default)] workspace_compare:bool,
         #[serde(default)] arena_compare:bool,
+        #[serde(default)] split_compare:bool,
     }
     let p:Probe=serde_json::from_slice(&std::fs::read(path)?)?;
     ensure!(!p.capacity_checks || cfg!(feature="storage-fault-injection"),"capacity probe requires diagnostic build");
@@ -371,12 +536,14 @@ pub fn placement_probe(path:&std::path::Path)->Result<Value> {
     let mut reference=Vec::new();let mut records=Vec::new();
     let mut capacity_records:Vec<Value>=Vec::new();
     let compact=crate::vision::compact_workspace()?;
-    let mut placements=if p.workspace_compare {vec![(0,false,false),(3,false,false),(3,true,false)]}else{vec![(0,compact,false),(3,compact,false)]};
-    if p.arena_compare {placements.push((3,true,true));}
+    let mut placements=if p.workspace_compare {vec![(0,false,false,false),(3,false,false,false),(3,true,false,false)]}
+        else{vec![(0,compact,false,false),(3,compact,false,false)]};
+    if p.arena_compare {placements.push((3,true,true,false));}
+    if p.split_compare {placements.push((3,compact,false,true));}
     let mut workspace_records=Vec::new();
-    for (location,compact,borrowed) in placements {
+    for (location,compact,borrowed,split) in placements {
         let before=cuda.admission_memory()?;
-        let mut media=Media::load_at(&cuda,p.rank,&model,&p.vision,location)?;
+        let mut media=Media::load_at(&cuda,p.rank,&model,&p.vision,location,split)?;
         media.compact_workspace=compact;
         if borrowed {media.lend_prefill_scratch(Some(cuda.row_arena(8192*30720*2)?));}
         let after=cuda.admission_memory()?;
@@ -397,7 +564,7 @@ pub fn placement_probe(path:&std::path::Path)->Result<Value> {
             control.agree(&serde_json::to_vec(hashes)?)?;
             ensure!(receipt["encoded_images"]==if step<2{1}else{0}
                 && receipt["prefix_images_skipped"]==usize::from(skip),"vision placement cache/skip contract");
-            records.push(json!({"encoder_rank":location,"compact_workspace":compact,"borrowed_prefill_scratch":borrowed,"step":step,"case":case,"seconds":started.elapsed().as_secs_f64(),
+            records.push(json!({"encoder_rank":location,"split":split,"compact_workspace":compact,"borrowed_prefill_scratch":borrowed,"step":step,"case":case,"seconds":started.elapsed().as_secs_f64(),
                 "receipt":receipt,"load_memory_before":before,"load_memory_after":after,
                 "encoder_weight_bytes":media.encoder.as_ref().map_or(0,Vision::weight_bytes),"all_peer_span_hashes_equal":true}));
             drop(bindings);
@@ -490,6 +657,11 @@ mod placement_tests {
         let e=coordinate_input_stage::<()>(Err(InputCapacityError("local",19).into()),19,"patch",
             &mut |v|{votes.push(v);Ok(v)}).unwrap_err();
         assert!(e.downcast_ref::<InputCapacityError>().is_some());assert_eq!(votes,vec![true,false]);
+        // A deferred pixel miss can need more host scratch than GPU encoding.
+        // Keep that requirement through the peer votes for the one reclaim.
+        let e=coordinate_input_stage::<()>(Err(InputCapacityError("pixel workspace",31).into()),19,"patch",
+            &mut |v|Ok(v)).unwrap_err();
+        assert_eq!(e.downcast_ref::<InputCapacityError>().unwrap().1,31);
         // Peer capacity releases this rank's allocation before returning.
         let owner=Rc::new(());let weak=Rc::downgrade(&owner);let mut call=0;
         let e=coordinate_input_stage(Ok(owner),19,"span",&mut |_|{call+=1;Ok(call==1)}).unwrap_err();

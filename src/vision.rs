@@ -8,7 +8,7 @@ use crate::{
     triton_ops::Operator,
     weights::Weights,
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use half::bf16;
 use serde::{Deserialize, Serialize};
 use std::{ffi::c_void, path::Path};
@@ -142,6 +142,12 @@ pub struct Vision {
     module: Module,
     attention: Operator,
     blas: Blas,
+    /// Optional cuBLASLt BF16 bias epilogue for biased projections (resolved at creation).
+    lt_bias: Option<crate::blas_lt::BlasLt>,
+    /// Row-split attention (local query rows, full keys), present when the artifact provides it.
+    split_attention: Option<Operator>,
+    // Fixed at construction; no environment lookup in image/block loops.
+    norm_mode: u8,
 }
 
 pub struct ImageSpan {
@@ -219,12 +225,31 @@ impl Vision {
         }
         let blas = Blas::new(cuda)?;
         blas.require_fp32_reduction()?;
+        // Fused normalization keeps BF16 image spans identical with modest
+        // small-image gains. Resolve once at encoder creation.
+        let norm_mode = match std::env::var("CANADA_SCRATCH_VISION_NORM_MODE").as_deref() {
+            Ok("baseline") => 0,
+            Ok("packed") => 1,
+            Err(std::env::VarError::NotPresent) | Ok("fused") => 2,
+            _ => anyhow::bail!("vision norm mode must be baseline, packed or fused"),
+        };
         Ok(Self {
             cuda: cuda.clone(),
             weights,
             module: cuda.module(kernel)?,
             attention: Operator::load(cuda, attention, "vision_full_attention")?,
+            split_attention: {
+                let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(attention.join("manifest.json"))?)?;
+                let present = manifest["entries"].as_array().is_some_and(|e| e.iter().any(|x| x["name"] == "vision_split_attention"));
+                if present { Some(Operator::load(cuda, attention, "vision_split_attention")?) } else { None }
+            },
             blas,
+            lt_bias: match std::env::var("CANADA_SCRATCH_VISION_LT_BIAS").as_deref() {
+                Err(std::env::VarError::NotPresent) | Ok("0") => None,
+                Ok("1") => Some(crate::blas_lt::BlasLt::new(cuda)?),
+                _ => anyhow::bail!("vision Lt bias policy must be 0 or 1"),
+            },
+            norm_mode,
         })
     }
     pub fn source_sha256(&self) -> &str {
@@ -232,6 +257,11 @@ impl Vision {
     }
     pub fn weight_bytes(&self) -> usize {
         self.weights.bytes()
+    }
+    pub(crate) fn set_probe_norm_mode(&mut self, mode: u8) -> Result<()> {
+        ensure!(mode <= 2, "vision probe norm mode");
+        self.norm_mode = mode;
+        Ok(())
     }
 
     fn launch(&self, name: &str, blocks: usize, values: &[u64], stream: &Stream) -> Result<()> {
@@ -271,6 +301,11 @@ impl Vision {
             "vision projection buffer extent"
         );
         let w = self.weights.ptr(&format!("{name}.weight"))?;
+        if let (true, Some(lt)) = (bias, &self.lt_bias) {
+            lt.prepare_bias(m, n, k)?;
+            return unsafe { lt.linear_bias_bf16_raw(x.ptr(), w, self.weights.ptr(&format!("{name}.bias"))?,
+                y.ptr(), m, n, k, stream) };
+        }
         unsafe {
             self.blas.linear_raw(
                 x.ptr(),
@@ -307,6 +342,10 @@ impl Vision {
         rows: usize,
         stream: &Stream,
     ) -> Result<()> {
+        if self.norm_mode != 0 {
+            return self.launch("vision_norm_rows", rows.div_ceil(8),
+                &[x.ptr(), self.weights.ptr(name)?, y.ptr(), rows as u64], stream);
+        }
         self.launch(
             "vision_norm",
             rows,
@@ -314,7 +353,131 @@ impl Vision {
             stream,
         )
     }
+    fn residual_norm(&self, x: &Buffer<bf16>, delta: &Buffer<bf16>,
+        y: &Buffer<bf16>, weight: &str, rows: usize, stream: &Stream) -> Result<()> {
+        self.launch("vision_residual_norm_rows", rows.div_ceil(8),
+            &[x.ptr(), delta.ptr(), self.weights.ptr(weight)?, y.ptr(), rows as u64], stream)
+    }
 
+    pub(crate) fn split_capable(&self) -> bool { self.split_attention.is_some() }
+    /// Rows per rank for a row-split encode: a multiple of 64 (keeps every row slice of the
+    /// 1176-byte patch rows 16-byte aligned and matches the attention query tile), leaving
+    /// the last rank at least one row. None means every rank uses single-rank encoding.
+    pub(crate) fn split_rows(g: Geometry) -> Option<usize> {
+        let n = g.rows();
+        let pad = n.div_ceil(4).next_multiple_of(64);
+        (3 * pad < n).then_some(pad)
+    }
+    /// Per-rank transient bytes of a row-split encode (plus the existing driver allowance).
+    pub(crate) fn split_admission_bytes(g: Geometry, root: bool) -> Result<usize> {
+        let g = g.validate()?; let n = g.rows(); let m = g.feature_rows();
+        let pad = Self::split_rows(g).context("image too small for a row-split encode")?;
+        let r = |bytes: usize| bytes.next_multiple_of(2 << 20);
+        let bf16 = [pad*1024, pad*1024, pad*3072, pad*1024, pad*1024, pad*1024, 4*pad*1024, 4*pad*1024,
+            pad*1024, pad*1024, pad*5632, pad*2816, 4*pad*1024, g.tokens()*5120];
+        let rootb = if root { [m*9216, m*5120, m*5120, m*5120] } else { [0; 4] };
+        Ok(bf16.iter().chain(rootb.iter()).map(|n| r(n * 2)).sum::<usize>()
+            + r((pad*3072).max(if root { m*5120 } else { 0 }) * 4) + 2 * r(n*32*4) + 2 * r(8) + (512 << 20))
+    }
+    /// Row-split encode across the four TP ranks. Each rank runs every block on its
+    /// contiguous quarter of the patch rows and gathers K/V per block; per-row attention
+    /// arithmetic matches vision_full_attention. Only `root` forms the aligned span; the
+    /// caller broadcasts it exactly as for single-rank encoding.
+    pub(crate) fn encode_split(&self, patches: &Buffer<bf16>, geometry: Geometry, comm: &crate::roce::Roce,
+        rank: usize, root: usize, stream: &Stream) -> Result<ImageSpan> {
+        let split = self.split_attention.as_ref().context("vision split attention artifact absent")?;
+        let g = geometry.validate()?;
+        let n = g.rows(); let m = g.feature_rows();
+        ensure!(rank < 4 && root < 4 && comm.rank() == rank && self.cuda.owns_stream(stream)
+            && self.cuda.owns_buffer(patches) && patches.len() == n * 588, "vision split input/context");
+        let pad = Self::split_rows(g).context("image too small for a row-split encode")?;
+        let r0 = rank * pad; let nl = n.saturating_sub(r0).min(pad);
+        ensure!(nl > 0 && nl <= pad && (r0 * 588 * 2) % 16 == 0, "vision split partition");
+        let needed = Self::split_admission_bytes(g, rank == root)?;
+        let reserve = self.cuda.allocation_reserve_bytes();
+        let memory_before = self.cuda.admission_memory()?;
+        ensure!(needed + reserve < memory_before.admitted_available,
+            crate::memory::InputCapacityError("vision split workspace exceeds available UMA above reserve", needed + reserve));
+        let a = |len: usize| -> Result<Buffer<bf16>> { self.cuda.allocate_input::<bf16>(len) };
+        let (x, norm, qkv) = (a(pad*1024)?, a(pad*1024)?, a(pad*3072)?);
+        let (q, k, v) = (a(pad*1024)?, a(pad*1024)?, a(pad*1024)?);
+        let (mut kf, mut vf) = (a(4*pad*1024)?, a(4*pad*1024)?);
+        let (attn, delta) = (a(pad*1024)?, a(pad*1024)?);
+        let (gate_up, gated) = (a(pad*5632)?, a(pad*2816)?);
+        let mut vit = a(4*pad*1024)?;
+        let scratch = self.cuda.allocate_input::<f32>((pad*3072).max(if rank == root { m*5120 } else { 0 }))?;
+        let co = self.cuda.allocate_input::<f32>(n*32)?;
+        let si = self.cuda.allocate_input::<f32>(n*32)?;
+        let mut starts = self.cuda.allocate_input::<i32>(1)?;
+        let mut lengths = self.cuda.allocate_input::<i32>(2)?;
+        starts.upload(&[0])?;
+        lengths.upload(&[n as i32, nl as i32])?;
+        let span = self.cuda.allocate_input::<bf16>(g.tokens()*5120)?;
+        let root_buffers = if rank == root { Some((a(m*9216)?, a(m*5120)?, a(m*5120)?, a(m*5120)?)) } else { None };
+        stream.join_default()?;
+        let decode_selected = comm.decode_reduction_selected();
+        comm.select_decode_reduction(false, stream)?;
+        let run = (|| -> Result<()> {
+            self.elementwise("vision_rope_table", n * 32, &[co.ptr(), si.ptr(), n as u64, g.width as u64], stream)?;
+            let local_patches = unsafe { patches.view(r0 * 588, nl * 588)? };
+            let co_l = unsafe { co.view(r0 * 32, nl * 32)? };
+            let si_l = unsafe { si.view(r0 * 32, nl * 32)? };
+            let count = nl * 1024;
+            self.linear(&local_patches, &x, &scratch, "vision.patch_embed.proj", nl, 1024, 588, true, stream)?;
+            for i in 0..32 {
+                let prefix = format!("vision.blocks.{i}");
+                if self.norm_mode != 2 || i == 0 {
+                    self.norm(&x, &norm, &format!("{prefix}.norm1.weight"), nl, stream)?;
+                }
+                self.linear(&norm, &qkv, &scratch, &format!("{prefix}.attn.wqkv"), nl, 3072, 1024, true, stream)?;
+                self.elementwise("vision_split_rope", count,
+                    &[qkv.ptr(), co_l.ptr(), si_l.ptr(), q.ptr(), k.ptr(), v.ptr(), nl as u64], stream)?;
+                unsafe {
+                    comm.gather_rows(&k, &mut kf, stream)?;
+                    comm.gather_rows(&v, &mut vf, stream)?;
+                    split.launch(nl as u32, &[q.ptr(), kf.ptr(), vf.ptr(), starts.ptr(), lengths.ptr(), attn.ptr()], stream)?;
+                }
+                self.linear(&attn, &delta, &scratch, &format!("{prefix}.attn.wo"), nl, 1024, 1024, true, stream)?;
+                if self.norm_mode == 2 {
+                    self.residual_norm(&x, &delta, &norm, &format!("{prefix}.norm2.weight"), nl, stream)?;
+                } else {
+                    self.elementwise("vision_residual", count, &[x.ptr(), delta.ptr(), count as u64], stream)?;
+                    self.norm(&x, &norm, &format!("{prefix}.norm2.weight"), nl, stream)?;
+                }
+                self.linear(&norm, &gate_up, &scratch, &format!("{prefix}.mlp.w1"), nl, 5632, 1024, false, stream)?;
+                self.elementwise("vision_swiglu", nl * 2816, &[gate_up.ptr(), gated.ptr(), (nl * 2816) as u64], stream)?;
+                self.linear(&gated, &delta, &scratch, &format!("{prefix}.mlp.w2"), nl, 1024, 2816, false, stream)?;
+                if self.norm_mode == 2 {
+                    let weight = if i == 31 { "vision.norm.weight".to_owned() }
+                        else { format!("vision.blocks.{}.norm1.weight", i + 1) };
+                    self.residual_norm(&x, &delta, &norm, &weight, nl, stream)?;
+                } else {
+                    self.elementwise("vision_residual", count, &[x.ptr(), delta.ptr(), count as u64], stream)?;
+                }
+            }
+            if self.norm_mode != 2 {
+                self.norm(&x, &norm, "vision.norm.weight", nl, stream)?;
+            }
+            unsafe { comm.gather_rows(&norm, &mut vit, stream)?; }
+            if let Some((unfolded, align1, gelu, features)) = &root_buffers {
+                self.elementwise("vision_unfold", m * 9216,
+                    &[vit.ptr(), unfolded.ptr(), g.height as u64, g.width as u64, (m * 9216) as u64], stream)?;
+                self.linear(unfolded, align1, &scratch, "aligner.w1", m, 5120, 9216, true, stream)?;
+                self.elementwise("vision_gelu", m * 5120, &[align1.ptr(), gelu.ptr(), (m * 5120) as u64], stream)?;
+                self.linear(gelu, features, &scratch, "aligner.w2", m, 5120, 5120, true, stream)?;
+                self.elementwise("vision_span", g.tokens() * 5120, &[features.ptr(), self.weights.ptr("image_start")?,
+                    self.weights.ptr("image_newline")?, self.weights.ptr("image_end")?, span.ptr(),
+                    g.width.div_ceil(3) as u64, g.tokens() as u64], stream)?;
+            }
+            Ok(())
+        })();
+        let synchronized = stream.synchronize();
+        let restored = comm.select_decode_reduction(decode_selected, stream);
+        run?;
+        synchronized?;
+        restored?;
+        Ok(ImageSpan { data: span, geometry: g })
+    }
     pub fn encode(
         &self,
         patches: &Buffer<bf16>,
@@ -434,7 +597,9 @@ impl Vision {
             tap("patch", x.ptr(), count, "BF16", stream)?;
             for i in 0..32 {
                 let prefix = format!("vision.blocks.{i}");
-                self.norm(&x, &norm, &format!("{prefix}.norm1.weight"), n, stream)?;
+                if self.norm_mode != 2 || i == 0 {
+                    self.norm(&x, &norm, &format!("{prefix}.norm1.weight"), n, stream)?;
+                }
                 if i == 0 {
                     tap("norm1", norm.ptr(), count, "BF16", stream)?;
                 }
@@ -502,16 +667,18 @@ impl Vision {
                 if i == 0 {
                     tap("attention_projection", delta.ptr(), count, "BF16", stream)?;
                 }
-                self.elementwise(
-                    "vision_residual",
-                    count,
-                    &[x.ptr(), delta.ptr(), count as u64],
-                    stream,
-                )?;
+                if self.norm_mode == 2 {
+                    self.residual_norm(&x, &delta, &norm, &format!("{prefix}.norm2.weight"), n, stream)?;
+                } else {
+                    self.elementwise("vision_residual", count,
+                        &[x.ptr(), delta.ptr(), count as u64], stream)?;
+                }
                 if i == 0 {
                     tap("attention_residual", x.ptr(), count, "BF16", stream)?;
                 }
-                self.norm(&x, &norm, &format!("{prefix}.norm2.weight"), n, stream)?;
+                if self.norm_mode != 2 {
+                    self.norm(&x, &norm, &format!("{prefix}.norm2.weight"), n, stream)?;
+                }
                 if i == 0 {
                     tap("norm2", norm.ptr(), count, "BF16", stream)?;
                 }
@@ -552,17 +719,21 @@ impl Vision {
                 if i == 0 {
                     tap("mlp_projection", delta.ptr(), count, "BF16", stream)?;
                 }
-                self.elementwise(
-                    "vision_residual",
-                    count,
-                    &[x.ptr(), delta.ptr(), count as u64],
-                    stream,
-                )?;
+                if self.norm_mode == 2 {
+                    let weight = if i == 31 { "vision.norm.weight".to_owned() }
+                        else { format!("vision.blocks.{}.norm1.weight", i+1) };
+                    self.residual_norm(&x, &delta, &norm, &weight, n, stream)?;
+                } else {
+                    self.elementwise("vision_residual", count,
+                        &[x.ptr(), delta.ptr(), count as u64], stream)?;
+                }
                 if [0, 7, 15, 23, 31].contains(&i) {
                     tap(&format!("block{i}"), x.ptr(), count, "BF16", stream)?;
                 }
             }
-            self.norm(&x, &norm, "vision.norm.weight", n, stream)?;
+            if self.norm_mode != 2 {
+                self.norm(&x, &norm, "vision.norm.weight", n, stream)?;
+            }
             tap("vit", norm.ptr(), count, "BF16", stream)?;
             self.elementwise(
                 "vision_unfold",

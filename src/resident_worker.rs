@@ -153,6 +153,14 @@ mod shared_down_flash_probe;
 mod prefill_head_probe;
 #[path = "prefill_bounds_probe.rs"]
 mod prefill_bounds_probe;
+#[path = "claude_profile_probe.rs"]
+mod claude_profile_probe;
+#[path = "claude_ab_probe.rs"]
+mod claude_ab_probe;
+#[path = "claude_decode_profile.rs"]
+mod claude_decode_profile;
+#[path = "claude_small_probe.rs"]
+mod claude_small_probe;
 #[path = "woa_prefill_probe.rs"]
 mod woa_prefill_probe;
 #[path="query_reuse_worker_probe.rs"]
@@ -2821,6 +2829,69 @@ impl Worker {
         Ok(event)
     }
 
+    /// Optional wide-prefill warmup (CANADA_SCRATCH_WIDE_STARTUP_WARMUP=1), after the public
+    /// startup warmup: one public 8,320-token Begin with prompt/encoder checkpoints and the
+    /// session cache disabled, cancelled after its first token and never published. First-use
+    /// library loads and NCCL connections of the 8K-row profile then happen before ready.
+    /// The reset and empty-state checks are exactly those of warm_before_ready.
+    #[cfg(feature = "serving")]
+    fn warm_wide_before_ready(&mut self, rank: usize) -> Result<Value> {
+        ensure!(self.current.is_none() && self.history.frontier()==0 && !self.progress_next
+            && self.large.context_capacity()>=16384,
+            "wide startup warmup needs an unpublished fresh worker");
+        let raw=include_bytes!("../tests/fixtures/long-context-continuation-v2.json");
+        let corpus:Value=serde_json::from_slice(raw)?;
+        let ids:Vec<u32>=serde_json::from_value(corpus["tokens"].clone())?;
+        ensure!(ids.len()>=8320,"wide startup warmup fixture extent");
+        let started=Instant::now();
+        // After the public warmup's reset the verify owner holds the lease; its digests are the
+        // initial empty state that warm_before_ready itself verified.
+        let empty_carry=self.verify.carry_digests()?;
+        let empty_encoder=self.verify.encoder_tail_digest()?;
+        let saved=(self.session_cache_budget,self.prompt_checkpoint,self.encoder_prompt_checkpoint,self.prompt_cache_logits);
+        self.cached_sessions.clear();
+        self.session_cache_budget=0;self.prompt_checkpoint=false;
+        self.encoder_prompt_checkpoint=false;self.prompt_cache_logits=false;
+        let run=(|| -> Result<usize> {
+            let wire=Command::Begin{images:Vec::new(),id:2,seed:0,greedy:false,limit:1,tokens:ids[..8320].to_vec()}.encode()?;
+            let command=self.control.command((rank==0).then_some(wire.as_slice()))?;
+            self.execute(Command::decode(&command)?)?;
+            let mut events=0;
+            loop {
+                let command=if rank==0 {Some(Command::Finish(Finish::Cancelled).encode()?)} else {None};
+                let wire=self.control.command(command.as_deref())?;
+                let event=self.execute(Command::decode(&wire)?)?;
+                events+=1;
+                if event["type"]=="finish" {break;}
+                ensure!(event["type"]=="tokens" && events<4,"unexpected wide startup warmup event");
+            }
+            Ok(events)
+        })();
+        (self.session_cache_budget,self.prompt_checkpoint,self.encoder_prompt_checkpoint,self.prompt_cache_logits)=saved;
+        let events=run?;
+        self.target_lineage=self.target_lineage.checked_add(1)
+            .ok_or_else(||anyhow::anyhow!("startup target lineage exhausted"))?;
+        self.verify.reset(self.target_lineage,&self.comm,&self.stream)?;
+        let draft_cleared=self.session.as_mut().context("wide warmup session")?.clear_startup_state(&self.stream)?;
+        self.cached_sessions.clear();
+        let carry_cleared=self.verify.carry_digests()?==empty_carry;
+        let encoder_cleared=self.verify.encoder_tail_digest()?==empty_encoder;
+        ensure!(carry_cleared && encoder_cleared,
+            "wide startup reset differs from initial empty state: carry={carry_cleared}, encoder={encoder_cleared}");
+        self.history=ResidentHistory::new(self.large.context_capacity(),self.cfg.eos_token_id)?;
+        self.emitted=0;self.limit=0;
+        ensure!(self.current.is_none() && self.history.frontier()==0
+            && self.history.pending().is_none() && self.verify.profile_is_current()
+            && self.verify.position()==0 && draft_cleared,
+            "wide startup model/session state was not cleared");
+        self.agree(&[])?;
+        let memory=self.cuda.admission_memory()?;
+        ensure!(memory.admitted_available>=8*1024usize.pow(3),"wide startup warmup consumed runtime reserve");
+        Ok(json!({"seconds":started.elapsed().as_secs_f64(),"public_prompt_tokens":8320,"finish_events":events,
+            "checkpoints_disabled_during_warmup":true,"carry_and_encoder_match_initial_empty":true,
+            "no_output_published":true,"memory":memory}))
+    }
+
     fn warm_before_ready(&mut self, rank: usize) -> Result<Value> {
         ensure!(self.current.is_none() && self.session.is_none()
             && self.history.frontier()==0 && !self.progress_next
@@ -3381,6 +3452,18 @@ pub fn run_file(path: &Path) -> Result<()> {
     }
     if std::env::var("CANADA_SCRATCH_PREFILL_BOUNDS_SCREEN").as_deref()==Ok("1") {
         return prefill_bounds_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_CLAUDE_PREFILL_PROFILE").as_deref()==Ok("1") {
+        return claude_profile_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_CLAUDE_SMALL_PROFILE").as_deref()==Ok("1") {
+        return claude_small_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var("CANADA_SCRATCH_CLAUDE_DECODE_PROFILE").as_deref()==Ok("1") {
+        return claude_decode_profile::run(&mut worker,p.rank,p.events.parent().unwrap());
+    }
+    if std::env::var_os("CANADA_SCRATCH_CLAUDE_AB").is_some() {
+        return claude_ab_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
     }
     if std::env::var("CANADA_SCRATCH_WOA_PREFILL_SCREEN").as_deref()==Ok("1") {
         return woa_prefill_probe::run(&mut worker,p.rank,p.events.parent().unwrap());
@@ -4056,6 +4139,13 @@ pub fn run_http(path: &Path) -> Result<()> {
         Err(std::env::VarError::NotPresent) => None,
         Err(error) => return Err(error.into()),
     };
+    #[cfg(feature = "serving")]
+    let wide_startup_warmup = if std::env::var("CANADA_SCRATCH_WIDE_STARTUP_WARMUP").as_deref()==Ok("1") {
+        ensure!(startup_warmup.is_some(),"wide startup warmup follows the public startup warmup");
+        Some(worker.warm_wide_before_ready(p.rank)?)
+    } else {None};
+    #[cfg(not(feature = "serving"))]
+    let wide_startup_warmup:Option<Value> = None;
     worker.cuda.report_allocation_sites("startup warmup complete")?;
     worker.progress_next = progress_next;
     let mut ready = json!({"type":"ready","rank":p.rank,"identity":worker.identity,
@@ -4097,6 +4187,7 @@ pub fn run_http(path: &Path) -> Result<()> {
         "nccl_init_seconds":worker.nccl_init_seconds,
         "nccl_runtime_connect_requested":std::env::var("NCCL_RUNTIME_CONNECT").ok(),
         "context_capacity":p.context,"memory":worker.cuda.admission_memory()?,"production_qualified":false});
+    ready["wide_startup_warmup"]=json!(wide_startup_warmup);
     ready["idle_anchor_enabled"]=json!(worker.idle_anchor_enabled);
     ready["retained_append32"]=json!(worker.retained_append32);
     ready["append_final_row_gather"]=json!(worker.verify.append_last_gather_enabled());
@@ -4166,7 +4257,7 @@ pub fn run_http(path: &Path) -> Result<()> {
                         .ok_or_else(|| anyhow::anyhow!("request counter exhausted"))?;
                     if !job.images.is_empty() {
                         worker.media.as_mut().ok_or_else(|| anyhow::anyhow!("image request without native vision"))?
-                            .set_inputs(&std::mem::take(&mut job.image_inputs))?;
+                            .set_job_inputs(&mut job)?;
                     }
                     let command = Command::Begin {images: std::mem::take(&mut job.images),
                         id,

@@ -724,3 +724,5 @@ extern "C" __global__ void ca_trace_copy_first(const uint32_t* current,
 #include "block_decide_finish_fused.cuh"
 
 #include "ffn_sum_shared.cuh"
+
+#include "wob8_sum4.cuh"

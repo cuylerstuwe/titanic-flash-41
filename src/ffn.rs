@@ -370,6 +370,45 @@ pub struct LayerFfn {
     expert_prefetch: Option<crate::l2_prefetch::Window>,
     row_transport: Option<RowTransport>,
     use_row_transport: bool,
+    local_shared: Option<LocalShared>,
+}
+/// Sequence-parallel row-local shared expert (CANADA_SCRATCH_PREFILL_LOCAL_SHARED=1):
+/// staged full w13 (rank-blocked [gate_r | up_r]) and full-K w2 on this rank's rows.
+/// Only the routed partial is reduce-scattered; the local shared output is added
+/// afterwards. With CANADA_SCRATCH_PREFILL_LOCAL_SHARED_OVERLAP=1 it runs on a side
+/// stream during the input gather and joins before the routed experts.
+struct LocalShared {
+    up: Linear,
+    down: Linear,
+    activation: Buffer<bf16>,
+    rows: usize,
+    branch: Option<SharedBranch>,
+    pending: Cell<bool>,
+}
+static LOCAL_SHARED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+static LOCAL_SHARED_OVERLAP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+/// CANADA_SCRATCH_PREFILL_LOCAL_SHARED_LATE=1 (with the overlap branch): start the row-local
+/// shared expert when the routed partial is ready, so it runs beside the routed reduce-scatter
+/// instead of the input gather. Same kernels, inputs and final addition order.
+static LOCAL_SHARED_LATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+fn resolved(flag: &std::sync::atomic::AtomicU8, name: &str) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match flag.load(Relaxed) {
+        2 => { let on = std::env::var(name).as_deref() == Ok("1"); flag.store(on as u8, Relaxed); on }
+        v => v == 1,
+    }
+}
+pub(crate) fn local_shared_constructed() -> bool {
+    std::env::var("CANADA_SCRATCH_PREFILL_LOCAL_SHARED").as_deref() == Ok("1")
+}
+pub(crate) fn set_local_shared_for_probe(enabled: bool) {
+    LOCAL_SHARED.store(enabled as u8, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn set_local_shared_overlap_for_probe(enabled: bool) {
+    LOCAL_SHARED_OVERLAP.store(enabled as u8, std::sync::atomic::Ordering::Relaxed);
+}
+pub(crate) fn set_local_shared_late_for_probe(enabled: bool) {
+    LOCAL_SHARED_LATE.store(enabled as u8, std::sync::atomic::Ordering::Relaxed);
 }
 type Codec = unsafe extern "C" fn(*const c_void, *const c_void, *const c_void, *mut c_void, i32, i32, *mut c_void) -> i32;
 type Decode = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, *mut c_void, i32, i32, *mut c_void) -> i32;
@@ -408,7 +447,52 @@ pub(crate) fn wide_overlap_enabled(rows:usize) -> Result<bool> {
     ensure!(!enabled||(fenced&&base),"wide FFN overlap requires fenced dense kernels and base overlap policies");
     Ok(enabled)
 }
+/// Prefill (>=512-row) shared-expert branch: the existing dual-stream schedule
+/// (routed work issued first on the parent, shared expert on an auxiliary stream,
+/// joined before the shared addition). Same kernels and buffers; ordering only.
+/// Same-allocation A/B control for the prefill branch: false issues the shared
+/// expert on its branch only after routed work (serial order, same stream binding).
+static PREFILL_SHARED_CONCURRENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub(crate) fn set_prefill_shared_concurrent_for_probe(enabled:bool) {
+    PREFILL_SHARED_CONCURRENT.store(enabled,std::sync::atomic::Ordering::Relaxed);
+}
+fn prefill_shared_concurrent(rows:usize)->bool {
+    rows<512 || PREFILL_SHARED_CONCURRENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) fn prefill_shared_overlap_requested()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_PREFILL_SHARED_OVERLAP") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","invalid prefill shared overlap policy");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
+    }
+}
 impl LayerFfn {
+    pub(crate) fn enable_prefill_shared_overlap(&mut self,stream:&Stream)->Result<()> {
+        ensure!(self.rows>=512&&self.shared_branch.is_none()&&self.cuda.owns_stream(stream),
+            "prefill shared-expert overlap admission");
+        self.shared_branch=Some(SharedBranch {stream:self.cuda.auxiliary_stream(stream)?,
+            input_ready:self.cuda.fence_event()?,output_ready:self.cuda.fence_event()?});
+        Ok(())
+    }
+    /// Routed packed experts on the parent, shared expert on the branch when installed.
+    fn run_packed_and_shared(&self,workspace:&Workspace,gathered:&Buffer<u8>,q:&Buffer<u8>,sm:&Buffer<u8>,
+        stream:&Stream)->Result<()> {
+        if let Some(branch)=&self.shared_branch {
+            let concurrent=prefill_shared_concurrent(self.rows);
+            if concurrent {branch.input_ready.record(stream)?;}
+            workspace.run_packed(&self.expert,gathered,self.router.ids(),self.router.routing(),stream)?;
+            if !concurrent {branch.input_ready.record(stream)?;}
+            branch.input_ready.wait(&branch.stream)?;
+            self.shared_up.run_quantized(q,sm,&branch.stream)?;
+            self.finish_shared(&branch.stream)?;
+            branch.output_ready.record(&branch.stream)?;
+            branch.output_ready.wait(stream)?;
+        } else {
+            workspace.run_packed(&self.expert,gathered,self.router.ids(),self.router.routing(),stream)?;
+            self.shared_up.run_quantized(q,sm,stream)?;
+            self.finish_shared(stream)?;
+        }
+        self.add_shared(workspace,stream)
+    }
     pub(crate) fn enable_verify16_overlap_before_capture(&mut self,stream:&Stream)->Result<()> {
         ensure!(wide_overlap_enabled(self.rows)?&&self.shared_branch.is_none()
             &&self.cuda.owns_stream(stream),"uncaptured M16 shared-expert overlap admission");
@@ -562,6 +646,7 @@ impl LayerFfn {
             expert_prefetch: None,
             row_transport: None,
             use_row_transport: false,
+            local_shared: None,
         })
     }
     pub(crate) fn enable_row_transport(&mut self, kernels: &Path, vendor_blas: Option<Rc<Blas>>) -> Result<()> {
@@ -606,6 +691,7 @@ impl LayerFfn {
             && input.len() == (self.rows/4)*5120 && self.cuda.owns_buffer(input)
             && self.cuda.owns_buffer(&tokens.ids) && self.cuda.owns_buffer(&tokens.live)
             && self.cuda.owns_stream(stream), "packed MoE transport input geometry/context");
+        let local_shared = self.local_shared_active();
         let t = self.row_transport.as_mut().context("packed MoE transport absent")?;
         // Both views refer to persistent owners. The graph reads the live count
         // on-device, so a captured partial chunk never freezes a CPU row count.
@@ -635,14 +721,18 @@ impl LayerFfn {
             comm.gather_rows(t.router.ids(),&mut self.router.ids,stream)?;
             comm.gather_rows(t.router.routing(),&mut self.router.routing,stream)?;
         }
+        if local_shared {
+            // Only routed experts consume the gathered rows; the shared expert ran row-locally.
+            let gathered=unsafe{t.gathered.view(0,t.gathered.len())}?;
+            self.join_local_shared(stream)?;
+            return workspace.run_packed(&self.expert,&gathered,self.router.ids(),self.router.routing(),stream);
+        }
         let (q,sr,sm) = self.shared_up.wide_shared_quantization_buffers()?;
         ensure!(unsafe {(t.decode)(t.gathered.ptr() as *const c_void,q.ptr() as *mut c_void,
             sr.ptr() as *mut c_void,sm.ptr() as *mut c_void,self.rows as i32,5120,stream.raw())} == 0,
             "packed MoE shared decode launch");
-        workspace.run_packed(&self.expert,&t.gathered,self.router.ids(),self.router.routing(),stream)?;
-        self.shared_up.run_quantized(q,sm,stream)?;
-        self.finish_shared(stream)?;
-        self.add_shared(workspace,stream)
+        let gathered=unsafe{t.gathered.view(0,t.gathered.len())}?;
+        self.run_packed_and_shared(workspace,&gathered,q,sm,stream)
     }
     pub(crate) fn prefetch_begin(&self, stream: &Stream) -> Result<()> {
         // Queue the small expert hint first. Its early join must not wait for
@@ -710,7 +800,16 @@ impl LayerFfn {
             self.cuda.owns_buffer(workspace.output()),
             "MoE workspace context mismatch"
         );
-        if let Some(branch) = &self.shared_branch {
+        if self.local_shared_active() {
+            // Routed experts only (no fused shared sum); the shared expert ran row-locally.
+            self.router.run(input, tokens, stream)?;
+            self.join_local_shared(stream)?;
+            workspace.run_live_for_ffn(&self.expert, input, self.router.ids(), self.router.routing(),
+                tokens.active_rows(), false, stream)?;
+            return Ok(());
+        }
+        let concurrent=prefill_shared_concurrent(self.rows);
+        if let Some(branch) = self.shared_branch.as_ref().filter(|_| concurrent) {
             branch.input_ready.record(stream)?;
         }
         self.router.run(input, tokens, stream)?;
@@ -724,6 +823,7 @@ impl LayerFfn {
             stream,
         )?;
         if let Some(branch) = &self.shared_branch {
+            if !concurrent {branch.input_ready.record(stream)?;}
             branch.input_ready.wait(&branch.stream)?;
             self.run_shared_quantized_input(input,quantized,&branch.stream)?;
             branch.output_ready.record(&branch.stream)?;
@@ -938,6 +1038,95 @@ pub(crate) fn shared_quant16_enabled() -> Result<bool> {
 }
 
 impl LayerFfn {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn enable_local_shared(&mut self, cuda: &Cuda, module: &Module, stream: &Stream,
+        weights: &Rc<Weights>, kernels: &Path, layer: usize, rank: usize) -> Result<()> {
+        ensure!(crate::config::wide_rows(self.rows) && self.rows % 512 == 0 && rank < 4 && self.local_shared.is_none(),
+            "row-local shared expert geometry");
+        let local = self.rows / 4;
+        let p = format!("layers.{layer}.ffn.shared_experts");
+        let up = crate::staged_full::load_parts(cuda, module, stream, weights, kernels, "claude-shared-full-v1",
+            Some("w13"), &[&format!("{p}.w1"), &format!("{p}.w3")], layer, rank, 4608, 5120, crate::staged_full::Split::Rows)?;
+        let down = crate::staged_full::load_parts(cuda, module, stream, weights, kernels, "claude-shared-full-v1",
+            Some("w2"), &[&format!("{p}.w2")], layer, rank, 5120, 2304, crate::staged_full::Split::Columns)?;
+        let overlap = std::env::var("CANADA_SCRATCH_PREFILL_LOCAL_SHARED_OVERLAP").as_deref() == Ok("1");
+        self.local_shared = Some(LocalShared {
+            up: Linear::new_rc(cuda, &kernels.join(format!("claude-fp8-shared-w13-full-m{local}-v1")), up)?,
+            down: Linear::new_rc(cuda, &kernels.join(format!("claude-fp8-shared-w2-full-m{local}-v1")), down)?,
+            activation: cuda.allocate_rows(local * 2304)?,
+            rows: local,
+            branch: if overlap { Some(SharedBranch { stream: cuda.auxiliary_stream(stream)?,
+                input_ready: cuda.fence_event()?, output_ready: cuda.fence_event()? }) } else { None },
+            pending: Cell::new(false),
+        });
+        Ok(())
+    }
+    /// out = a + b over `rows` BF16 rows of width 5120 (out may alias a).
+    pub(crate) fn add_rows_bf16(&self, a: &Buffer<bf16>, b: &Buffer<bf16>, out: &Buffer<bf16>,
+        rows: usize, stream: &Stream) -> Result<()> {
+        ensure!(a.len() >= rows * 5120 && b.len() >= rows * 5120 && out.len() >= rows * 5120
+            && self.cuda.owns_buffer(a) && self.cuda.owns_buffer(b) && self.cuda.owns_buffer(out), "BF16 row add extent");
+        ensure!(unsafe { (self.native.add)(rows as i32, a.ptr() as *const c_void, b.ptr() as *const c_void,
+            out.ptr() as *mut c_void, stream.raw()) } == 0, "BF16 row add launch");
+        Ok(())
+    }
+    pub(crate) fn local_shared_active(&self) -> bool {
+        self.local_shared.is_some() && resolved(&LOCAL_SHARED, "CANADA_SCRATCH_PREFILL_LOCAL_SHARED")
+    }
+    /// Late start applies only to the overlapped side-stream branch.
+    pub(crate) fn local_shared_late(&self) -> bool {
+        self.local_shared_active()
+            && self.local_shared.as_ref().is_some_and(|s| s.branch.is_some())
+            && resolved(&LOCAL_SHARED_OVERLAP, "CANADA_SCRATCH_PREFILL_LOCAL_SHARED_OVERLAP")
+            && resolved(&LOCAL_SHARED_LATE, "CANADA_SCRATCH_PREFILL_LOCAL_SHARED_LATE")
+    }
+    /// Start the row-local shared expert from this rank's normalized FFN rows.
+    pub(crate) fn begin_local_shared(&self, input: &Buffer<bf16>, stream: &Stream) -> Result<()> {
+        let s = self.local_shared.as_ref().context("row-local shared expert absent")?;
+        ensure!(input.len() == s.rows * 5120 && !s.pending.get() && self.cuda.owns_buffer(input),
+            "row-local shared input/state");
+        let run = |st: &Stream| -> Result<()> {
+            s.up.run(input, st)?;
+            // Rank-blocked [gate_r | up_r] rows of width 1152: the per-shard SwiGLU over
+            // 4x rows writes the activation in w2's K order.
+            ensure!(unsafe { (self.native.swiglu)((s.rows * 4) as i32, s.up.output().ptr() as *const c_void,
+                s.activation.ptr() as *mut c_void, st.raw()) } == 0, "row-local shared SwiGLU launch");
+            s.down.run(&s.activation, st)
+        };
+        // Linears bind to one ordered stream: with a branch, always run there; the
+        // serial selection joins immediately instead of before the routed experts.
+        match s.branch.as_ref() {
+            Some(b) => {
+                b.input_ready.record(stream)?;
+                b.input_ready.wait(&b.stream)?;
+                run(&b.stream)?;
+                b.output_ready.record(&b.stream)?;
+                s.pending.set(true);
+                if !resolved(&LOCAL_SHARED_OVERLAP, "CANADA_SCRATCH_PREFILL_LOCAL_SHARED_OVERLAP") {
+                    self.join_local_shared(stream)?;
+                }
+            }
+            None => run(stream)?,
+        }
+        Ok(())
+    }
+    pub(crate) fn join_local_shared(&self, stream: &Stream) -> Result<()> {
+        if let Some(s) = self.local_shared.as_ref().filter(|s| s.pending.get()) {
+            s.branch.as_ref().context("local shared branch")?.output_ready.wait(stream)?;
+            s.pending.set(false);
+        }
+        Ok(())
+    }
+    /// `reduced` (this rank's rows of the routed sum) += the row-local shared output.
+    pub(crate) fn add_local_shared(&self, reduced: &mut Buffer<bf16>, stream: &Stream) -> Result<()> {
+        self.join_local_shared(stream)?;
+        let s = self.local_shared.as_ref().context("row-local shared expert absent")?;
+        ensure!(reduced.len() == s.rows * 5120 && self.cuda.owns_buffer(reduced), "row-local shared sum extent");
+        ensure!(unsafe { (self.native.add)(s.rows as i32, reduced.ptr() as *const c_void,
+            s.down.output().ptr() as *const c_void, reduced.ptr() as *mut c_void, stream.raw()) } == 0,
+            "row-local shared addition launch");
+        Ok(())
+    }
     /// Caller must hold the idle target and forbid switching captured graphs.
     /// Both libraries retain the exact packed row layout and quantizers.
     pub(crate) fn set_coalesced_codec(&mut self, enabled: bool, kernels: &Path) -> Result<()> {
@@ -988,10 +1177,8 @@ impl LayerFfn {
             comm.gather_rows(t.router.routing(),&mut self.router.routing,stream)?;
             Ok(())
         })?;
-        workspace.run_packed(&self.expert,&t.gathered,self.router.ids(),self.router.routing(),stream)?;
-        self.shared_up.run_quantized(q,sm,stream)?;
-        self.finish_shared(stream)?;
-        self.add_shared(workspace,stream)
+        let gathered=unsafe{t.gathered.view(0,t.gathered.len())}?;
+        self.run_packed_and_shared(workspace,&gathered,q,sm,stream)
     }
 }
 

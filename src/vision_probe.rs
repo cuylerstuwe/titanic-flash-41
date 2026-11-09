@@ -26,6 +26,10 @@ struct Config {
     attention: PathBuf,
     reference: PathBuf,
     output: PathBuf,
+    /// Optional serving vision-only atlas (logical rank-zero plan), used where the
+    /// original safetensors are not present. Exactly one of model/stage is used.
+    #[serde(default)]
+    stage: Option<PathBuf>,
 }
 #[derive(Deserialize)]
 struct Cases {
@@ -47,19 +51,18 @@ pub fn run(path: &Path) -> Result<Value> {
     std::fs::create_dir(&p.output)?;
     let cfg = ModelConfig::parse(&std::fs::read(&p.config)?)?;
     let cp = Checkpoint::from_manifest(&p.checkpoint)?;
-    let plan = RankPlan::build(&cp, &cfg, 3, 4)?;
     let cuda = Cuda::open(0)?;
     cuda.qualify_gb10()?;
     let stream = cuda.stream()?;
     let load = Instant::now();
-    let vision = Vision::new(
-        &cuda,
-        &std::fs::read(&p.kernel)?,
-        &p.attention,
-        &cp,
-        &plan,
-        &p.model,
-    )?;
+    let vision = if let Some(stage) = &p.stage {
+        let plan = RankPlan::build(&cp, &cfg, 0, 4)?;
+        Vision::new_staged(&cuda, &std::fs::read(&p.kernel)?, &p.attention, &cp, &plan, stage)?
+    } else {
+        let plan = RankPlan::build(&cp, &cfg, 3, 4)?;
+        Vision::new(&cuda, &std::fs::read(&p.kernel)?, &p.attention, &cp, &plan, &p.model)?
+    };
+    let profile = std::env::var("CANADA_SCRATCH_VISION_PROFILE").as_deref() == Ok("1");
     let load_seconds = load.elapsed().as_secs_f64();
     let mut records = Vec::new();
     for case in cases.cases {
@@ -106,7 +109,9 @@ pub fn run(path: &Path) -> Result<Value> {
         drop(out);
         let mut times = Vec::new();
         let mut repeat_exact = true;
-        for _ in 0..3 {
+        for repeat in 0..3 {
+            let profiled = profile && repeat == 2;
+            if profiled { stream.synchronize()?; cuda.profiler_start()?; }
             let start = cuda.event()?;
             let end = cuda.event()?;
             let wall = Instant::now();
@@ -114,6 +119,7 @@ pub fn run(path: &Path) -> Result<Value> {
             let value = vision.encode(&patches, g, &stream)?;
             end.record(&stream)?;
             stream.synchronize()?;
+            if profiled { cuda.profiler_stop()?; }
             times.push(json!({"event_ms":end.elapsed_since(&start)?,"wall_ms":wall.elapsed().as_secs_f64()*1000.}));
             repeat_exact &= value
                 .data
