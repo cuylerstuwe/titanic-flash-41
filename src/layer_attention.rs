@@ -992,7 +992,17 @@ impl Layer {
         if self.woa_prefetch_active {self.woa_prefetch.as_ref().unwrap().join(stream)?;}
         // Read-only hints need no consumer dependency. Match the reference's
         // late join at the next communication boundary rather than stalling QB.
-        if let Some(hint) = &self.qb_prefetch {
+        // A deferred layer-20 projection may already have closed its hint.
+        if let Some(hint) = self.qb_prefetch.as_ref().filter(|h| h.is_open()) {
+            hint.join(stream)?;
+        }
+        Ok(())
+    }
+    /// Deferred layer 20: the projection stops before `finish`, so close the
+    /// read-only Q-B L2 hint (no data dependency) before the next projection.
+    pub(crate) fn join_projection_hint(&self, stream: &Stream) -> Result<()> {
+        ensure!(self.query_overlap.is_none(), "deferred projection cannot leave a query fork");
+        if let Some(hint) = self.qb_prefetch.as_ref().filter(|h| h.is_open()) {
             hint.join(stream)?;
         }
         Ok(())

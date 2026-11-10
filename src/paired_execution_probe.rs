@@ -92,7 +92,7 @@ impl Target {
         self.last_append_metrics=Some(AppendMetrics{
             live_rows:prepared.pending.live,physical_rows:self.rows,phase:format!("{:?}",self.source_phase),
             captured_new_graph:captured,engram_split14:false,engram_split14_adaptive:false,
-            encoder_graph_chunks:0,lookahead:Vec::new(),stall_counters:Vec::new(),native_fp32_rows:None,
+            encoder_graph_chunks:0,lookahead:Vec::new(),stall_counters:Vec::new(),native_fp32_rows:None,layer20_deferred_chunks:None,
             total_ms:prepared.marks.last().unwrap().1.duration_since(prepared.marks[0].1).as_secs_f64()*1000.,
             stages_ms:prepared.marks.windows(2).map(|p|(p[1].0,p[1].1.duration_since(p[0].1).as_secs_f64()*1000.)).collect(),
         });

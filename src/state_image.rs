@@ -233,6 +233,47 @@ impl Image {
             copy_module: None,
         }))
     }
+    /// Displaced-checkpoint materialization (CANADA_SCRATCH_DISPLACED_CHECKPOINT): a complete
+    /// image with exactly the `full` descriptors, assembled from a captured bank-retained image
+    /// of the same frontier. Every region the retained image holds is copied from it. Each
+    /// monotone prefix region it holds only the final part of (the bank-retained compressed
+    /// pages) gets its earlier bytes from the live allocation, which the caller guarantees
+    /// still belongs to the unchanged bank lineage (bytes below the final page are never
+    /// rewritten after capture). The result restores through the ordinary validated path.
+    pub(crate) fn try_materialize(cuda: &Cuda, full: &[Region<'_>], retained: &Image, budget: usize,
+        module: Option<&Module>, stream: &Stream) -> Result<Option<Self>> {
+        ensure!(retained.saved, "materialization needs a captured retained image");
+        let Some(mut image) = Self::try_allocate(cuda, full, budget, stream)? else { return Ok(None) };
+        if let Some(module) = module { image.configure_copy_kernel(module)?; }
+        let mut used = vec![false; retained.descriptors.len()];
+        let copies = (|| -> Result<()> {
+            for (region, offset) in full.iter().zip(&image.offsets) {
+                let f = &region.descriptor;
+                let (i, r) = retained.descriptors.iter().enumerate().find(|(_, r)| r.name == f.name)
+                    .with_context(|| format!("retained image lacks region {}", f.name))?;
+                ensure!(!used[i], "retained region used twice");
+                used[i] = true;
+                let destination = image.storage.ptr() + *offset as u64;
+                let source = retained.storage.ptr() + retained.offsets[i] as u64;
+                if r.pointer == f.pointer && r.bytes == f.bytes {
+                    unsafe { cuda.copy_device(destination, source, r.bytes, stream) }?;
+                } else {
+                    let head = f.bytes.checked_sub(r.bytes).filter(|&h| h > 0)
+                        .context("retained region is not a strict tail")?;
+                    ensure!(region.prefix && r.pointer == f.pointer + head as u64,
+                        "only a monotone prefix may omit its earlier bytes");
+                    unsafe { cuda.copy_device(destination, f.pointer, head, stream) }?;
+                    unsafe { cuda.copy_device(destination + head as u64, source, r.bytes, stream) }?;
+                }
+            }
+            ensure!(used.iter().all(|&u| u), "retained image has regions outside the complete image");
+            Ok(())
+        })();
+        let completed = stream.synchronize();
+        copies.and(completed)?;
+        image.saved = true;
+        Ok(Some(image))
+    }
     pub(crate) fn configure_copy_kernel(&mut self,module:&Module)->Result<()> {
         ensure!(!self.saved,"copy path must be selected before capture");
         if copy::enabled() {

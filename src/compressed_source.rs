@@ -509,6 +509,21 @@ impl Layer {
         self.query.run_quantized_distributed(hidden, q, scales, &self.keys, &meta.query, live, comm, stream)?;
         self.mapping.run(self.query.selection(), meta.query.windows(), stream)
     }
+    /// Deferred layer 20 (CANADA_SCRATCH_PREFILL_LAYER20_DEFER): the key-emission
+    /// half of run_*distributed. The matching select_* call, when one is needed,
+    /// issues exactly the remaining operations of the same call in the same order.
+    pub(crate) fn prepare_keys_only(&mut self, hidden: &Buffer<bf16>, meta: &Metadata,
+        stream: &Stream) -> Result<()> {
+        self.prepare_keys(hidden, meta, stream)
+    }
+    pub(crate) fn select_quantized_distributed(&mut self, hidden: &Buffer<bf16>, q: &Buffer<u8>,
+        scales: &Buffer<u8>, meta: &Metadata, live: &Buffer<i32>,
+        comm: &crate::roce::Roce, stream: &Stream) -> Result<()> {
+        ensure!(meta.owner_keys == self.keys.data().ptr() && meta.phase == self.phase && meta.rows == self.rows,
+            "source metadata belongs to another key owner");
+        self.query.run_quantized_distributed(hidden, q, scales, &self.keys, &meta.query, live, comm, stream)?;
+        self.mapping.run(self.query.selection(), meta.query.windows(), stream)
+    }
     fn prepare_keys(
         &mut self,
         hidden: &Buffer<bf16>,

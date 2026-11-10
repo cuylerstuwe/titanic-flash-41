@@ -86,6 +86,8 @@ pub struct AppendMetrics {
     stall_counters: Vec<serde_json::Value>,
     #[serde(skip_serializing_if="Option::is_none")]
     native_fp32_rows: Option<usize>,
+    #[serde(skip_serializing_if="Option::is_none")]
+    layer20_deferred_chunks: Option<usize>,
     stages_ms: Vec<(&'static str, f64)>,
     total_ms: f64,
 }
@@ -264,6 +266,22 @@ pub(crate) fn engram_behind_l0_enabled() -> bool {
             ENGRAM_BEHIND_L0.store(on as u8, Relaxed); on }
         v => v == 1,
     }
+}
+/// CANADA_SCRATCH_PREFILL_LAYER20_DEFER=1: in eager wide prefill, run only layer
+/// 20's projection and source20 keys for chunks before the request's final 128
+/// rows; the decoder replay reads layer 20's output only for those final rows.
+/// Every value later read is produced by the same kernels in the same order.
+pub(crate) fn layer20_defer_enabled() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_PREFILL_LAYER20_DEFER") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "layer20 deferral must be0or1"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+/// A full chunk [done, done+live) whose rows all precede the final 128 rows of
+/// this `total`-row append. Partial chunks (always the last) never defer.
+pub(crate) fn layer20_projection_only(done: usize, live: usize, rows: usize, total: usize) -> bool {
+    live == rows && done + live + 128 <= total
 }
 fn wide_arena_bytes_per_row(sequence_parallel: bool) -> usize {
     (if sequence_parallel { 384 } else { 448 }) * 1024
@@ -633,6 +651,10 @@ pub struct Target {
     replay: Option<crate::decoder_tail::Replay>,
     graph_replay: bool,
     prefill_last_head: bool,
+    // Deferred layer 20 (CANADA_SCRATCH_PREFILL_LAYER20_DEFER): set by the wide
+    // prefill loop for one eager chunk; pending until finished or abandoned.
+    layer20_projection_only: bool,
+    layer20_pending: bool,
     append_last_gather: bool,
     append_encoded_head: bool,
     comm_instance: Option<u64>,
@@ -1041,6 +1063,8 @@ impl Target {
             replay: None,
             graph_replay: false,
             prefill_last_head: false,
+            layer20_projection_only: false,
+            layer20_pending: false,
             append_last_gather: source_phase==Phase::Verify && [6,16,32].contains(&rows)
                 && crate::config::append_last_gather_requested()?,
             append_encoded_head,
@@ -1627,6 +1651,8 @@ impl Target {
             replay: None,
             graph_replay: false,
             prefill_last_head: false,
+            layer20_projection_only: false,
+            layer20_pending: false,
             append_last_gather: phase==Phase::Verify && [6,16,32].contains(&rows)
                 && crate::config::append_last_gather_requested()?,
             append_encoded_head,
@@ -4656,6 +4682,7 @@ impl Target {
             lookahead: Vec::new(),
             stall_counters: Vec::new(),
             native_fp32_rows: medium_native.then_some(ids.len()),
+            layer20_deferred_chunks: None,
             stages_ms: marks
                 .windows(2)
                 .map(|pair| {
@@ -5230,6 +5257,9 @@ impl Target {
         let mut captured_new_graph = false;
         let mut encoder_graph_chunks = 0;
         let mut lookahead_stages = Vec::new();
+        // Captured encoder graphs always contain the whole layer 20.
+        let layer20_defer=layer20_defer_enabled()? && !encoder_graph;
+        let mut layer20_deferred=0usize;
         let record_stalls=std::env::var("CANADA_SCRATCH_PREFILL_STALL_COUNTERS").as_deref()==Ok("1");
         let mut stall_counters=Vec::new();
         let available: Vec<usize> = std::iter::once(128).chain(wides.iter().map(|w| w.rows)).collect();
@@ -5308,9 +5338,16 @@ impl Target {
                 stream.synchronize()?;target.cuda.profiler_start()?;
             }
             let chunk_graph=encoder_graph || (tiny_encoder_graph && rows==128 && chunk.len()==128);
+            // Deferred layer 20: an eager full chunk whose rows all precede this
+            // request's final 128 rows (the only layer-20 rows the decoder reads).
+            target.layer20_pending=false;
+            target.layer20_projection_only=layer20_defer && !chunk_graph
+                && layer20_projection_only(done,chunk.len(),rows,ids.len())
+                && target.late.encoder_deferral_supported();
             let counters=record_stalls.then(crate::prefill_stall::Snapshot::read);
             let chunk_start=Instant::now();
             let chunk_result=target.encoder_chunk(chunk, next.as_deref(), &cache, comm, stream, chunk_graph);
+            target.layer20_projection_only=false;
             if let Some(counters)=counters {
                 stall_counters.push(counters.finish(previous+done,chunk.len(),rows,chunk_start.elapsed().as_secs_f64()*1000.));
             }
@@ -5331,8 +5368,21 @@ impl Target {
             // precedes the GPU work of the same chunk.
             marks.push(("encoder_host", prepared));
             marks.push(("encoder_chunk", Instant::now()));
-            if done<ids.len() && should_yield(done)? { break; }
+            if done<ids.len() && should_yield(done)? {
+                // This chunk now ends the turn, so its final rows feed the decoder
+                // tail: issue the deferred layer-20 work unchanged before stopping.
+                if target.layer20_pending {
+                    target.finish_deferred_layer20_now(comm, stream, &cache)?;
+                }
+                break;
+            }
+            if target.layer20_pending {
+                target.layer20_pending=false;
+                layer20_deferred+=1;
+            }
         }
+        ensure!(!self.layer20_pending && wides.iter().all(|w| !w.layer20_pending),
+            "deferred layer20 left pending");
         let end=previous+done;
         if let Some(h) = holder {
             self.handoff_from(&wides[h])?;
@@ -5372,6 +5422,7 @@ impl Target {
             lookahead: lookahead_stages,
             stall_counters,
             native_fp32_rows: None,
+            layer20_deferred_chunks: (layer20_deferred>0).then_some(layer20_deferred),
             stages_ms: marks
                 .windows(2)
                 .map(|pair| {
@@ -6164,6 +6215,23 @@ impl Target {
             comm,
             stream,
         )?;
+        if self.layer20_projection_only {
+            // Rows before the request's final 128: keep only the state that later
+            // rows, the decoder and decode read; layer 20's output rows are unused.
+            ensure!(!self.layer20_pending && self.source_phase != Phase::Verify,
+                "deferred layer20 owner");
+            self.late.run_encoder_projection(
+                self.group14.output(),
+                self.group14.pre(),
+                &self.step.compressed_positions,
+                &self.step.compressed_locations,
+                &self.step.m20,
+                comm,
+                stream,
+            )?;
+            self.layer20_pending = true;
+            return Ok(());
+        }
         self.late.run_encoder(
             self.group14.output(),
             self.group14.pre(),
@@ -6175,6 +6243,37 @@ impl Target {
             comm,
             stream,
         )?;
+        self.publish_encoder_tail(comm, stream)
+    }
+    /// Issue the rest of a deferred layer 20 exactly as run_encoder would have
+    /// (same retained buffers, same order), then publish its tail rows.
+    fn finish_deferred_layer20(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
+        ensure!(self.layer20_pending, "no deferred layer20 to finish");
+        self.late.finish_encoder_deferred(
+            self.group14.output(),
+            &self.step.compressed_positions,
+            &self.step.candidates,
+            &self.tokens,
+            &self.step.m20,
+            comm,
+            stream,
+        )?;
+        self.layer20_pending = false;
+        self.publish_encoder_tail(comm, stream)
+    }
+    /// A deferred chunk that now ends a turn (cancel or yield): its final rows
+    /// feed the decoder tail at this boundary.
+    fn finish_deferred_layer20_now(&mut self, comm: &Roce, stream: &Stream,
+        cache: &crate::decoder_tail::Cache) -> Result<()> {
+        self.lease.begin()?;
+        self.finish_deferred_layer20(comm, stream)?;
+        stream.synchronize()?;
+        comm.health()?;
+        self.check_candidates()?;
+        ensure!(cache.error()? == 0, "deferred layer20 publication fault");
+        self.lease.finish_write()
+    }
+    fn publish_encoder_tail(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
         let publishing = self.encoder_cache.is_some() && self.source_phase != Phase::Verify;
         let (output20, pre20) = match self.sp_full.as_mut() {
             Some((residual, pre)) if self.late.encoder_sequence_parallel() && tail_window_enabled() => {
@@ -6313,6 +6412,16 @@ impl Target {
     /// Greedy next-token choice only. Stochastic target sampling and DSpark
     /// remain separate gates. Sampling does not commit a token to history;
     /// the caller must append an accepted token through the normal state path.
+    /// Diagnostic only (CANADA_SCRATCH_CLAUDE_LOGIT_DIGEST=1): rank 0 logs the
+    /// SHA-256 of the full FP32 logits row a prompt's first token is drawn from.
+    fn log_prompt_logit_digest(&self, stream: &Stream) -> Result<()> {
+        if self.rank == 0 && std::env::var("CANADA_SCRATCH_CLAUDE_LOGIT_DIGEST").as_deref() == Ok("1") {
+            stream.synchronize()?;
+            eprintln!("claude prompt logits position={} sha256={}", self.history.position,
+                self.last_prompt_logit_digest()?);
+        }
+        Ok(())
+    }
     pub fn greedy_token(&mut self, stream: &Stream) -> Result<u32> {
         ensure!(
             self.lease.is_current()
@@ -6323,6 +6432,7 @@ impl Target {
                 && stream.raw() as usize == self.stream,
             "target greedy result is not publishable on this stream"
         );
+        self.log_prompt_logit_digest(stream)?;
         self.lease.begin()?;
         self.sampler.run(self.io.logits(), stream)?;
         let ids = self.sampler.finish(stream)?;
@@ -6335,6 +6445,7 @@ impl Target {
         ensure!(self.lease.is_current() && self.history.position > 0 && self.last_live > 0 && !self.last_head_local_only
             && self.cuda.owns_stream(stream) && stream.raw() as usize == self.stream,
             "target stochastic result is not publishable on this stream");
+        self.log_prompt_logit_digest(stream)?;
         self.lease.begin()?;
         let ids = self.categorical.sample(self.io.logits(), self.last_live - 1, 1, 1., seed,
             crate::categorical::TARGET_DOMAIN, self.history.position, stream)?;
@@ -6920,6 +7031,35 @@ mod tests {
         for &w in crate::config::WIDE_PROFILES {
             assert!(w % 4 == 0 && crate::config::mhc_rows(w / 4) && crate::config::mhc_rows(w));
         }
+    }
+    #[test]
+    fn layer20_deferral_covers_exactly_the_rows_before_the_final_128() {
+        let widths = [128, 512, 1024, 2048, 4096, 8192];
+        for total in (128..=40000).step_by(37).chain([128, 129, 255, 256, 8191, 8192, 8320, 8321, 145039]) {
+            let plan = crate::config::plan_encoder_chunks(total, &widths);
+            let mut done = 0;
+            for (i, &rows) in plan.iter().enumerate() {
+                let live = (total - done).min(rows);
+                let deferred = super::layer20_projection_only(done, live, rows, total);
+                // Deferred chunks never hold any of the final 128 rows, and never
+                // the last chunk; every chunk holding one of them runs layer 20.
+                assert_eq!(deferred, live == rows && done + live <= total - 128, "{total} {plan:?} {i}");
+                if deferred { assert!(i + 1 < plan.len()); }
+                if done + live > total - 128 { assert!(!deferred); }
+                done += live;
+            }
+            assert_eq!(done, total);
+        }
+        // 145039 rows: 17 full 8K chunks defer, the 4096/1024/512/512 tail runs layer 20
+        // only where it holds one of the final 128 rows.
+        let plan = crate::config::plan_encoder_chunks(145039, &widths);
+        let mut done = 0;
+        let deferred = plan.iter().filter(|&&rows| {
+            let live = (145039 - done).min(rows);
+            let d = super::layer20_projection_only(done, live, rows, 145039);
+            done += live; d
+        }).count();
+        assert!(deferred >= 17, "{plan:?}");
     }
     #[test]
     fn encoder_chunk_plan_minimizes_estimated_cost() {

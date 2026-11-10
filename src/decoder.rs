@@ -924,6 +924,68 @@ impl SwaLayer {
             residual, positions, cache, candidates, tokens, source, comm, stream,
         )
     }
+    /// Deferred layer 20 is available on this owner: an ordinary (unpaired)
+    /// source-20 layer without side-stream query or coefficient forks.
+    pub(crate) fn indexed_deferral_supported(&self) -> bool {
+        self.layer == 20 && self.engram.is_none() && matches!(self.pair_attention, PairAttention::Ordinary)
+            && !self.pair_deferred_ffn && !self.attention.query_overlap_enabled()
+            && !self.attn_boundary.overlap_active()
+    }
+    /// Layer 20 of a wide encoder chunk that ends before the request's final 128
+    /// rows. Issues the first part of run_indexed_from_previous unchanged: the
+    /// normalized input, the Q/KV projection with its SWA key store, and source20's
+    /// compressed KV and index keys, which later rows, the decoder and decode read.
+    /// Selection, attention, the output projection and the FFN only produce this
+    /// layer's output rows, which the decoder replay never reads for these rows;
+    /// finish_indexed_deferred issues them unchanged if this chunk must end a turn.
+    pub(crate) fn run_indexed_projection(
+        &mut self,
+        residual: &Buffer<bf16>,
+        previous_pre: &Buffer<f32>,
+        positions: &Positions,
+        locations: &RowLocations,
+        cache: &mut PagedKv,
+        source: &mut crate::compressed_source::Layer,
+        source_metadata: &crate::compressed_source::Metadata,
+        comm: &Roce,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(self.indexed_deferral_supported() && source.layer_id() == 20,
+            "deferred layer20 projection contract");
+        let precomputed = self.prepare_attention_input(residual, previous_pre, stream)?
+            .ok_or_else(|| anyhow::anyhow!("deferred layer20 needs an ordinary attention input"))?;
+        self.project_attention_input(precomputed, positions, locations, cache, comm, stream)?;
+        source.prepare_keys_only(
+            match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
+            source_metadata, stream,
+        )?;
+        self.attention.join_projection_hint(stream)
+    }
+    /// The remainder of run_indexed_from_previous after run_indexed_projection,
+    /// in the same order, on the same retained buffers.
+    pub(crate) fn finish_indexed_deferred(
+        &mut self,
+        residual: &Buffer<bf16>,
+        positions: &Positions,
+        cache: &PagedKv,
+        candidates: &Candidates,
+        tokens: &TokenRows,
+        source: &mut crate::compressed_source::Layer,
+        source_metadata: &crate::compressed_source::Metadata,
+        comm: &Roce,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(self.indexed_deferral_supported() && source.layer_id() == 20,
+            "deferred layer20 finish contract");
+        let (q, s) = self.attention.quantized_lora();
+        source.select_quantized_distributed(
+            match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
+            q, s, source_metadata, tokens.live(), comm, stream,
+        )?;
+        self.finish_compressed(
+            residual, positions, cache, candidates, tokens, source, comm, stream,
+        )
+    }
     /// Each source-sharing group uses its source's latents/selection for this step.
     /// They still compute and store their own SWA keys and their own Q/output.
     pub fn run_shared_from_previous(

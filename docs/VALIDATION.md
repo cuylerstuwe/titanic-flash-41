@@ -1,5 +1,65 @@
 # Validation status
 
+## November 10 prefill and cache release (s1394)
+
+s1394 is s1389 plus three options, all enabled in native production, and two diagnostics that are off by default:
+
+- **Deferred layer 20** (`CANADA_SCRATCH_PREFILL_LAYER20_DEFER=1`). Prefill skips the layer-20 output rows that the
+  decoder replay never reads.
+- **First-chunk Engram staging** (`CANADA_SCRATCH_PREFILL_ENGRAM_SPLIT14=1`). The first chunk's layer-14 rows are read
+  behind layers 1 to 13.
+- **Displaced checkpoint** (`CANADA_SCRATCH_DISPLACED_CHECKPOINT=1`). A conversation displaced by an unrelated request
+  keeps its newest checkpoint as a standalone image.
+- **Diagnostics:** `CANADA_SCRATCH_CLAUDE_LOGIT_DIGEST` logs the SHA-256 of each prompt's first-token logits on rank 0;
+  `CANADA_SCRATCH_CLAUDE_DECODE_SUMMARY` logs per-request verify steps, rows, accepted drafts and step times.
+
+The [operations guide](OPERATIONS.md#prefill-without-unused-layer-20-rows) explains them. No kernel, precision
+boundary, weight, sampler, memory floor, cache budget, entry count or clock policy changes. The portable profile is
+unchanged. The off-by-default displaced snapshot from an earlier commit did not fix the displaced-conversation case and
+stays off.
+
+**Exactness.**
+- **Deferral.** Prompt-logit SHA-256 was identical with the option off and on for eight prompts from 1K to 165K
+  tokens, including a retained append and the startup warmup. The 145,039-token cold prefill took 16.01 s instead of
+  16.86 s, and 64K took 7.23 s instead of 7.69 s.
+- **Engram staging.** It was identical on five rows, with the Engram page cache dropped before each arm. Cold
+  source-code prompts took 0.87 s instead of 1.05 s at 3.4K tokens and 2.54 s instead of 2.70 s at 16.8K; warm repeats
+  were unchanged.
+- **Displaced checkpoint.** A 62K-token conversation, then an unrelated 36-token request, then its follow-up: the
+  follow-up was served from 61,824 cached tokens in 0.35 s instead of 7.0 s. Its prompt logits equal, bit for bit, those
+  of a run without the unrelated request that restored the original bank checkpoint.
+- **Run-to-run variation.** One further control run of that screen differed already in the conversation's own cold
+  62K prefill. This is the same run-to-run variation as the gate's long-code chain below, so it is reported but not used.
+
+**Qualification of s1394, all options on:**
+- **Serving gate.** The 15-request tape plus cancel/resume passed. Eight outputs are identical to s1389's. The
+  129,955-token cold prefill took 15.37 s (s1389: 16.10 s), and plain-code decode ran at 89.7 tokens/s (s1389: 89.6).
+- **Near-1M cancellation check.** It passed: a 974,039-token, 28-image prefill in 125.8 s, the retry in 0.4 s and a new
+  image in 0.9 s.
+- **Stress panel.** It passed: 70 requests reaching 974,076 prompt tokens, with lowest available memory 12.094 GiB.
+  - The test observer's 90°C stop was replaced by a 100°C emergency stop, which was not reached. The hottest device read
+    91.0°C, for about 52 s at or above 90°C.
+  - No `allocation_failure` was logged and there were no driver messages.
+- **Other checks.** The native Arm64 build passed 223 CPU tests (25 ignored), and ten installation interruption and
+  rollback fixtures passed.
+- **First stress failure.** A first stress run of s1393 (the same options) failed in the context-reset phase: the
+  checkpoint copy did not count a cache parent that was held outside the cache while being restored, and reinserting it
+  exceeded the budget. s1394 counts it, and the full panel then passed.
+
+Native serving-source fingerprint: `a87d38cdf9521b604b59cb083c3217a9ba4879a109a6a63c0397206f3dac41bb`.
+
+**Installation.** s1394 was installed in journaled transactions:
+1. s1392 with the deferral, falling back to s1389;
+2. the Engram staging flag, falling back to s1392;
+3. s1394, falling back to s1392 with Engram staging.
+
+**Activation.** It was activated on fresh boots with one production model load per device. A head-local smoke test
+passed text, prompt reuse, continuation, image input and text after an image. On the fresh boots, source-code prompts
+took 0.75 s at 3.4K, 2.29 s at 16.8K, 3.69 s at 27.8K, 6.91 s at 56K and 15.04 s at 127K tokens. Runtime hashes,
+clocks, APST guards and health checks passed, and the reservation was released.
+
+See the [sanitized qualification record](../validation/prefill-cache-2026-11-10.json).
+
 ## November 9 checkpoint ladder (s1389)
 
 s1389 is s1387 plus two changes:

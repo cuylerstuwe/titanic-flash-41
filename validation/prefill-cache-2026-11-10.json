@@ -1,0 +1,225 @@
+{
+  "release": "s1394",
+  "date": "2026-11-10",
+  "base": "s1389",
+  "failed_start_fallback": "s1392 with split14, then s1392, then s1389",
+  "native_serving_source_fingerprint": "a87d38cdf9521b604b59cb083c3217a9ba4879a109a6a63c0397206f3dac41bb",
+  "changes": {
+    "CANADA_SCRATCH_PREFILL_LAYER20_DEFER=1": "skip layer-20 output rows the decoder replay never reads (prompt logits bit-identical)",
+    "CANADA_SCRATCH_PREFILL_ENGRAM_SPLIT14=1": "read the first chunk's layer-14 Engram rows behind layers 1-13 (bit-identical)",
+    "CANADA_SCRATCH_DISPLACED_CHECKPOINT=1": "keep a displaced conversation's newest checkpoint as a standalone image (exact restore)",
+    "diagnostics (off by default)": [
+      "CANADA_SCRATCH_CLAUDE_LOGIT_DIGEST",
+      "CANADA_SCRATCH_CLAUDE_DECODE_SUMMARY"
+    ],
+    "off by default, not enabled": [
+      "CANADA_SCRATCH_DISPLACED_SNAPSHOT"
+    ]
+  },
+  "unchanged": [
+    "kernels",
+    "precision boundaries",
+    "weights",
+    "sampler",
+    "memory floors",
+    "cache budget and entry count",
+    "2350 MHz clock policy",
+    "portable profile"
+  ],
+  "deferral_screen": {
+    "note": "synthetic text, same runtime, flag off vs on; prompt-logit SHA-256 identical for all rows",
+    "rows_compared": 8,
+    "positions": [
+      128,
+      1039,
+      3039,
+      9039,
+      20039,
+      64039,
+      145039,
+      165054
+    ],
+    "seconds_off": [
+      0.366,
+      0.778,
+      1.501,
+      2.717,
+      7.685,
+      16.857,
+      2.827
+    ],
+    "seconds_on": [
+      0.365,
+      0.742,
+      1.543,
+      2.565,
+      7.232,
+      16.006,
+      2.631
+    ],
+    "prompt_tokens": [
+      1039,
+      3039,
+      9039,
+      20039,
+      64039,
+      145039,
+      165054
+    ]
+  },
+  "split14_screen": {
+    "note": "source-code prompts; Engram page cache dropped before each arm; first two requests cold, last two warm",
+    "rows_compared": 5,
+    "off": [
+      {
+        "prompt_tokens": 3418,
+        "seconds": 1.047
+      },
+      {
+        "prompt_tokens": 16835,
+        "seconds": 2.697
+      },
+      {
+        "prompt_tokens": 3418,
+        "seconds": 0.659
+      },
+      {
+        "prompt_tokens": 16835,
+        "seconds": 2.235
+      }
+    ],
+    "on": [
+      {
+        "prompt_tokens": 3418,
+        "seconds": 0.868
+      },
+      {
+        "prompt_tokens": 16835,
+        "seconds": 2.544
+      },
+      {
+        "prompt_tokens": 3418,
+        "seconds": 0.659
+      },
+      {
+        "prompt_tokens": 16835,
+        "seconds": 2.229
+      }
+    ]
+  },
+  "displaced_checkpoint_screen": {
+    "positions": [
+      128,
+      62041,
+      62056,
+      62066
+    ],
+    "followup_cached_tokens": {
+      "s1392": 0,
+      "s1394": 61824
+    },
+    "note": "62K conversation A, unrelated 36-token request B, then A's follow-ups. With the displaced checkpoint the follow-up restores the copied checkpoint (61,824 cached) and its prompt logits equal, bit for bit, a run without B that restores the original bank checkpoint. One further control run differed already in A's cold prefill (run-to-run variation, as known for the gate's long-code chain); it is reported, not used."
+  },
+  "serving_gate": {
+    "passed": true,
+    "requests": 15,
+    "identical_to_s1389": 8,
+    "long_code_chain": "varies run to run on unchanged runtimes"
+  },
+  "cancellation_check": {
+    "passed": true,
+    "min_available_gib": [
+      14.235,
+      14.912,
+      14.854,
+      14.938
+    ]
+  },
+  "stress_panel": {
+    "passed": true,
+    "full_panel_passed": true,
+    "requests": 70,
+    "max_prompt_tokens": 974076,
+    "observer": "90 C stop bypassed on instruction; 100 C emergency backstop",
+    "max_temperature_c": [
+      91.0,
+      90.7,
+      89.4,
+      90.0
+    ],
+    "approx_seconds_at_or_above_90c": {
+      "0": 52.0,
+      "1": 14.0,
+      "2": 0.0,
+      "3": 4.0
+    },
+    "min_available_gib": [
+      12.094,
+      12.776,
+      12.739,
+      12.865
+    ],
+    "kernel_driver_large_page_retry_lines": 0,
+    "engine_allocation_failures": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 0
+    }
+  },
+  "recovery_fixtures": {
+    "passed": true,
+    "cases": 10
+  },
+  "cpu_tests": {
+    "passed": true,
+    "tests_passed": 223,
+    "failed": 0,
+    "ignored": 25
+  },
+  "fresh_boot_production_prefill": {
+    "note": "after activation; source-code prompts; first pass Engram-cold after reboot, second warm",
+    "runs": [
+      {
+        "prompt_tokens": 3419,
+        "seconds": 0.747
+      },
+      {
+        "prompt_tokens": 16836,
+        "seconds": 2.288
+      },
+      {
+        "prompt_tokens": 27778,
+        "seconds": 3.691
+      },
+      {
+        "prompt_tokens": 56148,
+        "seconds": 6.914
+      },
+      {
+        "prompt_tokens": 127367,
+        "seconds": 15.036
+      },
+      {
+        "prompt_tokens": 3419,
+        "seconds": 0.686
+      },
+      {
+        "prompt_tokens": 16836,
+        "seconds": 2.256
+      },
+      {
+        "prompt_tokens": 27778,
+        "seconds": 3.615
+      },
+      {
+        "prompt_tokens": 56148,
+        "seconds": 6.828
+      },
+      {
+        "prompt_tokens": 127367,
+        "seconds": 15.01
+      }
+    ]
+  }
+}

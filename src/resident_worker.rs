@@ -507,6 +507,38 @@ fn cache_pressure_reclaim()->Result<bool> {
         Err(std::env::VarError::NotPresent)=>Ok(true),Err(error)=>Err(error.into()),
     }
 }
+fn displaced_snapshot()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_DISPLACED_SNAPSHOT") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","displaced snapshot must be0or1");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
+    }
+}
+/// Whether an existing entry for the same prefix already keeps it for a later
+/// request. When another conversation is about to reuse the bank
+/// (`survivors_only`), a bank-retained encoder image does not: it is invalid as
+/// soon as the bank's pages are rewritten.
+fn keeps_prefix(bank_retained:bool,survivors_only:bool)->bool {!survivors_only||!bank_retained}
+/// Diagnostic only (CANADA_SCRATCH_CLAUDE_DECODE_SUMMARY=1): per-request decode
+/// totals, logged by rank 0 when the request finishes.
+#[derive(Default)]
+struct DecodeSummary {
+    steps: usize,
+    verified_rows: usize,
+    accepted: usize,
+    emitted: usize,
+    phase_ms: [f64; 4],
+    wall_ms: f64,
+    by_rows: std::collections::BTreeMap<usize, (usize, f64)>,
+}
+fn decode_summary_enabled() -> bool {
+    std::env::var("CANADA_SCRATCH_CLAUDE_DECODE_SUMMARY").as_deref() == Ok("1")
+}
+fn displaced_checkpoint()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_DISPLACED_CHECKPOINT") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","displaced checkpoint must be0or1");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
+    }
+}
 fn checkpoint_ladder()->Result<bool> {
     match std::env::var("CANADA_SCRATCH_CHECKPOINT_LADDER") {
         Ok(v)=>{ensure!(v=="0"||v=="1","checkpoint ladder must be0or1");Ok(v=="1")},
@@ -713,6 +745,7 @@ struct Worker {
     loaded_request_is_suspended: bool,
     session_cache_long_first: bool,
     checkpoint_ladder: bool,
+    displaced_snapshot: bool,
     session_cache_shared_ancestors: bool,
     cache_pressure_reclaim: bool,
     prompt_checkpoint: bool,
@@ -751,6 +784,8 @@ struct Worker {
     current: Option<u64>,
     pending_prefill: Option<PendingPrefill>,
     prefill_cancelled: bool,
+    decode_summary: Option<DecodeSummary>,
+    displaced_checkpoint_enabled: bool,
     media: Option<crate::worker_media::Media>,
     active_media: Option<std::rc::Rc<crate::prompt_media::Bindings>>,
     media_receipt: Value,
@@ -1029,6 +1064,8 @@ impl Worker {
             _=>anyhow::bail!("session cache policy must be fifo or long_parents_and_recent"),
         };
         let checkpoint_ladder=checkpoint_ladder()?;
+        let layer20_defer=crate::target::layer20_defer_enabled()?;
+        let displaced_snapshot=displaced_snapshot()?;
         let session_cache_shared_ancestors=match std::env::var("CANADA_SCRATCH_CACHE_SHARED_ANCESTORS") {
             Err(std::env::VarError::NotPresent)=>false,
             Ok(v)if v=="0"=>false,Ok(v)if v=="1"=>true,
@@ -1354,6 +1391,9 @@ impl Worker {
         control.agree(&[u8::from(parking_extra_slots)])?;
         control.agree(&[u8::from(session_cache_long_first)])?;
         control.agree(&[u8::from(checkpoint_ladder)])?;
+        control.agree(&[u8::from(layer20_defer)])?;
+        control.agree(&[u8::from(displaced_checkpoint()?)])?;
+        control.agree(&[u8::from(displaced_snapshot)])?;
         control.agree(&[u8::from(cache_pressure_reclaim)])?;
         control.agree(&[u8::from(state_copy_kernel)])?;
         control.agree(&[u8::from(prompt_checkpoint)])?;
@@ -1485,6 +1525,7 @@ impl Worker {
             loaded_request_is_suspended:false,
             session_cache_long_first,
             checkpoint_ladder,
+            displaced_snapshot,
             session_cache_shared_ancestors,
             cache_pressure_reclaim,
             prompt_checkpoint,
@@ -1525,6 +1566,8 @@ impl Worker {
             current: None,
             pending_prefill: None,
             prefill_cancelled: false,
+            decode_summary: None,
+            displaced_checkpoint_enabled: displaced_checkpoint()?,
             media,
             active_media: None,
             media_receipt: Value::Null,
@@ -1600,7 +1643,7 @@ impl Worker {
     }
 
     fn retain_cached_prefix(&mut self,prefix:&[u32],pending:u32,media:&crate::prompt_media::Identity)->Result<Value> {
-        self.retain_cached_prefix_reserved(prefix,pending,media.through(prefix.len()),0,0)
+        self.retain_cached_prefix_reserved(prefix,pending,media.through(prefix.len()),0,0,false)
     }
 
     fn cache_capacity(&self,extra_bytes:usize,extra_count:usize)->(usize,usize) {
@@ -1782,11 +1825,60 @@ impl Worker {
         Ok(Some(reclaimed))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// CANADA_SCRATCH_DISPLACED_CHECKPOINT=1: when an unrelated conversation is about to reuse
+    /// this bank, keep the displaced conversation's newest bank-retained encoder checkpoint as a
+    /// standalone image. Its next turn re-renders history differently after the prompt (thinking
+    /// is not resent), so only such a checkpoint can serve it; a bank-retained one dies with the
+    /// bank. Budget, entry and memory admission are those of an ordinary cache save, agreed by all
+    /// ranks; a refusal leaves the ordinary behavior. No arithmetic changes.
+    fn materialize_displaced_checkpoint(&mut self,incoming:&[u32],current:&[u32],wanted:Option<&CachedSession>)->Result<Value> {
+        if !self.displaced_checkpoint_enabled||self.session.is_none()||current.is_empty() {return Ok(Value::Null);}
+        let found=self.cached_sessions.iter().enumerate()
+            .filter(|(_,c)|c.owner==self.bank_id&&current.starts_with(&c.prefix)
+                &&matches!(&c.image,CachedState::Encoder{image,..}if image.bank_retained()&&self.verify.encoder_prefix_reusable_from(image)))
+            .max_by_key(|(_,c)|c.prefix.len()).map(|(i,_)|i);
+        let Some(index)=found else {return Ok(json!({"materialized":false,"candidate":false}))};
+        if incoming.starts_with(&self.cached_sessions[index].prefix) {
+            // The incoming request continues this checkpoint's lineage; the bank keeps serving it.
+            return Ok(json!({"materialized":false,"candidate":true,"continued":true}));
+        }
+        let started=Instant::now();
+        let CachedState::Encoder{image,..}=&self.cached_sessions[index].image else {unreachable!()};
+        let full=self.verify.materialized_encoder_bytes(image)?;
+        let delta=full.saturating_sub(image.bytes());
+        // A wanted parent held outside the vector is reinserted later under exactly this budget
+        // (return_encoder_parent) and is part of the transient shared-budget check; the copy
+        // grows this entry in place, so all three must still fit together.
+        let (budget,_)=self.cache_capacity(0,0);
+        let charged=self.cached_sessions.iter().map(|c|c.charge).sum::<usize>()
+            .saturating_add(wanted.map_or(0,|c|c.charge));
+        let reserve=self.cache_reserve()?;
+        let fits=full<=2*1024usize.pow(3)&&charged.saturating_add(delta)<=budget
+            &&self.cuda.admission_memory()?.admitted_available>=reserve+full;
+        if !self.control.all_admit(fits)? {
+            return Ok(json!({"materialized":false,"candidate":true,"refused":true,"bytes":full,"charged":charged,"budget":budget}));
+        }
+        // The copy writes only the new image; any refusal or mismatch leaves live state untouched.
+        let made=match self.verify.try_materialize_bank_encoder(image,full,&self.comm,&self.stream) {
+            Ok(made)=>made,
+            Err(error)=>{eprintln!("displaced checkpoint not materialized: {error:#}");None}
+        };
+        if !self.control.all_admit(made.is_some())? {
+            return Ok(json!({"materialized":false,"candidate":true,"late_refused":true,"bytes":full}));
+        }
+        let entry=&mut self.cached_sessions[index];
+        let tokens=entry.prefix.len();
+        if let CachedState::Encoder{image,..}=&mut entry.image {*image=made.unwrap();}
+        entry.charge+=delta;
+        Ok(json!({"materialized":true,"tokens":tokens,"bytes":full,"seconds":started.elapsed().as_secs_f64()}))
+    }
     fn retain_cached_prefix_reserved(&mut self,prefix:&[u32],pending:u32,media:crate::prompt_media::Identity,
-        extra_bytes:usize,extra_count:usize)->Result<Value> {
+        extra_bytes:usize,extra_count:usize,survivors_only:bool)->Result<Value> {
         ensure!(!prefix.is_empty() && self.verify.position()==prefix.len()as u64,
             "cached prefix and target frontier disagree");
-        if self.cached_sessions.iter().any(|c|c.owner==self.bank_id && c.prefix==prefix && c.media.matches_prefix(&media,prefix.len())) {
+        if self.cached_sessions.iter().any(|c|c.owner==self.bank_id && c.prefix==prefix && c.media.matches_prefix(&media,prefix.len())
+            && keeps_prefix(matches!(&c.image,CachedState::Encoder{image,..}if image.bank_retained()),survivors_only)) {
             return Ok(json!({"saved":false,"already_cached":true,"saved_seconds":0.,
                 "evicted_sessions":0,"capacity_refused":false}));
         }
@@ -1917,9 +2009,19 @@ impl Worker {
             json!({"saved":false,"saved_seconds":0.,"evicted_sessions":0,
                 "capacity_refused":false,"replaced_completion_skipped":true})
         }else{
+            // With the displaced snapshot, a conversation displaced by another
+            // one keeps a complete image even when its only entry for this
+            // prefix is a bank-retained anchor that the newcomer's prefill
+            // invalidates. A branch restored from this bank's own lineage
+            // (an edit) keeps the ordinary policy.
+            let branch=wanted.as_ref().is_some_and(|c|c.owner==self.bank_id
+                &&matches!(&c.image,CachedState::Encoder{image,..}if image.bank_retained()));
             self.retain_cached_prefix_reserved(&current_prefix,self.history.pending().context("cached session lacks pending anchor")?,self.history.media().through(current_prefix.len()),
-                wanted.as_ref().map_or(0,|c|c.charge),usize::from(wanted.is_some()))?
+                wanted.as_ref().map_or(0,|c|c.charge),usize::from(wanted.is_some()),self.displaced_snapshot&&!branch)?
         };
+        // Before the incoming request touches the bank: keep the displaced conversation's newest
+        // bank-retained checkpoint as a standalone image (CANADA_SCRATCH_DISPLACED_CHECKPOINT).
+        let displaced=self.materialize_displaced_checkpoint(&plan.prompt,&current_prefix,wanted.as_ref())?;
         let transient_image_bytes=self.suspended_image_bytes
             +self.cached_sessions.iter().map(|c|c.charge).sum::<usize>()
             +wanted.as_ref().map_or(0,|c|c.charge);
@@ -1958,12 +2060,14 @@ impl Worker {
                     // Transfer the charged parent to the compound operation.
                     // It keeps the parent alive through optional successor
                     // allocation; no incomplete decoder owner escapes.
-                    return Ok((json!({"enabled":true,"hit":true,"encoder_deferred":true,"imported_owner":imported_owner,
+                    let mut report=json!({"enabled":true,"hit":true,"encoder_deferred":true,"imported_owner":imported_owner,
                         "restored_tokens":cached.prefix.len(),"saved":saved["saved"],
                         "saved_seconds":saved["saved_seconds"],"evicted_sessions":saved["evicted_sessions"],
                         "replaced_completion_skipped":saved["replaced_completion_skipped"],
                         "capacity_refused":saved["capacity_refused"],"transient_image_bytes":transient_image_bytes,
-                        "transient_image_count":transient_image_count,"seconds":started.elapsed().as_secs_f64()}),Some(cached)));
+                        "transient_image_count":transient_image_count,"seconds":started.elapsed().as_secs_f64()});
+                    if !displaced.is_null() {report["displaced_checkpoint"]=displaced;}
+                    return Ok((report,Some(cached)));
                 }
                 let pending=match &cached.image {
                     CachedState::Complete{image,pending}=>{
@@ -2115,6 +2219,7 @@ impl Worker {
             "encoder_reconstructed":encoder_reconstructed,"imported_owner":imported_owner,
             "inactive_sessions":self.cached_sessions.len(),"charged_bytes":self.cached_sessions.iter().map(|c|c.charge).sum::<usize>(),
             "budget_bytes":self.session_cache_budget,"seconds":started.elapsed().as_secs_f64()}),None))
+            .map(|(mut report,none):(Value,Option<CachedSession>)|{if !displaced.is_null(){report["displaced_checkpoint"]=displaced;}(report,none)})
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2767,6 +2872,7 @@ impl Worker {
             }
             Command::Step => {
                 ensure!(self.current.is_some(), "decode without resident request");
+                let step_started = Instant::now();
                 let limit = if self.copy32_verify.is_some() {self.history.step_limit_for_rows(32)?}
                     else if self.long_verify.is_some() {self.history.step_limit_for_rows(16)?}
                     else {self.history.step_limit()?};
@@ -2796,6 +2902,14 @@ impl Worker {
                     self.verify.position() as usize,
                 )?;
                 self.emitted += output.len();
+                if decode_summary_enabled() {
+                    let ms = step_started.elapsed().as_secs_f64() * 1000.;
+                    let d = self.decode_summary.get_or_insert_with(DecodeSummary::default);
+                    d.steps += 1; d.verified_rows += step.verified_rows; d.accepted += step.matching_proposals;
+                    d.emitted += output.len(); d.wall_ms += ms;
+                    for (total, phase) in d.phase_ms.iter_mut().zip(step.phase_ms) { *total += phase; }
+                    let e = d.by_rows.entry(step.verified_rows).or_insert((0, 0.)); e.0 += 1; e.1 += ms;
+                }
                 if !self.progress_next { self.agree(&output)?; }
                 let mut event = json!({"type":"tokens","request_id":self.current,"output_ids":output,"frontier":self.history.frontier(),
                     "pending":self.history.pending(),"seconds":started.elapsed().as_secs_f64(),"phase_ms":step.phase_ms,
@@ -2832,6 +2946,13 @@ impl Worker {
                 self.history.finish(reason)?;
                 self.pending_prefill=None;
                 self.prefill_cancelled=false;
+                if let Some(d) = self.decode_summary.take().filter(|_| self.comm.rank() == 0) {
+                    let n = d.steps.max(1) as f64;
+                    eprintln!("claude decode summary: steps {} tokens {} rows/step {:.2} accepted/step {:.2} step ms {:.2} (draft {:.2} verify {:.2} commit {:.2} after {:.2}) by rows {:?}",
+                        d.steps, d.emitted, d.verified_rows as f64 / n, d.accepted as f64 / n, d.wall_ms / n,
+                        d.phase_ms[0] / n, d.phase_ms[1] / n, d.phase_ms[2] / n, d.phase_ms[3] / n,
+                        d.by_rows.iter().map(|(r, (c, ms))| (*r, *c, (ms / *c as f64 * 100.).round() / 100.)).collect::<Vec<_>>());
+                }
                 self.install_media(None)?;
                 self.agree(&[])?;
                 let id = self.current.take().unwrap();
@@ -4256,6 +4377,9 @@ pub fn run_http(path: &Path) -> Result<()> {
     ready["wide_startup_warmup"]=json!(wide_startup_warmup);
     ready["idle_anchor_enabled"]=json!(worker.idle_anchor_enabled);
     ready["checkpoint_ladder"]=json!(worker.checkpoint_ladder);
+    ready["prefill_layer20_defer"]=json!(crate::target::layer20_defer_enabled()?);
+    ready["displaced_checkpoint"]=json!(worker.displaced_checkpoint_enabled);
+    ready["displaced_snapshot"]=json!(worker.displaced_snapshot);
     ready["retained_append32"]=json!(worker.retained_append32);
     ready["append_final_row_gather"]=json!(worker.verify.append_last_gather_enabled());
     ready["ffn_hint_chunks"]=json!(worker.verify.ffn_hint_chunks());
@@ -4611,6 +4735,14 @@ mod tests {
             (545342,934416108),budget,true,4).is_none());
         assert_eq!(completed_cache_evictions(&[encoder,prompt],&[false,true],&[false,false],
             (367,12000000),budget,true,4),Some(vec![]));
+    }
+    #[test]
+    fn displaced_snapshot_ignores_only_bank_retained_entries_when_asked() {
+        // Ordinary policy: any same-prefix entry counts as already cached.
+        assert!(keeps_prefix(true,false)&&keeps_prefix(false,false));
+        // A displacement by another conversation: only entries that survive
+        // the bank's reuse (complete or independent encoder images) count.
+        assert!(!keeps_prefix(true,true)&&keeps_prefix(false,true));
     }
     #[test]
     fn checkpoint_ladder_spreads_rungs_over_one_growing_conversation() {

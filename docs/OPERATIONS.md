@@ -70,6 +70,48 @@ position falls from 0.46 to 0.13 of the conversation. It changes no arithmetic: 
 checkpoint path, and a restored suffix may differ from a cold prefill only as any cached restore does, by
 floating-point summation order.
 
+## Prefill without unused layer-20 rows
+
+The wide prefill encoder runs layers 0 to 20 over every prompt row, then replays layers 21 to 39 over the
+last 128 rows. Layer 20's output is read only for those last 128 rows. Its key/value projection, sliding-window
+keys and source-20 compressed entries and index keys are read for every row, by later rows, the decoder replay
+and decode.
+
+`CANADA_SCRATCH_PREFILL_LAYER20_DEFER=1` uses this. For an eager full chunk that ends before the request's
+final 128 rows, layer 20 runs only its input normalization, Q/KV projection with the sliding-window store, and
+the source-20 key emission. It skips candidate selection, attention, the output projection and the expert
+layer, about 46 ms per 8K-row chunk. Chunks that hold any of the final rows run unchanged.
+
+If such a chunk ends a turn early (a cancellation, or a scheduler yield to another request), the skipped
+operations are issued unchanged on the retained buffers before the decoder replay at that boundary. Every
+value that is read later comes from the same kernels in the same order. Prompt logits are bit-identical with
+the option off and on.
+
+`CANADA_SCRATCH_PREFILL_ENGRAM_SPLIT14=1` changes only I/O scheduling. The first chunk of a prompt has no
+earlier chunk to prefetch its Engram rows behind. By default all of its rows are read while layer 0 runs;
+with this option the layer-14 rows are read while layers 1 to 13 run. It shortens a prompt whose Engram rows
+are not in the page cache by about 0.15 to 0.18 s, and leaves warm prompts unchanged. Results are
+bit-identical.
+
+## Keeping a displaced conversation's checkpoint
+
+Each request keeps a bank-retained encoder checkpoint near its prompt end. That checkpoint stores only its
+tail, because the compressed prefix stays in the execution bank. An unrelated request that reuses the bank,
+such as a short title or summary request between two turns of an agent session, invalidates it. The
+displaced conversation's complete state is still saved, but its next turn re-renders the previous assistant
+message without the thinking tokens, so that state does not match. Before this option, the next turn
+re-prefilled the whole conversation.
+
+`CANADA_SCRATCH_DISPLACED_CHECKPOINT=1` copies the displaced conversation's newest bank-retained checkpoint
+into a standalone image before the incoming request touches the bank. The compressed pages it omitted are
+read from the bank while they still belong to that conversation; the rest comes from the checkpoint. The
+ordinary cache budget, entry limit and memory reserve apply, and all ranks agree. A refusal keeps the
+previous behavior.
+
+In a synthetic screen, a 62K-token conversation's follow-up after an unrelated 36-token request was served
+from 61,824 cached tokens in 0.35 s, instead of a 7.0 s cold prefill. Its prompt logits equal, bit for bit,
+those of the same follow-up restored from the original bank checkpoint without the interruption.
+
 ## Lifecycle and diagnostics
 
 `deploy/fleet.py` starts exactly one four-rank cohort with a fresh private ticket, validates the selected nodes and runtime files, and monitors health. Containers use Docker's init process for signal forwarding and reaping. Any failed rank causes coordinated cleanup of the recorded cohort. The controller checks project/generation ownership before stopping all four ranks concurrently, allowing up to 90 seconds for each Docker stop to finish GPU teardown. Docker sends SIGTERM and may escalate to SIGKILL after its 15-second grace period; stopping the service is not a promise to finish in-flight requests or preserve RAM caches. Systemd can restart a failed controller, with a bounded start limit. An unreachable worker can prevent safe complete cleanup; repair SSH and retry instead of starting a conflicting cohort or weakening ownership checks.

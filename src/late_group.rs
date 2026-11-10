@@ -430,6 +430,55 @@ impl Group {
             stream,
         )
     }
+    pub(crate) fn encoder_deferral_supported(&self) -> bool {
+        self.layers[0].indexed_deferral_supported()
+    }
+    /// Deferred layer 20: projection and source20 keys only (see SwaLayer).
+    pub(crate) fn run_encoder_projection(
+        &mut self,
+        input: &Buffer<bf16>,
+        pre: &Buffer<f32>,
+        positions: &Positions,
+        locations: &RowLocations,
+        metadata: &Metadata,
+        comm: &Roce,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.layers[0].run_indexed_projection(
+            input,
+            pre,
+            positions,
+            locations,
+            &mut self.caches[0],
+            &mut self.source,
+            metadata,
+            comm,
+            stream,
+        )
+    }
+    /// The rest of run_encoder after run_encoder_projection, unchanged.
+    pub(crate) fn finish_encoder_deferred(
+        &mut self,
+        input: &Buffer<bf16>,
+        positions: &Positions,
+        candidates: &Candidates,
+        tokens: &TokenRows,
+        metadata: &Metadata,
+        comm: &Roce,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.layers[0].finish_indexed_deferred(
+            input,
+            positions,
+            &self.caches[0],
+            candidates,
+            tokens,
+            &mut self.source,
+            metadata,
+            comm,
+            stream,
+        )
+    }
     pub(crate) fn encoder_output(&self) -> &Buffer<bf16> {
         self.layers[0].output()
     }

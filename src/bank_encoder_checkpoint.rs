@@ -60,6 +60,32 @@ impl Target {
             Some(bank_encoder_lineage::Binding::new(self.history.lineage)))))
     }
 
+    /// Bytes of a standalone (non-bank-retained) copy of this bank-retained checkpoint.
+    pub(crate) fn materialized_encoder_bytes(&self,saved:&EncoderPrefixImage)->Result<usize> {
+        ensure!(saved.bank_retained(),"only a bank-retained checkpoint is materialized");
+        Ok(self.state_image_regions_for_layers_mode(saved.position(),true,true,false)?.iter().map(|r|r.bytes()).sum())
+    }
+
+    /// Displaced checkpoint (CANADA_SCRATCH_DISPLACED_CHECKPOINT=1): before another conversation
+    /// reuses this bank, copy a bank-retained checkpoint into a standalone image. Its omitted
+    /// compressed pages come from the bank while they still belong to the checkpoint's lineage;
+    /// everything else comes from the captured image. Restore is the ordinary validated path
+    /// for a complete encoder image (no binding).
+    pub(crate) fn try_materialize_bank_encoder(&self,saved:&EncoderPrefixImage,budget:usize,
+        comm:&Roce,stream:&Stream)->Result<Option<EncoderPrefixImage>> {
+        ensure!(saved.bank_retained()&&self.encoder_prefix_reusable_from(saved),
+            "displaced checkpoint must still belong to this bank lineage");
+        self.state_image_guard(comm,stream)?;
+        let crate::state_image::Storage::Copy(retained)=&saved.0.image
+            else {anyhow::bail!("bank-retained checkpoint storage")};
+        let regions=self.state_image_regions_for_layers_mode(saved.position(),true,true,false)?;
+        let Some(image)=crate::state_image::Image::try_materialize(&self.cuda,&regions,retained,budget,
+            Some(self.io.core_module()),stream)? else {return Ok(None)};
+        comm.health()?;
+        Ok(Some(EncoderPrefixImage(StateImage{image:image.into(),owner:self.lease.fork(),
+            history:saved.0.history.clone(),context:self.context,rank:self.rank,stream:self.stream,compact:true},None)))
+    }
+
     pub(crate) fn bank_encoder_image_bytes_for_probe(&self,position:usize,retained:bool)->Result<usize> {
         admitted()?;
         Ok(self.state_image_regions_for_layers_mode(position,true,true,retained)?.iter().map(|r|r.bytes()).sum())

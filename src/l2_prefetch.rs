@@ -267,6 +267,9 @@ impl Window {
         self.open.set(true);
         Ok(())
     }
+    pub(crate) fn is_open(&self) -> bool {
+        self.open.get()
+    }
     pub(crate) fn join(&self, parent: &Stream) -> Result<()> {
         ensure!(
             self.cuda.owns_stream(parent)
