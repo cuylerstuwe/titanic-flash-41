@@ -1,5 +1,75 @@
 # Validation status
 
+## November 9 checkpoint ladder (s1389)
+
+s1389 is s1387 plus two changes:
+
+- **Allocation diagnostics.** A refused CUDA allocation writes one `allocation_failure` line on standard error.
+- **Optional checkpoint ladder.** Production enables it with `CANADA_SCRATCH_CHECKPOINT_LADDER=1`. The
+  [operations guide](OPERATIONS.md#earlier-checkpoints-for-edited-history) explains it.
+
+No kernel, precision boundary, weight, sampler, memory floor, cache budget, entry count or clock policy changes.
+The portable profile is unchanged.
+
+**Why.** In long agent sessions, harnesses rewrite old history: they offload old images and prune old tool output.
+Before s1389, the bounded cache held only checkpoints from the last few turns, so such an edit re-prefilled the whole
+conversation, even when the edit fell in its second half.
+
+**Screen.** A synthetic 40-turn conversation of about 6K tokens per turn, then three edits of older user messages,
+latest first, on separate model loads of s1389:
+
+| Request | Ladder off: cached tokens / time to first token | Ladder on |
+|---|---|---|
+| Edit turn 30 (235K-token prompt) | 0 / 27.3 s | 162,841 / 8.8 s |
+| Edit turn 20 (229K) | 0 / 26.5 s | 102,533 / 15.0 s |
+| Edit turn 10 (223K) | 0 / 25.8 s | 36,199 / 21.8 s |
+| Three continuations | fully cached, 0.09 s | fully cached, 0.09 s |
+
+**Answer differences.** The edited prompt asked a deliberately ambiguous question, and one answer differed between
+the arms. With the ladder off, four tagged copies of that prompt were answered both cold and after an ordinary
+checkpoint restore that only moves where the suffix prefill starts. All four pairs differed. Two flipped between
+the same two answers, in both directions. This is the floating-point near-tie sensitivity of any cached restore,
+not a new effect.
+
+**Qualification, with the ladder on:**
+
+- **Serving gate.** The 15-request image, tool and code tape plus cancel/resume passed. Eight outputs are identical
+  to s1387's on the same tape, ignoring random tool-call ids: the seven-request image chain and the plain-code
+  request. The seeded 130K-token code chain varies from run to run on unchanged runtimes, as before.
+- **Near-1M cancellation check.** It passed cleanly:
+  - a 974,039-token, 28-image prefill in 138.5 s;
+  - the retry fully cached in 0.3 s;
+  - a new image at 975,018 tokens with 973,824 cached, in 0.9 s.
+- **Stress panel: passed.**
+  - 70 requests reaching 974,076 prompt tokens: a 28-image conversation, two context resets, 16 later fresh
+    images, foreground image preemption of a 974K background request, and two 974K-token foreground peers
+    holding 3,273,868,848 bytes of temporary snapshots.
+  - Lowest available memory 10.995 GiB, above both floors.
+  - **Thermal guard.** Earlier attempts this evening were stopped during the 974K overlap phase by the
+    temporary test observer's 90°C guard. The qualifying run replaced that guard with a 100°C emergency stop,
+    which was not reached; the hottest device read 93.0°C. Production has no request-error rule at these
+    temperatures, and the 2350 MHz policy and hardware protections are unchanged.
+  - **Driver message.** One driver `NV_ERR_NO_MEMORY` line appeared during weight loading. All four engines
+    logged no `allocation_failure`; see [operations](OPERATIONS.md#lifecycle-and-diagnostics). There was no
+    Xid message.
+- **Driver message.** One earlier cancellation run logged a driver `NV_ERR_NO_MEMORY` line during weight loading,
+  after many back-to-back loads. The new diagnostics showed that no engine allocation had failed, and the model
+  served normally. That run was repeated cleanly.
+- **Other checks.** The native Arm64 build passed 221 CPU tests (25 ignored), and ten installation
+  interruption/rollback fixtures passed.
+
+Native serving-source fingerprint: `7673d73386d630fdb207f70f74090d1e58538c07957245f4838e223364080ef9`.
+Portable source fingerprint: `a370ff9a4f95f09a0e44264245f4e485958c129e7985e461a3c55e7fdacca129`. The portable tree's three
+changed engine files are byte-identical to native s1389; portable Rust/deployment checks and the portable GPU wrapper
+were not rerun for this release, and its profile does not enable the ladder.
+
+s1389 is installed through a journaled transaction with s1387 as the failed-start fallback, after fresh
+boots and one production model load per device. Five head-local streaming requests passed text, prompt reuse,
+continuation, image input and text after an image, and two routed requests passed through the incremental context
+transport. Runtime hashes, clocks, clock/APST recovery guards and kernel-health checks passed, and the reservation
+was released. See the
+[sanitized qualification record](../validation/checkpoint-ladder-2026-11-09.json).
+
 ## November 8 portable package with the s1387 options
 
 The portable profile now enables the [s1387 prefill and vision options](PREFILL.md), matching the

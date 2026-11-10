@@ -194,6 +194,23 @@ api! {
     host_free: unsafe extern "C" fn(*mut c_void)->CuResult = "cuMemFreeHost";
     function_attr: unsafe extern "C" fn(Handle,c_int,c_int)->CuResult = "cuFuncSetAttribute";
 }
+/// Failure-only allocation diagnostics. Driver refusals are otherwise visible
+/// only as kernel `NV_ERR_NO_MEMORY` lines without a size or caller.
+fn log_allocation_failure(result: &Result<()>, operation: &str, bytes: usize,
+    site: &'static std::panic::Location<'static>, cuda_free: Option<(usize, usize)>) {
+    let Err(error) = result else { return; };
+    let Some(driver) = error.downcast_ref::<DriverError>() else { return; };
+    if driver.code != 2 { return; }
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let field = |name: &str| meminfo.lines().find(|l| l.starts_with(name))
+        .and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).map(|kb| kb * 1024);
+    eprintln!("allocation_failure {}", serde_json::json!({
+        "operation": operation, "bytes": bytes, "site": format!("{}:{}", site.file(), site.line()),
+        "cuda_free": cuda_free.map(|f| f.0), "cuda_total": cuda_free.map(|f| f.1),
+        "mem_free": field("MemFree:"), "mem_available": field("MemAvailable:"), "cached": field("Cached:"),
+        "s_reclaimable": field("SReclaimable:"), "unix_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)}));
+}
 impl Api {
     fn check(&self, code: CuResult, op: &str) -> Result<()> {
         if code == 0 {
@@ -379,6 +396,7 @@ impl Cuda {
             "copy device bytes",
         )
     }
+    #[track_caller]
     pub fn mapped_host(&self, bytes: usize) -> Result<MappedHost> {
         ensure!(
             bytes > 0 && bytes <= 1024 * 1024 * 1024,
@@ -386,10 +404,12 @@ impl Cuda {
         );
         self.owner.current()?;
         let mut host = ptr::null_mut();
-        self.owner.api.check(
+        let result = self.owner.api.check(
             unsafe { (self.owner.api.host_alloc)(&mut host, bytes, 3) },
             "allocate mapped host region",
-        )?;
+        );
+        if result.is_err() { log_allocation_failure(&result, "allocate mapped host region", bytes, std::panic::Location::caller(), self.memory().ok()); }
+        result?;
         let mut region = MappedHost {
             owner: self.owner.clone(),
             host,
@@ -618,10 +638,12 @@ impl Cuda {
         self.owner.current()?;
         self.check_allocation_floor(bytes)?;
         let mut ptr = 0;
-        self.owner.api.check(
+        let result = self.owner.api.check(
             unsafe { (self.owner.api.alloc)(&mut ptr, bytes) },
             "allocate device memory",
-        )?;
+        );
+        if result.is_err() { log_allocation_failure(&result, "allocate device memory", bytes, std::panic::Location::caller(), self.memory().ok()); }
+        result?;
         if bytes>=65536&&let Some(sites)=&self.owner.allocation_sites {
             sites.borrow_mut().insert(ptr,(std::panic::Location::caller(),bytes));
         }
@@ -659,13 +681,16 @@ impl Cuda {
         let rounded=bytes.checked_add(granularity-1).context("compressible size overflow")?;
         Ok(rounded/granularity*granularity)
     }
+    #[track_caller]
     pub(crate) fn allocate_compressible<T: DeviceElement>(&self, len: usize) -> Result<Buffer<T>> {
         let bytes=len.checked_mul(size_of::<T>()).context("compressible buffer size overflow")?;
         let mapped_bytes=self.compressible_bytes(bytes)?;
         let prop=self.compressible_properties()?;
         let api=&self.owner.api;
         let mut allocation=VmmAllocation {owner:self.owner.clone(),ptr:0,bytes:mapped_bytes,handle:0,mapped:false};
-        api.check(unsafe{(api.mem_create)(&mut allocation.handle,mapped_bytes,&prop,0)},"create compressible memory")?;
+        let result=api.check(unsafe{(api.mem_create)(&mut allocation.handle,mapped_bytes,&prop,0)},"create compressible memory");
+        if result.is_err() { log_allocation_failure(&result, "create compressible memory", mapped_bytes, std::panic::Location::caller(), self.memory().ok()); }
+        result?;
         let mut obtained=MemAllocationProp::default();
         api.check(unsafe{(api.mem_properties)(&mut obtained,allocation.handle)},"check compressible memory properties")?;
         ensure!(obtained.compression==1 && obtained.location.kind==1 && obtained.location.id==self.owner.device,

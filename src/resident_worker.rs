@@ -507,6 +507,12 @@ fn cache_pressure_reclaim()->Result<bool> {
         Err(std::env::VarError::NotPresent)=>Ok(true),Err(error)=>Err(error.into()),
     }
 }
+fn checkpoint_ladder()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_CHECKPOINT_LADDER") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","checkpoint ladder must be0or1");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
+    }
+}
 
 /// Keep room for the current conversation's checkpoint and completed turn.
 /// Protect up to two longer parents; use oldest-first replacement in the
@@ -515,7 +521,21 @@ fn cache_pressure_reclaim()->Result<bool> {
 /// Entries are ordered by insertion/restoration, so cache hits refresh age.
 fn cache_evictions(entries:&[(usize,usize)], incoming:(usize,usize), budget:usize,
     long_first:bool,slots:usize)->Option<Vec<usize>> {
-    if incoming.1>budget || slots==0 {return None;}
+    cache_evictions_ladder(entries,None,incoming,budget,long_first,slots)
+}
+
+/// Earlier checkpoints of the incoming conversation (`ancestors`, entries whose
+/// prefix the incoming prefix extends) form a reuse ladder: an edit of early
+/// history restores the latest retained checkpoint at or before the edit.
+/// Whenever the ordinary policy would evict one of them, the ladder evicts
+/// instead the rung whose loss adds the least re-prefill for an edit at a
+/// uniformly random position, i.e. the smallest (at-prev)*(next-at). The two
+/// latest rungs (append, regenerate) are never ladder victims. Which entry
+/// class is evicted (an ancestor or another conversation) and how many are
+/// evicted are unchanged; `None` is exactly the ordinary policy.
+fn cache_evictions_ladder(entries:&[(usize,usize)], ancestors:Option<&[bool]>, incoming:(usize,usize),
+    budget:usize,long_first:bool,slots:usize)->Option<Vec<usize>> {
+    if incoming.1>budget || slots==0 || ancestors.is_some_and(|a|a.len()!=entries.len()) {return None;}
     let mut protected=if long_first {
         (0..entries.len()).filter(|&i|entries[i].0>incoming.0).collect::<Vec<_>>()
     }else{Vec::new()};
@@ -523,10 +543,28 @@ fn cache_evictions(entries:&[(usize,usize)], incoming:(usize,usize), budget:usiz
     protected.truncate(2.min(slots.saturating_sub(2)));
     let mut retained=(0..entries.len()).collect::<Vec<_>>();let mut removed=Vec::new();
     while retained.len()>=slots || retained.iter().map(|&i|entries[i].1).sum::<usize>()+incoming.1>budget {
-        let victim=*retained.iter().find(|&&i|!protected.contains(&i))?;
+        let oldest=*retained.iter().find(|&&i|!protected.contains(&i))?;
+        let victim=match ancestors {
+            Some(a) if a[oldest]=>ladder_victim(entries,a,&retained,&protected).unwrap_or(oldest),
+            _=>oldest,
+        };
         retained.retain(|&i|i!=victim);removed.push(victim);
     }
     Some(removed)
+}
+
+/// The retained ancestor whose removal merges the two smallest-product gaps.
+/// Positions are prefix lengths; the latest two rungs are kept.
+fn ladder_victim(entries:&[(usize,usize)],ancestors:&[bool],retained:&[usize],protected:&[usize])->Option<usize> {
+    let mut rungs=retained.iter().copied().filter(|&i|ancestors[i]).collect::<Vec<_>>();
+    rungs.sort_by_key(|&i|(entries[i].0,i));
+    if rungs.len()<3 {return None;}
+    (0..rungs.len()-2).filter(|&k|!protected.contains(&rungs[k])).min_by_key(|&k|{
+        let at=entries[rungs[k]].0;
+        let prev=if k==0{0}else{entries[rungs[k-1]].0};
+        let next=entries[rungs[k+1]].0;
+        ((at-prev) as u128*(next-at) as u128,rungs[k])
+    }).map(|k|rungs[k])
 }
 
 /// Image prompts have paid for visual prefill and use the ordinary bounded
@@ -542,7 +580,12 @@ fn prompt_cache_evictions(entries:&[(usize,usize)],incoming:(usize,usize),budget
 /// conversation cache. Image prompts retain ordinary conversation priority.
 fn cache_evictions_with_optional(entries:&[(usize,usize)], optional:&[bool],
     incoming:(usize,usize),budget:usize,long_first:bool,slots:usize)->Option<Vec<usize>> {
-    if incoming.1>budget || slots==0 || optional.len()!=entries.len() {return None;}
+    cache_evictions_with_optional_ladder(entries,optional,None,incoming,budget,long_first,slots)
+}
+fn cache_evictions_with_optional_ladder(entries:&[(usize,usize)], optional:&[bool], ancestors:Option<&[bool]>,
+    incoming:(usize,usize),budget:usize,long_first:bool,slots:usize)->Option<Vec<usize>> {
+    if incoming.1>budget || slots==0 || optional.len()!=entries.len()
+        || ancestors.is_some_and(|a|a.len()!=entries.len()) {return None;}
     let mut retained=(0..entries.len()).collect::<Vec<_>>();let mut removed=Vec::new();
     while retained.len()>=slots || retained.iter().map(|&i|entries[i].1).sum::<usize>()+incoming.1>budget {
         let Some(victim)=retained.iter().copied().filter(|&i|optional[i])
@@ -550,7 +593,9 @@ fn cache_evictions_with_optional(entries:&[(usize,usize)], optional:&[bool],
         retained.retain(|&i|i!=victim);removed.push(victim);
     }
     let rest=retained.iter().map(|&i|entries[i]).collect::<Vec<_>>();
-    removed.extend(cache_evictions(&rest,incoming,budget,long_first,slots)?.into_iter().map(|i|retained[i]));
+    let rest_ancestors=ancestors.map(|a|retained.iter().map(|&i|a[i]).collect::<Vec<_>>());
+    removed.extend(cache_evictions_ladder(&rest,rest_ancestors.as_deref(),incoming,budget,long_first,slots)?
+        .into_iter().map(|i|retained[i]));
     Some(removed)
 }
 
@@ -580,7 +625,13 @@ fn completed_cache_evictions(entries:&[(usize,usize)], optional:&[bool], ancesto
 fn encoder_checkpoint_evictions(entries:&[(usize,usize)], optional:&[bool],
     incoming:(usize,usize),parent_charge:Option<usize>,budget:usize,
     long_first:bool,slots:usize)->Option<Vec<usize>> {
-    cache_evictions_with_optional(entries,optional,incoming,
+    encoder_checkpoint_evictions_ladder(entries,optional,None,incoming,parent_charge,budget,long_first,slots)
+}
+#[allow(clippy::too_many_arguments)]
+fn encoder_checkpoint_evictions_ladder(entries:&[(usize,usize)], optional:&[bool], ancestors:Option<&[bool]>,
+    incoming:(usize,usize),parent_charge:Option<usize>,budget:usize,
+    long_first:bool,slots:usize)->Option<Vec<usize>> {
+    cache_evictions_with_optional_ladder(entries,optional,ancestors,incoming,
         budget.checked_sub(parent_charge.unwrap_or(0))?,long_first,
         slots.checked_sub(usize::from(parent_charge.is_some()))?)
 }
@@ -661,6 +712,7 @@ struct Worker {
     suspended_image_count: usize,
     loaded_request_is_suspended: bool,
     session_cache_long_first: bool,
+    checkpoint_ladder: bool,
     session_cache_shared_ancestors: bool,
     cache_pressure_reclaim: bool,
     prompt_checkpoint: bool,
@@ -976,6 +1028,7 @@ impl Worker {
             Ok(value)if value=="long_parents_and_recent" || value=="longest_prefix"=>true,
             _=>anyhow::bail!("session cache policy must be fifo or long_parents_and_recent"),
         };
+        let checkpoint_ladder=checkpoint_ladder()?;
         let session_cache_shared_ancestors=match std::env::var("CANADA_SCRATCH_CACHE_SHARED_ANCESTORS") {
             Err(std::env::VarError::NotPresent)=>false,
             Ok(v)if v=="0"=>false,Ok(v)if v=="1"=>true,
@@ -1300,6 +1353,7 @@ impl Worker {
         control.agree(&(shared_image_budget as u64).to_le_bytes())?;
         control.agree(&[u8::from(parking_extra_slots)])?;
         control.agree(&[u8::from(session_cache_long_first)])?;
+        control.agree(&[u8::from(checkpoint_ladder)])?;
         control.agree(&[u8::from(cache_pressure_reclaim)])?;
         control.agree(&[u8::from(state_copy_kernel)])?;
         control.agree(&[u8::from(prompt_checkpoint)])?;
@@ -1430,6 +1484,7 @@ impl Worker {
             suspended_image_count:0,
             loaded_request_is_suspended:false,
             session_cache_long_first,
+            checkpoint_ladder,
             session_cache_shared_ancestors,
             cache_pressure_reclaim,
             prompt_checkpoint,
@@ -1535,6 +1590,15 @@ impl Worker {
 
     /// Retain only a committed target/drafter/history image. Prompt checkpoints
     /// and displaced conversations share the bounded entry/2GiB budget.
+    /// With the checkpoint ladder, mark this owner's cached prefixes that the
+    /// incoming checkpoint extends (same tokens and media up to their length).
+    /// Every rank holds the same entries, so all ranks choose the same victims.
+    fn ladder_ancestors(&self,prefix:&[u32],media:&crate::prompt_media::Identity)->Option<Vec<bool>> {
+        self.checkpoint_ladder.then(||self.cached_sessions.iter().map(|c|c.owner==self.bank_id
+            &&c.prefix.len()<prefix.len()&&prefix.starts_with(&c.prefix)
+            &&media.matches_prefix(&c.media,c.prefix.len())).collect())
+    }
+
     fn retain_cached_prefix(&mut self,prefix:&[u32],pending:u32,media:&crate::prompt_media::Identity)->Result<Value> {
         self.retain_cached_prefix_reserved(prefix,pending,media.through(prefix.len()),0,0)
     }
@@ -2020,8 +2084,9 @@ impl Worker {
                         let cached=candidate;
                         let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
                         let (budget,slots)=self.cache_capacity(0,0);
-                        if let Some(mut evictions)=cache_evictions(&entries,(cached.prefix.len(),cached.charge),
-                            budget,self.session_cache_long_first,slots) {
+                        let ancestors=self.ladder_ancestors(&cached.prefix,&cached.media);
+                        if let Some(mut evictions)=cache_evictions_ladder(&entries,ancestors.as_deref(),
+                            (cached.prefix.len(),cached.charge),budget,self.session_cache_long_first,slots) {
                             evictions.sort_unstable();retention_evictions=evictions.len();
                             for i in evictions.into_iter().rev(){self.cached_sessions.remove(i);}
                             self.cached_sessions.push(cached);
@@ -2280,7 +2345,8 @@ impl Worker {
         let (budget,slots)=self.cache_capacity(0,0);
         let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
         let optional=self.cached_sessions.iter().map(CachedSession::opportunistic_logits).collect::<Vec<_>>();
-        let evictions=encoder_checkpoint_evictions(&entries,&optional,(checkpoint,charge),
+        let ancestors=self.ladder_ancestors(prefix,&media);
+        let evictions=encoder_checkpoint_evictions_ladder(&entries,&optional,ancestors.as_deref(),(checkpoint,charge),
             wanted.as_ref().map(|c|c.charge),budget,self.session_cache_long_first,slots);
         let eligible=!duplicate&&device_bytes<=2*1024usize.pow(3)&&evictions.is_some();
         // One extra index can become the new live index while the checkpoint
@@ -4189,6 +4255,7 @@ pub fn run_http(path: &Path) -> Result<()> {
         "context_capacity":p.context,"memory":worker.cuda.admission_memory()?,"production_qualified":false});
     ready["wide_startup_warmup"]=json!(wide_startup_warmup);
     ready["idle_anchor_enabled"]=json!(worker.idle_anchor_enabled);
+    ready["checkpoint_ladder"]=json!(worker.checkpoint_ladder);
     ready["retained_append32"]=json!(worker.retained_append32);
     ready["append_final_row_gather"]=json!(worker.verify.append_last_gather_enabled());
     ready["ffn_hint_chunks"]=json!(worker.verify.ffn_hint_chunks());
@@ -4544,6 +4611,54 @@ mod tests {
             (545342,934416108),budget,true,4).is_none());
         assert_eq!(completed_cache_evictions(&[encoder,prompt],&[false,true],&[false,false],
             (367,12000000),budget,true,4),Some(vec![]));
+    }
+    #[test]
+    fn checkpoint_ladder_spreads_rungs_over_one_growing_conversation() {
+        let (charge,budget,slots)=(77usize<<20,2usize<<30,8);
+        let grow=|ladder:bool|{
+            let mut cache:Vec<(usize,usize)>=Vec::new();
+            for k in 1..=150usize {
+                let incoming=(k*4096,charge);
+                let ancestors=vec![true;cache.len()];
+                let mut removed=cache_evictions_ladder(&cache,ladder.then_some(&ancestors[..]),incoming,
+                    budget,true,slots).unwrap();
+                removed.sort_unstable();
+                for i in removed.into_iter().rev(){cache.remove(i);}
+                cache.push(incoming);
+            }
+            let mut positions=cache.iter().map(|e|e.0).collect::<Vec<_>>();positions.sort_unstable();positions
+        };
+        // The ordinary policy keeps only the eight latest checkpoints, so an
+        // edit before them re-prefills everything (mean waste 0.46 of the
+        // conversation for a uniform edit). The ladder keeps the same two latest
+        // rungs and spreads the rest (mean waste 0.13); values match an
+        // independent Python model of this policy.
+        assert_eq!(grow(false),(143..=150).map(|k|k*4096).collect::<Vec<_>>());
+        assert_eq!(grow(true),vec![40960,106496,172032,270336,532480,606208,610304,614400]);
+    }
+    #[test]
+    fn checkpoint_ladder_changes_only_which_ancestor_is_evicted() {
+        let near=[(10000,10),(12000,10),(30000,10),(31000,10),(40000,10)];
+        assert_eq!(cache_evictions(&near,(50000,10),1000,true,5),Some(vec![0]));
+        assert_eq!(cache_evictions_ladder(&near,None,(50000,10),1000,true,5),Some(vec![0]));
+        assert_eq!(cache_evictions_ladder(&near,Some(&[false;5]),(50000,10),1000,true,5),Some(vec![0]));
+        // 30000 is nearly covered by 31000; the latest two rungs never go.
+        assert_eq!(cache_evictions_ladder(&near,Some(&[true;5]),(50000,10),1000,true,5),Some(vec![2]));
+        // The oldest entry belongs to another conversation: ordinary victim.
+        let foreign=[(5000,10),(10000,10),(20000,10),(30000,10),(40000,10)];
+        assert_eq!(cache_evictions_ladder(&foreign,Some(&[false,true,true,true,true]),(50000,10),1000,true,5),
+            Some(vec![0]));
+        // A duplicate position costs nothing to drop.
+        let duplicate=[(10000,10),(20000,10),(20000,10),(30000,10),(40000,10)];
+        assert_eq!(cache_evictions_ladder(&duplicate,Some(&[true;5]),(50000,10),1000,true,5),Some(vec![1]));
+        // Fewer than three rungs: ordinary victim. Mismatched masks refuse.
+        assert_eq!(cache_evictions_ladder(&[(10000,10),(20000,10)],Some(&[true;2]),(50000,10),1000,true,2),
+            Some(vec![0]));
+        assert!(cache_evictions_ladder(&near,Some(&[true;4]),(50000,10),1000,true,5).is_none());
+        // Longer protected parents stay protected and are never rungs.
+        let longer=[(10000,10),(12000,10),(30000,10),(90000,10),(31000,10),(40000,10)];
+        let removed=cache_evictions_ladder(&longer,Some(&[true,true,true,false,true,true]),(50000,10),1000,true,6);
+        assert_eq!(removed,Some(vec![2]));
     }
     #[test]
     fn completed_parent_reservation_preserves_bounds_and_unrelated_evictions() {

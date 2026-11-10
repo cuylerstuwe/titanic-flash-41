@@ -54,6 +54,22 @@ The default has **one physical execution bank**, not two permanently allocated b
 
 The internal priority-control endpoint uses the separate control key. Ordinary client integrations should use the request header. Do not expose or log the control credential. Background qualification is separate from normal foreground performance measurement.
 
+## Earlier checkpoints for edited history
+
+Each request leaves a small bank-retained encoder checkpoint at its prompt end, and an edit of history restores
+the latest retained checkpoint at or before the edit and prefills the rest. The bounded cache (8 entries, 2 GiB)
+used to replace the oldest entry first, so in a long conversation every retained checkpoint sat in the last few
+turns, and an edit of older history (an image offload, pruning old tool output) re-prefilled from the start.
+
+`CANADA_SCRATCH_CHECKPOINT_LADDER=1` keeps the conversation's earlier checkpoints spread over its length instead.
+When the ordinary policy would evict one of them, it evicts the one whose loss adds the least re-prefill for an
+edit at a uniformly random position (the smallest product of its two neighboring gaps). The two latest
+checkpoints, protected longer parents, the entry count, the byte budget and every admission check are
+unchanged. In a policy model of 150 checkpoints and 8 entries, the mean re-prefill for an edit at a random
+position falls from 0.46 to 0.13 of the conversation. It changes no arithmetic: a restore uses the existing
+checkpoint path, and a restored suffix may differ from a cold prefill only as any cached restore does, by
+floating-point summation order.
+
 ## Lifecycle and diagnostics
 
 `deploy/fleet.py` starts exactly one four-rank cohort with a fresh private ticket, validates the selected nodes and runtime files, and monitors health. Containers use Docker's init process for signal forwarding and reaping. Any failed rank causes coordinated cleanup of the recorded cohort. The controller checks project/generation ownership before stopping all four ranks concurrently, allowing up to 90 seconds for each Docker stop to finish GPU teardown. Docker sends SIGTERM and may escalate to SIGKILL after its 15-second grace period; stopping the service is not a promise to finish in-flight requests or preserve RAM caches. Systemd can restart a failed controller, with a bounded start limit. An unreachable worker can prevent safe complete cleanup; repair SSH and retry instead of starting a conflicting cohort or weakening ownership checks.
@@ -61,6 +77,8 @@ The internal priority-control endpoint uses the separate control key. Ordinary c
 Use `systemctl stop titanic-flash.service` for a systemd-managed installation. The standalone `fleet.py stop` action also handles an abandoned cohort when no supervisor owns the lifecycle lock. Inspect `fleet.py status`, Docker state and available memory before restarting after a failure. A process being alive is not equivalent to model Ready.
 
 Worker event diagnostics default to bounded **RAM** history. The portable launcher uses Docker's `none` log driver to avoid persistent per-token worker logs. Lifecycle state writes occur at transitions; model requests and generated text are not written by this wrapper. OS, SSH and systemd journals can still write ordinary operational logs. Authenticated `/_native/diagnostics` returns bounded diagnostic state with `Cache-Control: no-store`; save only deliberate, redacted incident evidence. A failed early startup may require a deliberate temporary bounded-log diagnostic run.
+
+A refused CUDA device, pinned-host or compressible allocation writes one `allocation_failure` JSON line to the worker's standard error: the size, the call site, CUDA's free and total memory, and the host's `MemFree`, `MemAvailable`, `Cached` and `SReclaimable`. Nothing is written otherwise. The line is kept only where the container's log driver keeps output; the portable launcher's `none` driver does not. After long uptime or many model loads, the kernel log can show `NVRM: ... NV_ERR_NO_MEMORY ... _memdescAllocInternal(pMemDesc) @ mem_desc.c:1359` with no matching `allocation_failure` line. The driver logs each failed large-page attempt at error level and then allocates with smaller pages; these lines need no action.
 
 Do not modify `deploy/profile.json` casually: it is the accumulated qualified model profile. Some internal environment variables retain a legacy `CANADA_SCRATCH_` prefix as an implementation compatibility detail. Diagnostic CLI commands and the `storage-fault-injection` feature are not part of the production build.
 

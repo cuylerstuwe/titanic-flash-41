@@ -161,8 +161,8 @@ impl Worker {
                 &&entries.len()+usize::from(replacement.is_none())<=slots
                 &&entries.iter().map(|e|e.1).sum::<usize>().checked_sub(retired_charge)
                     .and_then(|n|n.checked_add(charge)).is_some_and(|n|n<=budget)).then(Vec::new)
-        }else{encoder_checkpoint_evictions(&entries,&optional,(prefix.len(),charge),None,
-            budget,self.session_cache_long_first,slots)};
+        }else{encoder_checkpoint_evictions_ladder(&entries,&optional,self.ladder_ancestors(prefix,&media).as_deref(),
+            (prefix.len(),charge),None,budget,self.session_cache_long_first,slots)};
         let eligible=device<=2*1024usize.pow(3)&&evictions.is_some()
             &&(!only_free_capacity||charge<=64<<20);
         let reserve=self.cache_reserve()?;

@@ -1,0 +1,128 @@
+{
+  "release": "s1389",
+  "date": "2026-11-09",
+  "base": "s1387",
+  "changes": [
+    "failure-only allocation diagnostics (allocation_failure on stderr)",
+    "optional checkpoint ladder (CANADA_SCRATCH_CHECKPOINT_LADDER=1, enabled in native production)"
+  ],
+  "unchanged": [
+    "kernels",
+    "precision boundaries",
+    "weights",
+    "sampler",
+    "memory floors",
+    "cache budget and entry count",
+    "2350 MHz clock policy",
+    "portable profile"
+  ],
+  "ladder_screen": {
+    "workload": "synthetic 40-turn conversation, ~6K tokens per turn, then edits at turns 30, 20, 10",
+    "ladder_off": [
+      {
+        "tag": "edit-30",
+        "prompt_tokens": 235258,
+        "cached_tokens": 0,
+        "ttft_s": 27.279
+      },
+      {
+        "tag": "edit-20",
+        "prompt_tokens": 229288,
+        "cached_tokens": 0,
+        "ttft_s": 26.467
+      },
+      {
+        "tag": "edit-10",
+        "prompt_tokens": 223318,
+        "cached_tokens": 0,
+        "ttft_s": 25.813
+      }
+    ],
+    "ladder_on": [
+      {
+        "tag": "edit-30",
+        "prompt_tokens": 235258,
+        "cached_tokens": 162841,
+        "ttft_s": 8.788
+      },
+      {
+        "tag": "edit-20",
+        "prompt_tokens": 229303,
+        "cached_tokens": 102533,
+        "ttft_s": 14.965
+      },
+      {
+        "tag": "edit-10",
+        "prompt_tokens": 223333,
+        "cached_tokens": 36199,
+        "ttft_s": 21.847
+      }
+    ]
+  },
+  "restore_vs_cold_near_tie_check": {
+    "ladder": "off",
+    "pairs": 4,
+    "differing_pairs": 4,
+    "note": "cold vs ordinary checkpoint restore of the same ambiguous prompt"
+  },
+  "serving_gate": {
+    "passed": true,
+    "requests": 15,
+    "identical_to_s1387": 8,
+    "long_code_chain": "varies run to run on unchanged runtimes"
+  },
+  "cancellation_check": {
+    "passed": true,
+    "min_available_gib": [
+      14.336,
+      14.889,
+      14.901,
+      15.046
+    ]
+  },
+  "stress_panel": {
+    "passed": true,
+    "full_panel_passed": true,
+    "requests": 70,
+    "max_prompt_tokens": 974076,
+    "observer": "90 C stop bypassed on instruction; 100 C emergency backstop (not reached)",
+    "max_temperature_c": [
+      90.8,
+      93.0,
+      90.4,
+      90.0
+    ],
+    "approx_seconds_at_or_above_90c": {
+      "0": 80.0,
+      "1": 138.0,
+      "2": 8.0,
+      "3": 2.0
+    },
+    "min_available_gib": [
+      12.193,
+      10.995,
+      12.767,
+      12.896
+    ],
+    "kernel_driver_large_page_retry_lines": 1,
+    "engine_allocation_failures": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 0
+    },
+    "xid_messages": 0,
+    "earlier_attempts": "three earlier runs (two full panels and one cold-start run of the final phases) were stopped by the 90 C test-observer guard during the 974K background-overlap phase; one more rerun skipped those phases because of a harness label and completed the rest"
+  },
+  "recovery_fixtures": {
+    "passed": true,
+    "cases": 10
+  },
+  "cpu_tests": {
+    "passed": true,
+    "tests_passed": 221,
+    "failed": 0,
+    "ignored": 25
+  },
+  "native_serving_source_fingerprint": "7673d73386d630fdb207f70f74090d1e58538c07957245f4838e223364080ef9"
+}
