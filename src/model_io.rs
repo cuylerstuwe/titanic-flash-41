@@ -264,7 +264,7 @@ impl ModelIo {
         let head=self.lossless_atlas.borrow().as_ref().cloned()
             .ok_or_else(||anyhow::anyhow!("final head needs the existing shared M6 encoding"))?;
         ensure!(head.matches_canonical(&self.cuda,self.weights.ptr("head.weight")?,stream)
-            &&self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+6*5120*2,
+            &&self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+6*5120*2,
             "final head shared encoding/reserve");
         let mut input=self.cuda.allocate::<bf16>(6*5120)?;input.zero()?;
         stream.join_default()?;stream.synchronize()?;
@@ -276,7 +276,7 @@ impl ModelIo {
         ensure!(self.rows==128&&!self.input_only,"sparse publication geometry");
         self.bind(stream)?;
         if enabled&&self.last_published_rows.is_none() {
-            ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024,
+            ensure!(self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+64*1024,
                 "sparse publication tracker reserve");
             self.last_published_rows=Some(self.cuda.allocate::<i32>(505)?);
         }

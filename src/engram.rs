@@ -167,7 +167,7 @@ impl RowStore {
     pub fn new(shard: PackedShard, budget: usize) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
-            let required = budget.checked_add(8usize << 30).context("Engram cache admission overflow")?;
+            let required = budget.checked_add(crate::memory::floor_bytes()).context("Engram cache admission overflow")?;
             ensure!(crate::memory::Available::gb10(usize::MAX, usize::MAX)?.admitted_available >= required,
                 "Engram row cache cannot retain the 8 GiB UMA reserve");
         }

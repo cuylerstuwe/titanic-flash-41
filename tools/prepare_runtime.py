@@ -50,6 +50,16 @@ def validate_fenced_bundles(inventory):
         'CANADA_SCRATCH_MARKOV_HEAD_CG': ['draft-markov-gemv-cg-v1'],
         'CANADA_SCRATCH_VISION_SPLIT': ['vision-attention-split-v1'],
     }
+    if profile.get('CANADA_SCRATCH_KV_FORMAT') == 'v41':
+        # The reference's cache formats need their stores, compressors and attention kernels before any model load.
+        v41 = {'kv-v41-v1': 'libcanada_kv.so', 'compression-fp4-v1': 'libcanada_compression.so',
+               'compression-verify32-fp4-v1': 'libcanada_compression.so',
+               'compression-prefill-fp4-v1': 'libcanada_prefill_store.so',
+               'attention-dsv41-prefill-v1': 'libcanada_prefill.so', 'attention-dsv41-decode-v1': 'libcanada_decode.so',
+               'attention-pico-prefill-v1': 'libcanada_prefill.so'}
+        for directory, library in v41.items():
+            relative = f'kernels/{directory}/{library}'
+            assert relative in inventory['files'], f'missing V4.1 cache artifact: {relative}'
     for flag, directories in optional.items():
         if profile.get(flag) == '1':
             for directory in directories:

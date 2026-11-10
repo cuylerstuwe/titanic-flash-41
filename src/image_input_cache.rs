@@ -312,14 +312,14 @@ impl ImageInputCache {
             // conservative decoder/resize bound we reserve below, rather than
             // charging every small image the maximum supported 1GiB workspace.
             let enough = || -> Result<bool> {
-                Ok((self.available_memory)()? > (8usize << 30) + workspace + patch_bytes)
+                Ok((self.available_memory)()? > crate::memory::floor_bytes() + workspace + patch_bytes)
             };
             if !enough()? {
                 state.clear_warm();
             }
             ensure!(
                 enough()?,
-                crate::memory::InputCapacityError("image preprocessing cannot retain the UMA reserve", (8usize << 30) + workspace + patch_bytes)
+                crate::memory::InputCapacityError("image preprocessing cannot retain the UMA reserve", crate::memory::floor_bytes() + workspace + patch_bytes)
             );
         }
         let _workspace = (self.reserve_workspace)(workspace + patch_bytes)?;

@@ -1,0 +1,43 @@
+{
+  "abi": 2,
+  "width": 512,
+  "page_tokens": [
+    32,
+    64,
+    128,
+    256
+  ],
+  "norm": false,
+  "input_dtype": "BF16",
+  "layout": "dsv41_fp4_g16_e4m3_footer32",
+  "architecture": 121,
+  "physical_sms": 48,
+  "license": "Apache-2.0",
+  "image": "sha256:82bb585723d16d25423646dd9b1300c51f5913f28c5e3900d5cc8eaf52f8aa4d",
+  "source": "https://github.com/sgl-project/sglang (pinned in the build image)",
+  "adaptation": "compression-prefill-v1's store with KVLayout::V41_FP4: RoPE on the bf16 latent, then the FP4 values stored as e2m1 with one e4m3 scale per 16 (verified bit-exact on GB10, fp4check.py). The RMS operator files are byte-identical copies of compression-prefill-v1's.",
+  "rms_operator_sha256": {
+    "manifest.json": "468c76ab816eac1294e4adb2574c6c702d01ef8aff0d8ac5d33657aef891c990",
+    "prefill_rms512.cubin": "7b7212396811878b676e0df9992cca3df10c28d62fc4d134eb29541aa836d914",
+    "prefill_rms512.ptx": "390a46772e0616533f14f08459eef72aeb11289cb8df972bd2afa1e41dd5a04e"
+  },
+  "adapter_sha256": "a8d4aeb81b6b9b9412533ba2e923305b9a33e36dc5b77adba3a7270a5f9e780e",
+  "library_sha256": "0cc12175d5fb54fe95cafe3fca31e01480fa010eced4867a5e3dfb189edd10f5",
+  "compiler_arguments": [
+    "nvcc",
+    "-shared",
+    "-Xcompiler=-fPIC",
+    "-O3",
+    "-gencode=arch=compute_121a,code=sm_121a",
+    "-std=c++20",
+    "--expt-relaxed-constexpr",
+    "-DSGL_CUDA_ARCH=1210",
+    "-I/opt/sglang/lib/python3.12/site-packages/flashinfer/data/include",
+    "-I/sgl-workspace/sglang/python/sglang/kernels/jit/include",
+    "-I/opt/sglang/lib/python3.12/site-packages/tvm_ffi/include",
+    "/out/compression-prefill-fp4-v1/store.cu",
+    "-o",
+    "/out/compression-prefill-fp4-v1/libcanada_prefill_store.so",
+    "-lcudart"
+  ]
+}

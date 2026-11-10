@@ -767,7 +767,7 @@ impl Target {
                 .checked_sub(reserved_weights.as_ref().map_or(0,|r|r.already_allocated_bytes()))
                 .context("imported target weights exceed model weight forecast")?;
             ensure!(cuda.admission_memory()?.admitted_available
-                > remaining + derived + 8 * 1024usize.pow(3),
+                > remaining + derived + crate::memory::floor_bytes(),
                 "target weights plus exact WO-A cache would consume reserved headroom");
         }
         if reserved_weights.is_none() && crate::weights::early_layer_reservation_requested()? {
@@ -847,7 +847,7 @@ impl Target {
                 Some(vendor_blas.clone()),
                 medium_woa.clone(),
             )?);
-            early_caches.push(PagedKv::new(cuda, swa_pages, 64)?);
+            early_caches.push(PagedKv::new_layout(cuda, swa_pages, 64, crate::attention::kv_format()?.window)?);
             if layer == 2 {
                 source2 = Some(Source::new_rows(
                     cuda,
@@ -1186,7 +1186,7 @@ impl Target {
         // Includes private row scratch and transient construction before the
         // new owner coalesces its index arenas. Keep the physical floor intact.
         ensure!(self.cuda.admission_memory()?.admitted_available
-            > causal_bytes + 4*1024usize.pow(3) + 8*1024usize.pow(3),
+            > causal_bytes + 4*1024usize.pow(3) + crate::memory::floor_bytes(),
             "independent owner construction would consume reserved headroom");
         let build=||self.fork_profile_in(core,core_bytes,stream,kernels,128,Phase::Extend,None,Some(lineage));
         let mut target=if let Some(donor)=prefill_arena {
@@ -1203,7 +1203,7 @@ impl Target {
         if self.io.prefill_encoded_enabled() {target.set_prefill_encoded_head(true,stream)?;}
         if self.io.prefill_row_pruned() {target.set_prefill_row_head(true,stream)?;}
         if self.io.sparse_publish_enabled() {target.set_prefill_sparse_publish(true,stream)?;}
-        ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3),
+        ensure!(self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes(),
             "independent owner consumed physical reserve");
         ensure!(self.independent_state_report(&target)?["independent_causal_owners"]==true,
             "independent owner construction retained shared mutable state");
@@ -1353,7 +1353,7 @@ impl Target {
             let planned = if share.is_some() {0}else{rows * wide_arena_bytes_per_row(sequence_parallel) * 2}
                 + candidates
                 + self.context * 170 + 4 * 64 * 1024 * 1024;
-            ensure!(self.cuda.admission_memory()?.admitted_available > planned + 8 * 1024usize.pow(3),
+            ensure!(self.cuda.admission_memory()?.admitted_available > planned + crate::memory::floor_bytes(),
                 "full-context wide profile would consume reserved host/device headroom");
         }
         let wide = Rc::new(crate::decoder::WideBuild::new(
@@ -1438,7 +1438,7 @@ impl Target {
             "independent profile geometry and lineage");
         let cuda = &self.cuda;
         let early_caches=if independent {self.early_caches.iter()
-            .map(|c|PagedKv::new(cuda,c.pages(),c.page_tokens())).collect::<Result<Vec<_>>>()?}
+            .map(|c|PagedKv::new_layout(cuda,c.pages(),c.page_tokens(),c.layout())).collect::<Result<Vec<_>>>()?}
             else {self.early_caches.clone()};
         let pair_slots = (COMPRESSED_OFFSET..COMPRESSED_OFFSET + self.context / 2)
             .map(|s| s as i32)
@@ -2257,7 +2257,7 @@ impl Target {
             // caller's initial cache admission. Recheck at allocation time;
             // the checkpoint is optional and never owns the live model state.
             let fits=self.cuda.admission_memory()?.admitted_available
-                >=8*1024usize.pow(3)+16*1024usize.pow(2)+budget-recycled_bytes;
+                >=crate::memory::floor_bytes()+16*1024usize.pow(2)+budget-recycled_bytes;
             if admit_image(fits)? {
                 let bank_retained=crate::config::bank_encoder_checkpoint_requested();
                 let regions=self.state_image_regions_for_layers_mode(self.history.position as usize,true,true,bank_retained)?;
@@ -2266,7 +2266,7 @@ impl Target {
                     None=>crate::state_image::Image::try_allocate(&self.cuda,&regions,budget,stream)?,
                 };
                 let fits=allocation.is_some() && self.cuda.admission_memory()?.admitted_available
-                    >=8*1024usize.pow(3)+16*1024usize.pow(2);
+                    >=crate::memory::floor_bytes()+16*1024usize.pow(2);
                 if admit_image(fits)? {
                     let mut image=allocation.take().ok_or_else(||anyhow::anyhow!("all-rank image admission differs"))?;
                     image.configure_copy_kernel(self.io.core_module())?;
@@ -2775,14 +2775,14 @@ impl Target {
     pub(crate) fn prepare_qkv_alternates_for_probe(&self,kernels:&Path)->Result<Vec<crate::fp8_linear::Linear>> {
         ensure!(std::env::var("CANADA_SCRATCH_QKV_SCHEDULE_SCREEN").as_deref()==Ok("1")
             && self.rows==16 && self.pending.is_none() && self.lease.is_current()
-            && self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024usize.pow(2),
+            && self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+64*1024usize.pow(2),
             "alternate QKV screen memory/ownership");
         self.layer_owners().into_iter().map(|l|l.attention().legacy_qkv_for_probe(kernels)).collect()
     }
     pub(crate) fn prepare_qkv_fence_alternates_for_probe(&self,kernels:&Path)->Result<Vec<crate::fp8_linear::Linear>> {
         ensure!(std::env::var("CANADA_SCRATCH_QKV_FENCE_SCREEN").as_deref()==Ok("1")
             && matches!(self.rows,6|16)&&self.pending.is_none()&&self.lease.is_current()
-            &&self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024usize.pow(2),
+            &&self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+64*1024usize.pow(2),
             "QKV fence alternate admission/ownership");
         self.layer_owners().into_iter().map(|l|l.attention().producer_qkv_for_probe(kernels)).collect()
     }
@@ -3056,7 +3056,7 @@ impl Target {
     pub(crate) fn prepare_wo_b_alternates_for_probe(&self,kernels:&Path)->Result<Vec<crate::fp8_linear::Linear>> {
         ensure!(crate::fp8_linear::output_projection_probe(self.rows)
             &&self.pending.is_none()&&self.lease.is_current()
-            &&self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024usize.pow(2),
+            &&self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+64*1024usize.pow(2),
             "alternate WO-B screen memory/ownership");
         self.layer_owners().into_iter().map(|l|l.attention().wo_b_pdl_for_probe(kernels)).collect()
     }
@@ -3111,7 +3111,7 @@ impl Target {
     pub(crate) fn prepare_shared_up_alternates_for_probe(&self,kernels:&Path)->Result<Vec<crate::fp8_linear::Linear>> {
         ensure!(std::env::var("CANADA_SCRATCH_LEGACY16_FFN_W13").as_deref()==Ok("1")
             && self.rows==16 && self.pending.is_none() && self.lease.is_current()
-            && self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024usize.pow(2),
+            && self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+64*1024usize.pow(2),
             "alternate W13 screen memory/ownership");
         self.layer_owners().into_iter().map(|l|l.ffn().legacy_shared_up_for_probe(kernels)).collect()
     }
@@ -3875,7 +3875,7 @@ impl Target {
         if std::env::var("CANADA_SCRATCH_TINY_APPEND_RETAIN_GRAPHS").as_deref()==Ok("1") {
             ensure!(self.encoder_graph.is_none(),"M6 append graph bank has no wide encoder graph");
             if self.tiny_append_graphs.is_none() {
-                ensure!(enabled && self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+32*1024usize.pow(2),
+                ensure!(enabled && self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+32*1024usize.pow(2),
                     "tiny append graph metadata reserve");
                 let pairs=(COMPRESSED_OFFSET..COMPRESSED_OFFSET+self.context/2).map(|x|x as i32).collect::<Vec<_>>();
                 let singles=(COMPRESSED_OFFSET..COMPRESSED_OFFSET+self.context).map(|x|x as i32).collect::<Vec<_>>();
@@ -3912,7 +3912,7 @@ impl Target {
         for g in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) {*g=None;}
         self.decoder_graph=None;
         if enabled {
-            ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+32*1024usize.pow(2),
+            ensure!(self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+32*1024usize.pow(2),
                 "tiny append metadata must preserve the operating reserve");
             let pairs=(COMPRESSED_OFFSET..COMPRESSED_OFFSET+self.context/2).map(|x|x as i32).collect::<Vec<_>>();
             let singles=(COMPRESSED_OFFSET..COMPRESSED_OFFSET+self.context).map(|x|x as i32).collect::<Vec<_>>();
@@ -4206,7 +4206,7 @@ impl Target {
             &&self.graphs.iter().chain(&self.alternate_index_graphs).all(Option::is_none)
             &&self.cuda.owns_stream(stream)&&self.stream==stream.raw()as usize,
             "compact history sampling requires a fresh copy verifier");
-        ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024usize.pow(2),
+        ensure!(self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+64*1024usize.pow(2),
             "compact sampler preserves physical reserve");
         self.compact_categorical=Some(crate::sharded_categorical_probe::CompactSampler::new(
             &self.cuda,core,self.rows,self.rank)?);
@@ -4228,7 +4228,7 @@ impl Target {
         if enabled==self.compact_sampling_enabled{return Ok(())}
         stream.synchronize()?;
         if enabled&&self.compact_categorical.is_none() {
-            ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+64*1024usize.pow(2),
+            ensure!(self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+64*1024usize.pow(2),
                 "compact sampler preserves physical reserve");
             self.compact_categorical=Some(crate::sharded_categorical_probe::CompactSampler::new(
                 &self.cuda,core,self.rows,self.rank)?);
@@ -5278,7 +5278,7 @@ impl Target {
             let available=memory.admitted_available;
             #[cfg(feature="storage-fault-injection")]
             let available=crate::memory::prefill_preview_available(available);
-            let fits=available>=8*1024usize.pow(3)+16*1024usize.pow(2);
+            let fits=available>=crate::memory::floor_bytes()+16*1024usize.pow(2);
             if !fits {
                 // This task warms immutable local row caches only. Every rank
                 // executes the same GPU work and collective sequence when it
@@ -6612,6 +6612,7 @@ impl Target {
         let slot = self.swa_layout.slot(position);
         let mut records = Vec::new();
         for (layer, cache) in caches.into_iter().enumerate() {
+            ensure!(cache.layout() == crate::attention::KvLayout::V4, "the SWA row audit reads the V4 layout only");
             ensure!(slot < cache.capacity(), "SWA audit position outside cache");
             let tokens = cache.page_tokens();
             let base = cache.data().ptr() + ((slot / tokens) * cache.page_bytes()) as u64;

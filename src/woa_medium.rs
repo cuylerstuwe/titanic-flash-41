@@ -234,7 +234,7 @@ impl Grouped {
             return Ok(());
         }
         let bytes = 2048 * 4096 * 2;
-        ensure!(self.cuda.admission_memory()?.admitted_available > bytes + 8 * 1024usize.pow(3),
+        ensure!(self.cuda.admission_memory()?.admitted_available > bytes + crate::memory::floor_bytes(),
             "WO-A decoded operand would consume the8GiB reserve");
         let values = self.cuda.allocate(2048 * 4096)?;
         let mut w = self.weight;

@@ -1,0 +1,49 @@
+{
+  "abi": 2,
+  "kind": "pico_prefill",
+  "architecture": 121,
+  "physical_sms": 48,
+  "heads": 16,
+  "topk": 128,
+  "min_rows": 1,
+  "max_rows": 16384,
+  "main_page_tokens": 64,
+  "extra_page_tokens": [
+    64
+  ],
+  "max_extra_topk": 512,
+  "compute": "F16_EXACT_WIDENING",
+  "lengths": "explicit",
+  "layout": "dsv41_fp8_g32_ue8m0_footer16",
+  "extra_layout": "dsv41_fp4_g16_e4m3_footer32",
+  "lse": "log2_with_sink",
+  "lse_note": "P is rounded to bf16 before summing (as model.py), so the LSE is within ~1e-3 (log2) of the exact one; the engine does not consume prefill LSE.",
+  "license": "MIT (pico-dgx-ds4, Copyright (c) 2026 Andy Shu; LICENSE-pico)",
+  "upstream": "https://github.com/Picom-code/pico-dgx-ds4 engine/kernels/prefill_attn.cu",
+  "upstream_commit": "7a3b9825147e53c4f6eca70eaa96e32163691525",
+  "generator_sha256": "132782b3fe5ba5b5396fc30d26a916ba1dec8894bbfc9c82731282f5733a5564",
+  "adapter_sha256": "7e7d1aeed5115f51fde4cc9911f9bfee40e6d900b766a0ee2e1028454c18c561",
+  "library_sha256": "7e558e925a74b7adc63a528e87ac10f9a18bda09b9e3a5f3a7f1068bcf3d4874",
+  "header_sha256": {
+    "attn/attn.h": "988b4568dd7819c558175ce2f91e8a74e8aeea09ea049ae0b28781ab193d199d",
+    "attn/attn_common.cuh": "e79ce898c710bd1b0f8c539c6f9717fe06a9af7737a98ed3331838eb56261532",
+    "common/check.h": "c607dcc1b5a9102d8d74bbaa19e749faf20c983df58dc67e3b0d4d3e90f09811",
+    "kernels/pa_common.cuh": "4a1322e6b2395b1afd34f56c23dd53865055b123558bd9f92b27f1193848f18e"
+  },
+  "image": "sha256:82bb585723d16d25423646dd9b1300c51f5913f28c5e3900d5cc8eaf52f8aa4d",
+  "compiler_arguments": [
+    "nvcc",
+    "-shared",
+    "-Xcompiler=-fPIC",
+    "-O3",
+    "-gencode=arch=compute_121a,code=sm_121a",
+    "-std=c++17",
+    "--expt-relaxed-constexpr",
+    "-I/out/attention-pico-prefill-v1/include",
+    "/out/attention-pico-prefill-v1/prefill.cu",
+    "-o",
+    "/out/attention-pico-prefill-v1/libcanada_prefill.so",
+    "-lcudart"
+  ],
+  "validation": "fp4check.py 2026-11-10: output within bf16 rounding of the float64 oracle (rel 0.0022-0.0023); bench_attn.py same-load: 8K-row prefill 7.68 ms vs FlashInfer DSv4.1 13.86 and V4 15.67"
+}

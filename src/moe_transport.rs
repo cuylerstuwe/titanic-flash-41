@@ -28,7 +28,7 @@ impl Pipeline {
     pub(crate) fn new(cuda:&Cuda,root:&Path,rank:usize)->Result<Self> {
         ensure!(rank<4,"pipeline rank");
         const REGISTERED_BYTES:usize=128*1024*1024; // includes allocation rounding and controls
-        ensure!(cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+REGISTERED_BYTES,
+        ensure!(cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+REGISTERED_BYTES,
             "MoE pipeline must preserve the 8GiB UMA reserve");
         for(name,expected)in [
             ("bridge.so","10c49a2b5b55849e6a97370d3ad6a8df4100ca5fad3732642c74f311ae463bdc"),

@@ -197,7 +197,7 @@ impl LongHistoryBuffers {
             && (rows==16 || (rows==32 && crate::config::history32_enabled()))
             // Include both the external padded input and the conditioner's
             // captured-input allocation in the startup construction forecast.
-            && cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+(rows+6+if wide{256}else{0})*15360*2,
+            && cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+(rows+6+if wide{256}else{0})*15360*2,
             "long history scratch admission");
         Ok(Self{features:Features::new(cuda,core,rows)?,chunk:cuda.allocate(6*15360)?,
             wide:if wide{Some(cuda.allocate(128*15360)?)}else{None},wide_enabled:wide,rows,
@@ -248,14 +248,14 @@ pub(crate) fn new_history_lookup(cuda:&Cuda,context:usize,prefix:&[u32])->Result
     let(slots,maximum,_)=history_lookup_geometry()?;
     let expected=history_lookup_reserved_bytes(context)?;
     let memory=cuda.admission_memory()?;
-    ensure!(memory.admitted_available>=8*1024usize.pow(3)+expected,
+    ensure!(memory.admitted_available>=crate::memory::floor_bytes()+expected,
         "history lookup allocation must preserve reserved headroom: {memory:?}, required_history_bytes={expected}");
     let lookup=if history_strong_backup_enabled(maximum)?{HistoryLookup::with_strong_backup(context,prefix,slots)?}
         else if maximum==16&&slots==1<<16 {HistoryLookup::new(context,prefix)?}
         else if maximum==16 {HistoryLookup::with_slots(context,prefix,slots)?}
         else {HistoryLookup::with_maximum(context,prefix,slots,maximum)?};
     ensure!(lookup.workspace_bytes()==expected,"history lookup reserved size differs");
-    ensure!(cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+expected,
+    ensure!(cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+expected,
         "history lookup would consume reserved host/device headroom");Ok(lookup)
 }
 
@@ -1016,7 +1016,7 @@ impl GreedySession {
     pub(crate) fn configure_history_associativity_for_probe(&mut self,ways:usize)->Result<()> {
         ensure!(!self.poisoned&&std::env::var("CANADA_SCRATCH_HISTORY_ASSOCIATIVITY_SCREEN").as_deref()==Ok("1"),
             "history associativity requires the finite foreground screen");
-        ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+32*1024usize.pow(2),
+        ensure!(self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+32*1024usize.pow(2),
             "history index rebuild would consume reserved headroom");
         self.history_lookup.as_mut().ok_or_else(||anyhow::anyhow!("history lookup absent"))?
             .resize_associativity_for_probe(ways)
@@ -1173,7 +1173,7 @@ impl GreedySession {
             && self.history_lookup.as_ref().is_none_or(|h| h.position() == target.position()),
             "session image requires committed target/draft/history frontiers");
         let cpu_bytes = self.history_lookup.as_ref().map_or(0, HistoryLookup::reserved_workspace_bytes);
-        ensure!(self.cuda.admission_memory()?.admitted_available >= 8 * 1024usize.pow(3) + budget + cpu_bytes,
+        ensure!(self.cuda.admission_memory()?.admitted_available >= crate::memory::floor_bytes() + budget + cpu_bytes,
             crate::state_image::CapacityRefused);
         // Snapshot ownership includes the entire session, so altered seeds,
         // lookup-table collision history and warmup policy are restored too.
@@ -1217,7 +1217,7 @@ impl GreedySession {
     pub(crate) fn prepare_exchange(&mut self,target:&Target,saved:&StateImage,budget:usize,comm:&Roce,stream:&Stream)
         ->Result<Option<ExchangePrepared>> {
         let(extra,_)=self.exchange_growth(target,saved,budget)?;
-        if self.cuda.admission_memory()?.admitted_available<8*1024usize.pow(3)+extra{return Ok(None);}
+        if self.cuda.admission_memory()?.admitted_available<crate::memory::floor_bytes()+extra{return Ok(None);}
         let draft_bytes=self.draft.state_image_bytes()?;
         let Some(target)=target.prepare_exchange(&saved.target,budget-draft_bytes,comm,stream)?else{return Ok(None);};
         let draft=match self.draft.save_state_image(draft_bytes,comm,stream){
@@ -1257,7 +1257,7 @@ impl GreedySession {
             && target.profile_is_current() && target.position() == self.draft.position()?,
             "session image restore owner/frontier");
         let cpu_bytes = saved.history_lookup.as_ref().map_or(0, HistoryLookup::reserved_workspace_bytes);
-        ensure!(self.cuda.admission_memory()?.admitted_available >= 8 * 1024usize.pow(3) + cpu_bytes,
+        ensure!(self.cuda.admission_memory()?.admitted_available >= crate::memory::floor_bytes() + cpu_bytes,
             "restored lookup exceeds reserved UMA headroom");
         let lookup = saved.history_lookup.as_ref().map(HistoryLookup::clone_reserved);
         self.poisoned = true;
@@ -1333,7 +1333,7 @@ impl GreedySession {
         ensure!(!self.poisoned&&self.block_verification&&self.target_seed.is_some()
             &&std::env::var("CANADA_SCRATCH_HISTORY_STRONG_BACKUP_SCREEN").as_deref()==Ok("1"),
             "strong-history backup requires its finite screen");
-        ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+32*1024usize.pow(2),
+        ensure!(self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+32*1024usize.pow(2),
             "history backup rebuild must preserve reserved headroom");
         self.history_lookup.as_mut().ok_or_else(||anyhow::anyhow!("history lookup absent"))?
             .resize_strong_backup_for_probe(enabled)
@@ -1346,7 +1346,7 @@ impl GreedySession {
         ensure!(!self.poisoned && self.block_verification && self.target_seed.is_some()
             && std::env::var("CANADA_SCRATCH_HISTORY_MATCH_SCREEN").as_deref()==Ok("1"),
             "history maximum requires the isolated causal proposal screen");
-        ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+32*1024usize.pow(2),
+        ensure!(self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+32*1024usize.pow(2),
             "history index rebuild must preserve reserved headroom");
         let lookup=self.history_lookup.as_mut().ok_or_else(||anyhow::anyhow!("history index absent"))?;
         lookup.resize_maximum_for_probe(maximum)?;Ok(lookup.workspace_bytes())

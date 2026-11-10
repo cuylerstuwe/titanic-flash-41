@@ -487,7 +487,7 @@ impl Roce {
             &&crate::config::wide_rows(rows),"FP32 prefill construction state/extent");
         // Hidden5120 sums and the widest6144 Engram embedding both fit.
         let elements=rows.checked_mul(6144).ok_or_else(||anyhow::anyhow!("FP32 prefill extent overflow"))?;
-        let reserve=8*1024usize.pow(3)+16*1024usize.pow(2);
+        let reserve=crate::memory::floor_bytes()+16*1024usize.pow(2);
         let bytes=if exchange{elements*2+elements/4*2}else{elements*8};
         ensure!(self.cuda.admission_memory()?.admitted_available>reserve+bytes,
             "FP32 prefill scratch would consume the runtime reserve");
@@ -1223,7 +1223,7 @@ impl Roce {
         local.upload(&bytes)?;stream.join_default()?;
         unsafe{self.gather_rows(&local,&mut all,stream)}?;stream.synchronize()?;
         rs.connect(&all.download()?)?;
-        ensure!(self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3),
+        ensure!(self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes(),
             "prefill RS consumed runtime reserve");
         self.native_prefill_rs=Some(rs);Ok(())
     }

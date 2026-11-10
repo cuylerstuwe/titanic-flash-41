@@ -34,7 +34,7 @@ impl Pair {
             &&projection.entry.grid.x_add==0&&projection.entry.grid.y==1&&projection.entry.grid.z==1,
             "paired draft head must use the qualified M10/FP32 operator");
         ensure!(cuda.owns_stream(stream)&&cuda.admission_memory()?.admitted_available
-            >=8*1024usize.pow(3)+2*M*(K*2+N*4),"paired draft head reserve");
+            >=crate::memory::floor_bytes()+2*M*(K*2+N*4),"paired draft head reserve");
         Ok(Self{graph:None,bindings:None,cuda:cuda.clone(),projection,
             input:cuda.allocate(2*M*K)?,output:cuda.allocate(2*M*N)?,stream:stream.raw()as usize})
     }

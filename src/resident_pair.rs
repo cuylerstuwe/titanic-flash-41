@@ -103,7 +103,7 @@ impl Worker {
                     ensure!(first.session.paired_probabilities_disjoint(&a,second.session,&b)?,"paired q storage aliased");
                     let mut timing=pool.begin_with_capture_admission(first.verify,a.inputs(),second.verify,b.inputs(),
                         &self.comm,&self.stream,&mut||self.control.all_admit(
-                            self.cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+256*1024usize.pow(2)))?;
+                            self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+256*1024usize.pow(2)))?;
                     timing["pooled"]=json!(true);
                     timing["pooled_draft_head"]=json!(head_pooled);
                     let a=first.session.finish_pair_proposal(first.verify,a,&self.comm,&self.stream)?;

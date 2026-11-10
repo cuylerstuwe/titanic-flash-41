@@ -28,7 +28,7 @@ pub(super) mod idle_anchor_policy;
 use idle_anchor_policy::Policy as IdlePolicy;
 enum Scheduled {
     Native(Command),
-    Park(Option<u8>),
+    Park(Option<u16>),
     BeginBackground(Command),
     Prefill,
     Resume(u64),
@@ -67,7 +67,7 @@ impl Scheduled {
             Self::OutputWait=>Ok(vec![16]),
             Self::IdleAnchor=>Ok(vec![19]),
             Self::Park(None)=>Ok(vec![7]),
-            Self::Park(Some(mask))=>Ok(vec![7,*mask]),
+            Self::Park(Some(mask))=>{let mut bytes=vec![7];bytes.extend(mask.to_le_bytes());Ok(bytes)},
             Self::Exchange(id)=>{ensure!(*id>0,"invalid exchange request identity");let mut bytes=vec![17];bytes.extend(id.to_le_bytes());Ok(bytes)},
             Self::PairStep(id)=>{ensure!(*id>0,"invalid paired request identity");let mut bytes=vec![18];bytes.extend(id.to_le_bytes());Ok(bytes)},
             Self::Resume(id)|Self::Discard(id)=>{
@@ -79,7 +79,7 @@ impl Scheduled {
     fn decode(bytes:&[u8])->Result<Self> {
         match bytes {
             [7]=>Ok(Self::Park(None)),
-            [7,mask]=>Ok(Self::Park(Some(*mask))),
+            [7,low,high]=>Ok(Self::Park(Some(u16::from_le_bytes([*low,*high])))),
             [11]=>Ok(Self::Prefill),
             [14,..] if bytes.len()==10 && bytes[9]<=1=>Ok(Self::Priority(PrioritySnapshot{
                 revision:u64::from_le_bytes(bytes[1..9].try_into().unwrap()),hold:bytes[9]!=0})),
@@ -185,7 +185,7 @@ fn execute(w:&mut Worker,images:&mut Vec<ParkedRequest>,command:Scheduled,
                 "protected_entries_reclaimed_for_admitted_owner":protected_reclaimed,
                 "host_allocator_trim":w.state_pressure_trim.take(),
                 "prefill_working_allowance_bytes":prefill_working_allowance,
-                "protected_cache_entries":protected.map_or(0,u8::count_ones),
+                "protected_cache_entries":protected.map_or(0,u16::count_ones),
                 "seconds":began.elapsed().as_secs_f64()}))}
         }
         Scheduled::Resume(id)|Scheduled::Discard(id)=>{
@@ -583,14 +583,18 @@ mod tests {
         assert!(Scheduled::decode(&[8,0,0,0,0,0,0,0,0]).is_err());
         assert!(Scheduled::decode(&[18,0,0,0,0,0,0,0,0]).is_err());
         assert_eq!(Scheduled::decode(&[7]).unwrap().encode().unwrap(),[7]);
-        for mask in 0..=255 {assert_eq!(Scheduled::decode(&[7,mask]).unwrap().encode().unwrap(),[7,mask]);}
+        for mask in (0..=u16::MAX).step_by(257).chain([1,255,256,u16::MAX]) {
+            let [low,high]=mask.to_le_bytes();
+            assert_eq!(Scheduled::decode(&[7,low,high]).unwrap().encode().unwrap(),[7,low,high]);
+        }
         // Wire parsing cannot know the live cache extent; all ranks validate
         // the same mask against that extent before optional eviction or save.
-        for entries in 0..=8 {for mask in 0u8..=255 {
-            assert_eq!(cache_protection_mask_valid(mask,entries),u16::from(mask)<(1u16<<entries));
+        for entries in 0..=16 {for mask in (0..=u16::MAX).step_by(97).chain([0,1,u16::MAX]) {
+            assert_eq!(cache_protection_mask_valid(mask,entries),u32::from(mask)<(1u32<<entries));
         }}
-        assert!(!cache_protection_mask_valid(0,9));
-        assert!(Scheduled::decode(&[7,0,0]).is_err());
+        assert!(!cache_protection_mask_valid(0,17));
+        assert!(Scheduled::decode(&[7,0]).is_err());
+        assert!(Scheduled::decode(&[7,0,0,0]).is_err());
     }
     #[test]
     fn progress_cannot_start_or_restore_a_request_or_discard_an_unknown_owner() {

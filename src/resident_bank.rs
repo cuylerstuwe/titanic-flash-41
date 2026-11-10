@@ -327,7 +327,7 @@ impl Worker {
         long.enable_compact_history_sampling(&self.core,&self.stream)?;
         let long_buffers=LongHistoryBuffers::new(&self.cuda,&self.core)?;
         let copy_before=self.cuda.admission_memory()?;
-        let required=9*1024usize.pow(3)+768*1024usize.pow(2);
+        let required=(crate::memory::floor_bytes()+1024usize.pow(3))+768*1024usize.pow(2);
         ensure!(self.control.all_admit(copy_before.admitted_available>=required)?,
             "second copy-profile construction would consume physical reserve");
         let mut copy=fork(32)?;copy.set_graph_replay(true)?;
@@ -339,7 +339,7 @@ impl Worker {
             "second physical owner requires complete copy conditioning");
         self.stream.synchronize()?;
         let after=self.cuda.admission_memory()?;
-        ensure!(self.control.all_admit(after.admitted_available>=9*1024usize.pow(3))?,
+        ensure!(self.control.all_admit(after.admitted_available>=(crate::memory::floor_bytes()+1024usize.pow(3)))?,
             "complete resident owners consumed construction reserve");
         let ownership=self.large.independent_state_report(&large)?;
         ensure!(ownership["independent_causal_owners"]==true,"physical owners share causal state");
@@ -364,7 +364,7 @@ impl Worker {
         let shared_target_head=self.verify.shares_lossless_target_head(&self.peer_bank.as_ref().unwrap().verify);
         ensure!(std::env::var("CANADA_SCRATCH_SHARED_TARGET_HEAD").as_deref()!=Ok("1")||shared_target_head,
             "resident target head encoding was not shared");
-        ensure!(self.control.all_admit(final_memory.admitted_available>=9*1024usize.pow(3))?,
+        ensure!(self.control.all_admit(final_memory.admitted_available>=(crate::memory::floor_bytes()+1024usize.pow(3)))?,
             "paired workspace consumed construction reserve");
         Ok(json!({"enabled":true,"owners":2,"context_capacity_each":self.large.context_capacity(),
             "memory_before":before,"memory_after":after,"seconds":began.elapsed().as_secs_f64(),

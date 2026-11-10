@@ -61,7 +61,7 @@ impl Head {
         const COUNT:usize=32320*5120;
         const BYTES:usize=COUNT+COUNT/2+COUNT/32;
         ensure!(cuda.owns_stream(stream) && canonical!=0 && canonical%256==0
-            && cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+BYTES+COUNT/256,
+            && cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+BYTES+COUNT/256,
             "lossless target-head geometry/reserve");
         let raw=std::fs::read(root.join("manifest.json"))?;
         ensure!(format!("{:x}",Sha256::digest(&raw))==pin,

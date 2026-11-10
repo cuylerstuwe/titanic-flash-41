@@ -220,7 +220,7 @@ impl DraftHead {
             &&self.stream==stream.raw()as usize&&self.cuda.owns_stream(stream)
             &&self.integer.is_none()&&!self.gemv_active.get(),"private INT8 finite admission");
         let bytes=N*K+N*(K/128)*4;
-        ensure!(self.cuda.admission_memory()?.admitted_available>bytes+8*1024usize.pow(3),
+        ensure!(self.cuda.admission_memory()?.admitted_available>bytes+crate::memory::floor_bytes(),
             "private INT8 copy would consume reserved UMA headroom");
         let quantizer=Operator::load(&self.cuda,root,"private_int8_head_quantize")?;
         let projection=Operator::load(&self.cuda,root,"private_int8_head_m5")?;
@@ -270,7 +270,7 @@ impl DraftHead {
         );
         let bytes = N * K + (N / 32) * (K / 32);
         ensure!(
-            cuda.admission_memory()?.admitted_available > bytes + 8 * 1024usize.pow(3),
+            cuda.admission_memory()?.admitted_available > bytes + crate::memory::floor_bytes(),
             "private draft-head copy would consume reserved host/device headroom"
         );
         let quantizer = Operator::load(cuda, root, "draft_head_quantize")?;

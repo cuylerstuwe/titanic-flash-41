@@ -47,11 +47,11 @@ impl DrawTrace {
             else if compact_peer {80*2*6*5120*2}
             else {STRIDE+if layer_trace {80*boundary_bytes}else{0}};
         let bytes=stride*(capacity+1+usize::from(compare_bytes));let memory=cuda.admission_memory()?;
-        ensure!(memory.admitted_available>bytes+(8usize<<30)+(64<<20),
+        ensure!(memory.admitted_available>bytes+crate::memory::floor_bytes()+(64<<20),
             "buffered draw diagnosis would consume the UMA reserve");
         let storage=cuda.allocate(bytes)?;
         let byte_compare=if compare_bytes {Some((cuda.module(core)?,cuda.allocate(1)?))}else{None};
-        ensure!(cuda.admission_memory()?.admitted_available>(8usize<<30)+(64<<20),
+        ensure!(cuda.admission_memory()?.admitted_available>crate::memory::floor_bytes()+(64<<20),
             "buffered draw allocation consumed the UMA reserve");
         Ok(Self {cuda:cuda.clone(),storage,frames:Vec::new(),reference:true,
             compared:0,difference:None,memory_before:serde_json::to_value(memory)?,stride,layer_trace,
@@ -118,7 +118,7 @@ impl DrawTrace {
                 // driver byte copies of the same completed model buffers.
                 // The extra work occurs only on first use; all arithmetic
                 // remains outside this integer-only tracing path.
-                ensure!(self.cuda.admission_memory()?.admitted_available>offset+(8usize<<30),
+                ensure!(self.cuda.admission_memory()?.admitted_available>offset+crate::memory::floor_bytes(),
                     "peer copy check would consume the UMA reserve");
                 let check=self.cuda.allocate::<u8>(offset)?;let mut flag=self.cuda.allocate::<u32>(1)?;
                 flag.upload(&[u32::MAX])?;stream.join_default()?;

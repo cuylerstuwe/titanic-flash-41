@@ -45,12 +45,12 @@ pub(super) fn try_checkpoint(w: &mut Worker, other_charge: usize,
 }
 
 pub(super) fn try_checkpoint_protected(w: &mut Worker, other_charge: usize,
-    other_count: usize, protected: u8) -> Result<Option<(RequestCheckpoint, Value)>> {
+    other_count: usize, protected: u16) -> Result<Option<(RequestCheckpoint, Value)>> {
     checkpoint(w, other_charge, other_count, Some(protected))
 }
 
 fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
-    protected: Option<u8>) -> Result<Option<(RequestCheckpoint, Value)>> {
+    protected: Option<u16>) -> Result<Option<(RequestCheckpoint, Value)>> {
     w.state_pressure_trim=None;
     ensure!(w.current.is_some() && other_count<=1 && w.verify.profile_is_current()
         && w.verify.position() == w.history.frontier() as u64,
@@ -81,7 +81,7 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
     // cache may lend it, but an unfinished owner is never an eviction target.
     // Exchanges between already prepared owners account their staging below.
     let working_room=if exchange && other_count==0 {256}else{16}*1024usize.pow(2);
-    let reserve = 8*1024usize.pow(3)+working_room;
+    let reserve = crate::memory::floor_bytes()+working_room;
     let mut host_allocator_trim = None;
     if exchange || crate::config::single_bank_requested() {
         // Optional completed checkpoints may borrow unused parking capacity.
@@ -169,7 +169,7 @@ pub(super) fn try_exchange(w:&mut Worker,saved:&mut RequestCheckpoint)->Result<O
     // Unlike optional creation of another parked image, this moves existing
     // admitted owners. Their growth takes precedence over borrowed cache space.
     let evictions=cache_evictions(&entries,(usize::MAX,peak_charge),w.shared_image_budget,true,5);
-    let reserve=8*1024usize.pow(3)+16*1024usize.pow(2);
+    let reserve=crate::memory::floor_bytes()+16*1024usize.pow(2);
     if !w.control.all_admit(evictions.is_some())?{return Ok(None);}
     let mut evictions=evictions.unwrap();let mut available=w.cuda.admission_memory()?.admitted_available;
     let mut host_allocator_trim=None;
@@ -241,7 +241,7 @@ pub(super) fn suspend(w: &mut Worker) -> Result<Value> {
 
 pub(super) fn restore(w: &mut Worker, saved: &RequestCheckpoint) -> Result<Value> {
     ensure!(w.current.is_none(),"probe restore would replace an active request");
-    let reserve=8*1024usize.pow(3)+16*1024usize.pow(2);
+    let reserve=crate::memory::floor_bytes()+16*1024usize.pow(2);
     let mut admitted=w.control.all_admit(w.cuda.admission_memory()?.admitted_available>=reserve)?;
     if !admitted {
         w.cached_sessions.clear();

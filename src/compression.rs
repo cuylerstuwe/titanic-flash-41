@@ -63,6 +63,8 @@ struct Native {
     _lib: Library,
     c1: C1,
     c2: C2,
+    /// V4 (compression-v2, -verify32-v1) or V4.1-FP4 (compression-fp4-v1, -verify32-fp4-v1).
+    layout: crate::attention::KvLayout,
 }
 impl Native {
     fn open(root: &Path) -> Result<Self> {
@@ -74,17 +76,23 @@ impl Native {
                 c.physical_sms,
                 c.head_dim,
                 c.rope_dim
-            ) == (1, 121, 48, 512, 64)
+            ) == (c.abi, 121, 48, 512, 64)
                 && c.position_dtype == "i32"
                 && c.location_dtype == "i64"
                 && c.request_dtype == "i64"
                 && c.page_tokens == [32, 64, 128, 256]
                 && !c.pdl
                 && !c.fast_math
-                && c.eps.to_bits() == 1e-20f32.to_bits()
-                && c.layout == "dsv4_fp8_448_bf16_rope64_e8m0_footer8",
+                && c.eps.to_bits() == 1e-20f32.to_bits(),
             "compressor primitive contract mismatch"
         );
+        // abi 1: FP4 fake quantization re-rounded into the V4 FP8 page; abi 2: the FP4 values stored as they are,
+        // e2m1 with one e4m3 scale per 16 values (model.py's compressed cache).
+        let layout = match (c.abi, c.layout.as_str()) {
+            (1, "dsv4_fp8_448_bf16_rope64_e8m0_footer8") => crate::attention::KvLayout::V4,
+            (2, crate::attention::DSV41_EXTRA_LAYOUT) => crate::attention::KvLayout::V41Fp4,
+            _ => anyhow::bail!("compressor primitive contract mismatch"),
+        };
         let p = root.join("libcanada_compression.so");
         ensure!(
             format!("{:x}", Sha256::digest(std::fs::read(&p)?)) == c.library_sha256,
@@ -92,11 +100,12 @@ impl Native {
         );
         let lib = unsafe { Library::new(p) }?;
         let abi: unsafe extern "C" fn() -> i32 = *unsafe { lib.get(b"ca_compression_abi\0") }?;
-        ensure!(unsafe { abi() } == 1, "compressor ABI mismatch");
+        ensure!(unsafe { abi() } == c.abi as i32, "compressor ABI mismatch");
         Ok(Self {
             c1: *unsafe { lib.get(b"ca_compress1\0") }?,
             c2: *unsafe { lib.get(b"ca_compress2\0") }?,
             _lib: lib,
+            layout,
         })
     }
 }
@@ -300,16 +309,21 @@ type StoreFn = unsafe extern "C" fn(
 struct PrefillStore {
     _lib: Library,
     launch: StoreFn,
+    layout: crate::attention::KvLayout,
 }
 impl PrefillStore {
     fn open(root: &Path) -> Result<Self> {
         let c: StoreContract = serde_json::from_slice(&std::fs::read(root.join("store.json"))?)?;
+        let layout = match (c.abi, c.layout.as_str()) {
+            (1, "dsv4_fp8_448_bf16_rope64_e8m0_footer8") => crate::attention::KvLayout::V4,
+            (2, crate::attention::DSV41_EXTRA_LAYOUT) => crate::attention::KvLayout::V41Fp4,
+            _ => anyhow::bail!("prefill store contract"),
+        };
         ensure!(
-            (c.abi, c.architecture, c.physical_sms, c.width) == (1, 121, 48, 512)
+            (c.architecture, c.physical_sms, c.width) == (121, 48, 512)
                 && c.page_tokens == [32, 64, 128, 256]
                 && !c.norm
-                && c.input_dtype == "BF16"
-                && c.layout == "dsv4_fp8_448_bf16_rope64_e8m0_footer8",
+                && c.input_dtype == "BF16",
             "prefill store contract"
         );
         let path = root.join("libcanada_prefill_store.so");
@@ -319,10 +333,11 @@ impl PrefillStore {
         );
         let lib = unsafe { Library::new(path) }?;
         let abi: unsafe extern "C" fn() -> i32 = *unsafe { lib.get(b"ca_prefill_store_abi\0") }?;
-        ensure!(unsafe { abi() } == 1, "prefill store ABI");
+        ensure!(unsafe { abi() } == c.abi as i32, "prefill store ABI");
         Ok(Self {
             launch: *unsafe { lib.get(b"ca_prefill_store\0") }?,
             _lib: lib,
+            layout,
         })
     }
 }
@@ -476,7 +491,12 @@ impl PairPrefill {
                 })
                 .collect::<Vec<_>>(),
         )?;
-        let primitive = kernels.join("compression-prefill-v1");
+        // The prefill RMS operator is the same in both bundles; only the store differs by cache layout.
+        let primitive = kernels.join(if source.cache.layout() == crate::attention::KvLayout::V41Fp4 {
+            "compression-prefill-fp4-v1"
+        } else {
+            "compression-prefill-v1"
+        });
         let norm = Operator::load(cuda, &primitive, "prefill_rms512")?;
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(primitive.join("manifest.json"))?)?;
@@ -509,7 +529,12 @@ impl PairPrefill {
             locations: l,
             module: cuda.module(core)?,
             norm,
-            store: PrefillStore::open(&primitive)?,
+            store: {
+                let store = PrefillStore::open(&primitive)?;
+                ensure!(store.layout == source.cache.layout(), "prefill store layout {:?} for a {:?} cache",
+                    store.layout, source.cache.layout());
+                store
+            },
             owner_latent: source.latent.ptr(),
             owner_cache: source.cache.data().ptr(),
             owner_ring: source.ring.as_ref().map_or(0, |r| r.values().ptr()),
@@ -538,10 +563,13 @@ impl Source {
         );
         let mut latent = cuda.allocate::<bf16>(rows * 512)?;
         latent.zero()?;
+        let native = Native::open(root)?;
+        ensure!(native.layout == self.cache.layout(), "shared compressor writes {:?} into a {:?} cache",
+            native.layout, self.cache.layout());
         Ok(Self {
             cuda: cuda.clone(),
             _weights: self._weights.clone(),
-            native: Native::open(root)?,
+            native,
             frequencies: self.frequencies.clone(),
             weight: self.weight,
             ratio: self.ratio,
@@ -600,10 +628,13 @@ impl Source {
         } else {
             None
         };
+        // The compressed cache takes the layout of the compressor bundle that writes it.
+        let native = Native::open(root)?;
+        let layout = native.layout;
         Ok(Self {
             cuda: cuda.clone(),
             _weights: weights,
-            native: Native::open(root)?,
+            native,
             frequencies,
             weight,
             ratio,
@@ -611,7 +642,7 @@ impl Source {
             request_slots,
             ring_size,
             ring,
-            cache: PagedKv::new(cuda, pages, page_tokens)?,
+            cache: PagedKv::new_layout(cuda, pages, page_tokens, layout)?,
             latent,
             stream: Cell::new(0),
         })

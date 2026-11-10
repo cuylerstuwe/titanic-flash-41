@@ -1,0 +1,234 @@
+{
+  "release": "s1399",
+  "date": "2026-11-10",
+  "base": "s1394",
+  "failed_start_fallback": "s1394",
+  "native_serving_source_fingerprint": "096c9d6de074e6a644065301a0ce8809b1e12d0a792d4295cdb1fd76c7ff32cc",
+  "changes": {
+    "CANADA_SCRATCH_KV_FORMAT=v41": "KV caches in the reference implementation's own formats: a V4.1 sliding-window cache (e4m3, one ue8m0 scale per 32; 528 B/token) and a V4.1-FP4 compressed cache (e2m1, one e4m3 scale per 16; 288 B/token), about half the bytes per token",
+    "attention kernels (with v41)": "above 8 rows: an adapted open-source prefill sparse-attention kernel (MIT; keys packed in shared memory, exactly widened to f16 in registers); at 8 rows and below: FlashInfer v0.7.3 DeepSeek-V4.1 split decode with fp32 partials",
+    "CANADA_SCRATCH_SESSION_CACHE_SLOTS=16, CANADA_SCRATCH_SESSION_CACHE_BYTES=5 GiB": "up to 16 resident conversation images; usable bytes are limited to 4 GiB by the shared image budget (the one-bank maximum), which holds four ~600K-token conversations, or two of four at ~920K; every save is still admitted against real memory above the floor",
+    "diagnostics (off by default)": [
+      "CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB (test-only floor override)"
+    ]
+  },
+  "unchanged": [
+    "weights",
+    "sampler",
+    "non-attention kernels and precision boundaries",
+    "memory floor (8 GiB)",
+    "2350 MHz clock policy",
+    "drafter caches"
+  ],
+  "kernel_checks": {
+    "store_kernels": "bit-exact against the reference quantizers on GB10 (window and compressed caches)",
+    "attention": "outputs within bf16 rounding of a float64 oracle (relative error 0.0022-0.0023)",
+    "same_load_attention_ms_per_layer": {
+      "prefill rows=8192 extra=512": {
+        "previous_v4_kernel": 15.6669,
+        "flashinfer_dsv41_prefill": 13.8629,
+        "adapted_mit_prefill_kernel": 7.6822
+      },
+      "prefill rows=8192 extra=0": {
+        "previous_v4_kernel": 3.5163,
+        "flashinfer_dsv41_prefill": 2.41,
+        "adapted_mit_prefill_kernel": 1.6127
+      },
+      "prefill rows=128 extra=512": {
+        "previous_v4_kernel": 0.2274,
+        "flashinfer_dsv41_prefill": 0.2443,
+        "adapted_mit_prefill_kernel": 0.1234
+      },
+      "decode rows=6 extra=512": {
+        "previous_v4_split_decode": 0.0198,
+        "flashinfer_dsv41_split_decode": 0.0217,
+        "flashinfer_dsv41_unsplit": 0.0544,
+        "adapted_mit_prefill_kernel": 0.0298
+      },
+      "decode rows=16 extra=512": {
+        "previous_v4_split_decode": 0.0369,
+        "flashinfer_dsv41_split_decode": 0.0344,
+        "flashinfer_dsv41_unsplit": 0.0544,
+        "adapted_mit_prefill_kernel": 0.0297
+      },
+      "decode rows=32 extra=512": {
+        "previous_v4_split_decode": 0.0702,
+        "flashinfer_dsv41_split_decode": 0.0683,
+        "flashinfer_dsv41_unsplit": 0.0575,
+        "adapted_mit_prefill_kernel": 0.0299
+      }
+    }
+  },
+  "reference_quality": {
+    "kl": 0.010441654512728684,
+    "kl_ci95": [
+      0.009704502893623365,
+      0.011227998071462714
+    ],
+    "yardstick": 0.011033770378671802,
+    "kl_minus_yardstick_ci95": [
+      -0.001054036665850092,
+      -0.0001587537737855784
+    ],
+    "median": 0.005114153039851917,
+    "p99": 0.07541662613189107,
+    "kl_max": 0.518149545519587,
+    "clear_flips": 0,
+    "top1": 0.9563557010365521,
+    "positions": 5499
+  },
+  "reference_quality_note": "teacher-forced KL(reference || engine) per token against the reference forward, beside a split-K yardstick (the reference with its sums reordered) on the same 5,499-token text",
+  "prefill_same_window": {
+    "note": "cold, source-code prompts, one load each, same window (build vs build)",
+    "s1394": [
+      {
+        "prompt_tokens": 3418,
+        "seconds": 0.887
+      },
+      {
+        "prompt_tokens": 16835,
+        "seconds": 2.541
+      },
+      {
+        "prompt_tokens": 27777,
+        "seconds": 3.686
+      },
+      {
+        "prompt_tokens": 56147,
+        "seconds": 6.87
+      },
+      {
+        "prompt_tokens": 127366,
+        "seconds": 15.026
+      }
+    ],
+    "s1399": [
+      {
+        "prompt_tokens": 3418,
+        "seconds": 0.858
+      },
+      {
+        "prompt_tokens": 16835,
+        "seconds": 2.43
+      },
+      {
+        "prompt_tokens": 27777,
+        "seconds": 3.518
+      },
+      {
+        "prompt_tokens": 56147,
+        "seconds": 6.572
+      },
+      {
+        "prompt_tokens": 127366,
+        "seconds": 14.178
+      }
+    ]
+  },
+  "residency_check": {
+    "flags": "6 GiB session cache under the 4 GiB shared-image cap (effective 4 GiB, as released); 5 GiB test floor, not reached",
+    "sizes_k": [
+      600,
+      600,
+      600,
+      600
+    ],
+    "rounds": 3,
+    "return_turns": 8,
+    "return_cached_fraction": 0.9999,
+    "return_seconds_median": 0.413,
+    "min_available_gib": [
+      13.11,
+      13.84,
+      13.46,
+      12.25
+    ]
+  },
+  "residency_limit_near_1m": {
+    "flags": "release: 16 slots, 5 GiB session cache, 4 GiB shared-image cap, 8 GiB floor",
+    "sizes_k": [
+      980,
+      980,
+      980,
+      980
+    ],
+    "rounds": 3,
+    "return_turns": 8,
+    "return_cached_fraction": 0.5007,
+    "return_seconds_median": 108.976,
+    "min_available_gib": [
+      13.33,
+      14.12,
+      14.07,
+      12.2
+    ]
+  },
+  "memory_floor_test": {
+    "stage1": "one box, engine stopped: allocations reclaimed page cache smoothly down to 3.5 GiB available; no stalls, driver errors or OOM kills",
+    "stage2": "full stress panel with 4.5 GiB extra held on every box: passed; lowest available 5.9 GiB"
+  },
+  "serving_gate": {
+    "passed": true,
+    "requests": 15,
+    "criterion": "functional (tool-call behavior, cache reuse, cancel/resume)"
+  },
+  "cancellation_check": {
+    "passed": true,
+    "min_available_gib": [
+      13.133,
+      13.8,
+      13.781,
+      12.184
+    ]
+  },
+  "stress_panel": {
+    "passed": true,
+    "full_panel_passed": true,
+    "requests": 70,
+    "max_prompt_tokens": 974076,
+    "max_temperature_c": [
+      87.7,
+      86.8,
+      88.0,
+      87.8
+    ],
+    "approx_seconds_at_or_above_90c": {
+      "0": 0.0,
+      "1": 0.0,
+      "2": 0.0,
+      "3": 0.0
+    },
+    "min_available_gib": [
+      12.339,
+      13.012,
+      13.016,
+      11.405
+    ],
+    "kernel_driver_large_page_retry_lines": 0,
+    "engine_allocation_failures": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 0
+    }
+  },
+  "stress_panel_first_attempt": {
+    "result": "stopped at a test-fixture check, not an engine fault: the check required the two parked long conversations to total more than 2 GiB, a bar sized for the V4 cache; in the V4.1/FP4 layout each image is about half as large",
+    "requests_completed": 67,
+    "long_snapshot_bytes": 912614452,
+    "pair_held_bytes": 1825228872,
+    "engine_allocation_failures": 0,
+    "driver_issues": 0,
+    "fix": "the check now judges the pair from the parked images themselves; the full panel was rerun"
+  },
+  "recovery_fixtures": {
+    "passed": true,
+    "cases": 10
+  },
+  "cpu_tests": {
+    "passed": true,
+    "tests_passed": 226,
+    "failed": 0,
+    "ignored": 25
+  }
+}

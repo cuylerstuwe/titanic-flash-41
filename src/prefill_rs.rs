@@ -29,7 +29,7 @@ impl ReduceScatter {
     pub(crate) fn new(cuda: &Cuda, root: &Path, rank: usize) -> Result<Self> {
         ensure!(rank < 4, "prefill RS rank");
         // Ten 20MiB slots plus controls and CUDA graph metadata.
-        let reserve = 8 * 1024usize.pow(3) + 208 * 1024usize.pow(2);
+        let reserve = crate::memory::floor_bytes() + 208 * 1024usize.pow(2);
         ensure!(
             cuda.admission_memory()?.admitted_available >= reserve,
             "prefill RS must preserve the 8GiB UMA reserve"

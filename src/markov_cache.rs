@@ -31,7 +31,7 @@ impl CorrectionCache {
             &&op.entry.grid.y==1&&op.entry.grid.z==1&&op.entry.metadata.num_warps==4,
             "Markov cache ABI/grid");
         let bytes=SLOTS*(N+BLOCKS)*4+20;
-        ensure!(cuda.admission_memory()?.admitted_available>bytes+8*1024usize.pow(3),"Markov cache reserve");
+        ensure!(cuda.admission_memory()?.admitted_available>bytes+crate::memory::floor_bytes(),"Markov cache reserve");
         let values=cuda.allocate(SLOTS*N)?;let mut tags=cuda.allocate(SLOTS*BLOCKS)?;
         tags.upload(&vec![-1;SLOTS*BLOCKS])?;
         let hit=cuda.allocate(1)?;let mut counters=cuda.allocate(2)?;counters.upload(&[0,0])?;

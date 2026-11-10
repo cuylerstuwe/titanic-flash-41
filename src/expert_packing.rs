@@ -175,7 +175,7 @@ fn prepare_named(
     weights.finish_expert_layer(layer)?;
     if layer<40 && std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE_SCREEN").as_deref()==Ok("1") {
         let bytes=2*experts*sb;
-        ensure!(cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3)+bytes,
+        ensure!(cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+bytes,
             "scale-code experiment must preserve the physical memory reserve");
         let mut codes=cuda.allocate::<u8>(bytes)?;
         let mut error=cuda.allocate::<u32>(1)?;

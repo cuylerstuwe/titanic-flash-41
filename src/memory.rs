@@ -5,6 +5,51 @@ use serde::Serialize;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 static HOST_WORKSPACE_RESERVED: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only override of the physical memory floor, in MiB. Unset in production, where every
+/// admission keeps [`DEFAULT_FLOOR`] of MemAvailable (see [`Available::gb10`]) free. The
+/// memory-floor test sets it to measure how far below 8 GiB the GB10s stay healthy.
+pub(crate) const FLOOR_OVERRIDE_ENV: &str = "CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB";
+pub(crate) const DEFAULT_FLOOR: usize = 8 << 30;
+const MIN_FLOOR_MIB: usize = 2048;
+const MAX_FLOOR_MIB: usize = 65536;
+
+/// The floor an override value selects; `None` (unset) is the 8 GiB default.
+pub(crate) fn parse_floor_override(value: Option<&str>) -> Result<usize> {
+    let Some(value) = value else { return Ok(DEFAULT_FLOOR) };
+    let mib: usize = value
+        .trim()
+        .parse()
+        .with_context(|| format!("{FLOOR_OVERRIDE_ENV} must be a whole number of MiB"))?;
+    ensure!(
+        (MIN_FLOOR_MIB..=MAX_FLOOR_MIB).contains(&mib),
+        "{FLOOR_OVERRIDE_ENV} must be {MIN_FLOOR_MIB}..={MAX_FLOOR_MIB} MiB"
+    );
+    Ok(mib << 20)
+}
+
+fn floor_setting() -> &'static std::result::Result<usize, String> {
+    static FLOOR: std::sync::OnceLock<std::result::Result<usize, String>> = std::sync::OnceLock::new();
+    FLOOR.get_or_init(|| {
+        let value = std::env::var(FLOOR_OVERRIDE_ENV).ok();
+        parse_floor_override(value.as_deref()).map_err(|error| format!("{error:#}"))
+    })
+}
+
+/// Startup check: refuses an invalid override, and reports a valid one.
+pub(crate) fn validate_floor() -> Result<usize> {
+    let floor = floor_setting().clone().map_err(anyhow::Error::msg)?;
+    if floor != DEFAULT_FLOOR {
+        eprintln!("memory floor override: {} MiB (test only)", floor >> 20);
+    }
+    Ok(floor)
+}
+
+/// The physical memory floor every admission keeps free: 8 GiB unless the test-only override
+/// is set. An invalid override is refused by [`validate_floor`] at startup.
+pub(crate) fn floor_bytes() -> usize {
+    floor_setting().as_ref().copied().unwrap_or(DEFAULT_FLOOR)
+}
 #[cfg(feature="storage-fault-injection")]
 thread_local! { pub(crate) static PREFILL_PREVIEW_PRESSURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 /// The finite probe can exercise a late, rank-local memory decline without
@@ -64,7 +109,7 @@ impl std::fmt::Display for InputCapacityError {
 impl std::error::Error for InputCapacityError {}
 pub(crate) struct HostWorkspaceReservation(usize);
 pub(crate) fn reserve_host_workspace(bytes: usize) -> Result<HostWorkspaceReservation> {
-    reserve_host_workspace_with_floor(bytes, 8usize << 30)
+    reserve_host_workspace_with_floor(bytes, crate::memory::floor_bytes())
 }
 /// Raw inputs waiting for a lifetime slot cannot consume the unallocated
 /// part of the admitted owners' state capacity. Existing cache/image bytes
@@ -72,7 +117,7 @@ pub(crate) fn reserve_host_workspace(bytes: usize) -> Result<HostWorkspaceReserv
 pub(crate) fn reserve_waiting_host_workspace(bytes: usize, image_budget: usize) -> Result<HostWorkspaceReservation> {
     if image_budget == 0 { return reserve_host_workspace(bytes); }
     image_storage::with_unallocated_capacity(image_budget, |growth| {
-        reserve_host_workspace_with_floor(bytes, (8usize << 30) + growth)
+        reserve_host_workspace_with_floor(bytes, crate::memory::floor_bytes() + growth)
     })
 }
 fn reserve_host_workspace_with_floor(bytes: usize, floor: usize) -> Result<HostWorkspaceReservation> {
@@ -206,6 +251,22 @@ impl Available {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn memory_floor_override_is_bounded_and_defaults_to_eight_gib() {
+        assert_eq!(parse_floor_override(None).unwrap(), 8usize << 30);
+        assert_eq!(DEFAULT_FLOOR, 8usize << 30);
+        assert_eq!(parse_floor_override(Some("4096")).unwrap(), 4usize << 30);
+        assert_eq!(parse_floor_override(Some(" 6656 ")).unwrap(), 6656usize << 20);
+        assert_eq!(parse_floor_override(Some("2048")).unwrap(), 2usize << 30);
+        assert_eq!(parse_floor_override(Some("65536")).unwrap(), 64usize << 30);
+        for bad in ["2047", "65537", "0", "-1", "4.5", "", "4GiB"] {
+            assert!(parse_floor_override(Some(bad)).is_err(), "{bad:?} must be refused");
+        }
+        // Production never sets the override, so every admission check keeps exactly 8 GiB.
+        if std::env::var_os(FLOOR_OVERRIDE_ENV).is_none() {
+            assert_eq!(floor_bytes(), 8usize << 30);
+        }
+    }
     #[test]
     fn percpu_diagnostic_counts_zones_without_changing_admission() {
         let zones = "Node 0, zone DMA\n pagesets\n cpu: 0\n count: 2\n high: 9\n cpu: 1\n count: 3\nNode 0, zone Normal\n cpu: 0\n count: 5\n";

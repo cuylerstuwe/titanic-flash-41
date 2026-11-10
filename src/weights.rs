@@ -17,7 +17,6 @@ use std::{
     time::Instant,
 };
 const CHUNK: usize = 16 * 1024 * 1024;
-const RESERVE: usize = 8 * 1024 * 1024 * 1024;
 
 /// Opt-in startup diagnostics, never part of the generation loop. Preserve
 /// the loader, digest order and synchronous upload behavior while locating
@@ -165,7 +164,7 @@ impl StagedReservation {
             // reflects its GPU pages even where cgroup counters do not.
             // Do not subtract those pages twice or ignore physical use.
             let additional=if external.is_some(){0}else{outstanding};
-            ensure!(additional.checked_add(RESERVE+CHUNK).is_some_and(|n|n<available.admitted_available),
+            ensure!(additional.checked_add(crate::memory::floor_bytes()+CHUNK).is_some_and(|n|n<available.admitted_available),
                 "early layer weights exceed unchanged memory reserve: remaining={outstanding}, available={available:?}");
             let (bytes,allocated)=geometry[directory];
             let buffer=if let Some(pool)=&external {
@@ -487,7 +486,7 @@ impl Weights {
         // cache/workspace/graphs separately before a complete-engine load.
         ensure!(
             total
-                .checked_add(8 * 1024 * 1024 * 1024)
+                .checked_add(crate::memory::floor_bytes())
                 .is_some_and(|v| v < free),
             "weight atlas exceeds available memory with headroom"
         );
@@ -780,7 +779,7 @@ impl Weights {
         let additional=if reserved.is_some(){if pipeline{0}else{CHUNK}}else{allocated};
         ensure!(
             additional
-                .checked_add(RESERVE)
+                .checked_add(crate::memory::floor_bytes())
                 .is_some_and(|n| n < available.admitted_available),
             "staged atlas exceeds memory headroom: requested={total}, available={available:?}"
         );

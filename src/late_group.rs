@@ -208,7 +208,7 @@ impl Group {
                     &vec![0; num_rows],
                 )?);
             }
-            caches.push(PagedKv::new(cuda, swa_pages, 64)?);
+            caches.push(PagedKv::new_layout(cuda, swa_pages, 64, crate::attention::kv_format()?.window)?);
         }
         Ok(Self {
             encoder_only: false,
@@ -317,7 +317,7 @@ impl Group {
             encoder_only,
             layers,
             caches: if independent {self.caches.iter()
-                .map(|c|PagedKv::new(cuda,c.pages(),c.page_tokens())).collect::<Result<Vec<_>>>()?}
+                .map(|c|PagedKv::new_layout(cuda,c.pages(),c.page_tokens(),c.layout())).collect::<Result<Vec<_>>>()?}
                 else {self.caches.clone()},
             source,
             indices,

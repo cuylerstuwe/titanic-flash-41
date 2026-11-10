@@ -379,7 +379,7 @@ impl Command {
             Self::Shutdown => out.push(4),
             Self::Idle => out.push(5),
             Self::ReclaimInputs { headroom } => {
-                ensure!(*headroom > 8usize << 30 && *headroom <= 12usize << 30,
+                ensure!(*headroom > crate::memory::floor_bytes() && *headroom <= 12usize << 30,
                     "input reclamation headroom bounds");
                 out.push(17);out.extend_from_slice(&(*headroom as u64).to_le_bytes());
             }
@@ -419,7 +419,7 @@ impl Command {
             [5] => Ok(Self::Idle),
             [17, ..] if bytes.len() == 9 => {
                 let headroom = usize::try_from(u64::from_le_bytes(bytes[1..].try_into().unwrap()))?;
-                ensure!(headroom > 8usize << 30 && headroom <= 12usize << 30,
+                ensure!(headroom > crate::memory::floor_bytes() && headroom <= 12usize << 30,
                     "input reclamation headroom bounds");
                 Ok(Self::ReclaimInputs { headroom })
             }
@@ -456,14 +456,16 @@ impl CachedSession {
     }
 }
 
-const MAX_SESSION_CACHE_SLOTS:usize=8;
-fn cache_protection_mask_valid(mask:u8,entries:usize)->bool {
-    entries<=MAX_SESSION_CACHE_SLOTS && u16::from(mask)<(1u16<<entries)
+/// Sixteen slots keep four long conversations' prompt checkpoints and ladder rungs resident at once; the
+/// protection mask is 16 bits wide to match.
+const MAX_SESSION_CACHE_SLOTS:usize=16;
+fn cache_protection_mask_valid(mask:u16,entries:usize)->bool {
+    entries<=MAX_SESSION_CACHE_SLOTS && u32::from(mask)<(1u32<<entries)
 }
 fn session_cache_slots(value:Option<&str>)->Result<usize> {
     match value {
-        None|Some("4")=>Ok(4),Some("8")=>Ok(8),
-        _=>anyhow::bail!("session cache slots must be4or8"),
+        None|Some("4")=>Ok(4),Some("8")=>Ok(8),Some("16")=>Ok(16),
+        _=>anyhow::bail!("session cache slots must be 4, 8 or 16"),
     }
 }
 fn configured_session_cache_slots()->Result<usize> {
@@ -1043,9 +1045,11 @@ impl Worker {
             Err(error)=>return Err(error.into()),
         };
         let session_cache_slots=configured_session_cache_slots()?;
-        ensure!(session_cache_budget<=2*1024usize.pow(3)
+        // Every save is still admitted against real available memory above the floor; this is only the ceiling.
+        // After the FP4 cache a 1M conversation's image is about 1 GB, so 8 GiB holds four with their ladders.
+        ensure!(session_cache_budget<=8*1024usize.pow(3)
             && (session_cache_budget==0 || std::env::var("CANADA_SCRATCH_COMPACT_STATE_IMAGE").as_deref()==Ok("1")),
-            "session cache requires compact images and at most2GiB additional state");
+            "session cache requires compact images and at most 8 GiB additional state");
         let shared_image_budget=match std::env::var("CANADA_SCRATCH_SHARED_IMAGE_BYTES") {
             Err(std::env::VarError::NotPresent)=>2*1024usize.pow(3),
             Ok(value)=>value.parse::<usize>()?,
@@ -1241,7 +1245,7 @@ impl Worker {
         )?;
         if !startup_padding.is_empty(){
             stream.synchronize()?;
-            ensure!(cuda.admission_memory()?.admitted_available>=8*1024usize.pow(3),"startup padding consumed physical reserve");
+            ensure!(cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes(),"startup padding consumed physical reserve");
             drop(startup_padding);
             eprintln!("startup padding released before profile forks: {}",json!(cuda.admission_memory()?));
         }
@@ -1320,7 +1324,7 @@ impl Worker {
         }
         eprintln!("rank{} allocation boundary after vision: {}",p.rank,json!(cuda.admission_memory()?));
         ensure!(
-            cuda.admission_memory()?.admitted_available >= 8 * 1024usize.pow(3),
+            cuda.admission_memory()?.admitted_available >= crate::memory::floor_bytes(),
             "resident profiles and drafter consumed the runtime reserve"
         );
         let ticket = std::fs::read(&p.ticket)?;
@@ -1391,6 +1395,10 @@ impl Worker {
         control.agree(&[u8::from(parking_extra_slots)])?;
         control.agree(&[u8::from(session_cache_long_first)])?;
         control.agree(&[u8::from(checkpoint_ladder)])?;
+        // Every rank must write and read the same target cache format (CANADA_SCRATCH_KV_FORMAT).
+        control.agree(&[crate::attention::kv_format_code()?])?;
+        // All ranks must admit against the same physical floor (test override included).
+        control.agree(&(crate::memory::validate_floor()? as u64).to_le_bytes())?;
         control.agree(&[u8::from(layer20_defer)])?;
         control.agree(&[u8::from(displaced_checkpoint()?)])?;
         control.agree(&[u8::from(displaced_snapshot)])?;
@@ -1463,14 +1471,14 @@ impl Worker {
             let buffers=LongHistoryBuffers::with_rows(&cuda,&core_bytes,32)?;
             copy_conditioning_prepared=prepared_session.prepare_copy_conditioning(&buffers,&comm,&stream)?;
             stream.synchronize()?;
-            if control.all_admit(cuda.admission_memory()?.admitted_available>=9*1024usize.pow(3))? {
+            if control.all_admit(cuda.admission_memory()?.admitted_available>=(crate::memory::floor_bytes()+1024usize.pow(3)))? {
                 copy32_verify=Some(target);copy32_buffers=Some(buffers);
             }else if copy_conditioning_prepared {
                 prepared_session.release_copy_conditioning(&stream)?;copy_conditioning_prepared=false;
             }
         }
         let copy32_after=cuda.admission_memory()?;
-        ensure!(control.all_admit(copy32_after.admitted_available>=8*1024usize.pow(3))?,
+        ensure!(control.all_admit(copy32_after.admitted_available>=crate::memory::floor_bytes())?,
             "M32 admission consumed physical reserve");
         let copy32_admission=json!({"requested":use_copy32,"admitted":copy32_verify.is_some(),
             "adaptive_engram_overlap":adaptive_engram32&&copy32_verify.is_some(),
@@ -1667,7 +1675,7 @@ impl Worker {
     fn cache_reserve(&self)->Result<usize> {
         // Optional images must not spend the working room needed by the next
         // owner's prefill. Keep the legacy policy outside two-state exchange.
-        let ordinary=8*1024usize.pow(3)
+        let ordinary=crate::memory::floor_bytes()
             +if self.peer_bank.is_some()||request_checkpoint::exchange_enabled()?{256}else{16}*1024usize.pow(2);
         Ok(ordinary.max(self.cuda.allocation_reserve_bytes()))
     }
@@ -3073,7 +3081,7 @@ impl Worker {
             "wide startup model/session state was not cleared");
         self.agree(&[])?;
         let memory=self.cuda.admission_memory()?;
-        ensure!(memory.admitted_available>=8*1024usize.pow(3),"wide startup warmup consumed runtime reserve");
+        ensure!(memory.admitted_available>=crate::memory::floor_bytes(),"wide startup warmup consumed runtime reserve");
         Ok(json!({"seconds":started.elapsed().as_secs_f64(),"public_prompt_tokens":8320,"finish_events":events,
             "checkpoints_disabled_during_warmup":true,"carry_and_encoder_match_initial_empty":true,
             "no_output_published":true,"memory":memory}))
@@ -3183,7 +3191,7 @@ impl Worker {
             "startup model/session state was not cleared");
         self.agree(&[])?;
         let memory=self.cuda.admission_memory()?;
-        ensure!(memory.admitted_available>=8*1024usize.pow(3),"startup warmup consumed runtime reserve");
+        ensure!(memory.admitted_available>=crate::memory::floor_bytes(),"startup warmup consumed runtime reserve");
         Ok(json!({"seconds":started.elapsed().as_secs_f64(),"public_prompt_tokens":128,
             "prewarmed_append_rows":append_rows,
             "decode_steps":steps,"prewarmed_verify_rows":if self.copy32_verify.is_some(){vec![1,3,6,16,32]}
@@ -4377,6 +4385,7 @@ pub fn run_http(path: &Path) -> Result<()> {
     ready["wide_startup_warmup"]=json!(wide_startup_warmup);
     ready["idle_anchor_enabled"]=json!(worker.idle_anchor_enabled);
     ready["checkpoint_ladder"]=json!(worker.checkpoint_ladder);
+    ready["memory_floor_bytes"]=json!(crate::memory::floor_bytes());
     ready["prefill_layer20_defer"]=json!(crate::target::layer20_defer_enabled()?);
     ready["displaced_checkpoint"]=json!(worker.displaced_checkpoint_enabled);
     ready["displaced_snapshot"]=json!(worker.displaced_snapshot);
@@ -4400,6 +4409,9 @@ pub fn run_http(path: &Path) -> Result<()> {
     ready["idle_anchor_rolling"]=json!(worker.idle_anchor_rolling);
     ready["encoder_image_recycle"]=json!(worker.encoder_image_recycle);
     ready["session_cache_slots"]=json!(worker.session_cache_slots);
+    if let Ok(f)=crate::attention::kv_format() {
+        ready["kv_format"]=json!({"window":f.window.name(),"compressed":f.compressed.name()});
+    }
     ready["state_copy_kernel"]=json!(crate::state_image::copy::enabled());
     ready["bank_encoder_checkpoint"]=json!(crate::config::bank_encoder_checkpoint_requested());
     ready["resident_banks"]=resident_banks;
@@ -4861,14 +4873,14 @@ mod tests {
     #[test]
     fn cache_slots_remain_bounded_without_raising_the_byte_budget() {
         assert_eq!(session_cache_slots(None).unwrap(),4);
-        for slots in [4,8] {
+        for slots in [4,8,16] {
             assert_eq!(session_cache_slots(Some(&slots.to_string())).unwrap(),slots);
             let entries=vec![(2700usize,46usize);slots];
-            let victims=cache_evictions(&entries,(2700,46),8*46,true,slots).unwrap();
+            let victims=cache_evictions(&entries,(2700,46),slots*46,true,slots).unwrap();
             assert_eq!(victims.len(),1,"a full slot set still needs replacement");
             assert!(cache_evictions(&entries,(800000,2049),2048,true,slots).is_none());
         }
-        for value in ["0","3","5","9","16","-1",""] {
+        for value in ["0","3","5","9","12","17","32","-1",""] {
             assert!(session_cache_slots(Some(value)).is_err());
         }
         // A larger metadata bound cannot spend capacity held by another owner.

@@ -374,7 +374,7 @@ impl Layer {
             );
             owner
                 .source
-                .share_rows(cuda, rows, &kernels.join(if rows==32 {"compression-verify32-v1"} else {"compression-v2"}))?
+                .share_rows(cuda, rows, &kernels.join(compressor_bundle(rows)?))?
         } else {
             Source::new(
                 cuda,
@@ -386,7 +386,7 @@ impl Layer {
                 kv_pages,
                 if phase == Phase::Extend { 64 } else { 32 },
                 frequency.clone(),
-                &kernels.join(if rows==32 {"compression-verify32-v1"} else {"compression-v2"}),
+                &kernels.join(compressor_bundle(rows)?),
             )?
         };
         let wk = IndexProjection::new(
@@ -758,4 +758,16 @@ impl ReadIndex {
     pub fn query(&self) -> &Branch {
         &self.query
     }
+}
+
+/// The compressor bundle for a profile, by the process KV format: today's V4 bundles, or the V4.1-FP4 ones that
+/// store the compressed cache as model.py does.
+fn compressor_bundle(rows: usize) -> Result<&'static str> {
+    let fp4 = crate::attention::kv_format()?.compressed == crate::attention::KvLayout::V41Fp4;
+    Ok(match (rows == 32, fp4) {
+        (true, false) => "compression-verify32-v1",
+        (false, false) => "compression-v2",
+        (true, true) => "compression-verify32-fp4-v1",
+        (false, true) => "compression-fp4-v1",
+    })
 }

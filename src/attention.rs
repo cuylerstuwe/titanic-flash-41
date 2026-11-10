@@ -12,12 +12,66 @@ use std::{cell::Cell, ffi::c_void, path::Path, rc::Rc};
 pub const HEADS: usize = 16;
 pub const WIDTH: usize = 512;
 pub const PAGE_TOKENS: usize = 64;
-pub fn page_bytes(tokens: usize) -> Result<usize> {
+/// Paged KV byte layouts (SGLang's `KVLayout`). A page is `tokens` data rows followed by as many scale rows,
+/// padded to the reader's row stride.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvLayout {
+    /// 448 e4m3 + 64 bf16 RoPE, then 7 ue8m0 scales + 1 pad: 584 B/token, 576-aligned. Today's target caches and
+    /// always the drafter's.
+    V4,
+    /// 512 e4m3 (RoPE dims quantized too), then 16 ue8m0 scales: 528 B/token, 512-aligned. model.py's window cache.
+    V41,
+    /// 512 e2m1 (two per byte, even element in the low nibble), then 32 e4m3 scales: 288 B/token, 256-aligned.
+    /// model.py's compressed cache.
+    V41Fp4,
+}
+impl KvLayout {
+    pub const fn bytes_per_token(self) -> usize {
+        match self { Self::V4 => 584, Self::V41 => 528, Self::V41Fp4 => 288 }
+    }
+    pub const fn align(self) -> usize {
+        match self { Self::V4 => 576, Self::V41 => 512, Self::V41Fp4 => 256 }
+    }
+    pub const fn name(self) -> &'static str {
+        match self { Self::V4 => "v4", Self::V41 => "v41", Self::V41Fp4 => "v41_fp4" }
+    }
+}
+pub fn layout_page_bytes(layout: KvLayout, tokens: usize) -> Result<usize> {
     ensure!(
         (1..=256).contains(&tokens) && tokens.is_power_of_two(),
         "invalid KV page geometry"
     );
-    Ok((tokens * 584).div_ceil(576) * 576)
+    Ok((tokens * layout.bytes_per_token()).div_ceil(layout.align()) * layout.align())
+}
+pub fn page_bytes(tokens: usize) -> Result<usize> {
+    layout_page_bytes(KvLayout::V4, tokens)
+}
+/// Target cache format of this process. `CANADA_SCRATCH_KV_FORMAT` unset or `v4`: today's caches, exactly as
+/// before. `v41`: the reference's formats, a V4.1 window cache and a V4.1-FP4 compressed cache. The drafter's
+/// caches stay V4 in both. All ranks must agree (checked at startup).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvFormat {
+    pub window: KvLayout,
+    pub compressed: KvLayout,
+}
+pub(crate) const KV_FORMAT_ENV: &str = "CANADA_SCRATCH_KV_FORMAT";
+pub(crate) fn parse_kv_format(value: Option<&str>) -> Result<KvFormat> {
+    match value {
+        None | Some("v4") => Ok(KvFormat { window: KvLayout::V4, compressed: KvLayout::V4 }),
+        Some("v41") => Ok(KvFormat { window: KvLayout::V41, compressed: KvLayout::V41Fp4 }),
+        Some(other) => anyhow::bail!("invalid {KV_FORMAT_ENV}={other:?}: expected v4 or v41"),
+    }
+}
+pub(crate) fn kv_format() -> Result<KvFormat> {
+    static FORMAT: std::sync::OnceLock<std::result::Result<KvFormat, String>> = std::sync::OnceLock::new();
+    FORMAT
+        .get_or_init(|| parse_kv_format(std::env::var(KV_FORMAT_ENV).ok().as_deref()).map_err(|e| e.to_string()))
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+/// One byte per process for the startup agreement: 0 = v4, 1 = v41.
+pub(crate) fn kv_format_code() -> Result<u8> {
+    Ok(if kv_format()?.window == KvLayout::V41 { 1 } else { 0 })
 }
 #[derive(Clone)]
 pub struct PagedKv {
@@ -26,10 +80,15 @@ pub struct PagedKv {
     pages: usize,
     page_tokens: usize,
     page_bytes: usize,
+    layout: KvLayout,
 }
 impl PagedKv {
+    /// A V4-layout cache (today's target caches; always the drafter's).
     pub fn new(cuda: &Cuda, pages: usize, tokens: usize) -> Result<Self> {
-        let stride = page_bytes(tokens)?;
+        Self::new_layout(cuda, pages, tokens, KvLayout::V4)
+    }
+    pub fn new_layout(cuda: &Cuda, pages: usize, tokens: usize, layout: KvLayout) -> Result<Self> {
+        let stride = layout_page_bytes(layout, tokens)?;
         let bytes = pages
             .checked_mul(stride)
             .filter(|&x| x > 0 && x <= 16 * 1024 * 1024 * 1024)
@@ -42,7 +101,11 @@ impl PagedKv {
             pages,
             page_tokens: tokens,
             page_bytes: stride,
+            layout,
         })
+    }
+    pub fn layout(&self) -> KvLayout {
+        self.layout
     }
     pub(crate) fn bind_stream(&self, stream: &Stream) -> Result<()> {
         let raw = stream.raw() as usize;
@@ -376,6 +439,7 @@ impl Decode {
                 && self.cuda.owns_stream(stream),
             "attention Q/context mismatch"
         );
+        ensure!(kv.layout == KvLayout::V4, "the attention-v1 decode primitive reads only V4 caches");
         ensure!(
             kv.page_tokens == PAGE_TOKENS && self.cuda.owns_buffer(&kv.data),
             "main KV requires native 64-token pages in the same context"
@@ -397,6 +461,7 @@ impl Decode {
             );
         }
         let (ep, ei, el, epbs, estride) = if let Some((cache, ids)) = extra {
+            ensure!(cache.layout == KvLayout::V4, "the attention-v1 decode primitive reads only V4 caches");
             ensure!(
                 ids.ready.get()
                     && self.extra_topk > 0
@@ -507,6 +572,16 @@ type PrefillLaunch = unsafe extern "C" fn(
 /// without decode split/merge workspaces or silently chunking into decode.
 type SplitMerge = unsafe extern "C" fn(*const c_void,*const c_void,*mut c_void,*mut c_void,i32,i32,*mut c_void)->i32;
 struct SplitWorkspace { output:Buffer<u8>,lse:Buffer<f32>,merge:SplitMerge,parts:usize }
+/// `ca_sparse_decode` (attention-dsv41-decode-v1): the `ca_sparse_prefill` arguments, then scratch, its bytes and
+/// the split count. One call runs the split kernel (fp32 partials) and the sink-folding merge.
+type Dsv41DecodeLaunch = unsafe extern "C" fn(
+    i32, i32, i32, f32, *const c_void, *const c_void, usize, *const c_void, *mut c_void, *mut c_void,
+    *const c_void, *const c_void, *const c_void, usize, *const c_void, *const c_void, *mut c_void, usize, i32,
+    *mut c_void,
+) -> i32;
+struct Dsv41Split { launch: Dsv41DecodeLaunch, scratch: Buffer<u8>, splits: usize }
+pub(crate) const DSV41_MAIN_LAYOUT: &str = "dsv41_fp8_g32_ue8m0_footer16";
+pub(crate) const DSV41_EXTRA_LAYOUT: &str = "dsv41_fp4_g16_e4m3_footer32";
 pub struct Prefill {
     _library: Library,
     cuda: Cuda,
@@ -517,6 +592,10 @@ pub struct Prefill {
     output: Buffer<bf16>,
     lse: Buffer<f32>,
     split: Option<SplitWorkspace>,
+    /// Cache layouts this primitive reads: (V4, V4) for the FlashInfer 0.6.18 bundles, (V41, V41Fp4) for DSv4.1.
+    main_layout: KvLayout,
+    extra_layout: KvLayout,
+    dsv41_split: Option<Dsv41Split>,
 }
 impl Prefill {
     pub fn new(
@@ -559,6 +638,56 @@ impl Prefill {
             lse:cuda.allocate_rows(rows*parts*HEADS)?,merge:*unsafe{library.get(b"ca_merge_attention_parts\0") }?,parts };
         this.launch=*unsafe{library.get(b"ca_sparse_prefill\0")}?;
         this._library=library;this.split=Some(split);Ok(this)
+    }
+    /// FlashInfer v0.7.3's SM120 DeepSeek-V4.1 BF16 prefill kernel (attention-dsv41-prefill-v1): any row count
+    /// from 1 to 16,384, V4.1 window cache plus optional V4.1-FP4 compressed cache, log2 LSE with the sink folded in.
+    pub(crate) fn new_dsv41(cuda:&Cuda,root:&Path,rows:usize,extra_topk:usize)->Result<Self> {
+        cuda.qualify_gb10()?;
+        let m:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        // Two primitives share this contract: FlashInfer's DSv4.1 BF16 prefill (up to 1024 extra candidates) and the
+        // adapted pico prefill kernel (attention-pico-prefill-v1, f16 MMAs on exactly widened codes, up to 512).
+        let max_extra=m["max_extra_topk"].as_u64().unwrap_or(0) as usize;
+        ensure!(m["abi"]==2 && m["architecture"]==121 && m["heads"]==16 && m["topk"]==128 && m["min_rows"]==1
+            && m["max_rows"]==16384 && m["main_page_tokens"]==64 && m["extra_page_tokens"]==serde_json::json!([64])
+            && [512,1024].contains(&max_extra) && m["lengths"]=="explicit"
+            && (m["compute"]=="BF16" || m["compute"]=="F16_EXACT_WIDENING")
+            && m["layout"]==DSV41_MAIN_LAYOUT && m["extra_layout"]==DSV41_EXTRA_LAYOUT && m["lse"]=="log2_with_sink",
+            "DSv4.1 prefill primitive contract");
+        ensure!((1..=16384).contains(&rows) && extra_topk<=max_extra && extra_topk%64==0,"DSv4.1 prefill execution shape");
+        let path=root.join("libcanada_prefill.so");
+        ensure!(m["library_sha256"]==format!("{:x}",Sha256::digest(std::fs::read(&path)?)),"DSv4.1 prefill digest");
+        let library=unsafe{Library::new(path)}?;
+        let abi:unsafe extern "C" fn()->i32=*unsafe{library.get(b"ca_sparse_prefill_abi\0")}?;
+        ensure!(unsafe{abi()}==2,"DSv4.1 prefill ABI");
+        Ok(Self{launch:*unsafe{library.get(b"ca_sparse_prefill\0")}?,_library:library,cuda:cuda.clone(),rows,extra_topk,
+            stream:Cell::new(0),output:cuda.allocate_rows(rows*HEADS*WIDTH)?,lse:cuda.allocate_rows(rows*HEADS)?,
+            split:None,main_layout:KvLayout::V41,extra_layout:KvLayout::V41Fp4,dsv41_split:None})
+    }
+    /// FlashInfer v0.7.3's DeepSeek-V4.1 split decode with fp32 partials (attention-dsv41-decode-v1): `splits` CTAs
+    /// per row share its candidate chunks, then a merge folds in the sink. Same layouts and LSE as `new_dsv41`.
+    pub(crate) fn new_dsv41_split(cuda:&Cuda,root:&Path,rows:usize,extra_topk:usize,splits:usize)->Result<Self> {
+        cuda.qualify_gb10()?;
+        let m:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        ensure!(m["abi"]==1 && m["kind"]=="split_decode_fp32_partials" && m["architecture"]==121 && m["heads"]==16
+            && m["topk"]==128 && m["max_rows"]==4096 && m["max_splits"]==64 && m["main_page_tokens"]==64
+            && m["extra_page_tokens"]==serde_json::json!([64]) && m["max_extra_topk"]==1024
+            && m["partial_dtype"]=="float32" && m["layout"]==DSV41_MAIN_LAYOUT && m["extra_layout"]==DSV41_EXTRA_LAYOUT
+            && m["lse"]=="log2_with_sink","DSv4.1 split decode primitive contract");
+        ensure!((1..=4096).contains(&rows) && (1..=64).contains(&splits) && extra_topk<=1024 && extra_topk%64==0,
+            "DSv4.1 split decode execution shape");
+        let path=root.join("libcanada_decode.so");
+        ensure!(m["library_sha256"]==format!("{:x}",Sha256::digest(std::fs::read(&path)?)),"DSv4.1 decode digest");
+        let library=unsafe{Library::new(path)}?;
+        let abi:unsafe extern "C" fn()->i32=*unsafe{library.get(b"ca_sparse_decode_abi\0")}?;
+        ensure!(unsafe{abi()}==1,"DSv4.1 decode ABI");
+        let scratch_bytes:unsafe extern "C" fn(i32,i32)->usize=*unsafe{library.get(b"ca_sparse_decode_scratch_bytes\0")}?;
+        let bytes=unsafe{scratch_bytes(rows as i32,splits as i32)};
+        ensure!(bytes==rows*HEADS*splits*(WIDTH+1)*4,"DSv4.1 decode scratch geometry");
+        let split=Dsv41Split{launch:*unsafe{library.get(b"ca_sparse_decode\0")}?,scratch:cuda.allocate::<u8>(bytes)?,splits};
+        // `launch` is unused on this path; keep a valid symbol so the struct stays uniform.
+        Ok(Self{launch:*unsafe{library.get(b"ca_sparse_decode\0")}?,_library:library,cuda:cuda.clone(),rows,extra_topk,
+            stream:Cell::new(0),output:cuda.allocate_rows(rows*HEADS*WIDTH)?,lse:cuda.allocate_rows(rows*HEADS)?,
+            split:None,main_layout:KvLayout::V41,extra_layout:KvLayout::V41Fp4,dsv41_split:Some(split)})
     }
     fn new_admitted(cuda:&Cuda,root:&Path,rows:usize,topk:usize,extra_topk:usize,min_rows:usize)->Result<Self> {
         cuda.qualify_gb10()?;
@@ -608,6 +737,9 @@ impl Prefill {
             output: cuda.allocate_rows(rows * HEADS * WIDTH)?,
             lse: cuda.allocate_rows(rows * HEADS)?,
             split:None,
+            main_layout: KvLayout::V4,
+            extra_layout: KvLayout::V4,
+            dsv41_split: None,
         })
     }
     pub fn output(&self) -> &Buffer<bf16> {
@@ -621,6 +753,10 @@ impl Prefill {
     }
     pub fn workspace_bytes(&self) -> usize {
         self.split.as_ref().map_or(0,|s|s.output.bytes()+s.lse.bytes())
+            +self.dsv41_split.as_ref().map_or(0,|s|s.scratch.bytes())
+    }
+    pub fn main_layout(&self) -> KvLayout {
+        self.main_layout
     }
     pub fn run(
         &self,
@@ -638,6 +774,8 @@ impl Prefill {
                 && self.cuda.owns_stream(stream),
             "prefill Q/context"
         );
+        ensure!(kv.layout == self.main_layout, "prefill main cache layout {:?} for a {:?} primitive",
+            kv.layout, self.main_layout);
         ensure!(
             kv.page_tokens == 64
                 && self.cuda.owns_buffer(&kv.data)
@@ -654,6 +792,10 @@ impl Prefill {
             ensure!(s.len() == HEADS && self.cuda.owns_buffer(s), "prefill sink");
         }
         let (ep, es, ei, el, pbs) = if let Some((cache, ids)) = extra {
+            ensure!(cache.layout == self.extra_layout
+                    && (self.extra_layout == KvLayout::V4 || cache.page_tokens == 64),
+                "prefill secondary cache layout {:?}/{} for a {:?} primitive", cache.layout, cache.page_tokens,
+                self.extra_layout);
             ensure!(
                 self.extra_topk > 0
                     && [2, 64].contains(&cache.page_tokens)
@@ -689,6 +831,19 @@ impl Prefill {
             ids.bind_stream(stream)?;
         }
         self.stream.set(raw);
+        if let Some(d) = &self.dsv41_split {
+            ensure!(sink.is_some(), "DSv4.1 split decode needs the sink");
+            let status = unsafe {
+                (d.launch)(
+                    self.rows as i32, self.extra_topk as i32, pbs as i32, scale, q.ptr() as _, kv.data.ptr() as _,
+                    kv.page_bytes, indices.ids.ptr() as _, self.output.ptr() as _, self.lse.ptr() as _,
+                    indices.lengths.ptr() as _, sink.map_or(0, Buffer::ptr) as _, ep as _, es, ei as _, el as _,
+                    d.scratch.ptr() as _, d.scratch.bytes(), d.splits as i32, stream.raw(),
+                )
+            };
+            ensure!(status == 0, "DSv4.1 split decode launch failed: {status}");
+            return Ok(());
+        }
         ensure!(self.split.is_none() || ([2,64].contains(&pbs) && sink.is_some()),"split attention cache/sink");
         let (out,lse)=self.split.as_ref().map_or((self.output.ptr(),self.lse.ptr()),|s|(s.output.ptr(),s.lse.ptr()));
         let status = unsafe {
@@ -796,5 +951,26 @@ mod tests {
         assert!(super::page_bytes(0).is_err());
         assert!(super::page_bytes(63).is_err());
         assert!(super::page_bytes(512).is_err());
+    }
+    #[test]
+    fn v41_layouts_follow_sglang_page_alignment() {
+        use super::{KvLayout::*, layout_page_bytes};
+        assert_eq!(layout_page_bytes(V41, 64).unwrap(), 33792);
+        assert_eq!(layout_page_bytes(V41, 256).unwrap(), 135168);
+        assert_eq!(layout_page_bytes(V41Fp4, 64).unwrap(), 18432);
+        assert_eq!(layout_page_bytes(V41Fp4, 2).unwrap(), 768);
+        assert_eq!(layout_page_bytes(V4, 64).unwrap(), super::page_bytes(64).unwrap());
+        assert!(layout_page_bytes(V41Fp4, 3).is_err());
+    }
+    #[test]
+    fn kv_format_defaults_to_v4_and_rejects_unknown_values() {
+        use super::{KvLayout::*, parse_kv_format};
+        let v4 = parse_kv_format(None).unwrap();
+        assert_eq!((v4.window, v4.compressed), (V4, V4));
+        assert_eq!(parse_kv_format(Some("v4")).unwrap(), v4);
+        let v41 = parse_kv_format(Some("v41")).unwrap();
+        assert_eq!((v41.window, v41.compressed), (V41, V41Fp4));
+        assert!(parse_kv_format(Some("fp4")).is_err());
+        assert!(parse_kv_format(Some("")).is_err());
     }
 }

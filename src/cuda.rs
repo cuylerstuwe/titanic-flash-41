@@ -582,7 +582,7 @@ impl Cuda {
     /// that individual allocations enforce. Otherwise a successful preflight
     /// can fail halfway through a distributed image/cache operation.
     pub(crate) fn allocation_reserve_bytes(&self)->usize {
-        8*1024usize.pow(3)+if self.owner.allocation_floor_screen {512*1024usize.pow(2)}else{0}
+        crate::memory::floor_bytes()+if self.owner.allocation_floor_screen {512*1024usize.pow(2)}else{0}
     }
     fn check_allocation_floor(&self,bytes:usize)->Result<()> {
         if !self.owner.allocation_floor_screen{return Ok(());}

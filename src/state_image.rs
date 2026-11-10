@@ -6,7 +6,6 @@ use anyhow::{Context, Result, ensure};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, marker::PhantomData};
 
-const RESERVE: usize = 8 * 1024usize.pow(3);
 const MAX_IMAGE: usize = 2 * 1024usize.pow(3);
 
 /// Release the charge before the actual buffer: until CUDA frees it, this
@@ -218,9 +217,9 @@ impl Image {
         );
         let descriptors: Vec<_> = regions.iter().map(|r| r.descriptor.clone()).collect();
         let (offsets, total) = layout(&descriptors, budget)?;
-        if cuda.admission_memory()?.admitted_available < RESERVE + total { return Ok(None); }
+        if cuda.admission_memory()?.admitted_available < crate::memory::floor_bytes() + total { return Ok(None); }
         let storage = ImageBuffer::allocate(cuda, total)?;
-        if cuda.admission_memory()?.admitted_available < RESERVE {
+        if cuda.admission_memory()?.admitted_available < crate::memory::floor_bytes() {
             drop(storage);
             return Ok(None);
         }
@@ -296,7 +295,7 @@ impl Image {
         if total!=self.storage.bytes() {return Ok(None);}
         ensure!(descriptors.iter().all(|r|r.pointer+r.bytes as u64<=self.storage.ptr()
             ||self.storage.ptr()+total as u64<=r.pointer),"recycled image aliases live storage");
-        if self.cuda.admission_memory()?.admitted_available<RESERVE.max(self.cuda.allocation_reserve_bytes()) {
+        if self.cuda.admission_memory()?.admitted_available<crate::memory::floor_bytes().max(self.cuda.allocation_reserve_bytes()) {
             return Ok(None);
         }
         self.descriptors=descriptors;self.offsets=offsets;self.saved=false;self.copy_module=None;

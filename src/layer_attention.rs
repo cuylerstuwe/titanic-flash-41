@@ -471,7 +471,9 @@ impl Layer {
         } else {
             Query::Medium(cuda.allocate_rows(rows * 8192)?)
         };
-        let kstore = Store::open(cuda, &kernels.join("kv-v2"))?;
+        // Target caches follow the process KV format (CANADA_SCRATCH_KV_FORMAT); the drafter's stay V4.
+        let kv_v41 = !draft && crate::attention::kv_format()?.window == crate::attention::KvLayout::V41;
+        let kstore = Store::open(cuda, &kernels.join(if kv_v41 {"kv-v41-v1"} else {"kv-v2"}))?;
         // Isolated target-append experiment: preserve the BF16 prefill
         // arithmetic at M6 instead of inheriting decode's Q/P FP8 quantization.
         // The drafter and ordinary serving profile retain their own policy.
@@ -501,7 +503,24 @@ impl Layer {
         // s797 native verification and s798 completed-task checks support the
         // higher-precision generation candidate. s799 changes only stores and
         // preserves FP32 intermediates exactly. Append keeps its existing bank.
-        let decode = if generation_swa_bf16 {
+        // Same-load screen 2026-11-10 (check/bench_attn.py): the adapted pico kernel halves V4.1 attention from 16
+        // rows up (8K-row prefill 7.7 vs 13.9 ms, 32-row decode 0.030 vs 0.058 ms); at 6 rows FlashInfer's split
+        // decode stays faster. CANADA_SCRATCH_PICO_ATTENTION=0 keeps FlashInfer's kernels everywhere.
+        let pico=pico_attention_enabled()? && rows>8;
+        let dsv41_prefill=|rows:usize,extra:usize|->Result<Execution>{Ok(Execution::Prefill(
+            crate::attention::Prefill::new_dsv41(cuda,&kernels.join(if pico {"attention-pico-prefill-v1"}
+                else {"attention-dsv41-prefill-v1"}),rows,extra)?))};
+        let dsv41_split=|rows:usize,extra:usize,splits:usize|->Result<Execution>{Ok(Execution::Prefill(
+            crate::attention::Prefill::new_dsv41_split(cuda,&kernels.join("attention-dsv41-decode-v1"),rows,extra,splits)?))};
+        let decode = if kv_v41 {
+            // V4.1 caches: FlashInfer v0.7.3's DSv4.1 kernels in the roles of today's primitives. Layers 0-1 read the
+            // window only; split decode keeps today's split counts and fp32 partials.
+            if generation_swa_bf16 { dsv41_prefill(rows,0)? }
+            // Same-load screen 2026-11-10 (check/bench_attn.py): split 8 at 6 rows and split 3 at 16 rows are fastest;
+            // at 32 rows the unsplit kernel is (0.058 vs 0.066 ms per layer). Splitting only reorders fp32 sums.
+            else if generation_fp32 { if rows==32 || pico { dsv41_prefill(rows,512)? } else { dsv41_split(rows,512,if rows==6 {8}else{3})? } }
+            else { dsv41_prefill(rows,if layer>=2 {512}else{0})? }
+        }else if generation_swa_bf16 {
             // First-two-layer SWA: canonical BF16 Q/K, FP32 accumulation and
             // BF16 output, using the already qualified append primitive. Its
             // separate append workspace keeps both graph banks independent.
@@ -528,7 +547,9 @@ impl Layer {
             if draft { 192 } else { 128 },
             if !draft && layer >= 2 { 512 } else { 0 },
         )?};
-        let append_decode=if append_bf16 {
+        let append_decode=if append_bf16 && kv_v41 {
+            Some(dsv41_prefill(rows,if layer>=2 {512}else{0})?)
+        }else if append_bf16 {
             Some(Execution::Prefill(crate::attention::Prefill::new_small_bf16(cuda,
                 &kernels.join("attention-small-bf16-s729"),rows,128,if layer>=2 {512}else{0})?))
         }else{None};
@@ -536,12 +557,14 @@ impl Layer {
         let split_decode=if sparse16_screen||(!draft && rows==6 && layer>=2
             && std::env::var("CANADA_SCRATCH_SPLIT_ATTENTION_SCREEN").as_deref()==Ok("1")) {
             ensure!(append_decode.is_some(),"split attention screen needs unsplit BF16 control");
+            ensure!(!kv_v41,"the V4 split-attention screens read only V4 caches");
             Some(Execution::Prefill(crate::attention::Prefill::new_split_bf16(cuda,kernels,rows,512,
                 if sparse16_screen {3}else{8},sparse16_screen||fp32_partials,sparse16_screen)?))
         }else{None};
         let append_split=if append_bf16&&layer>=2
             &&std::env::var("CANADA_SCRATCH_APPEND_SPLIT_ATTENTION_SCREEN").as_deref()==Ok("1") {
             ensure!(split_decode.is_none()||fp32_partials,"combined split screens require FP32 partial experiment");
+            ensure!(!kv_v41,"the V4 split-attention screens read only V4 caches");
             Some(Execution::Prefill(crate::attention::Prefill::new_split_bf16(cuda,kernels,rows,512,
                 if rows==16{if fp32_partials{3}else{2}}else{8},fp32_partials,false)?))
         }else{None};
@@ -1081,5 +1104,14 @@ impl Layer {
             ]),
         }
         taps
+    }
+}
+
+/// CANADA_SCRATCH_PICO_ATTENTION: unset or 1 = the adapted pico kernel for V4.1 attention above 8 rows; 0 = FlashInfer's.
+pub(crate) fn pico_attention_enabled() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_PICO_ATTENTION").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("1") => Ok(true),
+        Ok("0") => Ok(false),
+        _ => anyhow::bail!("CANADA_SCRATCH_PICO_ATTENTION must be 0 or 1"),
     }
 }

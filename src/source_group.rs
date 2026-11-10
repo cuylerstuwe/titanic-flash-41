@@ -202,7 +202,7 @@ impl Group {
                     phase,
                 )?);
             }
-            caches.push(PagedKv::new(cuda, swa_pages, 64)?);
+            caches.push(PagedKv::new_layout(cuda, swa_pages, 64, crate::attention::kv_format()?.window)?);
         }
         let row_store = if start == 14 {
             Some(Rc::new(RowStore::new(
@@ -333,7 +333,7 @@ impl Group {
             start: self.start,
             layers,
             caches: if independent {self.caches.iter()
-                .map(|c|PagedKv::new(cuda,c.pages(),c.page_tokens())).collect::<Result<Vec<_>>>()?}
+                .map(|c|PagedKv::new_layout(cuda,c.pages(),c.page_tokens(),c.layout())).collect::<Result<Vec<_>>>()?}
                 else {self.caches.clone()},
             source: source.ok_or_else(|| anyhow::anyhow!("shared group source absent"))?,
             engram,

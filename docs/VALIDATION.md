@@ -1,5 +1,104 @@
 # Validation status
 
+## November 10 cache-format and attention release (s1399)
+
+s1399 is s1394 plus two options, both enabled in native production, and one test-only setting:
+
+- **Reference cache formats** (`CANADA_SCRATCH_KV_FORMAT=v41`). The sliding-window cache (528 B/token) and the
+  compressed cache (V4.1-FP4, 288 B/token) use the formats of DeepSeek's reference implementation, written by SGLang's
+  V4.1 store kernels. Above 8 rows, attention runs an adapted prefill kernel from pico-dgx-ds4 (MIT); at 8 rows and
+  below, FlashInfer 0.7.3's DeepSeek-V4.1 split decode with fp32 partials. `CANADA_SCRATCH_PICO_ATTENTION=0` keeps
+  FlashInfer's kernels at every row count.
+- **Resident conversations** (`CANADA_SCRATCH_SESSION_CACHE_SLOTS=16`,
+  `CANADA_SCRATCH_SESSION_CACHE_BYTES=5368709120`). The session cache now allows up to 16 entries and an 8 GiB
+  ceiling; production sets 16 entries and 5 GiB, and the 4 GiB shared image budget limits the usable bytes to 4 GiB.
+  Every save is still admitted against measured available memory above the unchanged 8 GiB floor.
+- **Test-only:** all memory-floor checks go through one function; `CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB` overrides
+  the floor for tests.
+
+The [operations guide](OPERATIONS.md#reference-cache-formats-and-attention) explains them. No weight, sampler,
+non-attention kernel, memory floor or clock policy changes. The drafter's caches keep the earlier layout. The
+portable profile is unchanged.
+
+**Numerics.** The quality bar is the reference itself, not bit-equality with s1394. The cache formats are the
+reference's own, so the reference's arithmetic is now reproduced more closely than before.
+- **Kernels.** On GB10, the store kernels reproduce the reference quantizers bit for bit for both caches. Attention
+  outputs are within BF16 rounding of a float64 oracle (relative error 0.0022-0.0023).
+- **Model.** Teacher-forced against the reference forward on a 5,499-token text:
+  - The divergence is 0.0104 nats per token (95% CI 0.0097-0.0112), median 0.0051, maximum 0.52. Top-1 agreement is
+    95.6%, with no clear flips.
+  - The reference with its sums reordered (a split-K yardstick) diverges from itself by 0.0110 on the same text.
+  - The difference has a 95% CI of [-0.0011, -0.0002]: s1399 is inside the reference's own summation noise.
+
+**Speed.**
+- **Same-load attention screen**, one GB10, ms per layer:
+
+  | Shape | Earlier layout | FlashInfer DeepSeek-V4.1 | Adapted kernel |
+  |---|---|---|---|
+  | 8K-row prefill with compressed entries | 15.67 | 13.86 | 7.68 |
+  | 8K-row prefill, window only | 3.52 | 2.41 | 1.61 |
+  | 32-row decode | 0.070 | 0.058 | 0.030 |
+
+- **Cold source-code prompts**, s1394 against s1399 in one window: 3.4K tokens 0.887 s against 0.858 s; 17K 2.541
+  against 2.430; 28K 3.686 against 3.518; 56K 6.870 against 6.572; 127K 15.026 against 14.178.
+- **Decode** is about unchanged. The attention kernels differ by about 2 µs per layer at decode shapes, and a sampled
+  decode comparison was within acceptance-rate noise.
+
+**Residency.** The session cache can use at most 4 GiB in production: the shared image budget, the one-bank maximum,
+limits it.
+- **Four ~600K conversations.** Four conversations of 543K-605K tokens took turns for three rounds. Cold first turns
+  took 62-69 s. The eight return turns had a median time to first token of 0.41 s, with 99.99% of prompt tokens served
+  from the cache. Lowest available memory was 12.25 GiB.
+  - That check set a 6 GiB session cache under the same 4 GiB shared budget, and a 5 GiB test floor that was never
+    approached.
+- **Four ~920K conversations, production settings.** Four conversations of 912K-929K tokens need more than 4 GiB.
+  - The two longest returned from the cache in about 0.4 s. The other two were prefilled again on each return, in about
+    110 s, so half of the return turns' prompt tokens came from the cache.
+  - Lowest available memory was 12.2 GiB. The run logged seven of the known driver large-page retry lines and nothing
+    else.
+  - Keeping four 1M conversations resident needs a larger shared image budget, a planned change with its own
+    qualification.
+
+**Memory floor test** (evidence for a later release; the floor stays at 8 GiB):
+- **One box, engine stopped.** GPU allocations reached 3.5 GiB available. The kernel reclaimed page cache smoothly,
+  with no stalls, driver errors or OOM kills.
+- **All four boxes.** The full s1394 stress panel ran while 4.5 GiB extra was held on every box. It passed, with
+  lowest available memory 5.9 GiB.
+
+**Qualification of s1399, all options on:**
+- **Stress panel.** It passed: 70 requests reaching 974,076 prompt tokens. Lowest available memory was 11.405 GiB.
+  The hottest device read 88.0°C and never reached 90°C. There were no `allocation_failure` lines and no driver
+  messages.
+  - After the foreground/background overlap, the long conversation's next request was served from 973,824 cached
+    tokens in 0.36 s. With the earlier layout this was a 124 s re-prefill, because the smaller images now leave room
+    in the session cache.
+- **First stress run.** It stopped at a test-fixture check, not an engine fault. It stopped at a test-fixture check, not an engine fault, after 67 requests.
+  - The check required the two parked long conversations to total more than 2 GiB, a bar sized for the earlier layout.
+    Each V4.1 image is 0.91 GB (1.64 GB before), so the pair held 1.83 GB.
+  - The check now judges the pair from the parked images themselves, and the full panel was rerun.
+  - The first run had no allocation failures and no driver messages.
+- **Near-1M cancellation check.** It passed: a 974,039-token, 28-image prefill in 117.7 s (s1394: 125.8 s), the
+  retry in 0.31 s and a new image in 0.88 s. Lowest available memory was 12.184 GiB.
+- **Serving gate.** It passed: all 15 requests had the expected tool-call behavior, and cancel/resume worked.
+  - The 129,955-token cold prefill reached its first token in 14.33 s (s1394: 15.37 s).
+  - Plain-code decode ran at 90.4 tokens/s (s1394: 89.7).
+  - Outputs differ from s1394's, as expected once the cached values change.
+- **Other checks.** The native Arm64 build passed 226 CPU tests, and ten installation interruption and rollback
+  fixtures passed.
+
+Native serving-source fingerprint: `096c9d6de074e6a644065301a0ce8809b1e12d0a792d4295cdb1fd76c7ff32cc`.
+
+**Installation.** s1399 was installed in one journaled transaction that falls back to s1394.
+
+**Activation.** It was activated on fresh boots with one production model load per device.
+- A head-local smoke test passed text, prompt reuse, continuation, image input and text after an image.
+- On the fresh boots, in two passes, source-code prompts took 0.66–0.72 s at 3.4K, 2.13–2.17 s at 16.8K, 3.40–3.46 s
+  at 27.8K, 6.37–6.42 s at 56K and 13.95–14.02 s at 127K tokens.
+- s1394 on its fresh boots, the same way: 0.69–0.75, 2.26–2.29, 3.62–3.69, 6.83–6.91 and 15.01–15.04 s.
+- Runtime hashes, clocks, APST guards and health checks passed, and the reservation was released.
+
+See the [sanitized qualification record](../validation/cache-format-2026-11-10.json).
+
 ## November 10 prefill and cache release (s1394)
 
 s1394 is s1389 plus three options, all enabled in native production, and two diagnostics that are off by default:

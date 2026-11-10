@@ -37,7 +37,7 @@ impl Head {
         // Includes the one-shot transpose/repack buffer and every persistent
         // projection buffer. Existing driver allocation floors remain active.
         let bytes=N*K+N*K/16+SM*16*256*4+M*N*2+SM*4+16;
-        ensure!(cuda.admission_memory()?.admitted_available>=17*1024usize.pow(3)/2+bytes,
+        ensure!(cuda.admission_memory()?.admitted_available>=(crate::memory::floor_bytes()+512*1024usize.pow(2))+bytes,
             "private NVFP4 scratch would consume the physical reserve");
         let raw=std::fs::read(root.join("manifest.json"))?;
         ensure!(format!("{:x}",Sha256::digest(&raw))==

@@ -112,6 +112,72 @@ In a synthetic screen, a 62K-token conversation's follow-up after an unrelated 3
 from 61,824 cached tokens in 0.35 s, instead of a 7.0 s cold prefill. Its prompt logits equal, bit for bit,
 those of the same follow-up restored from the original bank checkpoint without the interruption.
 
+## Reference cache formats and attention
+
+`CANADA_SCRATCH_KV_FORMAT=v41` stores the target model's attention caches in the formats of DeepSeek's reference
+implementation instead of the engine's earlier layout:
+
+| Cache | Earlier layout (`v4`, default) | `v41` |
+|---|---|---|
+| Sliding window | 448 e4m3 values, 64 BF16 RoPE values, 7 ue8m0 scales: 584 B/token | 512 e4m3 values (RoPE dimensions included), one ue8m0 scale per 32: 528 B/token |
+| Compressed entries | as above | 512 e2m1 values, one e4m3 scale per 16: 288 B/token |
+
+The drafter's caches keep the earlier layout. The store kernels reproduce the reference quantizers bit for bit
+on GB10. The only exception is a block whose largest magnitude is below 448 × 10^-4 (about 0.045). There the
+stored scale has a floor of 2^-13, so the block's elements below 2^-19 can round differently from the reference.
+
+A conversation's cache, and the state image that keeps it resident, need about 56% of their earlier bytes. A
+974K-token conversation's image is about 0.91 GB per rank instead of 1.64 GB.
+
+With `v41`, attention runs two kernels:
+- **Above 8 rows** (prefill and wide verification): a prefill sparse-attention kernel from
+  [pico-dgx-ds4](https://github.com/Picom-code/pico-dgx-ds4) (MIT), adapted to the paged caches, explicit candidate
+  lists and the engine's RoPE handling. It keeps the packed keys in shared memory, widens them exactly to f16 in
+  registers for the tensor-core MMAs, and rounds P to BF16 before the sum, as the reference does.
+- **At 8 rows and below** (decode): FlashInfer 0.7.3's DeepSeek-V4.1 split decode, with fp32 partials.
+
+`CANADA_SCRATCH_PICO_ATTENTION=0` keeps FlashInfer's kernels at every row count; unset or `1` uses the adapted
+kernel.
+
+Same-load screen on one GB10, in ms per layer:
+
+| Shape | Earlier layout | FlashInfer DeepSeek-V4.1 | Adapted kernel |
+|---|---|---|---|
+| 8K-row prefill with compressed entries | 15.67 | 13.86 | 7.68 |
+| 8K-row prefill, window only | 3.52 | 2.41 | 1.61 |
+| 32-row decode | 0.070 | 0.058 | 0.030 |
+
+Attention is a smaller share of a full prefill than in this screen. On fresh boots, cold source-code prompts took
+4-7% less time, and decode is about unchanged. Every output stays within BF16 rounding of a float64 oracle.
+
+## Resident conversations
+
+The session cache keeps finished conversations as state images on the GPU, so a returning conversation is
+restored by a device copy instead of a prefill. Two settings size it:
+- `CANADA_SCRATCH_SESSION_CACHE_SLOTS`: up to 16 entries (previously 8). Each conversation can hold several
+  entries, its newest checkpoint and earlier rungs.
+- `CANADA_SCRATCH_SESSION_CACHE_BYTES`: up to 8 GiB (previously 2 GiB). Native production sets 16 slots and
+  5 GiB.
+
+The session cache shares `CANADA_SCRATCH_SHARED_IMAGE_BYTES` with the images of paused requests. That setting is
+4 GiB, the maximum for the one-bank layout. The cache can use the smaller of the two budgets, after any paused
+images, so production's effective cache is 4 GiB.
+
+The budget is a ceiling, not a reservation. Every save is admitted against the measured available memory on every
+rank, leaving the memory floor and the next prefill's working room free. When memory is short, older entries are
+evicted or the save is refused. Nothing is allocated past the floor.
+
+With the `v41` formats, four conversations of 543K-605K tokens took turns for three rounds. Their return turns had
+a median time to first token of 0.41 s, with 99.99% of prompt tokens served from the cache.
+
+Four conversations of 912K-929K tokens need more than 4 GiB. With production settings, the two longest stayed
+resident and returned in about 0.4 s. The other two were prefilled again on each return, in about 110 s.
+Keeping four 1M conversations resident needs a larger shared image budget, a planned change with its own
+qualification.
+
+All memory-floor checks now use one function, with the same 8 GiB default.
+`CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB` overrides the floor and is for tests only.
+
 ## Lifecycle and diagnostics
 
 `deploy/fleet.py` starts exactly one four-rank cohort with a fresh private ticket, validates the selected nodes and runtime files, and monitors health. Containers use Docker's init process for signal forwarding and reaping. Any failed rank causes coordinated cleanup of the recorded cohort. The controller checks project/generation ownership before stopping all four ranks concurrently, allowing up to 90 seconds for each Docker stop to finish GPU teardown. Docker sends SIGTERM and may escalate to SIGKILL after its 15-second grace period; stopping the service is not a promise to finish in-flight requests or preserve RAM caches. Systemd can restart a failed controller, with a bounded start limit. An unreachable worker can prevent safe complete cleanup; repair SSH and retry instead of starting a conflicting cohort or weakening ownership checks.

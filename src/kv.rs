@@ -126,16 +126,25 @@ pub struct Store {
     _library: Library,
     cuda: Cuda,
     launch: Launch,
+    /// V4 (kv-v2) or V4.1 (kv-v41-v1): the window-cache layout this store writes.
+    layout: crate::attention::KvLayout,
 }
 impl Store {
     pub fn open(cuda: &Cuda, root: &Path) -> Result<Self> {
         cuda.qualify_gb10()?;
         let m: Manifest = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        // abi 1: the V4 store (fp32 registers quantized after the weighted RMSNorm). abi 2: the V4.1 store, which
+        // rounds the normed values to bf16, applies RoPE in fp32 and rounds again, as model.py does, then writes
+        // e4m3 with one ue8m0 scale per 32 values over all 512 dims.
+        let layout = match (m.abi, m.layout.as_str(), m.kv_quant_source.as_str()) {
+            (1, "dsv4_fp8_448_bf16_rope64_e8m0_footer8", "fp32_registers_after_weighted_rmsnorm") =>
+                crate::attention::KvLayout::V4,
+            (2, crate::attention::DSV41_MAIN_LAYOUT, "bf16_norm_bf16_rope") => crate::attention::KvLayout::V41,
+            _ => anyhow::bail!("KV primitive contract changed"),
+        };
         ensure!(
-            (m.abi, m.architecture, m.physical_sms) == (1, 121, 48)
+            (m.architecture, m.physical_sms) == (121, 48)
                 && m.page_tokens == [64, 256]
-                && m.layout == "dsv4_fp8_448_bf16_rope64_e8m0_footer8"
-                && m.kv_quant_source == "fp32_registers_after_weighted_rmsnorm"
                 && m.epsilon.to_bits() == 1e-20f32.to_bits(),
             "KV primitive contract changed"
         );
@@ -146,12 +155,13 @@ impl Store {
         );
         let lib = unsafe { Library::new(p) }?;
         let abi: unsafe extern "C" fn() -> i32 = *unsafe { lib.get(b"ca_kv_abi\0") }?;
-        ensure!(unsafe { abi() } == 1, "KV library ABI mismatch");
+        ensure!(unsafe { abi() } == m.abi as i32, "KV library ABI mismatch");
         let launch = *unsafe { lib.get(b"ca_kv_store\0") }?;
         Ok(Self {
             _library: lib,
             cuda: cuda.clone(),
             launch,
+            layout,
         })
     }
     pub fn run(
@@ -195,6 +205,7 @@ impl Store {
                 && [64, 256].contains(&cache.page_tokens()),
             "KV location/table contract mismatch"
         );
+        ensure!(cache.layout() == self.layout, "KV store writes {:?} into a {:?} cache", self.layout, cache.layout());
         ensure!(
             self.cuda.owns_buffer(input)
                 && self.cuda.owns_buffer(weight)

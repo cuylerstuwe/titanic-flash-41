@@ -2,7 +2,7 @@
 //! Small/rotating regions use two bounded images during exchange. All old
 //! small regions are retained until every outgoing small region is copied,
 //! so wrapped SWA layouts cannot overwrite another region's outgoing bytes.
-use super::{Descriptor,Region,Image as SmallImage,ImageBuffer,layout,RESERVE,MAX_IMAGE};
+use super::{Descriptor,Region,Image as SmallImage,ImageBuffer,layout,MAX_IMAGE};
 use crate::cuda::{Buffer,Cuda,Module,Stream};
 use anyhow::{Result,ensure};
 use sha2::{Digest,Sha256};
@@ -45,14 +45,14 @@ impl Image {
     pub(crate) fn try_allocate(cuda:&Cuda,regions:&[Region<'_>],budget:usize,stream:&Stream)->Result<Option<Self>>{
         ensure!(cuda.owns_stream(stream)&&regions.iter().all(|r|r.cuda.owns_stream(stream)),"exchange context");
         let capacity=shape(regions,budget)?;
-        if cuda.admission_memory()?.admitted_available<RESERVE+capacity{return Ok(None);}
+        if cuda.admission_memory()?.admitted_available<crate::memory::floor_bytes()+capacity{return Ok(None);}
         let mut prefixes=Vec::new();
         for descriptor in prefix_regions(regions){
             let chunks=(0..descriptor.bytes.div_ceil(CHUNK)).map(|_|ImageBuffer::allocate(cuda,CHUNK)).collect::<Result<Vec<_>>>()?;
             prefixes.push(Prefix{descriptor:descriptor.clone(),chunks});
         }
         let Some(small)=SmallImage::try_allocate(cuda,&small_regions(regions),budget,stream)?else{return Ok(None);};
-        if cuda.admission_memory()?.admitted_available<RESERVE{return Ok(None);}
+        if cuda.admission_memory()?.admitted_available<crate::memory::floor_bytes(){return Ok(None);}
         Ok(Some(Self{cuda:cuda.clone(),descriptors:descriptors(regions),prefixes,small,saved:false}))
     }
     pub(crate) fn bytes(&self)->usize{self.small.bytes()+self.prefixes.iter().map(|p|p.chunks.len()*CHUNK).sum::<usize>()}
@@ -108,7 +108,7 @@ impl Image {
     pub(crate) fn try_prepare(&self,next:&[Region<'_>],budget:usize,stream:&Stream)->Result<Option<Prepared>>{
         ensure!(self.cuda.owns_stream(stream)&&next.iter().all(|r|r.cuda.owns_stream(stream)),"exchange preparation context");
         let(extra_bytes,capacity)=self.growth(next,budget)?;
-        if self.cuda.admission_memory()?.admitted_available<RESERVE+extra_bytes{return Ok(None);}
+        if self.cuda.admission_memory()?.admitted_available<crate::memory::floor_bytes()+extra_bytes{return Ok(None);}
         let mut extra=Vec::new();let mut table=Vec::new();
         for(old,new)in self.prefixes.iter().zip(prefix_regions(next)){
             let count=old.chunks.len().max(new.bytes.div_ceil(CHUNK));
@@ -122,7 +122,7 @@ impl Image {
         }
         let Some(small)=SmallImage::try_allocate(&self.cuda,&small_regions(next),budget,stream)?else{return Ok(None);};
         let mut gpu_table=self.cuda.allocate(table.len())?;gpu_table.upload(&table)?;
-        if self.cuda.admission_memory()?.admitted_available<RESERVE{return Ok(None);}
+        if self.cuda.admission_memory()?.admitted_available<crate::memory::floor_bytes(){return Ok(None);}
         Ok(Some(Prepared{previous:self.descriptors.clone(),next:descriptors(next),extra,small,table:gpu_table,capacity}))
     }
     /// Safety: exclusive, drained model ownership; poison that owner if any
