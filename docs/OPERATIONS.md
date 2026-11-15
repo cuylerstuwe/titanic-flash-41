@@ -54,6 +54,27 @@ The default has **one physical execution bank**, not two permanently allocated b
 
 The internal priority-control endpoint uses the separate control key. Ordinary client integrations should use the request header. Do not expose or log the control credential. Background qualification is separate from normal foreground performance measurement.
 
+### Execution timing for routers
+
+A router can leave admission to the engine: it forwards every request at once, and the engine admits up to four and
+queues the rest. Such a router needs to know when a request is actually running, so it can count only running time
+against a request's time budget, and it needs a way to tell a backend that reports this from one that does not.
+
+- Every successful chat response, streamed or plain, carries the header `x-native-execution-timing: v1`.
+- A streamed response also carries SSE comments, `: native-execution running` and `: native-execution waiting`, one
+  at each change of state (the first one when the stream opens). A conversation runs while it owns region 0 or a
+  serving region. It waits while it is in line (not started yet, or paused for another conversation), while it
+  is a background conversation that a router holds, and while its reader is behind on the output. Conversations that take turns report
+  each turn.
+
+They are transport metadata: clients may ignore them, and they never appear inside `data:` frames. The final
+`timings` object described above is separate and is always sent.
+
+Earlier releases sent both with the two-owner scheduler (`CANADA_SCRATCH_TWO_STREAM_ADMISSION=1`). Release s1585
+replaced that scheduler with batched decode and stopped sending them, so a router that requires the header refused
+every response; s1586 sends them with batched decode too. `tools/smoke_http.py` checks the header and the first
+`running` comment.
+
 ## Earlier checkpoints for edited history
 
 Each request leaves a small bank-retained encoder checkpoint at its prompt end, and an edit of history restores
@@ -186,7 +207,7 @@ All memory-floor checks now use one function, with the same 8 GiB default.
 
 ## November 15 release settings
 
-Native production (s1585) runs the s1399 profile with five settings changed and 58 added, and twelve encoder
+Native production (s1586; the settings are s1585's) runs the s1399 profile with five settings changed and 58 added, and twelve encoder
 widths instead of five. Every one is a runtime setting read at startup; the portable profile is unchanged. They
 are grouped here by what they do. Settings that change which rows a kernel reads, in what order, or when work is
 launched leave results bit-identical; the ones that change a summation order or the drafter are named as such,

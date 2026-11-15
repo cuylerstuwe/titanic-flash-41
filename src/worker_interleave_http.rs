@@ -409,6 +409,23 @@ pub(super) fn two_stream_enabled()->Result<bool> {
     })
 }
 
+/// What the HTTP layer provides under a scheduler: (two-slot lifetime admission, running/waiting timing).
+/// Two-owner admission has both. Batched decode replaces the two-slot gate with one owner a serving region
+/// and keeps the timing, with or without the two-owner flag: a router that leaves admission to this engine
+/// refuses every response without it (release s1585, Nov 15 2026: "does not support native execution
+/// timing required for local admission" on all routed requests).
+pub(super) fn http_contract(two_stream_flag:bool,batched:bool)->(bool,bool) {
+    let two_stream=two_stream_flag&&!batched;
+    (two_stream,two_stream||batched)
+}
+
+/// Batched decode: each admitted conversation's running/waiting state for its response (Job::report_running).
+/// Region 0's owner and the serving regions' owners run; the ones in line, new or paused, wait.
+fn report_batched_timing(active:Option<&Job>,ready:&VecDeque<(Option<u64>,Job)>,region_jobs:&[(u64,Job)],held:bool) {
+    for job in active.into_iter().chain(region_jobs.iter().map(|(_,job)|job)) {job.report_running(true,held);}
+    for (_,job) in ready {job.report_running(false,held);}
+}
+
 /// Reject inconsistent scheduler settings before HTTP readiness or model I/O.
 /// The live scheduler still constructs its own turn state with the actual
 /// slice; this validation owns no requests and performs no device work.
@@ -428,9 +445,10 @@ pub(super) fn validate_startup()->Result<()> {
 pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_log::EventLog)->Result<()> {
     // Batched decode replaces the two-owner admission with one owner per serving region.
     let batched=super::batched_serving::enabled()?;
-    let two_stream=two_stream_enabled()?&&!batched;
+    let (two_stream,timing)=http_contract(two_stream_enabled()?,batched);
     ensure!(!exchange_enabled()?||two_stream,"HTTP state exchange requires two-owner admission");
     if two_stream {if let Some(queue)=queue {queue.enable_two_stream_admission();}}
+    if timing {if let Some(queue)=queue {queue.enable_execution_timing();}}
     if exchange_enabled()? {if let Some(queue)=queue {queue.reserve_waiting_image_capacity(w.shared_image_budget)?;}}
     let select=if two_stream{two_stream_admission::choose}else{choose};
     let mut images=Vec::new();
@@ -459,6 +477,7 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                 Some(if batched {batched_admission::choose(w,queue,&mut active,&mut ready,&region_jobs,&mut next_id,&mut prefill_turn_done,quantum_start,refused,&images)?}
                     else {select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns,&mut idle_policy)?}.encode()?)
             }else{None};
+            if batched {if let Some(queue)=queue {report_batched_timing(active.as_ref(),&ready,&region_jobs,queue.router_hold());}}
             let wire=if let Some(next)=authorized_next.take(){next}else{w.control.command(bytes.as_deref())?};
             let command=Scheduled::decode(&wire)?;
             let started=matches!(command,Scheduled::Native(Command::Begin{..})|Scheduled::BeginBackground(_));
@@ -498,6 +517,7 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                 let next=queue.map(|queue|if batched {batched_admission::choose(w,queue,&mut active,&mut ready,&region_jobs,&mut next_id,&mut prefill_turn_done,quantum_start,refused,&images)}
                     else {select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns,&mut idle_policy)}
                     .and_then(|command|command.encode())).transpose()?;
+                if batched {if let Some(queue)=queue {report_batched_timing(active.as_ref(),&ready,&region_jobs,queue.router_hold());}}
                 let tokens:Vec<u32>=serde_json::from_value(event["output_ids"].clone())?;
                 let wire=w.control.agree_and_next(&w.agreement_state(&tokens),next.as_deref())?;
                 let paused_ids=images.iter().map(|image|image.id).collect::<Vec<_>>();
@@ -702,6 +722,15 @@ mod tests {
         assert!(!cache_protection_mask_valid(0,17));
         assert!(Scheduled::decode(&[7,0]).is_err());
         assert!(Scheduled::decode(&[7,0,0,0]).is_err());
+    }
+    #[test]
+    fn batched_decode_keeps_the_timing_contract_and_drops_only_the_two_slot_gate() {
+        // (two-slot lifetime admission, running/waiting timing)
+        assert_eq!(http_contract(true,false),(true,true),"two-owner admission");
+        // Release s1585's settings: both flags set. Batched decode owns admission; the timing stays.
+        assert_eq!(http_contract(true,true),(false,true));
+        assert_eq!(http_contract(false,true),(false,true),"batched decode without the two-owner flag");
+        assert_eq!(http_contract(false,false),(false,false),"serial serving: the legacy response");
     }
     #[test]
     fn progress_cannot_start_or_restore_a_request_or_discard_an_unknown_owner() {

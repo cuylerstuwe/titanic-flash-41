@@ -1,6 +1,69 @@
 # Validation status
 
+## November 15 routed-serving fix (s1586)
+
+s1586 is s1585 with one change in the engine's HTTP layer. Every setting is unchanged.
+
+**What was wrong in s1585.** s1585 serves several conversations with batched decode, which replaced the two-owner
+scheduler of earlier releases. The two-owner setup was also what switched on the execution-timing contract: the
+response header `x-native-execution-timing: v1` and the stream comments that say when a request runs and when it
+waits ([operations guide](OPERATIONS.md#execution-timing-for-routers)). A router that leaves admission to the engine
+requires the header and refused every successful response without it, so no request reached a client through such
+a router. Requests sent to the engine directly were served, and the s1585 qualification sent every request
+directly.
+
+**The change.** Batched decode announces the contract on every successful chat response, streamed or plain, and
+reports each admitted conversation as running while it owns region 0 or a serving region, and as waiting while it
+is in line, held as background work, or behind on its output, as the two-owner scheduler did for its pair. Three
+source files (`src/http_server.rs`, `src/worker_interleave_http.rs`, two lines of `src/resident_worker.rs`). No
+kernel, numeric, memory or scheduling-decision change. The final `timings` object of a response was never affected.
+
+**Qualification of s1586, all release settings on.** Two panels are new and stay in the bar:
+- **Timing contract** (head-local, requests shaped as a router sends them). It passed:
+  - One streamed request and the same request plain: the header on both, a `running` comment before the first
+    token, usage and `timings` at the end (1,801 prompt tokens prefilled at 4,771 tokens/s, first token 0.41 s).
+  - Six conversations for four owners: the first four reported `running` within 1.2 s; the two that waited
+    reported it at 5.0 and 5.9 s, when earlier ones had ended.
+  - Three conversations without `max_tokens`, taking turns: 13 pauses, and all three streams reported `waiting`
+    again after they had run.
+- **Routed panel.** A router that leaves admission to the engine, started in front of the candidate with the route
+  settings used in production. It passed: nine routed requests, every response 200.
+  - A conversation turn (3,541 tokens, first token 0.62 s), then its follow-up through the incremental context
+    transport (3,540 of 3,607 prompt tokens reused, first token 0.15 s).
+  - An image request, and a plain response that the router assembles from a forced stream.
+  - Three conversations at once without `max_tokens`; a background request joined by a foreground one (first token
+    0.42 s, no router hold on the engine).
+- **Several-conversations panel.** It passed: 17 synthetic conversations, every answer naming its own planted code
+  words and none of another conversation's; all three follow-ups after turn-taking reused their prompt.
+- **Stress panel.** It passed: 70 requests reaching 974,076 prompt tokens. Lowest available memory was 10.88 GiB.
+  The hottest device read 90.7°C, with about 10 s at or above 90°C. There were no `allocation_failure` lines and no
+  driver messages.
+- **Near-1M cancellation check** and **serving gate.** Both passed; all fourteen tool turns had the expected
+  tool-call behavior, and cancel/resume worked.
+- **Residency.** Four conversations of about 980K tokens took turns for three rounds: all eight return turns were
+  served from the cache, with a median time to first token of 0.41 s. Lowest available memory was 11.47 GiB.
+- **Reference quality** is carried over from s1585 (below): no numeric code changed.
+- **Other checks.** The native Arm64 build passed 259 CPU tests, and ten installation interruption and rollback
+  fixtures passed.
+
+**Installation.** s1586 was installed in one journaled transaction that falls back to s1585. Only the runtime's
+paths and hash pins change in the deployment.
+
+**Activation.** It was activated on fresh boots with one production model load per device.
+- A head-local smoke test passed text, prompt reuse, continuation, image input and text after an image, and found
+  the execution-timing header and the `running` comment on the live service.
+- **Through the router.** Six requests went through the router in use, which runs the same code as the routed
+  panel: a conversation turn (3,662 tokens prefilled at 6,359 tokens/s, first token 0.59 s), its follow-up (3,661 of
+  3,728 prompt tokens reused, first token 0.15 s), an image, a plain response and two conversations at once. All
+  were served.
+- Runtime hashes, clocks, APST guards and health checks passed, and the reservation was released.
+
+See the [sanitized qualification record](../validation/routed-serving-fix-2026-11-15.json).
+
 ## November 15 decode, checkpoint and concurrency release (s1585)
+
+> s1585 could not serve through a router that requires the execution-timing header (see the fix above). s1586
+> replaced it the same day with the same settings.
 
 s1585 is s1399 with the work of November 10-14 enabled in native production: five settings changed, 58 added, and
 twelve encoder widths instead of five. The [operations guide](OPERATIONS.md#november-15-release-settings) lists

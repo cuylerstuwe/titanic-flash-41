@@ -1,0 +1,269 @@
+{
+  "release": "s1586",
+  "date": "2026-11-15",
+  "base": "s1585",
+  "failed_start_fallback": "s1585",
+  "what_was_wrong_in_s1585": "s1585 serves with batched decode, which replaced the two-owner scheduler. The two-owner setup was also what switched on the response header x-native-execution-timing: v1 and the running/waiting stream comments. A router that leaves admission to the engine requires the header and refused every successful response without it, so no request reached a client through such a router. Requests sent to the engine directly were served; the release bar of s1585 sent every request directly.",
+  "change": "batched decode announces the execution-timing contract on every successful chat response and reports each admitted conversation as running while it owns the first region or a serving region, and as waiting while it is in line, held by a router as background work, or behind on its output. HTTP layer and scheduler bookkeeping only (three source files)",
+  "unchanged": [
+    "every setting of s1585",
+    "weights",
+    "kernels and numeric code",
+    "scheduling decisions",
+    "memory floor (8 GiB)",
+    "2350 MHz clock policy",
+    "the final timings object of a response",
+    "portable profile"
+  ],
+  "timing_contract_panel": {
+    "what": "head-local, requests shaped as a router sends them: one streamed request and the same request plain (the header on both, a running comment no later than the first token, usage and timings at the end); six conversations for four owners (the two that wait report running only once an earlier one has ended); three conversations without max_tokens taking turns (every stream reports waiting again after it ran)",
+    "passed": true,
+    "streamed_header": "v1",
+    "plain_header": "v1",
+    "six_conversations_waited": 2,
+    "turn_taking_pauses": 13,
+    "streams_reporting_a_wait_after_running": 3,
+    "min_available_gib": [
+      16.675,
+      16.838,
+      16.936,
+      17.056
+    ]
+  },
+  "routed_panel": {
+    "what": "a router that leaves admission to the engine, started in front of the candidate with the route settings used in production: a conversation turn and its follow-up through the incremental context transport, an image, a plain response assembled by the router from a forced stream, three conversations at once without max_tokens, and a background request joined by a foreground one. Every routed response must be 200 with finish, usage, timings and the running comment reaching the client",
+    "passed": true,
+    "routed_requests": 9,
+    "statuses": [
+      200
+    ],
+    "context_outcomes": [
+      "seeded",
+      "incremental",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded"
+    ],
+    "follow_up_cached_tokens": 3540,
+    "min_available_gib": [
+      16.915,
+      16.844,
+      16.456,
+      16.787
+    ]
+  },
+  "several_conversations_panel": {
+    "passed": true,
+    "conversations_checked": 17,
+    "drafter_images_restored_into_another_drafter": 1,
+    "longest_prompt_tokens": 296940,
+    "follow_up_reuse_of_first_prompt": {
+      "30": 1.0,
+      "31": 1.0,
+      "32": 1.0
+    },
+    "min_available_gib": [
+      15.931,
+      16.208,
+      16.082,
+      15.927
+    ]
+  },
+  "stress_panel": {
+    "passed": true,
+    "requests": 70,
+    "max_prompt_tokens": 974076,
+    "max_temperature_c": [
+      88.0,
+      88.7,
+      88.8,
+      90.7
+    ],
+    "approx_seconds_at_or_above_90c": {
+      "0": 0.0,
+      "1": 0.0,
+      "2": 0.0,
+      "3": 10.0
+    },
+    "min_available_gib": [
+      10.883,
+      11.487,
+      11.22,
+      11.188
+    ],
+    "kernel_driver_large_page_retry_lines": 0,
+    "engine_allocation_failures": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 0
+    }
+  },
+  "serving_gate": {
+    "passed": true,
+    "requests": 15,
+    "min_available_gib": [
+      15.648,
+      15.969,
+      15.912,
+      16.294
+    ],
+    "criterion": "functional (tool-call behavior, cache reuse, cancel/resume)"
+  },
+  "cancellation_check": {
+    "passed": true,
+    "min_available_gib": [
+      14.475,
+      14.712,
+      14.688,
+      14.798
+    ]
+  },
+  "residency_check": {
+    "flags": "release: 16 slots, 6 GiB session cache, 7 GiB shared image budget, 8 GiB floor",
+    "sizes_k": [
+      980,
+      980,
+      980,
+      980
+    ],
+    "rounds": 3,
+    "return_turns": 8,
+    "return_cached_fraction": 1.0,
+    "return_seconds_median": 0.406,
+    "min_available_gib": [
+      11.47,
+      12.31,
+      12.25,
+      12.29
+    ]
+  },
+  "reference_quality": {
+    "carried_over_from": "s1585",
+    "why": "no numeric code changed: the difference is a response header, stream comments and which requests are marked running",
+    "positions": 2499,
+    "kl": 0.009325392849739931,
+    "kl_ci95": [
+      0.00814229524266305,
+      0.010598958210404472
+    ],
+    "yardstick": 0.009537610223259073,
+    "kl_minus_yardstick_ci95": [
+      -0.0009862300175128823,
+      0.00036526078701479433
+    ],
+    "top1_agree": 0.9595838335334134,
+    "yardstick_top1_agree": 0.9591836734693877,
+    "clear_flips": 0
+  },
+  "install_recovery_fixtures": {
+    "passed": true,
+    "cases": 10
+  },
+  "cpu_tests": {
+    "passed": true,
+    "tests_passed": 259,
+    "failed": 0,
+    "ignored": 29
+  },
+  "activation": {
+    "runtime": "s1586",
+    "fresh_boots": true,
+    "model_loads_per_device": 1,
+    "worker_starts_since_boot": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "kernel_allocation_or_xid_messages": 0,
+    "clock_cap_mhz": [
+      2350,
+      2350,
+      2350,
+      2350
+    ],
+    "reservation_released": true,
+    "smoke_test": {
+      "passed": true,
+      "text": true,
+      "prompt_reuse": true,
+      "continuation": true,
+      "image": true,
+      "unchanged_generation": true,
+      "execution_timing_header": "v1",
+      "running_comment": true
+    },
+    "routed_smoke": {
+      "what": "through the router in use, with the router's own address, key and model alias: a conversation turn, its follow-up (incremental context transport), an image, a plain response, two conversations at once; synthetic inputs",
+      "passed": true,
+      "router_code_equals_the_code_tested_in_the_routed_panel": true,
+      "requests": [
+        {
+          "name": "turn-1",
+          "seconds": 1.28,
+          "first_token_seconds": 0.585,
+          "prompt_tokens": 3662,
+          "cached_tokens": 0,
+          "prefill_tokens_per_second": 6359.0,
+          "completion_tokens": 93,
+          "finish": "stop"
+        },
+        {
+          "name": "turn-2",
+          "seconds": 1.113,
+          "first_token_seconds": 0.151,
+          "prompt_tokens": 3728,
+          "cached_tokens": 3661,
+          "prefill_tokens_per_second": 476.8,
+          "completion_tokens": 88,
+          "finish": "stop"
+        },
+        {
+          "name": "image",
+          "seconds": 1.789,
+          "first_token_seconds": 0.323,
+          "prompt_tokens": 643,
+          "cached_tokens": 0,
+          "prefill_tokens_per_second": 2909.9,
+          "completion_tokens": 168,
+          "finish": "stop"
+        },
+        {
+          "name": "plain",
+          "seconds": 1.02,
+          "first_token_seconds": null,
+          "prompt_tokens": 1262,
+          "cached_tokens": 0,
+          "prefill_tokens_per_second": 4013.6,
+          "completion_tokens": 72,
+          "finish": "stop"
+        },
+        {
+          "name": "pair-0",
+          "seconds": 2.127,
+          "first_token_seconds": 0.39,
+          "prompt_tokens": 1862,
+          "cached_tokens": 0,
+          "prefill_tokens_per_second": 4970.7,
+          "completion_tokens": 125,
+          "finish": "stop"
+        },
+        {
+          "name": "pair-1",
+          "seconds": 2.128,
+          "first_token_seconds": 0.768,
+          "prompt_tokens": 1862,
+          "cached_tokens": 0,
+          "prefill_tokens_per_second": 5011.2,
+          "completion_tokens": 136,
+          "finish": "stop"
+        }
+      ]
+    }
+  }
+}

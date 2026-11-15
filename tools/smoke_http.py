@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Three bounded foreground requests to verify serving, reuse and timing fields."""
+"""Three bounded foreground requests to verify serving, reuse and timing fields.
+
+Also checks the execution-timing contract a router relies on when it leaves admission to the engine (the
+supplied profile: batched decode): the header `x-native-execution-timing: v1` on every successful response and a
+`: native-execution running` comment in every stream. Pass --no-execution-timing for a profile that serves one
+request at a time without it."""
 import argparse
 import hashlib
 import json
@@ -12,6 +17,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--base-url', default='http://127.0.0.1:8000')
     ap.add_argument('--key-file', type=Path, required=True)
+    ap.add_argument('--no-execution-timing', action='store_true')
     a = ap.parse_args()
     key = a.key_file.read_text().strip()
     headers = {'Authorization': 'Bearer '+key, 'Content-Type': 'application/json',
@@ -29,11 +35,13 @@ def main():
             body['stream_options'] = dict(include_usage=True)
         request = urllib.request.Request(a.base_url.rstrip('/')+'/v1/chat/completions',
                                          data=json.dumps(body).encode(), headers=headers)
-        frames, content, usage, finish, done = [], '', None, None, False
+        frames, content, usage, finish, done, running = [], '', None, None, False, False
         begin = time.monotonic()
         with urllib.request.urlopen(request, timeout=90) as response:
+            contract = response.headers.get('x-native-execution-timing')
             if stream:
                 for line in response:
+                    running = running or line.strip() == b': native-execution running'
                     if not line.startswith(b'data:'):
                         continue
                     raw = line[5:].strip()
@@ -53,6 +61,9 @@ def main():
                 content = frame['choices'][0]['message']['content'] or ''
                 finish = frame['choices'][0]['finish_reason']
         assert finish == 'stop' and 'READY' in content, (label, finish, 'unexpected answer')
+        if not a.no_execution_timing:
+            assert contract == 'v1', (label, 'response lacks x-native-execution-timing: v1')
+            assert running or not stream, (label, 'stream never reported native-execution running')
         timings = [f['timings'] for f in frames if 'timings' in f]
         assert len(timings) == 1, (label, 'expected one timing object')
         timing = timings[0]

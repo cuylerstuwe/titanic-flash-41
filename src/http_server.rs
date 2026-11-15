@@ -154,6 +154,9 @@ struct Shared {
     decode_priority: AtomicBool,
     background_prefill: AtomicBool,
     execution_activity: AtomicBool,
+    // Responses carry the timing contract (x-native-execution-timing: v1 and running/waiting comments).
+    // On with two-owner admission and with batched decode; the two-slot gate above is two-owner only.
+    execution_timing: AtomicBool,
     execution_admission: Arc<Semaphore>,
     waiting_inputs: AtomicUsize,
     waiting_image_budget: AtomicUsize,
@@ -315,6 +318,14 @@ impl Job {
         if self.executing.replace(executing) != executing {
             if let Some(activity) = &self.activity { activity.send_replace(executing); }
         }
+    }
+    /// What a batched-decode owner reports, as the two-owner scheduler does for its pair: running while it
+    /// owns region 0 or a serving region, except a background conversation the router holds and one whose
+    /// reader is behind (they sit out steps); waiting while it is in line, new or paused. Reads the stall
+    /// mark the scheduler's own back-pressure checks keep; changes nothing else.
+    pub(crate) fn report_running(&self, owns_region: bool, router_hold: bool) {
+        self.set_executing(owns_region && !(router_hold && self.background)
+            && self.output_stalled_since.get().is_none());
     }
 
     pub(crate) fn needs_cached_prefix(&self, prefix: &[u32], media: &crate::prompt_media::Identity) -> bool {
@@ -528,6 +539,13 @@ impl Queue {
     pub(crate) fn enable_two_stream_admission(&self) {
         self.execution_owners.set(Some(0));
         self.shared.execution_activity.store(true, Ordering::Release);
+        self.shared.execution_timing.store(true, Ordering::Release);
+    }
+    /// The response timing contract without the two-slot lifetime gate. Batched decode admits one owner a
+    /// serving region itself and still tells a router when a request runs and when it waits: a router that
+    /// leaves admission to this engine refuses responses that lack the header (Nov 15 2026, release s1585).
+    pub(crate) fn enable_execution_timing(&self) {
+        self.shared.execution_timing.store(true, Ordering::Release);
     }
     pub(crate) fn reserve_waiting_image_capacity(&self, bytes: usize) -> Result<()> {
         assert!(bytes <= 2usize << 30);
@@ -1086,7 +1104,7 @@ async fn finish_chat(shared: Arc<Shared>, body: context::Input, permit: OwnedSem
     let id = registration.id.clone();
     let (output, incoming) = tokio::sync::mpsc::channel(OUTPUT_CHUNKS);
     let prefill_timing = Arc::new(OnceLock::new());
-    let activity_enabled = shared.execution_activity.load(Ordering::Acquire);
+    let activity_enabled = shared.execution_timing.load(Ordering::Acquire);
     let (activity, activity_rx) = if activity_enabled {
         let (tx, rx) = tokio::sync::watch::channel(false); (Some(tx), Some(rx))
     } else { (None, None) };
@@ -1243,6 +1261,7 @@ pub(crate) fn start(config: &ServerConfig, capacity: usize, images: bool) -> Res
         decode_priority: AtomicBool::new(false),
         background_prefill: AtomicBool::new(false),
         execution_activity: AtomicBool::new(false),
+        execution_timing: AtomicBool::new(false),
         execution_admission: Arc::new(Semaphore::new(2)),
         waiting_inputs: AtomicUsize::new(0),
         waiting_image_budget: AtomicUsize::new(0),
@@ -1564,6 +1583,7 @@ mod tests {
             decode_priority: AtomicBool::new(false),
             background_prefill: AtomicBool::new(false),
             execution_activity: AtomicBool::new(false),
+            execution_timing: AtomicBool::new(false),
             execution_admission: Arc::new(Semaphore::new(2)),
             waiting_inputs: AtomicUsize::new(0),
             waiting_image_budget: AtomicUsize::new(0),
@@ -1778,6 +1798,84 @@ mod tests {
         assert!(body.contains("[DONE]"), "{body}");
         assert!(body.contains("\"finish_reason\":\"stop\""));
         assert!(shared.requests.lock().unwrap().is_empty());
+    }
+    #[test]
+    #[ignore = "requires CANADA_TEST_TOKENIZER pointing to the pinned public1017 tokenizer"]
+    fn execution_timing_without_the_two_slot_gate_reports_running_and_waiting() {
+        // Batched decode's HTTP contract: every response announces the timing a router requires for local
+        // admission, requests are not held behind two lifetime slots, and each stream says when its
+        // conversation runs and when it waits. Release s1585 sent none of it (Nov 15 2026).
+        let (queue,shared,rt)=test_http_fixture();
+        queue.enable_decode_priority();queue.enable_execution_timing();
+        let request=|stream:bool,background:bool| Request::builder().method("POST").uri("/v1/chat/completions")
+            .header("authorization","Bearer test-token").header("content-type","application/json")
+            .header("x-localai-mode",if background {"background"}else{"foreground"})
+            .body(Body::from(json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":16,"stream":stream}).to_string())).unwrap();
+        let finish=|job:Job| {
+            job.emit(BackendEvent::Ready{fingerprint:"test".into(),cached_tokens:0});
+            job.emit(BackendEvent::Tokens(vec![42,1]));
+            job.emit(BackendEvent::Finish(deepseek_recipe::stream::InferenceFinishReason::Stop));
+            drop(job);
+        };
+        let chunk=|body:&mut axum::body::BodyDataStream| {
+            let bytes=rt.block_on(async {tokio::time::timeout(Duration::from_secs(2),body.next()).await}).unwrap().unwrap().unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+        // Three foreground conversations and a background one: all are converted and queued at once.
+        let mut bodies=Vec::new();
+        for k in 0..4 {
+            let response=rt.block_on(chat(State(shared.clone()),request(true,k==3)));
+            assert_eq!(response.status(),StatusCode::OK);
+            assert_eq!(response.headers()["x-native-execution-timing"],"v1");
+            bodies.push(response.into_body().into_data_stream());
+        }
+        assert_eq!(shared.waiting_inputs.load(Ordering::Acquire),0,"no raw input waits for a lifetime slot");
+        assert_eq!(shared.execution_admission.available_permits(),2,"the two-slot gate is not in use");
+        // Foreground requests leave the queue first; the background one follows.
+        let jobs:Vec<Job>=(0..4).map(|_|queue.try_fifo().unwrap().unwrap()).collect();
+        assert!(jobs[..3].iter().all(|job|!job.background)&&jobs[3].background);
+        for body in &mut bodies {assert!(chunk(body).contains("native-execution waiting"));}
+        // Region 0's owner and a region's owner run; the one in line keeps waiting.
+        jobs[0].report_running(true,false);jobs[1].report_running(true,false);jobs[2].report_running(false,false);
+        assert!(chunk(&mut bodies[0]).contains("native-execution running"));
+        assert!(chunk(&mut bodies[1]).contains("native-execution running"));
+        // A background owner the router holds waits; released, it runs.
+        jobs[3].report_running(true,true);
+        jobs[3].report_running(true,false);
+        assert!(chunk(&mut bodies[3]).contains("native-execution running"));
+        // Paused for another conversation: waiting again. A reader that is behind sits out steps: waiting.
+        jobs[0].report_running(false,false);
+        assert!(chunk(&mut bodies[0]).contains("native-execution waiting"));
+        jobs[1].output_stalled_since.set(Some(Instant::now()));
+        jobs[1].report_running(true,false);
+        assert!(chunk(&mut bodies[1]).contains("native-execution waiting"));
+        jobs[1].output_stalled_since.set(None);
+        jobs[1].report_running(true,false);
+        assert!(chunk(&mut bodies[1]).contains("native-execution running"));
+        // An unchanged state sends nothing: the next chunk of the conversation in line is model output.
+        jobs[2].report_running(false,false);
+        for job in jobs {finish(job);}
+        let rest=|mut body:axum::body::BodyDataStream| rt.block_on(async {
+            let mut out=Vec::new();while let Some(c)=body.next().await{out.extend_from_slice(&c.unwrap());}
+            String::from_utf8(out).unwrap()});
+        let texts:Vec<String>=bodies.into_iter().map(rest).collect();
+        assert!(texts.iter().all(|text|text.contains("\"finish_reason\":\"stop\"")&&text.contains("[DONE]")),"{texts:?}");
+        assert!(!texts[2].contains("native-execution running"),"{}",texts[2]);
+        // A plain (non-streamed) response carries the header too; a router asks for streams and checks it.
+        let plain=rt.block_on(async {
+            // The fixture's runtime runs spawned work only inside block_on.
+            let plain=tokio::spawn(chat(State(shared.clone()),request(false,false)));
+            let job=loop {
+                if let Some(job)=queue.try_fifo().unwrap() {break job;}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            finish(job);
+            plain.await.unwrap()
+        });
+        assert_eq!(plain.status(),StatusCode::OK);
+        assert_eq!(plain.headers()["x-native-execution-timing"],"v1");
+        assert!(shared.requests.lock().unwrap().is_empty());
+        assert_eq!(shared.admission.available_permits(),QUEUE_DEPTH + 1);
     }
     #[test]
     #[ignore = "requires CANADA_TEST_TOKENIZER pointing to the pinned public1017 tokenizer"]

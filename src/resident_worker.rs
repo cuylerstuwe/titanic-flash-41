@@ -5237,7 +5237,9 @@ pub fn run_http(path: &Path) -> Result<()> {
     if let Some(queue) = &queue {
         if http_interleave {
             // Configure lifetime admission before HTTP can advertise Ready.
-            if interleave_http::two_stream_enabled()? && !batched_serving::enabled()? { queue.enable_two_stream_admission(); }
+            let (two_stream, timing) = interleave_http::http_contract(interleave_http::two_stream_enabled()?, batched_serving::enabled()?);
+            if two_stream { queue.enable_two_stream_admission(); }
+            if timing { queue.enable_execution_timing(); }
             if request_checkpoint::exchange_enabled()? {
                 ensure!(interleave_http::two_stream_enabled()?,"state exchange requires two-owner admission");
                 queue.reserve_waiting_image_capacity(worker.shared_image_budget)?;
