@@ -94,13 +94,72 @@ impl InputMode {
         }
     }
 }
+/// A six-row decode layer's L2 hint queue under one plan (config::QueuePlan): QKV-A, wq_b, wo_a and wo_b in
+/// read order. W1 runs beside the previous layer's FFN sum (that layer begins it), W2 beside this layer's QKV
+/// gather, W3 from the attention's start; all are joined after wo_b.
+pub(crate) struct HintQueue {
+    pub(crate) w1: Option<crate::l2_prefetch::Window>,
+    /// When present, the previous layer begins `w1` only while this is set (config::l2_queue_engram_lead: the
+    /// Engram projection hint of layers 1 and 14, switched per step and by the plan screen).
+    pub(crate) w1_gate: Option<Rc<std::cell::Cell<bool>>>,
+    w2: Option<crate::l2_prefetch::Window>,
+    /// config::l2_queue_index_lead: W2 with the index work's cold weights ahead of wq_b (indexed layers only).
+    w2_lead: Option<crate::l2_prefetch::Window>,
+    w3: Option<crate::l2_prefetch::Window>,
+    /// The KV pages of the attention's window, hinted just before W2 (plan spec `k`).
+    kv: Option<crate::l2_prefetch::Window>,
+    /// Plan spec `t`: the previous layer starts `w1` in its experts' tail (mhc::tail_point).
+    pub(crate) w1_tail: bool,
+    /// Plan spec `e`: the previous layer starts `w1` when its routed experts end (mhc::routed_end_point).
+    pub(crate) w1_routed_end: bool,
+}
+/// Where a registered first window begins: at the gate on the shared branch, or when the routed experts end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TailKind { Gate, RoutedEnd, Any }
+thread_local! {
+    static TAIL_W1: std::cell::RefCell<Vec<(usize, TailKind, Rc<HintQueue>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+/// The next layer's first hint window waits for a point inside the FFN of the layer running on `parent`.
+pub(crate) fn tail_w1_register(parent: &Stream, queue: Rc<HintQueue>) {
+    let kind = if queue.w1_tail { TailKind::Gate } else { TailKind::RoutedEnd };
+    TAIL_W1.with(|t| t.borrow_mut().push((parent.raw() as usize, kind, queue)));
+}
+/// The windows registered for `parent` and `kind`, removed from the list (taken by their point, or, with
+/// `TailKind::Any`, dropped by the layer's FFN finish when the point never came).
+pub(crate) fn tail_w1_take(parent: &Stream, kind: TailKind) -> Vec<Rc<HintQueue>> {
+    TAIL_W1.with(|t| {
+        let mut t = t.borrow_mut();
+        let (hit, rest): (Vec<_>, Vec<_>) = t.drain(..)
+            .partition(|x| x.0 == parent.raw() as usize && (kind == TailKind::Any || x.1 == kind));
+        *t = rest;
+        hit.into_iter().map(|x| x.2).collect()
+    })
+}
+/// The byte range [start, start + bytes) of `regions` taken in order, as (address, size) pairs.
+fn range_w2(regions: &[(u64, usize)], start: usize, bytes: usize) -> Result<Vec<(u64, usize)>> {
+    let (mut skip, mut left, mut out) = (start / 16 * 16, bytes, Vec::new());
+    for &(address, size) in regions {
+        if skip >= size { skip -= size; continue; }
+        let take = (size - skip).min(left);
+        if take > 0 { out.push((address + skip as u64, take)); left -= take; }
+        skip = 0;
+    }
+    Ok(out)
+}
 pub struct Layer {
     cuda: Cuda,
     rows: usize,
     mode: InputMode,
     qa: Linear,
+    /// config::qkv_narrow_prequant: the other lowering of the same product (the one not in `qa`), if installed.
+    qa_alternate: Option<Linear>,
     gathered_qkv: Option<Buffer<bf16>>,
     qb: Linear,
+    hint_queues: Vec<Rc<HintQueue>>,
+    hint_queue_selected: Rc<std::cell::Cell<Option<usize>>>,
+    /// CANADA_SCRATCH_L2_QUEUE_INDEX_EARLY: begin the third window before a layer's index work.
+    index_early: std::cell::Cell<bool>,
+    index_lead: std::cell::Cell<bool>,
     qb_prefetch: Option<crate::l2_prefetch::Window>,
     woa_prefetch: Option<crate::l2_prefetch::Window>,
     woa_prefetch_active: bool,
@@ -127,6 +186,8 @@ pub struct Layer {
     query_norm_quant: Option<(crate::primitives::Primitives, i32)>,
     kvnorm_weight: Buffer<bf16>,
     query_overlap: Option<QueryOverlap>,
+    /// config::mhc_quarter_stats: the attention boundary's statistics partials ride this layer's QKV gather.
+    quarter: Option<Rc<crate::mhc::QuarterLink>>,
 }
 struct QueryOverlap {
     side: Rc<Stream>,
@@ -223,6 +284,35 @@ impl Layer {
     }
     pub(crate) fn cached_woa_allocation(&self) -> Option<(u64, usize)> {
         match &self.woa { WoA::Medium(v) => v.cached_allocation(), _ => None }
+    }
+    /// Plan screen: the native WO-A partial kernel on or off (config::woa_native_screen).
+    pub(crate) fn set_index_early_for_probe(&self, on: bool) { self.index_early.set(on); }
+    pub(crate) fn set_index_lead_for_probe(&self, on: bool) { self.index_lead.set(on); }
+    /// A layer whose index work sits between the query projection and the attention: begin the selected plan's
+    /// third window now (when enabled) so the output projections' weights arrive while that work runs.
+    pub(crate) fn begin_output_hint_early(&self, stream: &Stream) -> Result<()> {
+        if !self.index_early.get() { return Ok(()); }
+        if let Some(w) = self.selected_hint_queue().and_then(|q| q.w3.as_ref()) {
+            if !w.is_open() { w.begin(stream)?; }
+        }
+        Ok(())
+    }
+    /// Plan screen: every installed direct-read projection (wq_b, QKV-A) on or off; `None` puts each back on its
+    /// configured setting.
+    pub(crate) fn set_wqb_direct_for_probe(&self, on: Option<bool>) -> Result<()> {
+        if self.qb.direct_installed() { self.qb.set_direct_for_probe(on.unwrap_or_else(crate::config::wqb_direct))?; }
+        if self.qa.direct_installed() { self.qa.set_direct_for_probe(on.unwrap_or_else(crate::config::qkva_direct))?; }
+        Ok(())
+    }
+    /// Plan screen: the QKV-A and wq_b outputs of this layer (bytes), for a kernel-against-kernel comparison on a
+    /// layer whose input does not depend on the kernels compared.
+    pub(crate) fn direct_outputs_for_probe(&self) -> Result<[Vec<u8>; 2]> {
+        Ok([self.qa.output_bytes_for_probe()?, self.qb.output_bytes_for_probe()?])
+    }
+    pub(crate) fn set_woa_native_for_probe(&self, on: bool) -> Result<()> {
+        match &self.woa { WoA::Small(v) => v.set_native_for_probe(on),
+            WoA::Medium(v) => v.set_native_for_probe(on),
+            _ => anyhow::bail!("native WO-A covers the 2..8-row and the compact 16-row profiles") }
     }
     pub(crate) fn set_cached_woa_for_probe(&self, enabled: bool) -> Result<()> {
         match &self.woa { WoA::Medium(v) => v.set_cached_for_probe(enabled),
@@ -398,7 +488,12 @@ impl Layer {
                 },
             )?
         };
-        let qb = projection(
+        let mut qa = qa;
+        if !draft && rows == 6 && matches!(mode, InputMode::Split(_))
+            && (crate::config::qkva_direct() || crate::config::qkva_direct_screen()) {
+            qa.install_direct(crate::config::qkva_direct())?;
+        }
+        let mut qb = projection(
             "wq_b",
             &if draft {
                 "fp8-dspark-wq_b-r0-m5-v1".into()
@@ -408,6 +503,10 @@ impl Layer {
                 format!("fp8-canonical-wq_b-r0-m{rows}-v0")
             },
         )?;
+        // Stage 1 of the layer build: the six-row wq_b through the direct-read GEMV (config::wqb_direct).
+        if !draft && rows == 6 && (crate::config::wqb_direct() || crate::config::wqb_direct_screen()) {
+            qb.install_direct(crate::config::wqb_direct())?;
+        }
         let kv = if matches!(mode, InputMode::Fused | InputMode::Split(_)) {
             None
         } else {
@@ -590,6 +689,9 @@ impl Layer {
                 })?,
             )?)
         };
+        if crate::config::woa_native() || crate::config::woa_native_screen() {
+            if let WoA::Small(v) = &mut woa { v.install_native(module, crate::config::woa_native())?; }
+        }
         if crate::woa_medium::cached_policy()? {
             if let WoA::Medium(v) = &mut woa { v.prepare_cached(stream)?; }
         }
@@ -619,12 +721,17 @@ impl Layer {
             rows,
             mode,
             qa,
+            qa_alternate: None,
             gathered_qkv: if matches!(mode, InputMode::Split(_)) {
                 Some(cuda.allocate_rows::<bf16>(rows * 1792)?)
             } else {
                 None
             },
             qb,
+            hint_queues: Vec::new(),
+            hint_queue_selected: Rc::new(std::cell::Cell::new(None)),
+            index_early: std::cell::Cell::new(crate::config::l2_queue_index_early()),
+            index_lead: std::cell::Cell::new(crate::config::l2_queue_index_lead()),
             qb_prefetch,
             woa_prefetch,
             woa_prefetch_active: false,
@@ -655,7 +762,35 @@ impl Layer {
                 Some(QueryOverlap { side: cuda.query_stream(stream)?, ready: cuda.fence_event()?,
                     done: cuda.fence_event()?, parent: stream.raw() as usize, pending: Cell::new(false) })
             } else { None },
+            quarter: None,
         })
+    }
+    /// config::mhc_quarter_stats: give this layer's QKV gather a row block of its own (pseudo-rows for the
+    /// boundary's statistics partials, then the QKV-A rows, which the direct kernel now writes there) and return
+    /// the link the boundary shares. None when this layer's profile does not take it.
+    pub(crate) fn install_quarter_link(&mut self, on: bool) -> Result<Option<Rc<crate::mhc::QuarterLink>>> {
+        use crate::mhc::{QUARTER_COLUMNS, QUARTER_HEAD, QuarterLink};
+        let InputMode::Split(rank) = self.mode else { return Ok(None) };
+        if self.rows != 6 || self.gathered_qkv.is_none() || !self.qa.direct_installed() || self.kv.is_some()
+            || self.quarter.is_some() { return Ok(None); }
+        let mut xin: Buffer<bf16> = self.cuda.allocate((QUARTER_HEAD + self.rows) * QUARTER_COLUMNS)?;
+        let mut xout: Buffer<bf16> = self.cuda.allocate((QUARTER_HEAD + self.rows) * QUARTER_COLUMNS * 4)?;
+        xin.zero()?;
+        xout.zero()?;
+        self.qa.set_direct_output(xin.ptr() + (QUARTER_HEAD * QUARTER_COLUMNS * 2) as u64)?;
+        // The gathered QKV rows keep one fixed place (behind the pseudo-rows); every consumer reads this view.
+        self.gathered_qkv = Some(unsafe { xout.view(QUARTER_HEAD * QUARTER_COLUMNS * 4, self.rows * QUARTER_COLUMNS * 4) }?);
+        let link = Rc::new(QuarterLink { rank, on: Cell::new(on), xin, xout, armed: Cell::new(None),
+            partials_ready: self.cuda.fence_event()?, gathered: self.cuda.fence_event()? });
+        self.quarter = Some(link.clone());
+        Ok(Some(link))
+    }
+    /// Plan screen: the boundary's statistics by rank quarter on or off (the gather follows the boundary).
+    pub(crate) fn set_quarter_stats_for_probe(&self, on: bool) -> Result<bool> {
+        match &self.quarter {
+            Some(link) => { ensure!(link.armed.get().is_none() && (!on || self.qa.direct_on()), "idle quarter statistics link"); link.on.set(on); Ok(true) }
+            None => Ok(false),
+        }
     }
     pub fn output(&self) -> &Buffer<bf16> {
         self.ob.output()
@@ -678,6 +813,26 @@ impl Layer {
     }
     pub(crate) fn projection_quantized_input(&self) -> (&Buffer<u8>,&Buffer<u8>) { self.qa.quantized_input() }
     pub(crate) fn narrow_projection(&self) -> bool { self.qa.narrow_projection() }
+    /// config::qkv_narrow_prequant, before any capture: load the narrow lowering of this layer's six-row split
+    /// QKV-A product beside the default one and make it the active one if `active`. Whether it applies here.
+    pub(crate) fn install_narrow_qkv(&mut self, kernels: &Path, active: bool) -> Result<bool> {
+        if self.rows != 6 || !matches!(self.mode, InputMode::Split(_)) || self.gathered_qkv.is_none()
+            || self.kv.is_some() || self.qa.narrow_projection() { return Ok(false); }
+        ensure!(self.qa_alternate.is_none() && self.query_overlap.as_ref().is_none_or(|q| !q.pending.get()),
+            "narrow QKV installed once on an idle layer");
+        let mut alternate = self.qa.narrow_qkv_alternate(kernels)?;
+        if active { std::mem::swap(&mut self.qa, &mut alternate); }
+        self.qa_alternate = Some(alternate);
+        Ok(true)
+    }
+    /// Plan screen: the narrow lowering active or not (the caller synchronized and dropped the graphs).
+    pub(crate) fn set_narrow_qkv_for_probe(&mut self, on: bool) -> Result<bool> {
+        ensure!(self.query_overlap.as_ref().is_none_or(|q| !q.pending.get()), "narrow QKV switch on an idle layer");
+        let Some(alternate) = self.qa_alternate.as_mut() else { return Ok(false) };
+        if self.qa.narrow_projection() != on { std::mem::swap(&mut self.qa, alternate); }
+        ensure!(self.qa.narrow_projection() == on, "narrow QKV switch");
+        Ok(true)
+    }
     pub(crate) fn legacy_qkv_for_probe(&self,kernels:&Path)->Result<Linear> {self.qa.legacy_qkv_for_probe(kernels)}
     pub(crate) fn swap_qkv_for_probe(&mut self,other:&mut Linear)->Result<()> {self.qa.swap_qkv_for_probe(other)}
     pub(crate) fn producer_qkv_for_probe(&self,kernels:&Path)->Result<Linear> {self.qa.producer_qkv_for_probe(kernels)}
@@ -692,6 +847,151 @@ impl Layer {
     pub(crate) fn fused_projection(&self) -> bool {matches!(self.mode,InputMode::Fused)}
     pub(crate) fn input_matrix(&self) -> Rc<Matrix> {
         self.qa.immutable_matrix()
+    }
+    /// Build this layer's hint queue for every plan (see HintQueue). `has_w1`: the previous layer runs W1
+    /// (not before an Engram layer or the first layer); without it the queue starts after QKV-A.
+    /// `lead`: immutable regions (and the matrices that own them, if not this layer's weights) that an indexed
+    /// layer reads cold before it needs wq_b; config::l2_queue_index_lead puts them first in a second W2.
+    pub(crate) fn build_hint_queues(&mut self, module: &Module, stream: &Stream, plans: &[crate::config::QueuePlan],
+        selected: Rc<std::cell::Cell<Option<usize>>>, has_w1: bool, lead: &[(u64, usize)],
+        lead_owners: &[Rc<Matrix>], engram: Option<(Rc<Matrix>, Rc<std::cell::Cell<bool>>)>) -> Result<Vec<Rc<HintQueue>>> {
+        ensure!(engram.is_none() || !has_w1, "an Engram layer takes the Engram hint as its first window");
+        let (weights, woa_regions) = match &self.woa {
+            WoA::Small(woa) => woa.hint_regions(),
+            WoA::Medium(woa) => woa.hint_regions()
+                .ok_or_else(|| anyhow::anyhow!("the 16-row L2 hint queue needs the compact WO-A"))?,
+        };
+        ensure!(self.hint_queues.is_empty() && (self.rows <= 8 || self.rows == 16)
+            && matches!(self.mode, InputMode::Split(_)) && self.gathered_qkv.is_some(), "L2 hint queue layer profile");
+        let matrices = vec![self.qa.immutable_matrix(), self.qb.immutable_matrix(), self.ob.immutable_matrix()];
+        let (qa, qb) = (matrices[0].immutable_regions()?, matrices[1].immutable_regions()?);
+        let regions: Vec<(u64, usize)> = qa.into_iter().chain(qb).chain(woa_regions)
+            .chain(matrices[2].immutable_regions()?).collect();
+        let bytes = |r: &[(u64, usize)]| r.iter().map(|x| x.1).sum::<usize>();
+        let (after_qa, after_qb) = (bytes(&qa), bytes(&qa) + bytes(&qb));
+        let mut queues = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let window = |start: usize, w: crate::config::QueueWindow| -> Result<Option<crate::l2_prefetch::Window>> {
+                if w.bytes == 0 { return Ok(None); }
+                crate::l2_prefetch::Window::new_queue(&self.cuda, module, stream, matrices.clone(), weights.clone(),
+                    &regions, start / 16 * 16, w.bytes, w.pace)?.map(|x| x.with_warps(w.warps)?.with_wave(w.wave)).transpose()
+            };
+            // A window never hints what was already read: W2 starts after QKV-A, W3 after wq_b.
+            let first = if has_w1 { plan[0].bytes } else { 0 };
+            let second = first.max(after_qa);
+            let third = (second + plan[1].bytes).max(after_qb);
+            // The lead regions first (at most 16 MiB in all), then as much of W2's wq_b range as still fits.
+            let w2_lead = if lead.is_empty() || plan[1].bytes == 0 { None } else {
+                const CAP: usize = 16 * 1024 * 1024;
+                let mut table: Vec<(u64, usize)> = Vec::new();
+                let mut left = CAP;
+                for &(address, size) in lead {
+                    let take = size.min(left) / 16 * 16;
+                    if take > 0 { table.push((address, take)); left -= take; }
+                }
+                let tail = range_w2(&regions, second, plan[1].bytes.min(left) / 16 * 16)?;
+                table.extend(tail);
+                let total: usize = table.iter().map(|r| r.1).sum();
+                let mut owners = matrices.clone();
+                owners.extend(lead_owners.iter().cloned());
+                crate::l2_prefetch::Window::new_queue(&self.cuda, module, stream, owners, weights.clone(),
+                    &table, 0, total, plan[1].pace)?.map(|x| x.with_warps(plan[1].warps)?.with_wave(plan[1].wave)).transpose()?
+            };
+            // config::l2_queue_engram_lead: 12 MiB of the Engram projection, column slabs of 2 KiB over every row
+            // (what a paced hint delivers beside the previous layer's FFN sum and boundary, where it is joined).
+            let engram_w1 = match &engram {
+                Some((matrix, _)) if plan[0].bytes > 0 => Some(crate::l2_prefetch::Window::new_tiled(&self.cuda, module,
+                    stream, matrix.clone(), 2048, 12 * 1024 * 1024, plan[0].pace.unwrap_or(200))?),
+                _ => None,
+            };
+            // Plan prefix `l` on W1 (config::QueueWindow::lead): an indexed layer's lead regions follow QKV-A's
+            // bytes in W1 (at most 16 MiB in all), beside the previous layer's FFN sum; W2 is then wq_b alone.
+            let lead_in_w1 = plan[0].lead && has_w1 && !lead.is_empty() && plan[0].bytes > 0;
+            let w1_lead = if !lead_in_w1 { None } else {
+                const CAP: usize = 16 * 1024 * 1024;
+                let mut table = range_w2(&regions, 0, plan[0].bytes.min(CAP) / 16 * 16)?;
+                let mut left = CAP - table.iter().map(|r| r.1).sum::<usize>();
+                for &(address, size) in lead {
+                    let take = size.min(left) / 16 * 16;
+                    if take > 0 { table.push((address, take)); left -= take; }
+                }
+                let total: usize = table.iter().map(|r| r.1).sum();
+                let mut owners = matrices.clone();
+                owners.extend(lead_owners.iter().cloned());
+                crate::l2_prefetch::Window::new_queue(&self.cuda, module, stream, owners, weights.clone(),
+                    &table, 0, total, plan[0].pace)?.map(|x| x.with_warps(plan[0].warps)?.with_wave(plan[0].wave)).transpose()?
+            };
+            let w2_lead = if lead_in_w1 { None } else { w2_lead };
+            ensure!(!plan[0].tail || crate::config::experts_tail().is_some(),
+                "plan prefix t needs CANADA_SCRATCH_EXPERTS_TAIL");
+            let w1_tail = plan[0].tail && has_w1 && !lead_in_w1 && engram.is_none();
+            let w1_routed_end = plan[0].routed_end && has_w1 && !lead_in_w1 && engram.is_none();
+            // A tail window is begun from the shared expert's branch, which runs on the auxiliary stream: its
+            // own kernel goes to the hint stream.
+            let w1_plain = if has_w1 && !lead_in_w1 {
+                match window(0, plan[0])? {
+                    Some(w) if w1_tail || w1_routed_end => Some(w.on_stream(self.cuda.hint_stream(stream)?)?),
+                    w => w,
+                }
+            } else { None };
+            queues.push(Rc::new(HintQueue {
+                w1: if lead_in_w1 { w1_lead } else if has_w1 { w1_plain } else { engram_w1 },
+                w1_gate: engram.as_ref().map(|e| e.1.clone()),
+                w2: window(second, plan[1])?,
+                w2_lead,
+                w3: window(third, plan[2])?,
+                kv: if plan[1].kv { Some(crate::l2_prefetch::Window::new_kv(&self.cuda, module, stream)?) } else { None },
+                w1_tail, w1_routed_end,
+            }));
+        }
+        self.hint_queues = queues.clone();
+        self.hint_queue_selected = selected;
+        Ok(queues)
+    }
+    /// The drafter's hint queue (config::draft_hints). Its input mode has no QKV gather, so two windows: W1, the
+    /// first `w1` bytes of the QKV-A and KV projections, which the previous stage begins beside its FFN sum
+    /// (`has_w1`: not the first stage), and W3, `w3` bytes of wo_a and wo_b from the attention's start. Both are
+    /// joined after wo_b like the target layers' queue.
+    pub(crate) fn build_draft_hint_queue(&mut self, module: &Module, stream: &Stream, w1: usize, w3: usize, pace: u32,
+        has_w1: bool) -> Result<Rc<HintQueue>> {
+        ensure!(self.hint_queues.is_empty() && self.rows == 5 && matches!(self.mode, InputMode::Shared)
+            && self.kv.is_some() && self.gathered_qkv.is_none(), "draft hint queue layer profile");
+        let (weights, woa_regions) = match &self.woa {
+            WoA::Small(woa) => woa.hint_regions(),
+            WoA::Medium(_) => anyhow::bail!("the draft hint queue needs the small WO-A"),
+        };
+        let matrices = vec![self.qa.immutable_matrix(), self.kv.as_ref().unwrap().immutable_matrix(),
+            self.qb.immutable_matrix(), self.ob.immutable_matrix()];
+        let (qa, kv, qb) = (matrices[0].immutable_regions()?, matrices[1].immutable_regions()?, matrices[2].immutable_regions()?);
+        let bytes = |r: &[(u64, usize)]| r.iter().map(|x| x.1).sum::<usize>();
+        let after_qb = bytes(&qa) + bytes(&kv) + bytes(&qb);
+        let regions: Vec<(u64, usize)> = qa.into_iter().chain(kv).chain(qb).chain(woa_regions)
+            .chain(matrices[3].immutable_regions()?).collect();
+        let total = bytes(&regions);
+        let window = |start: usize, size: usize| -> Result<Option<crate::l2_prefetch::Window>> {
+            if size == 0 { return Ok(None); }
+            crate::l2_prefetch::Window::new_queue(&self.cuda, module, stream, matrices.clone(), weights.clone(),
+                &regions, start / 16 * 16, size, Some(pace))
+        };
+        let queue = Rc::new(HintQueue { w1: if has_w1 { window(0, w1)? } else { None }, w1_gate: None, w2: None,
+            w2_lead: None, w3: window(after_qb, w3)?, kv: None, w1_tail: false, w1_routed_end: false });
+        if !has_w1 {
+            eprintln!("DSpark draft hint queue: stage dense weights {total} bytes (QKV-A, KV, wq_b {after_qb}); W1 {w1} W3 {w3} bytes at {pace} GB/s");
+        }
+        self.hint_queues = vec![queue.clone()];
+        self.hint_queue_selected = Rc::new(std::cell::Cell::new(Some(0)));
+        Ok(queue)
+    }
+    fn selected_hint_queue(&self) -> Option<&Rc<HintQueue>> {
+        self.hint_queue_selected.get().and_then(|i| self.hint_queues.get(i))
+    }
+    fn join_hint_queue(&self, stream: &Stream) -> Result<()> {
+        if let Some(q) = self.selected_hint_queue() {
+            for w in [&q.w1, &q.w2, &q.w2_lead, &q.w3, &q.kv].into_iter().flatten() {
+                if w.is_open() { w.join(stream)?; }
+            }
+        }
+        Ok(())
     }
     pub fn rows(&self) -> usize {
         self.rows
@@ -732,6 +1032,23 @@ impl Layer {
         );
         self.project_distributed_quantized(input, quantized, positions, locations, cache, comm, stream)?;
         self.finish(positions, cache, candidates, sink, None, stream)
+    }
+    /// Batched drafter passes (config::batched_draft_interleave): one phase of this drafter's attention sublayer
+    /// (1 input projection, 2 KV projection, 4 query norm, wq_b and stores, 8 attention and wo_a, 16 wo_b), the
+    /// same kernels on the same inputs as `run_distributed` runs in that order. Several conversations take each
+    /// phase back to back, so a phase's weights (4-11 MB) are read from memory once and from L2 after that.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_draft_phase(&mut self, phase: u8, input: &Buffer<bf16>, positions: &Positions,
+        locations: &RowLocations, cache: &mut PagedKv, candidates: &Candidates, sink: &Buffer<f32>,
+        stream: &Stream) -> Result<()> {
+        ensure!(self.rows == 5 && matches!(self.mode, InputMode::Shared) && self.kv.is_some()
+            && self.gathered_qkv.is_none() && matches!(self.woa, WoA::Small(_)) && !self.frequencies.compressed(),
+            "draft attention phases need the drafter's profile");
+        match phase {
+            1 | 2 | 4 => self.project_input_phases(input, positions, locations, cache, None, None, None, false, phase, stream),
+            8 | 16 => self.finish_phases(positions, cache, candidates, sink, None, phase, stream),
+            _ => anyhow::bail!("unknown draft attention phase"),
+        }
     }
     /// Main projections/store precede the source/index branch, which consumes
     /// the exact normalized Q LoRA values before sparse attention runs.
@@ -777,16 +1094,29 @@ impl Layer {
             "paired QKV requires an idle split M6 projection");
         Ok(&self.qa)
     }
+    #[allow(clippy::too_many_arguments)]
     fn project_input(&mut self, input: &Buffer<bf16>, positions: &Positions,
         locations: &RowLocations, cache: &mut PagedKv, comm: Option<&Roce>,
         shard: Option<(&mut crate::fp8_linear::RowShard,bool)>,
         quantized:Option<(&Buffer<u8>,&Buffer<u8>)>, precomputed:bool, stream: &Stream) -> Result<()> {
+        self.project_input_phases(input, positions, locations, cache, comm, shard, quantized, precomputed, 7, stream)
+    }
+    /// `phases`: 1 = the input projection (and its gather), 2 = the KV projection, 4 = the query norm, wq_b and the
+    /// query and key stores; 7 = the whole projection in that order. Single phases serve batched drafter passes
+    /// (`run_draft_phase`), where several conversations take each phase back to back.
+    #[allow(clippy::too_many_arguments)]
+    fn project_input_phases(&mut self, input: &Buffer<bf16>, positions: &Positions,
+        locations: &RowLocations, cache: &mut PagedKv, comm: Option<&Roce>,
+        shard: Option<(&mut crate::fp8_linear::RowShard,bool)>,
+        quantized:Option<(&Buffer<u8>,&Buffer<u8>)>, precomputed:bool, phases: u8, stream: &Stream) -> Result<()> {
         if precomputed {
             self.paired_input_projection()?;
             ensure!(shard.is_none()&&quantized.is_none()&&comm.is_some(),"precomputed QKV input path");
         }
         ensure!(quantized.is_none() || (shard.is_none() && matches!(self.rows, 6 | 16)
-            && matches!(self.mode,InputMode::Split(_)) && !self.qa.narrow_projection()),
+            && matches!(self.mode,InputMode::Split(_))
+            // config::qkv_narrow_prequant: an installed alternate consumes the same quantized input.
+            && (!self.qa.narrow_projection() || self.qa_alternate.is_some())),
             "prequantized normalized attention requires the checked legacy QKV quantizer");
         if let Some(q) = &self.query_overlap {
             ensure!(!q.pending.get() && q.parent == stream.raw() as usize,
@@ -796,25 +1126,72 @@ impl Layer {
             self.gathered_qkv.is_none() || comm.is_some(),
             "split QKV requires TP4 communicator"
         );
+        if phases & 1 != 0 {
         if precomputed {
             // The paired normalizer/projector already wrote this private output.
         } else if let Some((shard,project_local)) = shard {
             self.qa.run_row_shard(input, shard, project_local,
                 comm.ok_or_else(|| anyhow::anyhow!("row gather communicator absent"))?, stream)?;
+        } else if crate::knockout::has(crate::knockout::Site::QkvA) {
+            // Plan-screen knockout: the projection's output of the previous run of this step stays.
         } else if let Some((values,scales)) = quantized {
             self.qa.run_quantized(values,scales,stream)?;
         } else {
             self.qa.run(input, stream)?;
         }
+        crate::mhc::stats_point(crate::mhc::StatsPoint::AfterInputProjection, stream)?;
         if let Some(output) = self.gathered_qkv.as_mut() {
-            if let Some(hint) = &self.qb_prefetch {
+            if let Some(q) = self.hint_queue_selected.get().and_then(|i| self.hint_queues.get(i)) {
+                if let Some(k) = &q.kv {
+                    k.begin_kv(stream, locations.locations_ptr(), cache.data().ptr(), cache.page_tokens(),
+                        cache.page_bytes(), cache.pages(), self.rows, 128)?;
+                }
+                let lead = q.w2_lead.as_ref().filter(|_| self.index_lead.get());
+                if let Some(w) = lead.or(q.w2.as_ref()) { w.begin(stream)?; }
+            } else if let Some(hint) = &self.qb_prefetch {
                 hint.begin(stream)?;
             }
-            unsafe {
-                comm.unwrap()
-                    .gather_bf16(self.qa.output(), output, 448, stream)
-            }?;
+            // The rows ride with the QKV-A rows only when the direct kernel wrote those behind the pseudo-rows (not
+            // after a pooled / precomputed projection, which writes the projection's own output).
+            let rider = self.quarter.as_ref().filter(|_| self.qa.direct_on() && !precomputed);
+            if crate::knockout::has(crate::knockout::Site::Gather) {
+                // Plan-screen knockout: the gathered rows of the previous run of this step stay.
+                ensure!(self.quarter.as_ref().is_none_or(|link| link.armed.get().is_none()), "gather knockout with quarter statistics");
+            } else if let Some(link) = self.quarter.as_ref().filter(|link| rider.is_none() && link.armed.get().is_some()) {
+                // Partials were issued but this step's QKV-A rows are not in the row block: the ordinary gather,
+                // then the pseudo-rows in a gather of their own (correct in every path, one collective more).
+                use crate::mhc::{QUARTER_COLUMNS, QUARTER_HEAD};
+                let comm = comm.unwrap();
+                let pseudo = link.armed.take().unwrap();
+                unsafe { comm.gather_bf16(self.qa.output(), output, 448, stream) }?;
+                link.partials_ready.wait(stream)?;
+                let first = QUARTER_HEAD - pseudo;
+                let input = unsafe { link.xin.view(first * QUARTER_COLUMNS, pseudo * QUARTER_COLUMNS) }?;
+                let mut gathered = unsafe { link.xout.view(first * QUARTER_COLUMNS * 4, pseudo * QUARTER_COLUMNS * 4) }?;
+                unsafe { comm.gather_bf16_exact(&input, &mut gathered, QUARTER_COLUMNS, stream) }?;
+                link.gathered.record(stream)?;
+            } else if let Some(link) = rider {
+                // The direct kernel wrote this step's QKV-A rows behind the pseudo-rows; the boundary's partials
+                // (when it issued any) end where those rows begin: one gather takes both.
+                use crate::mhc::{QUARTER_COLUMNS, QUARTER_HEAD};
+                let comm = comm.unwrap();
+                let pseudo = link.armed.take();
+                let (first, rows) = (QUARTER_HEAD - pseudo.unwrap_or(0), pseudo.unwrap_or(0) + comm.gather_live_rows(self.rows));
+                if pseudo.is_some() { link.partials_ready.wait(stream)?; }
+                let input = unsafe { link.xin.view(first * QUARTER_COLUMNS, rows * QUARTER_COLUMNS) }?;
+                let mut gathered = unsafe { link.xout.view(first * QUARTER_COLUMNS * 4, rows * QUARTER_COLUMNS * 4) }?;
+                unsafe { comm.gather_bf16_exact(&input, &mut gathered, QUARTER_COLUMNS, stream) }?;
+                if pseudo.is_some() { link.gathered.record(stream)?; }
+            } else {
+                unsafe {
+                    comm.unwrap()
+                        .gather_bf16(self.qa.output(), output, 448, stream)
+                }?;
+            }
+            crate::mhc::stats_point(crate::mhc::StatsPoint::AfterGather, stream)?;
         }
+        }
+        if phases & 2 != 0 {
         if let Some(kv) = &self.kv {
             if matches!(self.mode, InputMode::Shared) {
                 let (a, s) = self.qa.quantized_input();
@@ -823,6 +1200,8 @@ impl Layer {
                 kv.run(input, stream)?;
             }
         }
+        }
+        if phases & 4 == 0 { return Ok(()); }
         // The qualified FLASHINFER_CUTLASS backend normalizes via CuTe
         // RMSNorm, rounds to BF16, then quantizes for wq_b. Its alternative
         // fused Triton norm has different BF16 ties on real inputs.
@@ -847,7 +1226,9 @@ impl Layer {
             q.pending.set(true);
             q.side.as_ref()
         } else { stream };
-        if self.query_norm_quant.is_some() {
+        if crate::knockout::has(crate::knockout::Site::WqB) {
+            // Plan-screen knockout: the query projection of the previous run of this step stays.
+        } else if self.query_norm_quant.is_some() {
             let (q,s)=self.qb.query_quantization_buffers()?;
             self.qb.run_quantized(q,s,query_stream)?;
         } else {self.qb.run(&self.normalized, query_stream)?;}
@@ -947,6 +1328,13 @@ impl Layer {
         Ok(())
     }
     pub(crate) fn query_overlap_enabled(&self) -> bool { self.query_overlap.is_some() }
+    /// config::index_fork: make `side` wait for the fence recorded where the normalized query latent became final
+    /// (where Q-B forked in this layer's projection), so other work that reads it can begin there too.
+    pub(crate) fn wait_query_ready(&self, side: &Stream) -> Result<()> {
+        let q = self.query_overlap.as_ref().ok_or_else(|| anyhow::anyhow!("no query fork to follow"))?;
+        ensure!(q.pending.get() && self.cuda.owns_stream(side), "the query fork has not begun in this layer");
+        q.ready.wait(side)
+    }
     pub(crate) fn query_norm_quant_enabled(&self) -> bool {self.query_norm_quant.is_some()}
     pub(crate) fn schedule_flags(&self)->(bool,bool) {
         (self.qb_prefetch.is_some(),self.qb.pdl_active())
@@ -974,15 +1362,35 @@ impl Layer {
         extra: Option<(&PagedKv, &Candidates)>,
         stream: &Stream,
     ) -> Result<()> {
+        self.finish_phases(positions, cache, candidates, sink, extra, 24, stream)
+    }
+    /// `phases`: 8 = the attention and wo_a, 16 = wo_b and the hint joins; 24 = both in that order.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_phases(
+        &mut self,
+        positions: &Positions,
+        cache: &PagedKv,
+        candidates: &Candidates,
+        sink: &Buffer<f32>,
+        extra: Option<(&PagedKv, &Candidates)>,
+        phases: u8,
+        stream: &Stream,
+    ) -> Result<()> {
+        if phases & 8 != 0 {
         if let Some(q) = &self.query_overlap {
             ensure!(q.pending.get() && q.parent == stream.raw() as usize,
                 "attention consumer has no matching query fork");
             q.done.wait(stream)?;
             q.pending.set(false);
         }
+        crate::layer_clock::fine(stream, crate::layer_clock::FINE_QUERY_JOINED)?;
         if self.woa_prefetch_active {self.woa_prefetch.as_ref().unwrap().begin(stream)?;}
+        if let Some(w) = self.selected_hint_queue().and_then(|q| q.w3.as_ref()) {
+            if !w.is_open() { w.begin(stream)?; }
+        }
         let query = if matches!(self.qstore, Query::Medium(_)) && crate::config::wide_rows(self.rows)
             && self.rows >= 512 && q_inplace_enabled() { self.qb.output() } else { self.qstore.output() };
+        if !crate::knockout::has(crate::knockout::Site::Attention) {
         self.decode.run(
             query,
             cache,
@@ -1000,19 +1408,30 @@ impl Layer {
             true,
             stream,
         )?;
+        }
+        crate::layer_clock::fine(stream, crate::layer_clock::FINE_ATTENDED)?;
+        }
         match &mut self.woa {
             WoA::Small(w) => {
-                w.run(self.decode.output(), stream)?;
-                self.ob.run_quantized(w.values(), w.scales(), stream)
+                if phases & 8 != 0 && !crate::knockout::has(crate::knockout::Site::WoA) { w.run(self.decode.output(), stream)?; }
+                if phases & 8 != 0 { crate::layer_clock::fine(stream, crate::layer_clock::FINE_WOA)?; }
+                if phases & 16 != 0 && !crate::knockout::has(crate::knockout::Site::WoB) {
+                    self.ob.run_quantized(w.values(), w.scales(), stream)?;
+                }
+                if phases & 16 != 0 { crate::layer_clock::fine(stream, crate::layer_clock::FINE_WOB)?; }
+                Ok(())
             }
             WoA::Medium(w) => {
+                ensure!(phases == 24, "attention phases need the small WO-A");
                 w.run(self.decode.output(), stream)?;
                 if self.wob_deferrable && (wob_exchange_active() || wob8_active()) { Ok(()) } else { self.ob.run(w.output(), stream) }
             }
         }?;
+        if phases & 16 == 0 { return Ok(()); }
         // No data dependency: immutable prefetch can finish after its consumer.
         // Join before the next layer so the side stream remains graph-owned.
         if self.woa_prefetch_active {self.woa_prefetch.as_ref().unwrap().join(stream)?;}
+        self.join_hint_queue(stream)?;
         // Read-only hints need no consumer dependency. Match the reference's
         // late join at the next communication boundary rather than stalling QB.
         // A deferred layer-20 projection may already have closed its hint.
@@ -1025,6 +1444,7 @@ impl Layer {
     /// read-only Q-B L2 hint (no data dependency) before the next projection.
     pub(crate) fn join_projection_hint(&self, stream: &Stream) -> Result<()> {
         ensure!(self.query_overlap.is_none(), "deferred projection cannot leave a query fork");
+        self.join_hint_queue(stream)?;
         if let Some(hint) = self.qb_prefetch.as_ref().filter(|h| h.is_open()) {
             hint.join(stream)?;
         }

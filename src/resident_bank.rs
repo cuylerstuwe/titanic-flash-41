@@ -195,7 +195,7 @@ impl Worker {
                 ensure!(image.bytes()==device&&image.position()==prefix.len(),"resumed encoder image extent");
                 fused_copy=image.fused_copy();
                 self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,charge,
-                    prompt_logits:None,speculative:only_free_capacity,image:CachedState::Encoder{image,history,policy}});
+                    prompt_logits:None,speculative:only_free_capacity,shared:false,image:CachedState::Encoder{image,history,policy}});
                 saved=true;
             }
         }
@@ -284,13 +284,18 @@ impl Worker {
             Ok(v)=>{ensure!(v=="0"||v=="1","paired draft head flag");v=="1"},
             Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
         };
-        ensure!(!head||paired||std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1"),
+        // Batched decode pools pairs of its conversations' heads (CANADA_SCRATCH_BATCHED_POOLED_HEAD=1) and
+        // forks its drafters as independent query owners, single bank or not.
+        let batched=crate::config::batched_rows_admitted();
+        ensure!(!head||paired||std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1")
+            ||(batched&&crate::config::batched_pooled_head()),
             "paired draft head requires paired serving or finite generation");
         let shared_head=match std::env::var("CANADA_SCRATCH_SHARED_DRAFT_HEAD") {
             Ok(v)=>{ensure!(v=="0"||v=="1","shared draft head flag");v=="1"},
             Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
         };
-        ensure!(!shared_head||enabled||std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1"),
+        ensure!(!shared_head||enabled||std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1")
+            ||batched,
             "shared draft encoding requires independent query owners");
         self.control.agree(&[0x68,u8::from(enabled),u8::from(import),u8::from(head),u8::from(shared_head),u8::from(bank_checkpoint),u8::from(single)])?;
         if !enabled{return Ok(json!({"enabled":false}));}

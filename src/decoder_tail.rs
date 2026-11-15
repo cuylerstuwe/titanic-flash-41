@@ -96,6 +96,68 @@ impl Cache {
         cache.accepted.borrow_mut().zero()?;
         Ok(cache)
     }
+    /// A second, empty tail cache of this one's shape, for a frontier captured beside the
+    /// live one (the inline encoder checkpoint).
+    pub(crate) fn twin(&self) -> Result<Self> {
+        let cuda = &self.cuda;
+        let mut tags = cuda.allocate(128)?;
+        tags.upload(&[-1i32; 128])?;
+        let mut error = cuda.allocate(1)?;
+        error.zero()?;
+        let mut cache = Self {
+            cuda: cuda.clone(),
+            module: self.module.clone(),
+            context: self.context,
+            kv_capacity: self.kv_capacity,
+            hidden: cuda.allocate(128 * 20480)?,
+            pre: cuda.allocate(128 * 4)?,
+            ids: cuda.allocate(128 * 512)?,
+            lengths: cuda.allocate(128)?,
+            tokens: cuda.allocate(128)?,
+            tags,
+            error,
+            accepted: RefCell::new(cuda.allocate(1)?),
+            masks: self.masks.as_ref().map(|m| cuda.allocate(m.len())).transpose()?,
+            bounded_copy: self.bounded_copy,
+            committed: Cell::new(0),
+            stream: Cell::new(0),
+        };
+        cache.hidden.zero()?;
+        cache.pre.zero()?;
+        cache.ids.zero()?;
+        cache.lengths.zero()?;
+        cache.tokens.zero()?;
+        cache.accepted.borrow_mut().zero()?;
+        if let Some(masks) = &mut cache.masks { masks.zero()?; }
+        Ok(cache)
+    }
+    /// Set the row count that `as_of_rows` holds on the device: the frontier, inside a
+    /// finished chunk, whose tail this cache captures.
+    pub(crate) fn set_as_of_rows(&self, end: usize, stream: &Stream) -> Result<()> {
+        ensure!((128..=crate::config::MAX_WIDE_ROWS).contains(&end), "encoder tail as-of frontier");
+        self.bind(stream)?;
+        self.accepted.borrow_mut().upload(&[end as i32])?;
+        stream.join_default()
+    }
+    pub(crate) fn as_of_rows(&self) -> std::cell::Ref<'_, Buffer<i32>> {
+        self.accepted.borrow()
+    }
+    /// Publish the 128 rows before the frontier set by `set_as_of_rows`, from a finished
+    /// chunk's producers: the tail a chunk ending at that row would have published.
+    pub(crate) fn publish_as_of(
+        &self,
+        x: &Buffer<bf16>,
+        pre: &Buffer<f32>,
+        selected: &Candidates,
+        tokens: &TokenRows,
+        positions: &Positions,
+        mask: Option<&Buffer<u8>>,
+        compact_mask: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure!(self.bounded_copy, "as-of encoder tail needs the bounded publication");
+        self.publish_live(x, pre, selected, tokens, positions, mask, compact_mask, &self.accepted.borrow(), stream)
+    }
     fn mask_stride(context: usize) -> usize {
         context.div_ceil(crate::candidates::BLOCK)
     }
@@ -189,6 +251,115 @@ impl Cache {
         self.bind(stream)?;
         ensure!(position <= self.context && self.error()? == 0, "restored encoder state invalid");
         self.committed.set(position);
+        Ok(())
+    }
+    /// Make this tail an exact copy of `other`: a conversation moving between serving
+    /// regions takes its 128-row encoder tail (and frontier) along. Its candidate ids are physical
+    /// compressed slots of the region it leaves; `id_shift` (destination base minus source base of
+    /// the single-ratio source) moves them to the new region. Block masks are row-relative.
+    pub(crate) fn copy_from(&self, other: &Self, id_shift: i64, stream: &Stream) -> Result<()> {
+        ensure!(self.context == other.context && self.masks.as_ref().map(|m| m.bytes())
+            == other.masks.as_ref().map(|m| m.bytes()) && !std::ptr::eq(self, other), "encoder tail copy shape");
+        self.bind(stream)?;
+        stream.join_default()?;
+        let pairs = [
+            (self.hidden.ptr(), other.hidden.ptr(), self.hidden.bytes()),
+            (self.pre.ptr(), other.pre.ptr(), self.pre.bytes()),
+            (self.ids.ptr(), other.ids.ptr(), self.ids.bytes()),
+            (self.lengths.ptr(), other.lengths.ptr(), self.lengths.bytes()),
+            (self.tokens.ptr(), other.tokens.ptr(), self.tokens.bytes()),
+            (self.tags.ptr(), other.tags.ptr(), self.tags.bytes()),
+            (self.error.ptr(), other.error.ptr(), self.error.bytes()),
+        ];
+        unsafe {
+            for (destination, source, bytes) in pairs { self.cuda.copy_device(destination, source, bytes, stream)?; }
+            if let (Some(destination), Some(source)) = (&self.masks, &other.masks) {
+                self.cuda.copy_device(destination.ptr(), source.ptr(), destination.bytes(), stream)?;
+            }
+        }
+        if id_shift != 0 {
+            let mut shift = i32::try_from(id_shift)?;
+            let mut ids = self.ids.ptr();
+            let mut count = self.ids.len() as i32;
+            let mut args = [(&mut ids as *mut u64).cast::<c_void>(), (&mut count as *mut i32).cast(),
+                (&mut shift as *mut i32).cast()];
+            unsafe {
+                self.module.function("ca_shift_tail_ids")?.launch(
+                    [self.ids.len().div_ceil(256) as u32, 1, 1], [256, 1, 1], 0, stream, &mut args)
+            }?;
+        }
+        self.committed.set(other.committed.get());
+        Ok(())
+    }
+    /// publish_prefix for one conversation of a batched step: its accepted rows start at
+    /// `row_offset` of the step's producers (its block), not at row 0.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_prefix_at(
+        &self,
+        x: &Buffer<bf16>,
+        pre: &Buffer<f32>,
+        selected: &Candidates,
+        tokens: &TokenRows,
+        positions: &Positions,
+        mask: Option<&Buffer<u8>>,
+        row_offset: usize,
+        accepted: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = tokens.ids().len();
+        ensure!(accepted > 0 && row_offset + accepted <= rows, "region encoder tail rows");
+        ensure!(
+            x.len() == rows * 20480 && pre.len() == rows * 4 && selected.ids().len() == rows * 512
+                && selected.lengths().len() == rows && positions.values().len() == rows
+                && self.masks.is_some() == mask.is_some()
+                && mask.is_none_or(|m| m.len() == rows * Self::mask_stride(self.context)),
+            "region encoder tail producer geometry"
+        );
+        self.accepted.borrow_mut().upload(&[accepted as i32])?;
+        stream.join_default()?;
+        self.bind(stream)?;
+        let o = row_offset as u64;
+        let live = self.accepted.borrow().ptr();
+        let mut values = [
+            x.ptr() + o * 20480 * 2,
+            pre.ptr() + o * 4 * 4,
+            selected.ids().ptr() + o * 512 * 4,
+            selected.lengths().ptr() + o * 4,
+            tokens.ids().ptr() + o * 8,
+            positions.values().ptr() + o * 4,
+            live,
+            self.hidden.ptr(),
+            self.pre.ptr(),
+            self.ids.ptr(),
+            self.lengths.ptr(),
+            self.tokens.ptr(),
+            self.tags.ptr(),
+            self.error.ptr(),
+        ];
+        let mut args = values.iter_mut().map(|v| (v as *mut u64).cast::<c_void>()).collect::<Vec<_>>();
+        let remaining = rows - row_offset;
+        let mut r = remaining as i32;
+        let mut context = self.context as i32;
+        args.extend([(&mut r as *mut i32).cast(), (&mut context as *mut i32).cast()]);
+        unsafe {
+            self.module.function("ca_store_encoder_tail")?.launch(
+                [(remaining * 2560).div_ceil(256) as u32, 1, 1], [256, 1, 1], 0, stream, &mut args)
+        }?;
+        if let (Some(ring), Some(mask)) = (&self.masks, mask) {
+            let stride = Self::mask_stride(self.context);
+            let (mut m, mut s, mut p, mut l, mut out, mut r, mut c) = (
+                mask.ptr() + o * stride as u64, stride as i32, positions.values().ptr() + o * 4, live,
+                ring.ptr(), remaining as i32, self.context as i32);
+            let mut args = [
+                (&mut m as *mut u64).cast::<c_void>(), (&mut s as *mut i32).cast(), (&mut p as *mut u64).cast(),
+                (&mut l as *mut u64).cast(), (&mut out as *mut u64).cast(), (&mut r as *mut i32).cast(),
+                (&mut c as *mut i32).cast(),
+            ];
+            unsafe {
+                self.module.function("ca_store_tail_mask")?.launch(
+                    [(remaining * stride).div_ceil(256) as u32, 1, 1], [256, 1, 1], 0, stream, &mut args)
+            }?;
+        }
         Ok(())
     }
     /// Publish only a completed target-accepted prefix. Speculative encoder

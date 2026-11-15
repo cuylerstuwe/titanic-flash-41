@@ -2,7 +2,7 @@
 //! AOT low-level kernels preserve the reference's BF16 and FMA boundaries.
 use crate::{
     checkpoint::Dtype,
-    cuda::{Buffer, Cuda, Event, Stream},
+    cuda::{Buffer, Cuda, Event, Module, Stream},
     prelude::Native,
     primitives::Primitives,
     triton_ops::Operator,
@@ -10,10 +10,87 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use half::bf16;
-use std::{cell::Cell, path::Path, rc::Rc};
+use std::{cell::{Cell, RefCell}, path::Path, rc::Rc};
 
 thread_local! {
     static ACTIVE_ROWS:Cell<Option<(usize,usize,usize,bool)>>=const{Cell::new(None)};
+}
+/// Where a deferred statistics fork may be released later than its boundary's normalization
+/// (CANADA_SCRATCH_MHC_STATS_LATE, default off). The statistics read only the boundary's input residual and are
+/// joined before the boundary's post-mix, so any point inside the sublayer gives the same bits; the point decides
+/// which kernels the 80-block statistics kernel shares the SMs with. Released at the normalization (today), it
+/// starts just ahead of the sublayer's first weight kernel (QKV-A, the router product) and holds it back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StatsPoint { AfterInputProjection = 1, AfterGather = 2, AfterRouterProduct = 3, AfterRouting = 4, AfterExperts = 5,
+    BeforeAttentionSum = 6, ExpertsTail = 7, AfterRoutedExperts = 8 }
+struct LateFork { ready: Rc<Event>, parent: usize, point: u8 }
+thread_local! {
+    static LATE_FORKS: RefCell<Vec<LateFork>> = const { RefCell::new(Vec::new()) };
+}
+/// A sublayer reached one of its named points on `stream`: release the statistics forks waiting for it.
+pub(crate) fn stats_point(point: StatsPoint, stream: &Stream) -> Result<()> {
+    crate::layer_clock::fine(stream, 16 + point as u8)?;
+    LATE_FORKS.with(|forks| -> Result<()> {
+        let mut forks = forks.borrow_mut();
+        let mut index = 0;
+        while index < forks.len() {
+            if forks[index].point == point as u8 && forks[index].parent == stream.raw() as usize {
+                forks.swap_remove(index).ready.record(stream)?;
+            } else { index += 1; }
+        }
+        Ok(())
+    })
+}
+/// The routed experts' kernels have just been issued on `stream` (before the shared expert's join and the sums
+/// that follow them): release the statistics forks waiting for `StatsPoint::AfterRoutedExperts` and begin the hint
+/// windows registered for that point (plan prefix `e`). They start when the routed experts end, a few microseconds
+/// (up to ten when the shared expert's FC2 is late) before the points after the FFN's small sums.
+pub(crate) fn routed_end_point(stream: &Stream) -> Result<()> {
+    stats_point(StatsPoint::AfterRoutedExperts, stream)?;
+    for queue in crate::layer_attention::tail_w1_take(stream, crate::layer_attention::TailKind::RoutedEnd) {
+        if let Some(window) = queue.w1.as_ref() { window.begin(stream)?; }
+    }
+    Ok(())
+}
+/// The shared expert's branch (`source`) passed its activation while the routed experts run on `parent`
+/// (CANADA_SCRATCH_EXPERTS_TAIL): launch the gate there and release, on its completion, the statistics forks
+/// waiting for `StatsPoint::ExpertsTail` and the hint windows registered for the tail
+/// (layer_attention::tail_w1_register). Nothing waits: no gate.
+pub(crate) fn tail_point(module: &crate::cuda::Module, shared_bytes: u32, parent: &Stream, source: &Stream) -> Result<()> {
+    let forks: Vec<LateFork> = LATE_FORKS.with(|forks| {
+        let mut forks = forks.borrow_mut();
+        let (hit, rest): (Vec<_>, Vec<_>) = forks.drain(..)
+            .partition(|f| f.point == StatsPoint::ExpertsTail as u8 && f.parent == parent.raw() as usize);
+        *forks = rest;
+        hit
+    });
+    let windows = crate::layer_attention::tail_w1_take(parent, crate::layer_attention::TailKind::Gate);
+    if forks.is_empty() && windows.is_empty() { return Ok(()); }
+    let mut args: [*mut std::ffi::c_void; 0] = [];
+    unsafe { module.function("ca_tail_gate")?.launch([1, 1, 1], [32, 1, 1], shared_bytes, source, &mut args) }?;
+    for fork in forks { fork.ready.record(source)?; }
+    for queue in windows {
+        if let Some(window) = queue.w1.as_ref() { window.begin_from(parent, source)?; }
+    }
+    Ok(())
+}
+/// The release points requested for an owner of `rows` physical rows: (attention boundary, FFN boundary), 0 = at
+/// the normalization. CANADA_SCRATCH_MHC_STATS_LATE=<a><f> for the six-row owner, ..._LATE16 for the 16-row one;
+/// a in {0, 1, 2, 6}, f in {0, 3, 4, 5, 7, 8} (the `StatsPoint` numbers; 7 needs CANADA_SCRATCH_EXPERTS_TAIL).
+pub(crate) fn stats_late_requested(rows: usize) -> Result<(u8, u8)> {
+    let name = match rows { 6 => "CANADA_SCRATCH_MHC_STATS_LATE", 16 => "CANADA_SCRATCH_MHC_STATS_LATE16", _ => return Ok((0, 0)) };
+    match std::env::var(name) {
+        Ok(value) => parse_stats_late(&value),
+        Err(std::env::VarError::NotPresent) => Ok((0, 0)), Err(error) => Err(error.into()),
+    }
+}
+pub(crate) fn parse_stats_late(value: &str) -> Result<(u8, u8)> {
+    let digits: Vec<u8> = value.bytes().map(|b| b.wrapping_sub(b'0')).collect();
+    ensure!(digits.len() == 2 && [0, 1, 2, 6].contains(&digits[0]) && [0, 3, 4, 5, 7, 8].contains(&digits[1]),
+        "invalid mHC late statistics points");
+    ensure!(digits[1] != 7 || crate::config::experts_tail().is_some(),
+        "statistics point 7 needs CANADA_SCRATCH_EXPERTS_TAIL");
+    Ok((digits[0], digits[1]))
 }
 pub(crate) struct ActiveRowsScope(std::marker::PhantomData<Rc<()>>);
 impl ActiveRowsScope {
@@ -68,6 +145,10 @@ pub struct Boundary {
     prepared_rows: Cell<usize>,
     prepared_pre: Cell<u64>,
     deferred_stats: Option<DeferredStats>,
+    /// 0: the statistics fork is released at the normalization; otherwise a `StatsPoint` of this sublayer.
+    late_point: Cell<u8>,
+    /// The FFN boundary of its layer (the attention boundary otherwise): which knockout names its statistics.
+    ffn_branch: bool,
     stats_pending: Cell<bool>,
     full_stats: Option<FullStats>,
     use_full_stats: bool,
@@ -78,9 +159,46 @@ pub struct Boundary {
     alternate_pdl_pair: Option<(Operator, Operator)>,
     pdl_stats: bool,
     alternate_pdl_stats: Option<(Operator, Operator)>,
+    // CANADA_SCRATCH_PREFILL_MHC_POST_STATS: the core module of a finishing boundary that also
+    // forms the next boundary's statistics (finish_with_next_stats), and, on the next boundary,
+    // the residual whose statistics partials are already in place.
+    post_stats: Option<Module>,
+    stats_precomputed: Cell<u64>,
+    /// config::mhc_quarter_stats: the link to the attention's QKV gather and the core module (ca_stats_unpack);
+    /// and, between a `prepare` that issued this rank's partials and its `finish`, (pseudo-rows, live rows).
+    quarter: Option<(Rc<QuarterLink>, Module)>,
+    quarter_step: Cell<Option<(usize, usize)>>,
+}
+/// CANADA_SCRATCH_PREFILL_MHC_POST_STATS=1 (default off): in sequence-parallel prefill layers the
+/// attention boundary's post-mix also forms the FFN boundary's mixing statistics in the same pass
+/// over the residual (kernels/mhc_post_stats.cuh). The new residual is bit-identical; the
+/// statistics are FP32 FMAs instead of tf32x3 tensor-core dots, so the mixes differ in the last bits.
+pub(crate) fn prefill_post_stats_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_PREFILL_MHC_POST_STATS") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid fused mHC post/statistics policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 /// Keep both canonical BF16 routing inputs and the projection's exact native
 /// MXFP8 representation. These are transient, profile-owned graph buffers.
+/// Shared by an attention boundary and its attention's QKV gather when the boundary's statistics run by rank
+/// quarter (config::mhc_quarter_stats). `xin` is the gather's local input: QUARTER_HEAD pseudo-rows of 448 BF16
+/// for partial bytes (a step's partials end at row QUARTER_HEAD), then the six QKV-A rows; `xout` the same rows
+/// gathered (four ranks side by side in each row).
+pub(crate) struct QuarterLink {
+    pub(crate) rank: usize,
+    pub(crate) on: Cell<bool>,
+    pub(crate) xin: Buffer<bf16>,
+    pub(crate) xout: Buffer<bf16>,
+    /// Pseudo-rows the coming gather carries: set by the boundary's `prepare`, taken by the gather.
+    pub(crate) armed: Cell<Option<usize>>,
+    pub(crate) partials_ready: Event,
+    pub(crate) gathered: Event,
+}
+/// ceil(2,000 bytes of partials a live row x 6 rows / 896 bytes a pseudo-row).
+pub(crate) const QUARTER_HEAD: usize = 14;
+pub(crate) const QUARTER_COLUMNS: usize = 448;
 struct NormQuant {
     op: Operator,
     values: Buffer<u8>,
@@ -96,7 +214,7 @@ struct FullStats {
 struct DeferredStats {
     side: Rc<Stream>,
     parent: usize,
-    ready: Event,
+    ready: Rc<Event>,
     done: Event,
 }
 pub(crate) fn overlap_enabled() -> bool {
@@ -122,6 +240,11 @@ fn wide_flag(name:&str)->Result<bool> {
 }
 pub(crate) fn wide_norm_quant_enabled()->Result<bool>{wide_flag("CANADA_SCRATCH_MHC_NORM_QUANT16")}
 pub(crate) fn wide_stats_pdl_enabled()->Result<bool>{wide_flag("CANADA_SCRATCH_MHC_STATS_PDL16")}
+/// CANADA_SCRATCH_DRAFT_STATS_OVERLAP=1 (default off): the drafter's boundaries fork their mixing statistics to the
+/// coefficient stream at the normalization, as the target's small-row boundaries do (they run inline today:
+/// ~20 us a boundary, six a draft pass). Same kernels and inputs, joined before the post-mix. Five-row drafters
+/// only (the batched body's ten and fifteen rows keep inline statistics).
+pub(crate) fn draft_stats_overlap()->Result<bool>{wide_flag("CANADA_SCRATCH_DRAFT_STATS_OVERLAP")}
 pub(crate) fn attention16_overlap_enabled() -> Result<bool> {
     match std::env::var("CANADA_SCRATCH_ATTENTION16_OVERLAP") {
         Ok(value) => {
@@ -186,7 +309,7 @@ impl Boundary {
             &&self.deferred_stats.is_none()&&!self.stats_pending.get()&&self.cuda.owns_stream(stream),
             "uncaptured M16 FFN coefficient overlap admission");
         self.deferred_stats=Some(DeferredStats {side:self.cuda.coefficient_stream(stream)?,
-            parent:stream.raw()as usize,ready:self.cuda.fence_event()?,done:self.cuda.fence_event()?});
+            parent:stream.raw()as usize,ready:Rc::new(self.cuda.fence_event()?),done:self.cuda.fence_event()?});
         Ok(())
     }
     /// Wide sequence-parallel boundaries: run the coefficient statistics on the shared
@@ -195,7 +318,7 @@ impl Boundary {
         ensure!(!self.stats_pending.get() && self.cuda.owns_stream(stream), "idle wide coefficient overlap");
         if enabled && self.deferred_stats.is_none() {
             self.deferred_stats=Some(DeferredStats { side:self.cuda.coefficient_stream(stream)?,
-                parent:stream.raw()as usize,ready:self.cuda.fence_event()?,done:self.cuda.fence_event()? });
+                parent:stream.raw()as usize,ready:Rc::new(self.cuda.fence_event()?),done:self.cuda.fence_event()? });
         }
         if !enabled { self.deferred_stats=None; }
         Ok(())
@@ -215,7 +338,7 @@ impl Boundary {
             "idle wide coefficient schedule screen");
         if enabled && self.deferred_stats.is_none() {
             self.deferred_stats=Some(DeferredStats { side:self.cuda.coefficient_stream(stream)?,
-                parent:stream.raw()as usize,ready:self.cuda.fence_event()?,done:self.cuda.fence_event()? });
+                parent:stream.raw()as usize,ready:Rc::new(self.cuda.fence_event()?),done:self.cuda.fence_event()? });
         }
         if !enabled { self.deferred_stats=None; }
         Ok(())
@@ -225,7 +348,7 @@ impl Boundary {
             && self.rows==16 && self.prepared.get()==0 && self.deferred_stats.is_none()
             && self.cuda.owns_stream(stream),"isolated uncaptured M16 coefficient overlap admission");
         self.deferred_stats=Some(DeferredStats { side:self.cuda.coefficient_stream(stream)?,
-            parent:stream.raw()as usize,ready:self.cuda.fence_event()?,done:self.cuda.fence_event()? });
+            parent:stream.raw()as usize,ready:Rc::new(self.cuda.fence_event()?),done:self.cuda.fence_event()? });
         Ok(())
     }
     pub fn new(
@@ -569,26 +692,129 @@ impl Boundary {
             prepared_pre: Cell::new(0),
             // s673: the attention branch passed paired logits, abort state and
             // changed-history handoff. The independent M16 FFN path stays off.
-            deferred_stats: if overlap_enabled() && !id.is_draft()
+            deferred_stats: if overlap_enabled() && (!id.is_draft() || draft_stats_overlap()?)
                 && (rows <= 8 || (rows == 16 && branch == "attn" && attention16_overlap_enabled()?)) {
                 Some(DeferredStats {
                     side: cuda.coefficient_stream(stream)?,
                     parent: stream.raw() as usize,
-                    ready: cuda.fence_event()?,
+                    ready: Rc::new(cuda.fence_event()?),
                     done: cuda.fence_event()?,
                 })
             } else {
                 None
             },
+            late_point: Cell::new(if id.is_draft() { 0 } else {
+                let (attention, ffn) = stats_late_requested(rows)?;
+                if branch == "attn" { attention } else { ffn }
+            }),
+            ffn_branch: branch != "attn",
             stats_pending: Cell::new(false),
             full_stats,
             use_full_stats,
             norm_quant_active: norm_quant.is_some() && (rows != 16 || wide_norm),
             norm_quant,
             quant_ready: false,
+            post_stats: None,
+            stats_precomputed: Cell::new(0),
+            quarter: None,
+            quarter_step: Cell::new(None),
         };
         stream.synchronize()?;
         Ok(result)
+    }
+    /// config::mhc_quarter_stats: this (attention) boundary's statistics by rank quarter over `link`. Needs the
+    /// six-row profile's forked 80-slice kernel (not the two-MMA or whole-K forms).
+    pub(crate) fn install_quarter(&mut self, link: Rc<QuarterLink>, module: &Module) -> Result<()> {
+        ensure!(self.rows == 6 && !self.ffn_branch && self.deferred_stats.is_some() && !self.use_two_mma
+            && !self.use_full_stats && link.rank < 4 && self.quarter.is_none() && self.post_stats.is_none(),
+            "quarter statistics boundary profile");
+        module.function("ca_stats_unpack")?;
+        self.quarter = Some((link, module.clone()));
+        Ok(())
+    }
+    /// The plain 80-slice statistics path that finish_with_next_stats can stand in for.
+    fn plain_stats(&self) -> bool {
+        self.rows >= 64 && !self.use_two_mma && !self.use_full_stats && self.deferred_stats.is_none()
+    }
+    /// Opt this boundary into finish_with_next_stats (sequence-parallel prefill layers).
+    pub(crate) fn enable_post_stats(&mut self, module: &Module, next: &Self) -> Result<()> {
+        // The launch itself refuses a module of another context.
+        ensure!(self.plain_stats() && next.plain_stats() && next.rows == self.rows && self.rows % 16 == 0,
+            "fused mHC post/statistics geometry");
+        self.post_stats = Some(module.clone());
+        Ok(())
+    }
+    pub(crate) fn post_stats_enabled(&self) -> bool { self.post_stats.is_some() }
+    /// finish(), and in the same pass the mixing statistics of the new residual for `next`, whose
+    /// prepare() on that residual then runs only the reduction.
+    pub(crate) fn finish_with_next_stats(&self, sublayer: &Buffer<bf16>, residual: &Buffer<bf16>,
+        next: &Self, stream: &Stream) -> Result<()> {
+        self.guard(residual, stream)?;
+        let module = self.post_stats.as_ref().ok_or_else(|| anyhow::anyhow!("fused mHC post/statistics not enabled"))?;
+        let rows = self.prepared_rows.get();
+        ensure!(self.prepared.get() == residual.ptr() && sublayer.len() == self.rows * 5120
+            && self.cuda.owns_buffer(sublayer) && rows == self.rows && next.rows == self.rows
+            && next.plain_stats() && !next.stats_pending.get() && next.stats_precomputed.get() == 0,
+            "fused mHC post/statistics requires a whole prepared shard and an idle next boundary");
+        let (mut x, mut r, mut p, mut c, mut w) =
+            (sublayer.ptr(), residual.ptr(), self.post.ptr(), self.comb.ptr(), next.fn_pointer);
+        let (mut y, mut mix, mut sq, mut m) =
+            (self.output.ptr(), next.partial_mix.ptr(), next.partial_square.ptr(), rows as i32);
+        let mut args = [(&mut x as *mut u64).cast(), (&mut r as *mut u64).cast(), (&mut p as *mut u64).cast(),
+            (&mut c as *mut u64).cast(), (&mut w as *mut u64).cast(), (&mut y as *mut u64).cast(),
+            (&mut mix as *mut u64).cast(), (&mut sq as *mut u64).cast(), (&mut m as *mut i32).cast()];
+        unsafe {
+            module.function("ca_mhc_post_stats")?.launch(
+                [rows.div_ceil(16) as u32, 20, 1], [256, 1, 1], 24 * 256 * 4, stream, &mut args)?;
+        }
+        if std::env::var("CANADA_SCRATCH_MHC_POST_STATS_CHECK").as_deref() == Ok("1") {
+            self.check_post_stats(sublayer, residual, next, stream)?;
+        }
+        next.stats_precomputed.set(self.output.ptr());
+        Ok(())
+    }
+    /// Diagnostic (CANADA_SCRATCH_MHC_POST_STATS_CHECK=1): rerun the separate post-mix and
+    /// statistics kernels on the same inputs into scratch and compare with the fused results:
+    /// the new residual must be bit-identical; the statistics partials are reported by their
+    /// largest absolute and relative differences. Reports the first 64 boundaries of a process.
+    fn check_post_stats(&self, sublayer: &Buffer<bf16>, residual: &Buffer<bf16>, next: &Self,
+        stream: &Stream) -> Result<()> {
+        static CHECKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let index = CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if index >= 64 { return Ok(()); }
+        let rows = self.rows;
+        let y_ref = self.cuda.allocate::<bf16>(rows * 20480)?;
+        let mix_ref = self.cuda.allocate::<f32>(80 * rows * 24)?;
+        let sq_ref = self.cuda.allocate::<f32>(80 * rows)?;
+        unsafe {
+            self.post_op.launch(rows as u32,
+                &[sublayer.ptr(), residual.ptr(), self.post.ptr(), self.comb.ptr(), y_ref.ptr()], stream)?;
+            next.stats.launch(rows as u32,
+                &[self.output.ptr(), next.fn_pointer, mix_ref.ptr(), sq_ref.ptr(), rows as u64, 20480, 20480, 20480],
+                stream)?;
+        }
+        stream.synchronize()?;
+        let fused_y = self.output.download()?;
+        let ref_y = y_ref.download()?;
+        let y_differ = fused_y.iter().zip(&ref_y).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let compare = |fused: &Buffer<f32>, reference: &Buffer<f32>| -> Result<(f32, f32, usize)> {
+            let (a, b) = (fused.download()?, reference.download()?);
+            let mut worst = (0f32, 0f32, 0usize);
+            for (x, y) in a.iter().zip(&b) {
+                let d = (x - y).abs();
+                worst.0 = worst.0.max(d);
+                worst.1 = worst.1.max(d / y.abs().max(1e-30));
+                if x.to_bits() != y.to_bits() { worst.2 += 1; }
+            }
+            Ok(worst)
+        };
+        let mix = compare(&next.partial_mix, &mix_ref)?;
+        let sq = compare(&next.partial_square, &sq_ref)?;
+        eprintln!("mhc post/stats check {index}: rows {rows} residual bits differing {y_differ}/{}; \
+            mix partials max abs {:.3e} max rel {:.3e} differing {}/{}; square partials max abs {:.3e} max rel {:.3e} differing {}/{}",
+            ref_y.len(), mix.0, mix.1, mix.2, 80 * rows * 24, sq.0, sq.1, sq.2, 80 * rows);
+        ensure!(y_differ == 0, "fused mHC post-mix differs from the separate kernel");
+        Ok(())
     }
     fn guard(&self, residual: &Buffer<bf16>, stream: &Stream) -> Result<()> {
         ensure!(
@@ -608,6 +834,12 @@ impl Boundary {
     }
     /// The Target owner admits this switch only with no captured executions.
     pub(crate) fn overlap_active(&self)->bool { self.deferred_stats.is_some() }
+    /// Plan screen only (graphs retired by the caller): move this boundary's statistics fork. No arithmetic change.
+    pub(crate) fn set_stats_late_point_for_probe(&self, point: u8) -> Result<()> {
+        ensure!(point <= 8 && !self.stats_pending.get(), "idle mHC late statistics point");
+        self.late_point.set(if self.deferred_stats.is_some() { point } else { 0 });
+        Ok(())
+    }
     pub(crate) fn set_norm_fusion(&mut self, enabled: bool) -> Result<()> {
         ensure!(self.rows >= 128 && !self.stats_pending.get()
             && (!enabled || self.fused_norm.is_some()), "unavailable or busy prefill norm fusion");
@@ -691,6 +923,10 @@ impl Boundary {
         }else{(self.rows,false)};
         self.prepared_rows.set(live);
         self.prepared_pre.set(previous_pre.map_or(0, |p| p.ptr()));
+        // config::mhc_quarter_stats: this rank's slice partials are issued first. They read the residual only, and
+        // the QKV gather that carries them comes two short kernels later (s1565: before the collapse and norm).
+        let quarter_issued = !self.stats_knocked_out() && self.quarter.as_ref().is_some_and(|(link, _)| link.on.get());
+        if quarter_issued { self.issue_quarter_partials(residual, stream)?; }
         if let Some(p) = previous_pre {
             ensure!(
                 p.len() == self.rows * 4 && self.cuda.owns_buffer(p),
@@ -759,20 +995,87 @@ impl Boundary {
                 stream,
             )?;
         }
-        if let Some(branch) = &self.deferred_stats {
+        if self.stats_knocked_out() {
+            // Plan-screen knockout: the coefficients of the previous run of this step stay in place.
+        } else if quarter_issued {
+            // Issued before the collapse (issue_quarter_partials).
+        } else if let Some(branch) = &self.deferred_stats {
             ensure!(
                 branch.parent == stream.raw() as usize,
                 "mHC stats parent changed"
             );
             // SGLang _hc_combine records the tiny-row fork after normalization.
             // Coefficients consume the residual, independently of attention/FFN.
-            branch.ready.record(stream)?;
+            let point = self.late_point.get();
+            LATE_FORKS.with(|forks| forks.borrow_mut().retain(|f| !Rc::ptr_eq(&f.ready, &branch.ready)));
+            if point == 0 { branch.ready.record(stream)?; }
+            else {
+                // Released by `stats_point` at this sublayer's named point (or by `finish` if it never comes).
+                LATE_FORKS.with(|forks| forks.borrow_mut().push(LateFork { ready: branch.ready.clone(), parent: branch.parent, point }));
+            }
             self.stats_pending.set(true);
+        } else if self.stats_precomputed.get() != 0 {
+            ensure!(self.stats_precomputed.get() == residual.ptr() && self.prepared_rows.get() == self.rows
+                && self.plain_stats(), "precomputed mHC statistics belong to another residual");
+            self.stats_precomputed.set(0);
+            self.run_reduce(stream)?;
         } else {
             self.run_stats(residual, stream)?;
         }
         self.prepared.set(residual.ptr());
+        crate::layer_clock::fine(stream, crate::layer_clock::FINE_NORMALIZED)?;
         Ok(())
+    }
+    /// config::mhc_quarter_stats: this rank's 20 slices of the mixing statistics on the statistics stream: the
+    /// exported kernel on this rank's stream of the residual and of the projection, writing where the QKV gather
+    /// picks the bytes up.
+    fn issue_quarter_partials(&self, residual: &Buffer<bf16>, stream: &Stream) -> Result<()> {
+        let (link, _) = self.quarter.as_ref().unwrap();
+        let branch = self.deferred_stats.as_ref().unwrap();
+        let m = self.prepared_rows.get();
+        let pseudo = (2000 * m).div_ceil(QUARTER_COLUMNS * 2);
+        ensure!(branch.parent == stream.raw() as usize && (1..=self.rows).contains(&m) && pseudo <= QUARTER_HEAD
+            && link.armed.get().is_none() && self.quarter_step.get().is_none(), "quarter statistics step");
+        LATE_FORKS.with(|forks| forks.borrow_mut().retain(|f| !Rc::ptr_eq(&f.ready, &branch.ready)));
+        branch.ready.record(stream)?;
+        branch.ready.wait(&branch.side)?;
+        let out = link.xin.ptr() + ((QUARTER_HEAD - pseudo) * QUARTER_COLUMNS * 2) as u64;
+        unsafe {
+            self.stats.launch_y(m as u32, 20, &[residual.ptr() + (5120 * link.rank * 2) as u64,
+                self.fn_pointer + (5120 * link.rank * 4) as u64, out, out + (480 * m * 4) as u64,
+                m as u64, 20480, 20480, 20480], &branch.side)
+        }?;
+        link.partials_ready.record(&branch.side)?;
+        crate::layer_clock::fine_from(stream, &branch.side, crate::layer_clock::FINE_SIDE_PARTIALS)?;
+        link.armed.set(Some(pseudo));
+        self.quarter_step.set(Some((pseudo, m)));
+        self.stats_pending.set(true);
+        Ok(())
+    }
+    fn stats_knocked_out(&self) -> bool {
+        crate::knockout::has(if self.ffn_branch { crate::knockout::Site::StatsFfn } else { crate::knockout::Site::StatsAttn })
+    }
+    /// The reduction half of the plain statistics path (partials already formed).
+    fn run_reduce(&self, stream: &Stream) -> Result<()> {
+        let rows = self.prepared_rows.get();
+        unsafe {
+            self.reduce.launch(
+                rows as u32,
+                &[
+                    self.partial_mix.ptr(),
+                    self.partial_square.ptr(),
+                    self.scale_pointer,
+                    self.base_pointer,
+                    self.pre.ptr(),
+                    self.post.ptr(),
+                    self.comb.ptr(),
+                    rows as u64,
+                    (1f32 / 20480.).to_bits() as u64,
+                    1e-20f32.to_bits() as u64,
+                ],
+                stream,
+            )
+        }
     }
     fn run_stats(&self, residual: &Buffer<bf16>, stream: &Stream) -> Result<()> {
         let rows=self.prepared_rows.get();
@@ -840,7 +1143,26 @@ impl Boundary {
                 && self.cuda.owns_buffer(sublayer),
             "mHC finish requires matching prepared residual and reduced BF16 sublayer"
         );
-        if let Some(branch) = &self.deferred_stats {
+        if let Some((pseudo, m)) = self.quarter_step.take() {
+            // The gather brought every rank's partials: unpack them into the reduce kernel's arrays, reduce.
+            let (link, module) = self.quarter.as_ref().unwrap();
+            let branch = self.deferred_stats.as_ref().unwrap();
+            ensure!(self.stats_pending.get() && link.armed.get().is_none() && m == self.prepared_rows.get(),
+                "quarter statistics partials were not gathered");
+            link.gathered.wait(&branch.side)?;
+            let (mut source, mut mix, mut square, mut rows) = (
+                link.xout.ptr() + ((QUARTER_HEAD - pseudo) * QUARTER_COLUMNS * 4 * 2) as u64,
+                self.partial_mix.ptr(), self.partial_square.ptr(), m as i32);
+            let mut args: [*mut std::ffi::c_void; 4] = [(&mut source as *mut u64).cast(), (&mut mix as *mut u64).cast(),
+                (&mut square as *mut u64).cast(), (&mut rows as *mut i32).cast()];
+            unsafe { module.function("ca_stats_unpack")?.launch([(2000 * m as u32).div_ceil(256), 1, 1], [256, 1, 1], 0,
+                &branch.side, &mut args) }?;
+            self.run_reduce(&branch.side)?;
+            branch.done.record(&branch.side)?;
+            crate::layer_clock::fine_from(stream, &branch.side, crate::layer_clock::FINE_SIDE_STATS)?;
+            branch.done.wait(stream)?;
+            self.stats_pending.set(false);
+        } else if let Some(branch) = self.deferred_stats.as_ref().filter(|_| !self.stats_knocked_out()) {
             ensure!(
                 self.stats_pending.get(),
                 "mHC finish without deferred stats fork"
@@ -848,12 +1170,22 @@ impl Boundary {
             // Match _hc_mix_stats: issue the main sublayer first, then record
             // independent coefficient work immediately before its consuming join.
             // This preserves the main CUDA-graph chain and all numeric kernels.
+            // A late fork whose point never came on this path is released here, before its join.
+            let unreleased = LATE_FORKS.with(|forks| {
+                let mut forks = forks.borrow_mut();
+                let before = forks.len();
+                forks.retain(|f| !Rc::ptr_eq(&f.ready, &branch.ready));
+                forks.len() != before
+            });
+            if unreleased { branch.ready.record(stream)?; }
             branch.ready.wait(&branch.side)?;
             self.run_stats(residual, &branch.side)?;
             branch.done.record(&branch.side)?;
+            crate::layer_clock::fine_from(stream, &branch.side, crate::layer_clock::FINE_SIDE_STATS)?;
             branch.done.wait(stream)?;
             self.stats_pending.set(false);
         }
+        if crate::knockout::has(crate::knockout::Site::Post) { return Ok(()); }
         unsafe {
             self.post_op.launch(
                 self.prepared_rows.get() as u32,
@@ -866,7 +1198,8 @@ impl Boundary {
                 ],
                 stream,
             )
-        }
+        }?;
+        crate::layer_clock::fine(stream, crate::layer_clock::FINE_POST)
     }
     /// Read-only diagnostics after a completed verification. Layer-owned inputs
     /// survive the forward; never inject these snapshots into inference.
@@ -907,5 +1240,16 @@ impl Boundary {
     }
     pub fn output(&self) -> &Buffer<bf16> {
         &self.output
+    }
+}
+#[cfg(test)]
+mod late_statistics_tests {
+    #[test]
+    fn release_points_parse() {
+        assert_eq!(super::parse_stats_late("00").unwrap(), (0, 0));
+        assert_eq!(super::parse_stats_late("13").unwrap(), (1, 3));
+        assert_eq!(super::parse_stats_late("25").unwrap(), (2, 5));
+        assert_eq!(super::parse_stats_late("65").unwrap(), (6, 5));
+        for bad in ["", "1", "31", "12", "16", "56", "130", "a3"] { assert!(super::parse_stats_late(bad).is_err(), "{bad}"); }
     }
 }

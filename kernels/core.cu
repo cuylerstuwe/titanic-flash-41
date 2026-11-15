@@ -17,6 +17,15 @@ extern "C" __global__ void ca_kv_ring_metadata(int32_t* positions,int32_t* locat
  }
 }
 
+// A gate for work that should start in the routed experts' tail (CANADA_SCRATCH_EXPERTS_TAIL). One block that asks
+// for more dynamic shared memory than the SM configuration of the experts' phase kernels leaves free (64 KiB
+// carve-out, two 23 KiB blocks an SM), so it starts when an SM has drained them: where the shared expert's FC2
+// (47 KiB) starts today. Launched on the shared branch between its activation and FC2; what is released on its
+// completion starts in that tail. Reads and writes no model data.
+extern "C" __global__ void ca_tail_gate() {
+  extern __shared__ unsigned char gate[];
+  if (threadIdx.x == 0) gate[0] = 1;
+}
 // Independent implementation of NVIDIA's PTX cache-hint primitive. Rust
 // validates immutable allocation bounds/alignment and retains source ownership.
 // 16KiB pieces keep each 32-bit size aligned; this kernel writes no model data.
@@ -44,6 +53,436 @@ extern "C" __global__ void ca_l2_hint_sized(const uint64_t* segments, uint32_t c
                    :: "l"(address + off), "r"(size) : "memory");
     }
   }
+}
+// A paced L2 hint: one warp issues the 8 KiB pieces of `count` immutable (address, bytes) segments in order,
+// from piece `first`, at most `budget` pieces, one piece due every `ns_piece` ns of the global timer; each poll
+// issues the pieces due by now, at most 32. Small paced waves leave concurrent loads alone where one burst
+// delays them, and one warp needs no whole SM. The scheme and its measurements are pico-dgx-ds4 / dsgx10's
+// l2pf (MIT); this implementation is ours. Rust validates the ranges as for ca_l2_hint. Writes no model data.
+extern "C" __global__ void ca_l2_paced(const uint64_t* segments, uint32_t count, uint32_t first,
+                                       uint32_t budget, uint32_t ns_piece) {
+  constexpr uint32_t piece = 8192;
+  const uint32_t lane = threadIdx.x;
+  uint32_t ends[16];
+  uint32_t total = 0;
+  for (uint32_t s = 0; s < 16; ++s) {
+    if (s < count) total += uint32_t((segments[s * 2 + 1] + piece - 1) / piece);
+    ends[s] = total;
+  }
+  const uint32_t last = total < first + budget ? total : first + budget;
+  unsigned long long t0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  t0 = __shfl_sync(0xffffffffu, t0, 0);
+  uint32_t done = first < last ? first : last;
+  while (done < last) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    t = __shfl_sync(0xffffffffu, t, 0);
+    const unsigned long long by_now = first + (t - t0) / ns_piece + 1;
+    const uint32_t cap = last < done + 32 ? last : done + 32;
+    const uint32_t due = by_now < cap ? uint32_t(by_now) : cap;
+    const uint32_t c = done + lane;
+    if (c < due) {
+      uint32_t i = 0;
+      while (c >= ends[i]) ++i;
+      const uint64_t off = uint64_t(c - (i ? ends[i - 1] : 0)) * piece, left = segments[i * 2 + 1] - off;
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                   :: "l"(segments[i * 2] + off), "r"(uint32_t(left < piece ? left : piece)) : "memory");
+    }
+    if (due > done) done = due;
+    else __nanosleep(64);
+  }
+}
+// ca_l2_paced issued by `warps` warps of one block (plan spec p<GB/s>w<N>x<KiB>). Warp w takes the pieces
+// first + w, first + w + warps, ... on its own token bucket (one piece every ns_piece * warps ns, at most 32 a
+// poll), so a poll of the block can put warps x 32 pieces in flight. One warp's polls take 1.5-2 us in the model:
+// 32 pieces a poll is 133-175 GB/s, which is what every window delivered whatever pace was asked (Nov 13).
+// Same validated ranges as ca_l2_paced. Writes no model data.
+// `cap` (1..32, plan spec c<cap>): the most pieces a warp issues in one poll. 32 is ca_l2_paced's wave; pico's
+// notes measure small waves (8 chunks) as free for concurrent loads and larger ones as a cost.
+extern "C" __global__ void ca_l2_paced_wide(const uint64_t* segments, uint32_t count, uint32_t first,
+                                            uint32_t budget, uint32_t ns_piece, uint32_t warps, uint32_t wave) {
+  constexpr uint32_t piece = 8192;
+  const uint32_t lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  uint32_t ends[16];
+  uint32_t total = 0;
+  for (uint32_t s = 0; s < 16; ++s) {
+    if (s < count) total += uint32_t((segments[s * 2 + 1] + piece - 1) / piece);
+    ends[s] = total;
+  }
+  const uint32_t last = total < first + budget ? total : first + budget;
+  const uint32_t span = first < last ? last - first : 0;
+  const uint32_t mine = span > warp ? (span - warp + warps - 1) / warps : 0;
+  const unsigned long long ns = (unsigned long long)ns_piece * warps;
+  unsigned long long t0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  t0 = __shfl_sync(0xffffffffu, t0, 0);
+  uint32_t done = 0;
+  while (done < mine) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    t = __shfl_sync(0xffffffffu, t, 0);
+    const unsigned long long by_now = (t - t0) / ns + 1;
+    const uint32_t cap = mine < done + wave ? mine : done + wave;
+    const uint32_t due = by_now < cap ? uint32_t(by_now) : cap;
+    const uint32_t k = done + lane;
+    if (k < due) {
+      const uint32_t c = first + warp + k * warps;
+      uint32_t i = 0;
+      while (c >= ends[i]) ++i;
+      const uint64_t off = uint64_t(c - (i ? ends[i - 1] : 0)) * piece, left = segments[i * 2 + 1] - off;
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                   :: "l"(segments[i * 2] + off), "r"(uint32_t(left < piece ? left : piece)) : "memory");
+    }
+    if (due > done) done = due;
+    else __nanosleep(64);
+  }
+}
+// Sensitivity screen (crate::inject; CANADA_SCRATCH_INJECT_SCREEN): a spin of `ns` nanoseconds with no memory traffic
+// (one thread on the global timer), and a cold read of `packs` 16-byte packs with streaming loads (they allocate no
+// L2 lines, so hinted data stays). Timing instruments: nothing the model reads is written.
+extern "C" __global__ void ca_inject_spin(uint32_t ns) {
+  unsigned long long t0, t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while (t - t0 < ns);
+}
+extern "C" __global__ void ca_inject_read(const uint32_t* base, uint32_t packs, uint32_t* sink) {
+  uint32_t acc = 0;
+  for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < packs; i += gridDim.x * blockDim.x) {
+    uint32_t a, b, c, d;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "l"(base + (size_t)i * 4));
+    acc ^= a ^ b ^ c ^ d;
+  }
+  if (acc == 0x9e3779b9u && threadIdx.x == 0 && blockIdx.x == 0) sink[0] = acc;  // keeps the loads
+}
+// Route census (CANADA_SCRATCH_ROUTE_CENSUS, diagnostic): one count per routed slot of a live row, by expert.
+// ids are row-major [rows][topk]; the live row count is read on the device (a captured partial chunk keeps it there).
+extern "C" __global__ void ca_route_census(const int32_t* ids, const int32_t* live, int rows, int topk, uint32_t* counters, int experts) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * topk || i / topk >= live[0]) return;
+  const int e = ids[i];
+  if (e >= 0 && e < experts) atomicAdd(counters + e, 1u);
+}
+// Mixing statistics by rank quarter (config::mhc_quarter_stats): the four ranks' slice partials, as the QKV gather
+// delivered them (pseudo-rows of 896 bytes, the ranks side by side in each row), back into the reduce kernel's
+// arrays. Rank r computed slices 20 r ... 20 r + 19: 480 m words of dot-product partials, then 20 m words of squares.
+extern "C" __global__ void ca_stats_unpack(const uint32_t* gathered, uint32_t* mix, uint32_t* sq, int m) {
+  const int per = 500 * m, i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= 4 * per) return;
+  const int r = i / per, w = i - r * per;
+  const uint32_t v = gathered[(size_t)((w / 224) * 4 + r) * 224 + (w % 224)];
+  if (w < 480 * m) mix[(size_t)r * 480 * m + w] = v;
+  else sq[(size_t)r * 20 * m + (w - 480 * m)] = v;
+}
+// A paced L2 hint of the routed experts' first FC1 tiles. One warp reads a layer's top-k expert ids (-1: none),
+// orders the distinct experts, and issues the first `pieces` 8 KiB pieces of every N-tile stream of each expert's
+// up and gate matrices, breadth first (piece 0 of every stream, then piece 1, ...), paced as ca_l2_paced, at most
+// `budget` pieces. Layout (expert_packing: the compact N64 W4A8 ABI): expert e's up matrix starts at
+// base + e * 2 * 1,474,560 and its gate matrix 1,474,560 bytes later; within a matrix N-tile t (128 rows; the
+// fifth has 64) is one K sweep starting at t * 327,680, which is the order the FC1 kernel reads it. The experts'
+// first kernel is bound by memory bandwidth, so bytes brought in while the route/pack kernel runs come off its
+// time. Rust validates the region and the id buffer; hints only, writes no model data.
+extern "C" __global__ void ca_l2_routed(const int32_t* ids, uint32_t count, uint64_t base, uint32_t experts,
+                                        uint32_t pieces, uint32_t budget, uint32_t ns_piece) {
+  constexpr uint32_t piece = 8192, matrix = 1474560, tile = 327680;
+  __shared__ uint16_t order[128];
+  __shared__ uint32_t distinct;
+  const uint32_t lane = threadIdx.x;
+  if (lane == 0) {
+    uint32_t words[12];
+    for (uint32_t w = 0; w < 12; ++w) words[w] = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+      const int32_t e = ids[i];
+      if (e >= 0 && uint32_t(e) < experts && e < 384) words[e >> 5] |= 1u << (e & 31);
+    }
+    uint32_t n = 0;
+    for (uint32_t w = 0; w < 12; ++w) {
+      uint32_t bits = words[w];
+      while (bits && n < 128) { order[n++] = uint16_t(w * 32 + __ffs(bits) - 1); bits &= bits - 1; }
+    }
+    distinct = n;
+  }
+  __syncthreads();
+  const uint32_t streams = distinct * 10;  // five N-tiles of the up and of the gate matrix
+  const unsigned long long all = (unsigned long long)streams * pieces;
+  const uint32_t last = all < budget ? uint32_t(all) : budget;
+  unsigned long long t0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  t0 = __shfl_sync(0xffffffffu, t0, 0);
+  uint32_t done = 0;
+  while (done < last) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    t = __shfl_sync(0xffffffffu, t, 0);
+    const unsigned long long by_now = (t - t0) / ns_piece + 1;
+    const uint32_t cap = last < done + 32 ? last : done + 32;
+    const uint32_t due = by_now < cap ? uint32_t(by_now) : cap;
+    const uint32_t c = done + lane;
+    if (c < due) {
+      const uint32_t p = c / streams, s = c % streams, e = order[s / 10], t5 = (s % 10) >> 1, m = s & 1;
+      const uint32_t limit = t5 == 4 ? tile / 2 : tile, off = p * piece;
+      if (off < limit) {
+        const uint32_t left = limit - off;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                     :: "l"(base + (unsigned long long)e * 2 * matrix + (unsigned long long)m * matrix
+                            + (unsigned long long)t5 * tile + off),
+                        "r"(left < piece ? left : piece) : "memory");
+      }
+    }
+    if (due > done) done = due;
+    else __nanosleep(64);
+  }
+}
+// A paced L2 hint over `tiles` equal streams of one immutable region, breadth first: round r takes piece r (`piece`
+// bytes) of every stream (stream t starts at base + t * tile_bytes), one piece due every ns_piece ns, at most
+// `budget` pieces. For a product that cannot be hinted whole (the Engram projection: 39 MB, row-major, 6144 rows that
+// 48 blocks sweep along K together): with the rows as streams, the first rounds are the first K columns of every
+// row, which is what every block reads first. Rust validates the region. Hints only, writes no model data.
+extern "C" __global__ void ca_l2_tiled(uint64_t base, uint32_t tile_bytes, uint32_t tiles, uint32_t piece,
+                                       uint32_t budget, uint32_t ns_piece) {
+  const uint32_t lane = threadIdx.x;
+  const uint32_t rounds = (tile_bytes + piece - 1) / piece;
+  const unsigned long long all = (unsigned long long)rounds * tiles;
+  const uint32_t last = all < budget ? uint32_t(all) : budget;
+  unsigned long long t0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  t0 = __shfl_sync(0xffffffffu, t0, 0);
+  uint32_t done = 0;
+  while (done < last) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    t = __shfl_sync(0xffffffffu, t, 0);
+    const unsigned long long by_now = (t - t0) / ns_piece + 1;
+    const uint32_t cap = last < done + 32 ? last : done + 32;
+    const uint32_t due = by_now < cap ? uint32_t(by_now) : cap;
+    const uint32_t c = done + lane;
+    if (c < due) {
+      const uint32_t r = c / tiles, s = c % tiles, off = r * piece;
+      if (off < tile_bytes) {
+        const uint32_t left = tile_bytes - off;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                     :: "l"(base + (unsigned long long)s * tile_bytes + off), "r"(left < piece ? left : piece) : "memory");
+      }
+    }
+    if (due > done) done = due;
+    else __nanosleep(64);
+  }
+}
+// The grouped WO-A partial product for 2..8 rows from the canonical FP8 bytes: the arithmetic of the exported
+// woa_w8_partial kernel (Mia's adapter/wo_a_w8.py through Triton), instruction for instruction where it rounds.
+// Weight: the two e4m3 bytes of a pair go through cvt.rn.f16x2.e4m3x2 and cvt.f32.f16, times
+// ex2.approx.ftz(exponent - 127) of their 32x32 block (mul.f32), then cvt.rn.bf16.f32, as in its PTX.
+// Product: for each of the eight K splits of 512, every output is one chain of 64 m16n8k16 BF16 tensor-core steps
+// from zero in that kernel's operand layout, which Triton's dot lowering fixes: a K block of 32 feeds two
+// consecutive steps, and lane t of a row holds K = 4t..4t+3 and 16+4t..16+4t+3 of the block, the first pair of each
+// quad in the first step (slots 2t, 2t+1 and 8+2t, 8+2t+1) and the second pair in the second. Blocks run in K order.
+// Rows from M up are zero operands. The unchanged epilogue (woa_reduce_quant) sums the eight partials in its fixed
+// order. The exported kernel stages every byte through shared memory and reloads the rebuilt tile with ldmatrix;
+// here each lane reads its own four bytes of a quad from global memory and rebuilds its operands in registers.
+// Grid (16 column tiles of 64, 2 groups, 8 splits) as there; 4 warps of 16 columns. Rust validates extents.
+__device__ __forceinline__ float ca_woa_scale(uint32_t exponent) {
+  float scale;
+  const float x = float(exponent) - 127.f;
+  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(scale) : "f"(x));
+  return scale;
+}
+// Two e4m3 bytes (bits 7:0 and 15:8) times `scale` -> two BF16 (bits 15:0 and 31:16).
+__device__ __forceinline__ uint32_t ca_woa_bf16x2(uint32_t pair, float scale) {
+  uint32_t out;
+  const unsigned short bytes = (unsigned short)(pair & 0xffffu);
+  asm volatile("{ .reg .b16 lo, hi; .reg .b32 h2; .reg .f32 f0, f1;\n"
+               "cvt.rn.f16x2.e4m3x2 h2, %1;\n"
+               "mov.b32 {lo, hi}, h2;\n"
+               "cvt.f32.f16 f0, lo;\n"
+               "cvt.f32.f16 f1, hi;\n"
+               "mul.f32 f0, %2, f0;\n"
+               "mul.f32 f1, %2, f1;\n"
+               "cvt.rn.bf16.f32 lo, f0;\n"
+               "cvt.rn.bf16.f32 hi, f1;\n"
+               "mov.b32 %0, {lo, hi}; }"
+               : "=r"(out) : "h"(bytes), "f"(scale));
+  return out;
+}
+__device__ __forceinline__ void ca_woa_mma(float (&c)[4], uint32_t a0, uint32_t a2, uint32_t b0, uint32_t b1) {
+  // A rows 8..15 are zero (at most eight rows): registers 1 and 3.
+  const uint32_t zero = 0u;
+  float d0, d1, d2, d3;
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+               "{%10, %11, %12, %13};"
+               : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+               : "r"(a0), "r"(zero), "r"(a2), "r"(zero), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+  c[0] = d0; c[1] = d1; c[2] = d2; c[3] = d3;
+}
+extern "C" __global__ void ca_woa_partial_w8(const __nv_bfloat16* X, const uint8_t* W8, const uint8_t* S, float* P,
+                                             int M) {
+  const uint32_t tile = blockIdx.x, group = blockIdx.y, split = blockIdx.z;
+  const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u, g = lane >> 2, t = lane & 3u;
+  const uint32_t n0 = tile * 64u + warp * 16u, k0 = split * 512u;
+  // Lane (g, t) holds column g of each of the warp's two eight-column fragments in B, and row g in A and C.
+  // Its bytes of a K block of 32 are the quads at 4t and 16 + 4t.
+  const uint8_t* w0 = W8 + size_t(group * 1024u + n0 + g) * 4096u + k0 + 4u * t;
+  const uint8_t* w1 = w0 + size_t(8u) * 4096u;
+  // Both fragments' sixteen columns lie in one 32-column scale block (n0 is a multiple of 16).
+  const uint8_t* e = S + size_t(group * 32u + (n0 + g) / 32u) * 128u + k0 / 32u;
+  const bool live = int(g) < M;
+  // The lane's activation quad of a block: two words (K 4t, 4t+1 and 4t+2, 4t+3).
+  const uint32_t* x = reinterpret_cast<const uint32_t*>(X + size_t(live ? g : 0u) * 8192u + group * 4096u + k0) + 2u * t;
+  // The warp's weight patch (sixteen rows of this split's 512 bytes) is asked for up front, one non-blocking bulk
+  // request a row: a patch that is not in the cache then arrives while the first blocks compute. Without the
+  // requests every block of 32 costs the warp two blocking misses, and the kernel reads cold weights at 127 GB/s
+  // where the exported kernel (which stages its tile through shared memory) reads at 212 (woacold/run1).
+  if (t == 0u) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(w0)), "r"(512u) : "memory");
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(w1)), "r"(512u) : "memory");
+  }
+  float c0[4] = {0.f, 0.f, 0.f, 0.f}, c1[4] = {0.f, 0.f, 0.f, 0.f};
+  for (uint32_t block = 0; block < 16u; ++block) {
+    const uint32_t kk = block * 32u;
+    uint32_t xa0 = 0u, xa1 = 0u, xb0 = 0u, xb1 = 0u;
+    if (live) { xa0 = x[kk >> 1]; xa1 = x[(kk >> 1) + 1u]; xb0 = x[(kk >> 1) + 8u]; xb1 = x[(kk >> 1) + 9u]; }
+    const float scale = ca_woa_scale(e[block]);
+    const uint32_t qa0 = *reinterpret_cast<const uint32_t*>(w0 + kk), qb0 = *reinterpret_cast<const uint32_t*>(w0 + kk + 16u);
+    const uint32_t qa1 = *reinterpret_cast<const uint32_t*>(w1 + kk), qb1 = *reinterpret_cast<const uint32_t*>(w1 + kk + 16u);
+    // First step of the block: the first pair of each quad; second step: the second pair.
+    ca_woa_mma(c0, xa0, xb0, ca_woa_bf16x2(qa0, scale), ca_woa_bf16x2(qb0, scale));
+    ca_woa_mma(c1, xa0, xb0, ca_woa_bf16x2(qa1, scale), ca_woa_bf16x2(qb1, scale));
+    ca_woa_mma(c0, xa1, xb1, ca_woa_bf16x2(qa0 >> 16, scale), ca_woa_bf16x2(qb0 >> 16, scale));
+    ca_woa_mma(c1, xa1, xb1, ca_woa_bf16x2(qa1 >> 16, scale), ca_woa_bf16x2(qb1 >> 16, scale));
+  }
+  if (live) {
+    float* p = P + (size_t(split * uint32_t(M) + g) * 2u + group) * 1024u + n0 + 2u * t;
+    p[0] = c0[0]; p[1] = c0[1];
+    p[8] = c1[0]; p[9] = c1[1];
+  }
+}
+// The 16-row WO-A partial product from the canonical FP8 bytes: the arithmetic of the exported woa_mid_partial_m16
+// kernel (Mia's _wo_a_mid_kernel through Triton: four K splits of 1024, tiles of 16 rows by 64 columns, eight
+// warps), in the same way as ca_woa_partial_w8 above: the same weight rebuild and the same operand layout per K
+// block of 32, here with rows 8..15 live in the second half of each A fragment and one eight-column fragment a
+// warp. Every output is one chain of 64 m16n8k16 steps from zero a split; the unchanged reduce kernel sums the
+// four partials. Grid (16 column tiles of 64, 2 groups, 4 splits), 8 warps. Rust validates extents.
+__device__ __forceinline__ void ca_woa_mma16(float (&c)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                             uint32_t b0, uint32_t b1) {
+  float d0, d1, d2, d3;
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+               "{%10, %11, %12, %13};"
+               : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+               : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
+  c[0] = d0; c[1] = d1; c[2] = d2; c[3] = d3;
+}
+extern "C" __global__ void ca_woa_mid_partial_w8(const __nv_bfloat16* X, const uint8_t* W8, const uint8_t* S,
+                                                 float* Y, int M) {
+  const uint32_t tile = blockIdx.x, group = blockIdx.y, split = blockIdx.z;
+  const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u, g = lane >> 2, t = lane & 3u;
+  const uint32_t n0 = tile * 64u + warp * 8u, k0 = split * 1024u;
+  // The block's activation tile (16 rows by the split's 1024 K, 32 KiB) once in shared memory: its eight warps
+  // all read it, and sixteen rows of a split do not stay in a core's first-level cache beside the weights.
+  __shared__ uint32_t xs[16][512];
+  for (uint32_t i = threadIdx.x; i < 16u * 512u; i += blockDim.x) {
+    const uint32_t row = i >> 9, word = i & 511u;
+    xs[row][word] = int(row) < M
+      ? reinterpret_cast<const uint32_t*>(X + size_t(row) * 8192u + group * 4096u + k0)[word] : 0u;
+  }
+  __syncthreads();
+  // Lane (g, t) holds column g of the warp's fragment in B, rows g and g + 8 in A and C, and the quads at 4t and
+  // 16 + 4t of each K block of 32.
+  const uint8_t* w = W8 + size_t(group * 1024u + n0 + g) * 4096u + k0 + 4u * t;
+  // As in ca_woa_partial_w8: the warp's eight row segments (1,024 bytes each) are requested up front.
+  if (t == 0u)
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(w)), "r"(1024u) : "memory");
+  const uint8_t* e = S + size_t(group * 32u + (n0 + g) / 32u) * 128u + k0 / 32u;
+  const uint32_t* xl = &xs[g][2u * t];
+  const uint32_t* xh = &xs[g + 8u][2u * t];
+  float c[4] = {0.f, 0.f, 0.f, 0.f};
+  for (uint32_t block = 0; block < 32u; ++block) {
+    const uint32_t kk = block * 32u, j = kk >> 1;
+    const float scale = ca_woa_scale(e[block]);
+    const uint32_t qa = *reinterpret_cast<const uint32_t*>(w + kk), qb = *reinterpret_cast<const uint32_t*>(w + kk + 16u);
+    ca_woa_mma16(c, xl[j], xh[j], xl[j + 8u], xh[j + 8u], ca_woa_bf16x2(qa, scale), ca_woa_bf16x2(qb, scale));
+    ca_woa_mma16(c, xl[j + 1u], xh[j + 1u], xl[j + 9u], xh[j + 9u], ca_woa_bf16x2(qa >> 16, scale), ca_woa_bf16x2(qb >> 16, scale));
+  }
+  float* y = Y + (size_t(split) * uint32_t(M) + g) * 2048u + group * 1024u + n0 + 2u * t;
+  if (int(g) < M) { y[0] = c[0]; y[1] = c[1]; }
+  if (int(g + 8u) < M) { y[size_t(8u) * 2048u] = c[2]; y[size_t(8u) * 2048u + 1u] = c[3]; }
+}
+// The KV pages a decode step's attention reads over its sliding window, hinted ahead of it: from the first new
+// row's slot, the pages (page_tokens slots of page_bytes) holding the `window` slots before it and the step's own
+// rows, in 8 KiB pieces, at once (at most 64 pieces). They are a few pages, cold after the experts, and the
+// attention's loads otherwise queue behind the weight hints that run beside it. A wrap of the ring is not followed
+// (those steps read as before). Rust validates the buffer extents; reads no values, writes nothing.
+extern "C" __global__ void ca_l2_kv_window(const int32_t* locations, uint64_t base, uint32_t page_tokens,
+                                           uint32_t page_bytes, uint32_t pages, uint32_t rows, uint32_t window) {
+  constexpr uint32_t piece = 8192;
+  const int32_t first = locations[0];
+  if (first < 0) return;
+  const uint32_t lo = uint32_t(first) > window ? uint32_t(first) - window : 0u;
+  const uint32_t p0 = lo / page_tokens, p1 = (uint32_t(first) + rows - 1u) / page_tokens;
+  const uint32_t per = (page_bytes + piece - 1u) / piece;
+  const uint32_t count = (p1 - p0 + 1u) * per;
+  for (uint32_t i = threadIdx.x; i < count && i < 64u; i += blockDim.x) {
+    const uint32_t page = p0 + i / per, off = (i % per) * piece;
+    if (page < pages) {
+      const uint32_t left = page_bytes - off;
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                   :: "l"(base + (unsigned long long)page * page_bytes + off), "r"(left < piece ? left : piece) : "memory");
+    }
+  }
+}
+// Draft-head script subset (CANADA_SCRATCH_DRAFT_HEAD_SUBSET_SCREEN): three plain copies around the Marlin head.
+// ca_subset_gather_rows: row j of dst is row order[j] of src, both [rows][columns] of 16-bit words (a block a row).
+extern "C" __global__ void ca_subset_gather_rows(const uint16_t* src, uint16_t* dst, const uint32_t* order,
+                                                  uint32_t rows, uint32_t columns) {
+  const uint32_t j = blockIdx.x;
+  if (j >= rows) return;
+  const uint16_t* s = src + (uint64_t)order[j] * columns;
+  uint16_t* d = dst + (uint64_t)j * columns;
+  for (uint32_t c = threadIdx.x; c < columns; c += blockDim.x) d[c] = s[c];
+}
+// ca_subset_take_columns: the first `kept` columns of every row of a [rows][columns] matrix whose elements are
+// `width` bytes, written as [rows][kept] (a block a row).
+extern "C" __global__ void ca_subset_take_columns(const uint8_t* src, uint8_t* dst, uint32_t rows, uint32_t columns,
+                                                   uint32_t kept, uint32_t width) {
+  const uint32_t r = blockIdx.x;
+  if (r >= rows) return;
+  const uint8_t* s = src + (uint64_t)r * columns * width;
+  uint8_t* d = dst + (uint64_t)r * kept * width;
+  const uint32_t bytes = kept * width;
+  for (uint32_t b = threadIdx.x; b < bytes; b += blockDim.x) d[b] = s[b];
+}
+// ca_subset_publish: the head's bf16 logits [m][run], whose column j is vocabulary row order[j] of this rank, to
+// FP32 [m][n] in vocabulary order (the widening the Marlin bundle's own publish kernel does); rows that were not
+// projected (j >= run) get `absent`. One thread an element.
+extern "C" __global__ void ca_subset_publish(const uint16_t* in, float* out, const uint32_t* order,
+                                              uint32_t m, uint32_t n, uint32_t run, float absent) {
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= m * n) return;
+  const uint32_t row = i / n, j = i % n;
+  const float v = j < run ? __uint_as_float((uint32_t)in[(uint64_t)row * run + j] << 16) : absent;
+  out[(uint64_t)row * n + order[j]] = v;
+}
+// Layer clock (CANADA_SCRATCH_LAYER_CLOCK, screens only): one thread stores the device's global timer (ns).
+extern "C" __global__ void ca_clock_mark(uint64_t* slot) {
+  if (threadIdx.x | blockIdx.x) return;
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  *slot = t;
+}
+// Collective timing screen only. ca_probe_delay: one thread waits `ns` of the global timer (no memory traffic).
+// ca_probe_read: every thread reads its share of `words` 8-byte words (memory-bandwidth-bound work over cold
+// scratch) and each block stores an XOR so the loads are kept; no model data is read or written.
+extern "C" __global__ void ca_probe_delay(uint64_t ns) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  unsigned long long t0, t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while (t - t0 < ns);
+}
+extern "C" __global__ void ca_probe_read(const uint64_t* source, uint64_t words, uint64_t* out) {
+  const uint64_t threads = uint64_t(gridDim.x) * blockDim.x, id = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  uint64_t acc = 0;
+  for (uint64_t i = id; i < words; i += threads) acc ^= source[i];
+  for (int offset = 16; offset > 0; offset >>= 1) acc ^= __shfl_xor_sync(0xffffffffu, acc, offset);
+  if ((threadIdx.x & 31) == 0) atomicXor(reinterpret_cast<unsigned long long*>(out + blockIdx.x), (unsigned long long)acc);
 }
 #include <math.h>
 #include "collective_probe.cuh"
@@ -279,6 +718,74 @@ extern "C" __global__ void ca_gather_index_k_bounded(const uint8_t* cache,const 
   int slot=slots[row];const uint8_t* page=cache+(int64_t)(slot/64)*4352;
   if(lane<16)payload[(int64_t)row*16+lane]=((const uint32_t*)(page+(slot%64)*64))[lane];
   if(lane==0)scales[row]=((const uint32_t*)(page+4096))[slot%64];
+ }
+}
+// Batched serving (region steps): query rows of several conversations start at their regions' keys.
+// Copy only key rows inside some query's [start, end), each range widened to whole 128-row tiles as the
+// bounded gather widens its end; every copied row gets exactly ca_gather_index_k_bounded's bytes.
+// At most 32 queries. The row test is warp-uniform (one row per warp).
+extern "C" __global__ void ca_gather_index_k_ranges(const uint8_t* cache,const int32_t* slots,
+ uint32_t* payload,uint32_t* scales,int rows,const int32_t* starts,const int32_t* ends,int queries){
+ __shared__ int lo[32],hi[32],bounds[2];
+ if(threadIdx.x<32){
+  bool live=threadIdx.x<queries&&ends[threadIdx.x]>starts[threadIdx.x];
+  lo[threadIdx.x]=live?starts[threadIdx.x]/128*128:0;
+  hi[threadIdx.x]=live?min(rows,(ends[threadIdx.x]+127)/128*128):0;
+ }
+ __syncthreads();
+ if(threadIdx.x==0){
+  int a=rows,b=0;
+  for(int q=0;q<32;q++)if(hi[q]>lo[q]){a=min(a,lo[q]);b=max(b,hi[q]);}
+  bounds[0]=a;bounds[1]=b;
+ }
+ __syncthreads();
+ int lane=threadIdx.x%32,warp=threadIdx.x/32;
+ for(int row=bounds[0]+blockIdx.x*4+warp;row<bounds[1];row+=gridDim.x*4){
+  bool needed=false;
+  for(int q=0;q<32;q++)needed|=row>=lo[q]&&row<hi[q];
+  if(!needed)continue;
+  int slot=slots[row];const uint8_t* page=cache+(int64_t)(slot/64)*4352;
+  if(lane<16)payload[(int64_t)row*16+lane]=((const uint32_t*)(page+(slot%64)*64))[lane];
+  if(lane==0)scales[row]=((const uint32_t*)(page+4096))[slot%64];
+ }
+}
+// The same rows as ca_gather_index_k_ranges, visited range by range instead of scanning the hull of all ranges.
+// Conversations' key regions are far apart (65,536 key rows or more), so four conversations' hull is 200K-800K
+// rows, each tested against 32 ranges, for a few hundred rows copied once the region gather cache is warm:
+// 100-200 us a layer in a trace. Here every block first merges the (tile-widened) ranges into disjoint intervals
+// (rank sort of at most 32 starts, one pass), then its warps walk only those; every copied row gets the same bytes.
+extern "C" __global__ void ca_gather_index_k_ranges_q(const uint8_t* cache,const int32_t* slots,
+ uint32_t* payload,uint32_t* scales,int rows,const int32_t* starts,const int32_t* ends,int queries){
+ __shared__ int lo[32],hi[32],slo[32],shi[32],mlo[32],mhi[32],count;
+ if(threadIdx.x<32){
+  bool live=threadIdx.x<queries&&ends[threadIdx.x]>starts[threadIdx.x];
+  lo[threadIdx.x]=live?starts[threadIdx.x]/128*128:0x7fffffff;
+  hi[threadIdx.x]=live?min(rows,(ends[threadIdx.x]+127)/128*128):0;
+ }
+ __syncthreads();
+ if(threadIdx.x<32){
+  int me=lo[threadIdx.x],rank=0;
+  for(int p=0;p<32;p++)rank+=(lo[p]<me||(lo[p]==me&&p<(int)threadIdx.x))?1:0;
+  slo[rank]=me;shi[rank]=hi[threadIdx.x];
+ }
+ __syncthreads();
+ if(threadIdx.x==0){
+  int n=0;
+  for(int p=0;p<32;p++){
+   if(shi[p]<=slo[p])continue;
+   if(n>0&&slo[p]<=mhi[n-1]){if(shi[p]>mhi[n-1])mhi[n-1]=shi[p];}
+   else{mlo[n]=slo[p];mhi[n]=shi[p];n++;}
+  }
+  count=n;
+ }
+ __syncthreads();
+ int lane=threadIdx.x%32,warp=threadIdx.x/32;
+ for(int q=0;q<count;q++){
+  for(int row=mlo[q]+blockIdx.x*4+warp;row<mhi[q];row+=gridDim.x*4){
+   int slot=slots[row];const uint8_t* page=cache+(int64_t)(slot/64)*4352;
+   if(lane<16)payload[(int64_t)row*16+lane]=((const uint32_t*)(page+(slot%64)*64))[lane];
+   if(lane==0)scales[row]=((const uint32_t*)(page+4096))[slot%64];
+  }
  }
 }
 extern "C" __global__ void ca_map_index_candidates(const int32_t* selected,const int32_t* slots,
@@ -573,6 +1080,21 @@ extern "C" __global__ void ca_store_tail_mask(const uint8_t* mask,int stride,
  if(p<0||p>=context||p<=positions[live[0]-1]-128)return;
  ring[(size_t)(p%128)*stride+j]=mask[i];
 }
+// Encoder-tail candidate ids are physical compressed slots of their conversation's serving region;
+// a tail moving between regions shifts its valid ids (padding stays -1) by the regions' base difference.
+extern "C" __global__ void ca_shift_tail_ids(int32_t* ids,int count,int shift){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=count)return;
+ int id=ids[i];if(id>=0)ids[i]=id+shift;
+}
+// Batched verification (region mode): rows between one conversation's live rows and the next
+// conversation's block are padding (never committed). Each takes the experts of a live row of its
+// conversation (source[r] >= 0) with zero weights, so it reads no expert of its own; live rows and
+// rows past the step have source -1. Sources always name live rows, which this kernel never writes.
+extern "C" __global__ void ca_route_padding_rows(int32_t* ids,float* weights,const int32_t* source,int rows,int topk){
+ int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=rows*topk)return;
+ int r=i/topk,s=source[r];if(s<0)return;
+ ids[i]=ids[s*topk+(i-r*topk)];weights[i]=0.f;
+}
 extern "C" __global__ void ca_gather_tail_mask(const uint8_t* ring,int stride,
  const int32_t* tags,const int32_t* begin,uint8_t* out,int context){
  int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=128*stride)return;
@@ -717,6 +1239,7 @@ extern "C" __global__ void ca_trace_copy_first(const uint32_t* current,
 #include "sampler_law_probe.cuh"
 #include "key_sharded_index.cuh"
 #include "key_sharded_publisher.cuh"
+#include "head4_rescore.cuh"
 #include "allocation_placement_probe.cuh"
 
 #include "block_finish_parallel.cuh"
@@ -726,3 +1249,5 @@ extern "C" __global__ void ca_trace_copy_first(const uint32_t* current,
 #include "ffn_sum_shared.cuh"
 
 #include "wob8_sum4.cuh"
+#include "mhc_post_stats.cuh"
+#include "moe_frontend.cuh"

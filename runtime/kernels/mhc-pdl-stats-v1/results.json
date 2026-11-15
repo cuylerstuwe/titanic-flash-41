@@ -1,0 +1,949 @@
+{
+  "all_exact": true,
+  "checks": [
+    {
+      "rows": 3,
+      "case": "normal",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 3,
+      "case": "changed",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 3,
+      "case": "zero",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 3,
+      "case": "tiny",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 3,
+      "case": "near_floor",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 3,
+      "case": "mixed_scales",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 3,
+      "case": "large",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 6,
+      "case": "normal",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 6,
+      "case": "changed",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 6,
+      "case": "zero",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 6,
+      "case": "tiny",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 6,
+      "case": "near_floor",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 6,
+      "case": "mixed_scales",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    },
+    {
+      "rows": 6,
+      "case": "large",
+      "different_bytes": [
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ]
+    }
+  ],
+  "timings": [
+    {
+      "rows": 3,
+      "locality": "hot",
+      "median_us": [
+        9.891200065612793,
+        9.883999824523926,
+        9.337200224399567,
+        9.512000158429146
+      ],
+      "samples_us": [
+        [
+          9.95199978351593,
+          9.878399968147278,
+          9.895200282335281,
+          9.852000325918198,
+          9.887199848890305,
+          9.904000163078308
+        ],
+        [
+          9.892799705266953,
+          9.902399778366089,
+          9.852000325918198,
+          9.889599680900574,
+          9.87439975142479,
+          9.878399968147278
+        ],
+        [
+          9.34320017695427,
+          9.358400106430054,
+          9.325599670410156,
+          9.324000030755997,
+          9.336800128221512,
+          9.337600320577621
+        ],
+        [
+          9.489600360393524,
+          9.534399956464767,
+          9.533599764108658,
+          9.532800316810608,
+          9.491200000047684,
+          9.487999975681305
+        ]
+      ]
+    },
+    {
+      "rows": 3,
+      "locality": "rotating40",
+      "median_us": [
+        16.94839969277382,
+        16.87919944524765,
+        16.302400082349777,
+        16.705600172281265
+      ],
+      "samples_us": [
+        [
+          16.967999935150146,
+          16.874399781227112,
+          17.139199376106262,
+          16.96079969406128,
+          16.93599969148636,
+          16.90240055322647
+        ],
+        [
+          16.969600319862366,
+          16.917599737644196,
+          16.884799301624298,
+          16.873599588871002,
+          16.817599534988403,
+          16.870400309562683
+        ],
+        [
+          16.385599970817566,
+          16.2992000579834,
+          16.300800442695618,
+          16.303999722003937,
+          16.392000019550323,
+          16.29520058631897
+        ],
+        [
+          16.703200340270996,
+          16.752000153064728,
+          16.661599278450012,
+          16.72399938106537,
+          16.708000004291534,
+          16.657599806785583
+        ]
+      ]
+    },
+    {
+      "rows": 6,
+      "locality": "hot",
+      "median_us": [
+        9.968400001525879,
+        9.911200031638145,
+        9.377600252628326,
+        9.583200141787529
+      ],
+      "samples_us": [
+        [
+          9.995199739933014,
+          9.920799732208252,
+          9.941600263118744,
+          10.012800246477127,
+          12.308000028133392,
+          9.894400089979172
+        ],
+        [
+          9.901600331068039,
+          9.947200119495392,
+          9.920799732208252,
+          9.89919975399971,
+          10.711999982595444,
+          9.89919975399971
+        ],
+        [
+          9.36800017952919,
+          9.387200325727463,
+          9.361600130796432,
+          10.965599864721298,
+          9.590400010347366,
+          9.36639979481697
+        ],
+        [
+          9.588800370693207,
+          9.577599912881851,
+          10.80399975180626,
+          11.805599927902222,
+          9.573599696159363,
+          9.536799788475037
+        ]
+      ]
+    },
+    {
+      "rows": 6,
+      "locality": "rotating40",
+      "median_us": [
+        16.76959991455078,
+        16.744399815797806,
+        16.196800023317337,
+        16.56999960541725
+      ],
+      "samples_us": [
+        [
+          16.69600009918213,
+          16.63919985294342,
+          16.64000004529953,
+          17.635199427604675,
+          18.863199651241302,
+          16.843199729919434
+        ],
+        [
+          16.755999624729156,
+          16.732800006866455,
+          16.66959971189499,
+          21.823200583457947,
+          16.679200530052185,
+          16.859200596809387
+        ],
+        [
+          16.197599470615387,
+          16.147199273109436,
+          16.101600229740143,
+          16.227200627326965,
+          16.196000576019287,
+          16.200000047683716
+        ],
+        [
+          16.56239926815033,
+          16.56239926815033,
+          19.53040063381195,
+          24.860799312591553,
+          16.55679941177368,
+          16.577599942684174
+        ]
+      ]
+    }
+  ],
+  "variants": [
+    [
+      "native",
+      "native",
+      0
+    ],
+    [
+      "plain",
+      "plain",
+      0
+    ],
+    [
+      "early",
+      "early",
+      1
+    ],
+    [
+      "late",
+      "early",
+      1
+    ]
+  ],
+  "compiler": "ptxas-blackwell: NVIDIA (R) Ptx optimizing assembler\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Fri_Nov__7_07:21:52_PM_PST_2025\nCuda compilation tools, release 13.1, V13.1.80\nBuild cuda_13.1.r13.1/compiler.36836380_0\n",
+  "provenance": {
+    "post": {
+      "source": "https://github.com/sgl-project/sglang",
+      "source_commit": "f80c91a4b97e52e17fbcff088aa6b47b6270f6b9",
+      "license": "Apache-2.0",
+      "original_cubin": "f21f17b63da9cc74b8a959ed715ea6d146fbacbea4caafba955aed5f260ece87",
+      "original_ptx": "61f4bc341b9d69d67b9e8fe60607bf0ee1775e8420cd4539a3a7aaa3ff705b5b",
+      "entry": {
+        "name": "hc_stats_mb8_s2",
+        "symbol": "_hc_mix_stats_partial_kernel",
+        "architecture": 121,
+        "physical_sms": 48,
+        "arguments": [
+          {
+            "name": "x_ptr",
+            "kind": "*bf16"
+          },
+          {
+            "name": "w_ptr",
+            "kind": "*fp32"
+          },
+          {
+            "name": "part_mix_ptr",
+            "kind": "*fp32"
+          },
+          {
+            "name": "part_sq_ptr",
+            "kind": "*fp32"
+          },
+          {
+            "name": "M",
+            "kind": "i32"
+          },
+          {
+            "name": "K",
+            "kind": "i32"
+          },
+          {
+            "name": "x_stride_m",
+            "kind": "i32"
+          },
+          {
+            "name": "w_stride_n",
+            "kind": "i32"
+          }
+        ],
+        "signature": {
+          "x_ptr": "*bf16",
+          "w_ptr": "*fp32",
+          "part_mix_ptr": "*fp32",
+          "part_sq_ptr": "*fp32",
+          "M": "i32",
+          "K": "i32",
+          "x_stride_m": "i32",
+          "w_stride_n": "i32"
+        },
+        "constexprs": {
+          "MIX": 24,
+          "MIX_PAD": 32,
+          "NUM_SLICES": 80,
+          "BLOCK_M": 8,
+          "BLOCK_K": 64,
+          "DOT_PRECISION": "tf32x3"
+        },
+        "metadata": {
+          "allowed_dot_input_precisions": [
+            "tf32",
+            "tf32x3",
+            "ieee",
+            "bf16x3",
+            "bf16x6"
+          ],
+          "arch": "sm121",
+          "backend_name": "cuda",
+          "debug": false,
+          "default_dot_input_precision": "tf32",
+          "deprecated_fp8_dot_operand_dtypes": [
+            "fp8e4b15"
+          ],
+          "enable_fp_fusion": true,
+          "enable_reflect_ftz": true,
+          "extern_libs": [
+            [
+              "libdevice",
+              "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+            ]
+          ],
+          "global_scratch_align": 1,
+          "global_scratch_size": 0,
+          "hash": "f4971e9fe70ab2daa1d6c465df95fcf4c0171dfd0db2c9ab196b71c407c873f4",
+          "instrumentation_mode": "",
+          "ir_override": null,
+          "launch_cooperative_grid": false,
+          "launch_pdl": false,
+          "max_num_imprecise_acc_default": 0,
+          "maxnreg": null,
+          "name": "_hc_mix_stats_partial_kernel",
+          "num_ctas": 1,
+          "num_stages": 2,
+          "num_warps": 4,
+          "profile_scratch_align": 1,
+          "profile_scratch_size": 0,
+          "ptx_options": null,
+          "ptx_version": null,
+          "sanitize_overflow": true,
+          "shared": 9216,
+          "supported_fp8_dtypes": [
+            "fp8e4b15",
+            "fp8e4nv",
+            "fp8e5"
+          ],
+          "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+          "tensordesc_meta": [],
+          "tmem_size": 0,
+          "triton_version": "3.7.1",
+          "warp_size": 32
+        },
+        "grid": {
+          "rows_div": 8,
+          "y": 80,
+          "z": 1
+        },
+        "ptx_parameters": [
+          [
+            "u64",
+            "_hc_mix_stats_partial_kernel_param_0"
+          ],
+          [
+            "u64",
+            "_hc_mix_stats_partial_kernel_param_1"
+          ],
+          [
+            "u64",
+            "_hc_mix_stats_partial_kernel_param_2"
+          ],
+          [
+            "u64",
+            "_hc_mix_stats_partial_kernel_param_3"
+          ],
+          [
+            "u32",
+            "_hc_mix_stats_partial_kernel_param_4"
+          ],
+          [
+            "u32",
+            "_hc_mix_stats_partial_kernel_param_5"
+          ],
+          [
+            "u32",
+            "_hc_mix_stats_partial_kernel_param_6"
+          ],
+          [
+            "u32",
+            "_hc_mix_stats_partial_kernel_param_7"
+          ],
+          [
+            "u64",
+            "_hc_mix_stats_partial_kernel_param_8"
+          ],
+          [
+            "u64",
+            "_hc_mix_stats_partial_kernel_param_9"
+          ]
+        ],
+        "source_sha256": "12c54574c37181761cab6190cacfe7937d7ff1eca8d24eb88028147f4fe3ad95",
+        "artifact_sha256": "f21f17b63da9cc74b8a959ed715ea6d146fbacbea4caafba955aed5f260ece87"
+      }
+    },
+    "norm": {
+      "source": "https://github.com/sgl-project/sglang",
+      "source_commit": "f80c91a4b97e52e17fbcff088aa6b47b6270f6b9",
+      "license": "Apache-2.0",
+      "original_cubin": "16356a1f6373f67c0fa3d70e604885e9c6e78376f7b4f792f2fdd438c38ddc72",
+      "original_ptx": "0d4e566b4017a932de36a8fcea66d0850d2c47991763636d326241bdf36572c2",
+      "entry": {
+        "name": "hc_reduce80",
+        "symbol": "_hc_mix_reduce_sinkhorn_kernel",
+        "architecture": 121,
+        "physical_sms": 48,
+        "arguments": [
+          {
+            "name": "part_mix_ptr",
+            "kind": "*fp32"
+          },
+          {
+            "name": "part_sq_ptr",
+            "kind": "*fp32"
+          },
+          {
+            "name": "scale_ptr",
+            "kind": "*fp32"
+          },
+          {
+            "name": "base_ptr",
+            "kind": "*fp32"
+          },
+          {
+            "name": "pre_ptr",
+            "kind": "*fp32"
+          },
+          {
+            "name": "post_ptr",
+            "kind": "*fp32"
+          },
+          {
+            "name": "comb_ptr",
+            "kind": "*fp32"
+          },
+          {
+            "name": "m",
+            "kind": "i32"
+          },
+          {
+            "name": "inv_k",
+            "kind": "fp32"
+          },
+          {
+            "name": "rms_eps",
+            "kind": "fp32"
+          }
+        ],
+        "signature": {
+          "part_mix_ptr": "*fp32",
+          "part_sq_ptr": "*fp32",
+          "scale_ptr": "*fp32",
+          "base_ptr": "*fp32",
+          "pre_ptr": "*fp32",
+          "post_ptr": "*fp32",
+          "comb_ptr": "*fp32",
+          "m": "i32",
+          "inv_k": "fp32",
+          "rms_eps": "fp32"
+        },
+        "constexprs": {
+          "MIX": 24,
+          "HC": 4,
+          "NUM_SLICES": 80,
+          "ITERS": 20,
+          "EPS": 1e-06,
+          "part_mix_residual_ptr": null
+        },
+        "metadata": {
+          "allowed_dot_input_precisions": [
+            "tf32",
+            "tf32x3",
+            "ieee",
+            "bf16x3",
+            "bf16x6"
+          ],
+          "arch": "sm121",
+          "backend_name": "cuda",
+          "debug": false,
+          "default_dot_input_precision": "tf32",
+          "deprecated_fp8_dot_operand_dtypes": [
+            "fp8e4b15"
+          ],
+          "enable_fp_fusion": true,
+          "enable_reflect_ftz": true,
+          "extern_libs": [
+            [
+              "libdevice",
+              "/opt/sglang/lib/python3.12/site-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+            ]
+          ],
+          "global_scratch_align": 1,
+          "global_scratch_size": 0,
+          "hash": "83d9735438579d9eef06d9bf60e6bf9d0533885fd7d362640a657d32230c29b5",
+          "instrumentation_mode": "",
+          "ir_override": null,
+          "launch_cooperative_grid": false,
+          "launch_pdl": false,
+          "max_num_imprecise_acc_default": 0,
+          "maxnreg": null,
+          "name": "_hc_mix_reduce_sinkhorn_kernel",
+          "num_ctas": 1,
+          "num_stages": 3,
+          "num_warps": 1,
+          "profile_scratch_align": 1,
+          "profile_scratch_size": 0,
+          "ptx_options": null,
+          "ptx_version": null,
+          "sanitize_overflow": true,
+          "shared": 0,
+          "supported_fp8_dtypes": [
+            "fp8e4b15",
+            "fp8e4nv",
+            "fp8e5"
+          ],
+          "target": "GPUTarget(backend='cuda', arch=121, warp_size=32)",
+          "tensordesc_meta": [],
+          "tmem_size": 0,
+          "triton_version": "3.7.1",
+          "warp_size": 32
+        },
+        "grid": {
+          "rows_div": 1,
+          "y": 1,
+          "z": 1
+        },
+        "ptx_parameters": [
+          [
+            "u64",
+            "_hc_mix_reduce_sinkhorn_kernel_param_0"
+          ],
+          [
+            "u64",
+            "_hc_mix_reduce_sinkhorn_kernel_param_1"
+          ],
+          [
+            "u64",
+            "_hc_mix_reduce_sinkhorn_kernel_param_2"
+          ],
+          [
+            "u64",
+            "_hc_mix_reduce_sinkhorn_kernel_param_3"
+          ],
+          [
+            "u64",
+            "_hc_mix_reduce_sinkhorn_kernel_param_4"
+          ],
+          [
+            "u64",
+            "_hc_mix_reduce_sinkhorn_kernel_param_5"
+          ],
+          [
+            "u64",
+            "_hc_mix_reduce_sinkhorn_kernel_param_6"
+          ],
+          [
+            "u32",
+            "_hc_mix_reduce_sinkhorn_kernel_param_7"
+          ],
+          [
+            "f32",
+            "_hc_mix_reduce_sinkhorn_kernel_param_8"
+          ],
+          [
+            "f32",
+            "_hc_mix_reduce_sinkhorn_kernel_param_9"
+          ],
+          [
+            "u64",
+            "_hc_mix_reduce_sinkhorn_kernel_param_10"
+          ],
+          [
+            "u64",
+            "_hc_mix_reduce_sinkhorn_kernel_param_11"
+          ]
+        ],
+        "source_sha256": "12c54574c37181761cab6190cacfe7937d7ff1eca8d24eb88028147f4fe3ad95",
+        "artifact_sha256": "16356a1f6373f67c0fa3d70e604885e9c6e78376f7b4f792f2fdd438c38ddc72"
+      }
+    }
+  },
+  "artifacts": {
+    "post-native": "f21f17b63da9cc74b8a959ed715ea6d146fbacbea4caafba955aed5f260ece87",
+    "post-plain": "2c1c310741e9e580c5b13278a4a3b76ac83f14cfc51f867b68323e7f1e8dbb6f",
+    "post-early": "f410bc04cf44c47d6cbfecb0a293a43d9ff0256e15facc6e70ba2d0be032cc05",
+    "post-late": "57b6fe00159dbb1888c5e1340c99af85cb66bcaa0dd4de5d119c62347da46f0a",
+    "norm-native": "16356a1f6373f67c0fa3d70e604885e9c6e78376f7b4f792f2fdd438c38ddc72",
+    "norm-plain": "9dfac4874be4d674647946e79ee12e19678ee9853c59b3157c518025b68fb634",
+    "norm-early": "e5bf788785318290f2b3447d0f0867e3a19ccea56649ea043d3804dfffe7e6c8",
+    "norm-late": "c63a3931b5b778b650a7874263625b9628eefc68d22d7c4837faa92505c8525f"
+  },
+  "scope": "M3/M6 actual immutable80-slice coefficient stats/reduce. Rebuilt plain assembler control plus early/latePDL, unchanged PTX arithmetic.14changed-input/guard checks and6reversed40-pair graph timings,hot androtating40coefficient matrices. Small component screen, no whole-model or auxiliary-overlap claim."
+}

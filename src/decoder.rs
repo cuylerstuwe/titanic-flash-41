@@ -18,7 +18,7 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use half::bf16;
-use std::{cell::RefCell, path::Path, rc::Rc};
+use std::{cell::{Cell, RefCell}, path::Path, rc::Rc};
 
 /// Construction context of the wide encoder profile. Layers alternate between
 /// two row arenas by layer parity (layer L's output stays valid while layer
@@ -38,6 +38,10 @@ pub(crate) struct WideBuild {
     // storage and lend them only to sequential wide profiles.
     input_arena: Option<Rc<crate::cuda::RowArena>>,
     gather_arena: Option<Rc<crate::cuda::RowArena>>,
+    // Row transients shared across profiles (shared_wide_scratch_level).
+    source_arena: Option<Rc<crate::cuda::RowArena>>,
+    scratch_level: u8,
+    scratch_kinds: u32,
 }
 /// Engram layers 1/14 and the embedding-fed layer0 keep full rows; every
 /// other encoder layer may run its mHC boundaries sequence-parallel.
@@ -58,10 +62,57 @@ pub(crate) fn sp_early_enabled() -> bool {
         Err(_) => false,
     })
 }
+/// CANADA_SCRATCH_SHARED_WIDE_SOURCES (default 0, off). One arena, owned by the largest
+/// wide profile and lent to the smaller ones as the layer transients already are, holds
+/// row-proportional buffers that every chunk rewrites before reading. Profiles run one
+/// at a time, and nothing reads these buffers after their chunk, so they carry no state
+/// from one profile to the next.
+///   1: the four compressed sources' projection inputs and outputs;
+///   2: also the sources' compressor latents, quantized query rows, top-k indices and
+///      candidate ids, the step's pooled pairs, both Engram row buffers, the MoE output
+///      and the WO-A grouped scratch.
+pub(crate) fn shared_wide_scratch_level() -> Result<u8> {
+    match std::env::var("CANADA_SCRATCH_SHARED_WIDE_SOURCES") {
+        Ok(v) => { ensure!(matches!(v.as_str(), "0" | "1" | "2"), "invalid shared wide source policy"); Ok(v.parse()?) }
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_SHARED_WIDE_SCRATCH_KINDS: diagnostic mask of the level-2 kinds
+/// (cuda::ChunkScratch bits; default all), to isolate one kind without a rebuild.
+fn shared_wide_scratch_kinds() -> Result<u32> {
+    match std::env::var("CANADA_SCRATCH_SHARED_WIDE_SCRATCH_KINDS") {
+        Ok(v) => { let kinds = v.parse::<u32>().ok().filter(|kinds| *kinds < 256);
+            ensure!(kinds.is_some(), "invalid shared wide scratch kinds"); Ok(kinds.unwrap()) }
+        Err(std::env::VarError::NotPresent) => Ok(255),
+        Err(e) => Err(e.into()),
+    }
+}
+/// Bytes per row carved at each level. Measured high water: 52,800 at level 1 (s1421)
+/// and 121,408 at level 2 (s1422), at every width; the pair-pool outputs add 3,072.
+const SCRATCH_ARENA_BYTES_PER_ROW: [usize; 3] = [0, 54 * 1024, 123 * 1024];
 impl WideBuild {
+    /// Build one compressed source with its row transients in the shared arena.
+    pub(crate) fn source<R>(&self, cuda: &Cuda, build: impl FnOnce() -> Result<R>) -> Result<R> {
+        match &self.source_arena {
+            Some(arena) if self.scratch_level >= 2 =>
+                cuda.with_chunk_scratch(arena, self.scratch_kinds, || cuda.with_row_arena_append(arena, build)),
+            Some(arena) => cuda.with_row_arena_append(arena, build),
+            None => build(),
+        }
+    }
+    /// Build an owner of audited chunk scratch (Engram rows, WO-A scratch) with that
+    /// scratch in the shared arena (level 2).
+    pub(crate) fn scratch<R>(&self, cuda: &Cuda, build: impl FnOnce() -> Result<R>) -> Result<R> {
+        match &self.source_arena {
+            Some(arena) if self.scratch_level >= 2 => cuda.with_chunk_scratch(arena, self.scratch_kinds, build),
+            _ => build(),
+        }
+    }
     pub(crate) fn transient_arena_for_probe(&self,slot:usize)->Result<Rc<crate::cuda::RowArena>> {
+        // The lender is the bank's widest profile: 8,192 rows, or 16,384 when that profile is configured.
         ensure!(std::env::var("CANADA_SCRATCH_NARROW_ARENA_LOAN_SCREEN").as_deref()==Ok("1")
-            &&self.rows==8192&&self.sp_rank.is_some()&&slot<2,"finite prefill arena loan");
+            &&[8192,16384].contains(&self.rows)&&self.sp_rank.is_some()&&slot<2,"finite prefill arena loan");
         Ok(self.arenas[slot].clone())
     }
     pub(crate) fn new(
@@ -90,6 +141,20 @@ impl WideBuild {
         } else {
             [cuda.row_arena(arena_bytes)?, cuda.row_arena(arena_bytes)?]
         };
+        let scratch_level = shared_wide_scratch_level()?;
+        let scratch_kinds = shared_wide_scratch_kinds()?;
+        let source_arena = if scratch_level > 0 {
+            Some(match share {
+                Some(prior) => {
+                    let arena = prior.source_arena.clone().ok_or_else(|| anyhow::anyhow!("wide source arena donor absent"))?;
+                    ensure!(prior.rows >= rows, "wide source arena donor is narrower");
+                    // This profile's sources carve from the beginning again.
+                    arena.rewind();
+                    arena
+                }
+                None => cuda.row_arena(rows * SCRATCH_ARENA_BYTES_PER_ROW[scratch_level as usize])?,
+            })
+        } else { None };
         let peer_moe=std::env::var("CANADA_SCRATCH_PEER_WIDE_MOE_SHARE_SCREEN").as_deref()==Ok("1")
             &&share.is_some_and(|p|p.rows==rows);
         let moe=if peer_moe {
@@ -98,12 +163,16 @@ impl WideBuild {
             share.unwrap().moe.clone()
         }else{
             let root=kernels.join(format!("moe-runtime-m{rows}-v0"));
-            let mut moe=if std::env::var("CANADA_SCRATCH_WIDE_MOE_ARENA_SCREEN").as_deref()==Ok("1") {
+            let build=||if std::env::var("CANADA_SCRATCH_WIDE_MOE_ARENA_SCREEN").as_deref()==Ok("1") {
                 ensure!(crate::config::shared_owner_profiles_requested()&&sp_rank.is_some(),
                     "wide MoE arena loan requires sequential owner profiles");
-                Workspace::new_sequential(cuda,&root,share.map(|s|s.moe.as_ref()))?
-            }else{Workspace::new(cuda,&root)?};
-            if [8192,16384].contains(&rows) && sp_rank.is_some() && crate::moe::packed_gather_requested()? {
+                Workspace::new_sequential(cuda,&root,share.map(|s|s.moe.as_ref()))
+            }else{Workspace::new(cuda,&root)};
+            let mut moe=match &source_arena {
+                Some(arena) if scratch_level>=2 => cuda.with_chunk_scratch(arena,scratch_kinds,build)?,
+                _ => build()?,
+            };
+            if crate::config::packed_wide_width(rows) && sp_rank.is_some() && crate::moe::packed_gather_requested()? {
                 moe.enable_packed(&kernels.join(format!("moe-runtime-m{rows}-prequant-v1")))?;
             }
             Rc::new(moe)
@@ -128,6 +197,9 @@ impl WideBuild {
             shared_moe: peer_moe,
             moe,
             input_arena,gather_arena,
+            source_arena,
+            scratch_level,
+            scratch_kinds,
         })
     }
     pub(crate) fn input_arena(&self)->Option<&Rc<crate::cuda::RowArena>> {self.input_arena.as_ref()}
@@ -152,6 +224,9 @@ impl WideBuild {
             "sequential_moe_backing_bytes":self.moe.sequential_scratch_bytes(),
             "owned_arena_bytes":if self.shared_arenas {0}else{self.arenas[0].bytes()+self.arenas[1].bytes()},
             "arena_high_water":[self.arenas[0].high_water(),self.arenas[1].high_water()],
+            "shared_scratch_level":self.scratch_level,"shared_scratch_kinds":self.scratch_kinds,
+            "source_arena_bytes":self.source_arena.as_ref().map_or(0,|a|a.bytes()),
+            "source_arena_high_water":self.source_arena.as_ref().map_or(0,|a|a.high_water()),
             "shared_wide_IO":self.input_arena.is_some(),
             "wide_IO_backing_bytes":self.input_arena.as_ref().map_or(0,|a|a.bytes())
                 +self.gather_arena.as_ref().map_or(0,|a|a.bytes())})
@@ -209,9 +284,20 @@ pub struct SwaLayer {
     ffn_reduced: Buffer<bf16>,
     sink: Buffer<f32>,
     next_input_prefetch: Option<crate::l2_prefetch::Window>,
+    /// The next layer's hint queues (one per plan) and the selected plan: this layer begins their W1.
+    next_hint_queues: Vec<Rc<crate::layer_attention::HintQueue>>,
+    hint_queue_selected: Rc<Cell<Option<usize>>>,
     pair_deferred_ffn: bool,
     pair_attention: PairAttention,
+    /// config::source_keys_fork: the side stream and fences of this source layer's key emission, and the switch.
+    keys_fork: Option<Rc<KeysFork>>,
+    keys_fork_on: Cell<bool>,
+    /// config::index_fork: the side stream and fences of this consuming layer's index work, and where it starts
+    /// (true: where Q-B forks; false: after the key store, the order without the fork).
+    index_fork: Option<Rc<KeysFork>>,
+    index_fork_on: Cell<bool>,
 }
+struct KeysFork { side: Rc<Stream>, ready: crate::cuda::Event, done: crate::cuda::Event }
 /// Enqueue/capture-only state. A pooled projection must consume exactly the
 /// private normalization prepared from this predecessor, on the same stream.
 #[derive(Clone,Copy,PartialEq,Eq)]
@@ -403,10 +489,13 @@ impl SwaLayer {
         );
         // Sequence-parallel boundaries hold only this rank's quarter of the rows.
         let local_rows = if sp_rank.is_some() { rows / 4 } else { rows };
-        let attn_boundary =
+        let mut attn_boundary =
             Boundary::new(cuda, stream, weights.clone(), layer, "attn", local_rows, kernels)?;
         let ffn_boundary =
             Boundary::new(cuda, stream, weights.clone(), layer, "ffn", local_rows, kernels)?;
+        if sp_rank.is_some() && crate::mhc::prefill_post_stats_requested()? && !wide_stats_overlap_requested() {
+            attn_boundary.enable_post_stats(module, &ffn_boundary)?;
+        }
         let attention = Attention::new_rows(
             cuda,
             module,
@@ -446,7 +535,7 @@ impl SwaLayer {
         if rows==16 && crate::ffn::shared_quant16_enabled()? {
             ffn.enable_shared_quant16(kernels)?;
         }
-        if [8192,16384].contains(&rows) && sp_rank.is_some() && crate::moe::packed_gather_requested()? {
+        if crate::config::packed_wide_width(rows) && sp_rank.is_some() && crate::moe::packed_gather_requested()? {
             ffn.enable_row_transport(kernels,vendor_blas)?;
             // s699 component and s700 whole-model pairs preserve every codec
             // byte, logit and retained-state check. Carry the small M8192 gain.
@@ -520,6 +609,12 @@ impl SwaLayer {
             "local QKV requires the current quantized gather control");
         let mut attention = attention;
         let (mut attn_boundary, mut ffn_boundary) = (attn_boundary, ffn_boundary);
+        // config::mhc_quarter_stats: the attention boundary's statistics by rank quarter, riding the QKV gather.
+        if rows == 6 && sp_rank.is_none()
+            && (crate::config::mhc_quarter_stats() || crate::config::mhc_quarter_stats_screen())
+            && let Some(link) = attention.install_quarter_link(crate::config::mhc_quarter_stats())? {
+            attn_boundary.install_quarter(link, module)?;
+        }
         if sp_rank.is_some() && wide_stats_overlap_requested() {
             attn_boundary.set_wide_stats_overlap(true, stream)?;
             ffn_boundary.set_wide_stats_overlap(true, stream)?;
@@ -533,7 +628,7 @@ impl SwaLayer {
                     // input may use the same quantized row gather (and local QKV).
                     let eligible = ((3..=19).contains(&layer) && ![8, 14].contains(&layer))
                         || (layer < 2 && sp_early_enabled());
-                    let local_qkv_prepared = eligible && [8192,16384].contains(&rows) && (local_qkv || local_qkv_ab);
+                    let local_qkv_prepared = eligible && crate::config::packed_wide_width(rows) && (local_qkv || local_qkv_ab);
                     let local_root = kernels.join(format!("fp8-canonical-wqkv_a-r0-m{}-v0",rows/4));
                     let wob = if crate::layer_attention::wob_exchange_constructed()
                         && crate::config::wide_rows(rows) && rows % 512 == 0 {
@@ -592,14 +687,47 @@ impl SwaLayer {
             ffn_boundary,
             sink,
             next_input_prefetch: None,
+            next_hint_queues: Vec::new(),
+            hint_queue_selected: Rc::new(Cell::new(None)),
             pair_deferred_ffn: false,
             pair_attention: PairAttention::Ordinary,
+            keys_fork: None,
+            keys_fork_on: Cell::new(false),
+            index_fork: None,
+            index_fork_on: Cell::new(false),
             attn_reduced: cuda.allocate_rows(local_rows * 5120)?,
             ffn_reduced: cuda.allocate_rows(local_rows * 5120)?,
         })
     }
     pub(crate) fn input_matrix(&self) -> Rc<crate::blockscaled::Matrix> {
         self.attention.input_matrix()
+    }
+    /// This layer's L2 hint queues, one per plan (layer_attention::HintQueue).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_hint_queues(&mut self, module: &Module, stream: &Stream, plans: &[crate::config::QueuePlan],
+        ffn_plans: &[crate::config::FfnPlan], selected: Rc<Cell<Option<usize>>>, has_w1: bool,
+        lead: &[(u64, usize)], lead_owners: &[Rc<crate::blockscaled::Matrix>],
+        engram: Option<(Rc<crate::blockscaled::Matrix>, Rc<Cell<bool>>)>)
+        -> Result<Vec<Rc<crate::layer_attention::HintQueue>>> {
+        ensure!(plans.len() == ffn_plans.len(), "L2 hint queue plans");
+        self.hint_queue_selected = selected.clone();
+        if ffn_plans.iter().any(|p| p.w4.bytes > 0 || p.routed.is_some()) {
+            self.ffn.build_hint_queues(module, stream, ffn_plans, selected.clone())?;
+        }
+        self.attention.build_hint_queues(module, stream, plans, selected, has_w1, lead, lead_owners, engram)
+    }
+    /// Plan screen: config::l2_queue_index_lead on or off for this layer's second window.
+    pub(crate) fn set_index_lead_for_probe(&self, on: bool) { self.attention.set_index_lead_for_probe(on); }
+    pub(crate) fn install_next_hint_queues(&mut self, queues: Vec<Rc<crate::layer_attention::HintQueue>>) -> Result<()> {
+        ensure!(self.next_hint_queues.is_empty(), "next hint queues already installed");
+        self.next_hint_queues = queues; Ok(())
+    }
+    /// The next layer's W1 under the selected plan; Some(None) when the plan has no W1 for it.
+    fn next_queue_w1(&self) -> Option<Option<Rc<crate::layer_attention::HintQueue>>> {
+        let selected = self.hint_queue_selected.get()?;
+        if self.next_hint_queues.is_empty() { return None; }
+        Some(self.next_hint_queues.get(selected)
+            .filter(|q| q.w1.is_some() && q.w1_gate.as_ref().is_none_or(|gate| gate.get())).cloned())
     }
     pub(crate) fn input_hint(&self)->bool { self.next_input_prefetch.is_some() }
     pub(crate) fn large_input_hint(&self)->bool {
@@ -695,7 +823,11 @@ impl SwaLayer {
             Some(x) if exchanged => x.full.output(),
             _ => &self.attn_reduced,
         };
-        self.attn_boundary.finish(reduced, residual, stream)?;
+        if self.attn_boundary.post_stats_enabled() {
+            self.attn_boundary.finish_with_next_stats(reduced, residual, &self.ffn_boundary, stream)?;
+        } else {
+            self.attn_boundary.finish(reduced, residual, stream)?;
+        }
         self.ffn_boundary.prepare(
             self.attn_boundary.output(),
             Some(self.attn_boundary.pre()),
@@ -808,6 +940,7 @@ impl SwaLayer {
             x.full.run(&x.local, stream)?;
             return Ok(true);
         }
+        crate::mhc::stats_point(crate::mhc::StatsPoint::BeforeAttentionSum, stream)?;
         unsafe { Self::reduce(sp.is_some(), comm, attention.output(), attn_reduced, stream) }?;
         Ok(false)
     }
@@ -819,6 +952,7 @@ impl SwaLayer {
         reduced: &mut Buffer<bf16>,
         stream: &Stream,
     ) -> Result<()> {
+        if crate::knockout::has(crate::knockout::Site::Sums) { return Ok(()); }
         if sp {
             unsafe { comm.scatter_sum_bf16(partial, reduced, stream) }
         } else {
@@ -878,6 +1012,35 @@ impl SwaLayer {
                 self.attn_boundary.quantized_input(),positions,locations,cache,Some(comm),stream)
         }
     }
+    /// Before any capture: give a source layer (2, 8, 14, 20) of a decode owner its key-emission side stream
+    /// (config::source_keys_fork). The FFN hint stream is idle during the attention sublayer.
+    pub(crate) fn enable_source_keys_fork(&mut self, cuda: &Cuda, stream: &Stream, on: bool) -> Result<()> {
+        if ![2, 8, 14, 20].contains(&self.layer) || self.sp.is_some() || self.engram.is_some() { return Ok(()); }
+        ensure!(self.keys_fork.is_none() && cuda.owns_stream(stream), "source key fork installed once on the owner's stream");
+        self.keys_fork = Some(Rc::new(KeysFork { side: cuda.hint_stream(stream)?, ready: cuda.fence_event()?, done: cuda.fence_event()? }));
+        self.keys_fork_on.set(on);
+        Ok(())
+    }
+    /// Plan screen: the key-emission fork on or off (graphs are recaptured by the caller). Whether it applies here.
+    pub(crate) fn set_source_keys_fork_for_probe(&self, on: bool) -> bool {
+        if self.keys_fork.is_some() { self.keys_fork_on.set(on); true } else { false }
+    }
+    /// Before any capture: give a consuming layer (24, 28, 32, 36) of a decode owner the side stream of its index
+    /// work (config::index_fork; the FFN hint stream is idle during the attention sublayer). Whether it applies.
+    pub(crate) fn enable_index_fork(&mut self, cuda: &Cuda, stream: &Stream, on: bool) -> Result<bool> {
+        if ![24, 28, 32, 36].contains(&self.layer) || self.sp.is_some() || self.engram.is_some()
+            || !self.attention.query_overlap_enabled() { return Ok(false); }
+        if self.index_fork.is_some() { return Ok(true); }
+        ensure!(cuda.owns_stream(stream), "index fork installed on the owner's stream");
+        self.index_fork = Some(Rc::new(KeysFork { side: cuda.hint_stream(stream)?, ready: cuda.fence_event()?, done: cuda.fence_event()? }));
+        self.index_fork_on.set(on);
+        Ok(true)
+    }
+    /// Plan screen: the index work's start at the query fork (on) or after the key store (off); graphs are
+    /// recaptured by the caller. Whether it applies here.
+    pub(crate) fn set_index_fork_for_probe(&self, on: bool) -> bool {
+        if self.index_fork.is_some() { self.index_fork_on.set(on); true } else { false }
+    }
     pub fn run_indexed_from_previous(
         &mut self,
         residual: &Buffer<bf16>,
@@ -899,8 +1062,31 @@ impl SwaLayer {
             "ratio2 source-layer graph contract"
         );
         let Some(precomputed)=self.prepare_attention_input(residual,previous_pre,stream)? else{return Ok(());};
+        // config::source_keys_fork: the boundary's normalized input is final here. The source's projection of it
+        // (a vendor product over cold weights) is a pure function into its own output buffer, so it can run beside
+        // QKV-A and the gather; the compressor, its cache and the index keys keep their one ordered stream.
+        let fork = self.keys_fork.clone().filter(|_| self.keys_fork_on.get() && !precomputed && self.sp.is_none());
+        if let Some(fork) = &fork {
+            fork.ready.record(stream)?;
+            fork.ready.wait(&fork.side)?;
+            source.project_only(self.attn_boundary.input(), &fork.side)?;
+            fork.done.record(&fork.side)?;
+        }
         self.project_attention_input(precomputed,positions,locations,cache,comm,stream)?;
-        if self.attention.query_overlap_enabled() {
+        self.attention.begin_output_hint_early(stream)?;
+        if let Some(fork) = &fork {
+            // Join, then issue the rest of the same call in the same order: key emission, index query, mapping.
+            fork.done.wait(stream)?;
+            source.emit_keys_after_projection(source_metadata, stream)?;
+            if self.attention.query_overlap_enabled() {
+                source.select_distributed(self.attn_boundary.input(), self.attention.normalized_lora(),
+                    source_metadata, tokens.live(), comm, stream)?;
+            } else {
+                let (q, s) = self.attention.quantized_lora();
+                source.select_quantized_distributed(self.attn_boundary.input(), q, s, source_metadata,
+                    tokens.live(), comm, stream)?;
+            }
+        } else if self.attention.query_overlap_enabled() {
             // Q-B's quantized workspace is still in flight on its side stream.
             // The index's own canonical quantizer consumes the ready BF16
             // normalized values, keeping its scheduling independent.
@@ -1015,6 +1201,7 @@ impl SwaLayer {
                 cache, comm, sp.quantized.as_mut().ok_or_else(|| anyhow::anyhow!("quantized shard absent"))?, sp.use_local_qkv, stream)?;
         } else {
             self.project_attention_input(precomputed,positions,locations,cache,comm,stream)?;
+        self.attention.begin_output_hint_early(stream)?;
         }
         self.finish_compressed(
             residual, positions, cache, candidates, tokens, source, comm, stream,
@@ -1041,6 +1228,7 @@ impl SwaLayer {
         );
         let Some(precomputed)=self.prepare_attention_input(residual,previous_pre,stream)? else{return Ok(());};
         self.project_attention_input(precomputed,positions,locations,cache,comm,stream)?;
+        self.attention.begin_output_hint_early(stream)?;
         self.finish_auxiliary(
             residual,
             positions,
@@ -1100,7 +1288,25 @@ impl SwaLayer {
         );
         let Some(precomputed)=self.prepare_attention_input(residual,previous_pre,stream)? else{return Ok(());};
         self.project_attention_input(precomputed,positions,locations,cache,comm,stream)?;
-        if self.attention.query_overlap_enabled() {
+        self.attention.begin_output_hint_early(stream)?;
+        if let Some(fork) = self.index_fork.clone() {
+            // config::index_fork. The index reads the layer's normalized input and query latent (both final where
+            // Q-B forked), source 20's keys and published blocks, and writes its own buffers. It runs on the side
+            // stream from that fence, beside Q-B and the key store, and is joined before the attention. A plan
+            // screen's control arms start it behind the key store instead: the order without the fork.
+            ensure!(!precomputed && self.sp.is_none() && self.attention.query_overlap_enabled(),
+                "index fork on a layer without an ordinary query fork");
+            index.candidates().admit_reader(stream)?;
+            if self.index_fork_on.get() {
+                self.attention.wait_query_ready(&fork.side)?;
+            } else {
+                fork.ready.record(stream)?;
+                fork.ready.wait(&fork.side)?;
+            }
+            index.run(self.attn_boundary.input(), self.attention.normalized_lora(), owner, metadata, replay_mask, &fork.side)?;
+            fork.done.record(&fork.side)?;
+            fork.done.wait(stream)?;
+        } else if self.attention.query_overlap_enabled() {
             index.run(
                 match &self.sp { Some(sp) => &sp.gathered, None => self.attn_boundary.input() },
                 self.attention.normalized_lora(), owner, metadata, replay_mask, stream,
@@ -1153,6 +1359,7 @@ impl SwaLayer {
         );
         let Some(precomputed)=self.prepare_attention_input(residual,previous_pre,stream)? else{return Ok(());};
         self.project_attention_input(precomputed,positions,locations,cache,comm,stream)?;
+        self.attention.begin_output_hint_early(stream)?;
         self.finish_auxiliary(
             residual,
             positions,
@@ -1191,7 +1398,11 @@ impl SwaLayer {
             Some(x) if exchanged => x.full.output(),
             _ => &self.attn_reduced,
         };
-        self.attn_boundary.finish(reduced, residual, stream)?;
+        if self.attn_boundary.post_stats_enabled() {
+            self.attn_boundary.finish_with_next_stats(reduced, residual, &self.ffn_boundary, stream)?;
+        } else {
+            self.attn_boundary.finish(reduced, residual, stream)?;
+        }
         self.ffn_boundary.prepare(
             self.attn_boundary.output(),
             Some(self.attn_boundary.pre()),
@@ -1227,8 +1438,15 @@ impl SwaLayer {
         Ok(())
     }
     fn finish_ffn(&mut self,comm:&Roce,stream:&Stream)->Result<()> {
+        crate::mhc::stats_point(crate::mhc::StatsPoint::AfterExperts, stream)?;
         self.ffn.prefetch_join(stream)?;
-        if let Some(hint) = &self.next_input_prefetch {
+        // A selected hint queue replaces the next layer's QKV-A hint; that layer joins it after its wo_b.
+        let queue = self.next_queue_w1();
+        // A tail registration the FFN did not take (no concurrent shared branch) is dropped; the window begins here.
+        drop(crate::layer_attention::tail_w1_take(stream, crate::layer_attention::TailKind::Any));
+        if let Some(q) = queue.as_ref() {
+            if let Some(w) = q.as_ref().and_then(|q| q.w1.as_ref()) && !w.is_open() { w.begin(stream)?; }
+        } else if let Some(hint) = &self.next_input_prefetch {
             hint.begin(stream)?;
         }
         if self.ffn.local_shared_active() {
@@ -1245,8 +1463,13 @@ impl SwaLayer {
         }
         self.ffn_boundary
             .finish(&self.ffn_reduced, self.attn_boundary.output(), stream)?;
-        if let Some(hint) = &self.next_input_prefetch {
+        if queue.is_none() && let Some(hint) = &self.next_input_prefetch {
             hint.join(stream)?;
+        }
+        // An Engram lead (a gated first window) ends with this layer: the Engram layer starts in another graph,
+        // and a capture must not end with unjoined work (s1482's screen stopped there).
+        if let Some(Some(q)) = queue.as_ref() && q.w1_gate.is_some() && let Some(w) = q.w1.as_ref() && w.is_open() {
+            w.join(stream)?;
         }
         Ok(())
     }
@@ -1275,6 +1498,11 @@ impl SwaLayer {
         self.attn_boundary.set_wide_epilogues_for_probe(enabled,kernels)?;
         self.ffn_boundary.set_wide_epilogues_for_probe(enabled,kernels)
     }
+    /// Plan screen: where the two boundaries release their statistics forks (mhc::StatsPoint; 0 = today).
+    pub(crate) fn set_mhc_stats_late_for_probe(&self, attention: u8, ffn: u8) -> Result<()> {
+        self.attn_boundary.set_stats_late_point_for_probe(attention)?;
+        self.ffn_boundary.set_stats_late_point_for_probe(ffn)
+    }
     pub(crate) fn set_mhc_pdl_pair_for_probe(&mut self, mode: u8) -> Result<()> {
         ensure!(mode <= 3, "MHC PDL screen mode");
         for boundary in [&mut self.attn_boundary, &mut self.ffn_boundary] {
@@ -1292,6 +1520,11 @@ impl SwaLayer {
     pub(crate) fn set_append_split_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
         self.attention.set_append_split_for_probe(enabled,stream)
     }
+    pub(crate) fn install_narrow_qkv(&mut self, kernels: &std::path::Path, active: bool) -> Result<bool> {
+        if self.sp.is_some() || !matches!(self.pair_attention, PairAttention::Ordinary) { return Ok(false); }
+        self.attention.install_narrow_qkv(kernels, active)
+    }
+    pub(crate) fn set_narrow_qkv_for_probe(&mut self, on: bool) -> Result<bool> { self.attention.set_narrow_qkv_for_probe(on) }
     pub(crate) fn swap_qkv_for_probe(&mut self,other:&mut crate::fp8_linear::Linear)->Result<()> {
         self.attention.swap_qkv_for_probe(other)
     }
@@ -1343,6 +1576,10 @@ impl SwaLayer {
             self.ffn.run_row_transport(&self.moe_workspace,self.ffn_boundary.input(),tokens,sp.rank,comm,stream)
         } else {
             Self::gather_input(&mut self.sp,&self.ffn_boundary,comm,stream)?;
+            // Plan prefix `t`: the next layer's first hint window starts in this layer's experts' tail.
+            if !self.pair_deferred_ffn && let Some(Some(q)) = self.next_queue_w1() && (q.w1_tail || q.w1_routed_end) {
+                crate::layer_attention::tail_w1_register(stream, q);
+            }
             self.ffn.run_quantized_input(&self.moe_workspace,
                 match &self.sp {Some(sp)=>&sp.gathered,None=>self.ffn_boundary.input()},
                 self.ffn_boundary.quantized_input(),tokens,stream)

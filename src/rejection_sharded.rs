@@ -88,6 +88,8 @@ impl Rejection {
                 let key=(logits.ptr(),q.ptr(),selected,live,comm.instance(),stream.raw()as usize,readout,local_target,self.bundled_ids);
                 if self.sharded_graphs[live-1].as_ref().is_none_or(|g|g.key!=key) {
                     self.sharded_graphs[live-1]=None;
+                    // A capture starts on an idle stream, as before verify_sample_ahead queued this behind the forward.
+                    stream.synchronize()?;
                     let graph=stream.capture(||{
                         self.enqueue_sharded(logits,q,&mut h,live,local_target,comm,stream)?;
                         if captured_readout{self.enqueue_sharded_readout(live,local_target,stream)?;}

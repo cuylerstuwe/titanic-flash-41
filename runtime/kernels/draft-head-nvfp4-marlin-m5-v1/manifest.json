@@ -1,0 +1,83 @@
+{
+  "shape": [
+    5,
+    32320,
+    5120
+  ],
+  "cuda_arch": 121,
+  "sm_count": 48,
+  "projection_threads": 128,
+  "repack_threads": 256,
+  "shared_bytes": 101376,
+  "artifact": "head.cubin",
+  "artifact_sha256": "1cd18640c47f5191e70ea9369b5401e5932667c1a933f467e434e522299436b2",
+  "functions": [
+    {
+      "name": "amax",
+      "symbol": "nvfp4_head_amax",
+      "parameters": [
+        "u64",
+        "u64"
+      ]
+    },
+    {
+      "name": "quantize",
+      "symbol": "nvfp4_head_quantize",
+      "parameters": [
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64"
+      ]
+    },
+    {
+      "name": "publish",
+      "symbol": "nvfp4_head_publish",
+      "parameters": [
+        "u64",
+        "u64"
+      ]
+    },
+    {
+      "name": "projection",
+      "symbol": "_ZN6marlin6MarlinILl1125899906909960ELl562949953487106ELl1125899906909960ELl2814749767172868ELi128ELi1ELi4ELi8ELb1ELi4ELi1ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+      "parameters": [
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u32",
+        "u32",
+        "u32",
+        "u32",
+        "u64",
+        "u8",
+        "u8",
+        "u8",
+        "u32"
+      ]
+    },
+    {
+      "name": "repack",
+      "symbol": "_ZN6marlin25gptq_marlin_repack_kernelILi256ELi4ELb0EEEvPKjPjii",
+      "parameters": [
+        "u64",
+        "u64",
+        "u32",
+        "u32"
+      ]
+    }
+  ],
+  "source_revision": "784d1fff0c491b9add10ecd732de8f707a7e7dbe",
+  "upstream_license": "Apache-2.0",
+  "source_manifest_sha256": "87c6487883e3bd850f5bb486226b585a483c2e12a4247321fc1645a1416a3336",
+  "quantizer_sha256": "5c0d803f655e1853c9538d1f6deb6db9a5296f02c5286fa6fc6052a9461c526a",
+  "contract": "Private proposal head only: GPU E2M1 RNE, E4M3/16 positive scales, global FP32. BF16 inputs/output, FP32 Marlin reduction, no atomic. Exact FP32 conversion of BF16 output for actual q. Target unchanged."
+}

@@ -21,6 +21,10 @@ pub struct Metadata {
     ranges: Ranges,
     windows: Windows,
     slots: KeySlots,
+    /// Region steps with CANADA_SCRATCH_REGION_GATHER_CACHE=1: each row's first key row to gather.
+    gather_starts: Buffer<i32>,
+    /// Host copies of each row's key range (the gather check's ranges).
+    host_ranges: Vec<(usize, usize)>,
 }
 impl Metadata {
     pub fn update(&mut self, positions: &[i32], starts: &[i32], lengths: &[i32]) -> Result<()> {
@@ -32,7 +36,18 @@ impl Metadata {
         self.ranges.update(starts, lengths)?;
         self.windows.update(&vec![0; self.rows], lengths, starts)?;
         self.zero_based = starts.iter().all(|&s| s == 0);
+        self.host_ranges = starts.iter().zip(lengths).map(|(&s, &l)| (s.max(0) as usize, (s + l).max(0) as usize)).collect();
         Ok(())
+    }
+    /// Every row's key range holds at most `keys` keys (host copy of the latest update).
+    pub(crate) fn rows_within(&self, keys: usize) -> bool {
+        self.host_ranges.len() == self.rows && self.host_ranges.iter().all(|&(s, e)| e.saturating_sub(s) <= keys)
+    }
+    /// Region steps: each row's first key row to gather (its range start for a full gather).
+    pub(crate) fn set_gather_starts(&mut self, starts: &[i32]) -> Result<()> {
+        ensure!(starts.len() == self.rows && starts.iter().zip(&self.host_ranges)
+            .all(|(&g, &(s, e))| g >= 0 && (g as usize) >= s && (g as usize) <= e.max(s)), "region gather starts");
+        self.gather_starts.upload(starts)
     }
     pub(crate) fn windows(&self) -> &Windows {
         &self.windows
@@ -66,6 +81,8 @@ impl Metadata {
             ranges: Ranges::new(cuda, slots.len(), columns, starts, lengths)?,
             windows: Windows::new(cuda, columns, &vec![0; positions.len()], lengths, starts)?,
             slots: KeySlots::new(cuda, cache_capacity, slots)?,
+            gather_starts: { let mut b = cuda.allocate::<i32>(positions.len())?; b.upload(starts)?; b },
+            host_ranges: starts.iter().zip(lengths).map(|(&s, &l)| (s.max(0) as usize, (s + l).max(0) as usize)).collect(),
         })
     }
 }
@@ -114,6 +131,11 @@ pub struct Branch {
     key_sharded_min_position: u64,
     compact_verifier: Option<crate::grouped_sparse_index::Grouped>,
     compact_verifier_active: Cell<bool>,
+    /// Serving regions: this step's rows have non-zero key starts (see set_region_mode).
+    region_mode: Cell<bool>,
+    /// config::index_short_rows: set by the owning target around the enqueue of a step whose rows all have at most
+    /// 512 keys (Target::begin_verification); see `short_step`.
+    short_rows: Rc<Cell<bool>>,
     selection: Selection,
     // Beyond 16384 positions: source20 publishes kept blocks, 24..36 consume them.
     publisher: Option<crate::candidates::Publisher>,
@@ -125,6 +147,12 @@ pub struct Branch {
     key_splits: u32,
 }
 impl Branch {
+    /// Plan screen: this branch's candidate consumer (if any) with the bounded mask kernel on or off.
+    pub(crate) fn set_bounded_mask_for_probe(&self, on: bool) -> Result<bool> {
+        match &self.consumer { Some(c) => { c.set_bounded_for_probe(on)?; Ok(true) } None => Ok(false) }
+    }
+    /// The index query projection's immutable weights (hint regions for config::l2_queue_index_lead).
+    pub(crate) fn query_matrix(&self) -> Rc<crate::blockscaled::Matrix> { self.q.immutable_matrix() }
     pub(crate) fn set_query_flash_for_probe(&self,enabled:bool)->Result<()> {
         self.q.set_index_query_flash_for_probe(enabled)
     }
@@ -174,6 +202,16 @@ impl Branch {
         self.gather.set_packed32_for_probe(enabled)?;
         if self.has_compact32() {self.compact_verifier_active.set(enabled);}
         Ok(())
+    }
+    /// Serving regions (target.rs SessionBase): a batched step's rows start at their region's
+    /// keys, which only the dense scorer handles. In region mode a step runs the dense
+    /// alternative instead of the adaptive sparse, compact (grouped) or key-sharded scorer,
+    /// without changing their states; the next ordinary step uses them again. The target
+    /// captures region-mode steps in their own graph slots.
+    pub(crate) fn set_region_mode(&self,enabled:bool)->Result<()> {
+        ensure!(!enabled||!matches!(self.scorer,Scorer::Grouped(_)|Scorer::Sparse6(_)),
+            "region mode needs a dense index scorer");
+        self.region_mode.set(enabled);Ok(())
     }
     pub(crate) fn set_grouped16_for_probe(&self,enabled:bool) {
         if self.compact_verifier.is_some() {
@@ -476,7 +514,7 @@ impl Branch {
             Scorer::Sparse6(s) => s.stride(),
             Scorer::Adaptive6{dense,..} => dense.stride(),
         };
-        let selection = Selection::new(
+        let selection = Selection::new_chunk_scratch(
             cuda,
             topk_native.clone(),
             rows,
@@ -524,7 +562,8 @@ impl Branch {
             keys,
             scorer,
             key_sharded,key_sharded_active,key_sharded_auto,key_sharded_min_position,
-            compact_verifier,compact_verifier_active,
+            compact_verifier,compact_verifier_active,region_mode:Cell::new(false),
+            short_rows:Rc::new(Cell::new(false)),
             selection,
             publisher,
             consumer,
@@ -536,6 +575,16 @@ impl Branch {
         };
         if compact_sparse_index_enabled(columns,adaptive6)? {branch.enable_compact_sparse6()?;}
         Ok(branch)
+    }
+    /// The owning target's switch for config::index_short_rows (it sets it around a short step's enqueue).
+    pub(crate) fn short_rows_flag(&self) -> Rc<Cell<bool>> { self.short_rows.clone() }
+    /// config::index_short_rows: this enqueue is a step whose rows all have at most 512 keys, on the dense
+    /// six-row profile. The selector then writes every key of a row in order without reading a score
+    /// (topk-v2's rule for a row no longer than k), so nothing that only feeds the scores is enqueued.
+    fn short_step(&self, meta: &Metadata) -> bool {
+        self.short_rows.get() && meta.rows_within(512) && meta.zero_based && !self.region_mode.get()
+            && !self.key_sharded_active.get() && !self.compact_verifier_active.get() && !self.shard_index_rows
+            && matches!(self.scorer, Scorer::Dense(_) | Scorer::Adaptive6{active:false,..})
     }
     pub fn run(
         &mut self,
@@ -549,13 +598,13 @@ impl Branch {
     }
     pub(crate) fn run_with_mask(&mut self, hidden: &Buffer<bf16>, q_lora: &Buffer<bf16>,
         cache: &KeyCache, meta: &Metadata, mask: Option<&Buffer<u8>>, stream: &Stream) -> Result<()> {
-        self.q.run(q_lora, stream)?;
+        if !self.short_step(meta) { self.q.run(q_lora, stream)?; }
         self.finish(hidden, cache, meta, mask, None, None, stream)
     }
     pub(crate) fn run_distributed(&mut self, hidden: &Buffer<bf16>, q_lora: &Buffer<bf16>,
         cache: &KeyCache, meta: &Metadata, live: &Buffer<i32>,
         comm: &crate::roce::Roce, stream: &Stream) -> Result<()> {
-        self.q.run(q_lora, stream)?;
+        if !self.short_step(meta) { self.q.run(q_lora, stream)?; }
         self.finish(hidden, cache, meta, None, Some(comm), Some(live), stream)
     }
     /// Main attention already materializes the same normalized MXFP8 input.
@@ -570,14 +619,41 @@ impl Branch {
         mask: Option<&Buffer<u8>>,
         stream: &Stream,
     ) -> Result<()> {
-        self.q.run_quantized(q, scales, stream)?;
+        if !self.short_step(meta) { self.q.run_quantized(q, scales, stream)?; }
         self.finish(hidden, cache, meta, mask, None, None, stream)
     }
     pub(crate) fn run_quantized_distributed(&mut self, hidden: &Buffer<bf16>, q: &Buffer<u8>,
         scales: &Buffer<u8>, cache: &KeyCache, meta: &Metadata, live: &Buffer<i32>,
         comm: &crate::roce::Roce, stream: &Stream) -> Result<()> {
-        self.q.run_quantized(q, scales, stream)?;
+        if !self.short_step(meta) { self.q.run_quantized(q, scales, stream)?; }
         self.finish(hidden, cache, meta, None, Some(comm), Some(live), stream)
+    }
+    /// Rerun the retained candidate publication of the latest row-sharded run for another
+    /// frontier of the same chunk: the 128 rows before row `end` (`live` holds `end`).
+    /// Only the score chunks that hold those rows are recomputed, from the same queries
+    /// and gathered keys; the per-row selection of the run is not touched.
+    pub(crate) fn republish_retained_window(&mut self, meta: &Metadata, comm: &crate::roce::Roce,
+        live: &Buffer<i32>, end: usize, stream: &Stream) -> Result<()> {
+        ensure!(self.shard_index_rows && self.consumer.is_none() && self.publisher.is_some()
+            && comm.rank() < 4 && end >= 128 && end <= meta.rows && live.len() == 1
+            && !self.key_sharded_active.get() && !self.compact_verifier_active.get(),
+            "retained window republication admission");
+        let quarter = meta.rows / 4;
+        let owned = comm.rank() * quarter..(comm.rank() + 1) * quarter;
+        let window = end - 128..end;
+        self.publisher.as_mut().unwrap().prepare_retained_windows(&meta.windows, Some(live), Some(comm.rank()), stream)?;
+        let Scorer::Chunked(chunked) = &mut self.scorer else {
+            anyhow::bail!("retained window republication needs the chunked scorer");
+        };
+        let stride = chunked.stride();
+        for index in 0..chunked.len() {
+            let rows = chunked.rows(index)?;
+            if rows.start < owned.start || rows.end > owned.end
+                || rows.end <= window.start || rows.start >= window.end { continue; }
+            chunked.run_chunk(index, &meta.ranges, stream)?;
+            self.publisher.as_ref().unwrap().score_rows(chunked.output_mut(), stride, &meta.windows, rows, stream)?;
+        }
+        self.publisher.as_mut().unwrap().publish_sharded(&meta.windows, owned, comm, Some(live), stream)
     }
     /// Candidate blocks this source published in its latest run, if any.
     pub(crate) fn candidate_mask(&self) -> Option<&Buffer<u8>> {
@@ -606,6 +682,27 @@ impl Branch {
         };
         if let Some(s)=&mut self.compact_verifier {released+=s.share_score_scratch(storage)?;}
         Ok(released)
+    }
+    /// config::sparse_union_share: this consumer's sparse scorer reuses `owner`'s candidate union and gathered
+    /// keys (same source-20 publication, lengths and key cache in every pass). Before any execution.
+    pub(crate) fn share_sparse_union_from(&mut self, owner: &Self, follow: bool) -> Result<()> {
+        match (&mut self.scorer, &owner.scorer) {
+            (Scorer::Adaptive6{sparse: mine, ..}, Scorer::Adaptive6{sparse: theirs, ..})
+            | (Scorer::Sparse6(mine), Scorer::Sparse6(theirs)) => mine.share_union_from(theirs, follow),
+            _ => anyhow::bail!("shared candidate union needs two six-row sparse consumers"),
+        }
+    }
+    pub(crate) fn follows_sparse_union(&self) -> bool {
+        matches!(&self.scorer, Scorer::Sparse6(s) | Scorer::Adaptive6{sparse: s, ..} if s.follows_union())
+    }
+    pub(crate) fn sparse_union_linked(&self) -> bool {
+        matches!(&self.scorer, Scorer::Sparse6(s) | Scorer::Adaptive6{sparse: s, ..} if s.union_linked())
+    }
+    pub(crate) fn set_sparse_union_follow_for_probe(&self, on: bool) -> Result<()> {
+        match &self.scorer {
+            Scorer::Sparse6(s) | Scorer::Adaptive6{sparse: s, ..} => s.set_union_follow_for_probe(on),
+            _ => anyhow::bail!("candidate union follower switch on a non-sparse consumer"),
+        }
     }
     pub(crate) fn share_candidate_scratch_from(&mut self, prior: &Self) -> Result<()> {
         match (&mut self.publisher, &prior.publisher) {
@@ -647,14 +744,34 @@ impl Branch {
         if let Some(p) = &mut self.publisher {
             p.prepare_retained_windows(&meta.windows, live, comm.map(|c|c.rank()), stream)?;
         }
+        let short = self.short_step(meta);
+        if !short {
         self.heads.run(hidden, stream)?;
         self.query
             .run(self.q.output(), self.heads.output(), &meta.query, stream)?;
-        let compact_verifier_active=self.compact_verifier_active.get();
-        let key_sharded_active=self.key_sharded_active.get();
-        if !key_sharded_active && !compact_verifier_active && !self.sparse6_active() && !matches!(self.scorer, Scorer::Grouped(_)) {
-            self.gather.run_with_bound(cache, &meta.slots, &self.keys,
-                self.bounded_gather.then_some(meta.ranges.key_ends()), stream)?;
+        }
+        let region=self.region_mode.get();
+        let compact_verifier_active=self.compact_verifier_active.get()&&!region;
+        let key_sharded_active=self.key_sharded_active.get()&&!region;
+        let sparse6_active=self.sparse6_active()&&!region;
+        if !key_sharded_active && !compact_verifier_active && !sparse6_active && !matches!(self.scorer, Scorer::Grouped(_)) {
+            if region && !meta.zero_based {
+                // Rows start at their regions' keys: copy only those ranges, not everything below them;
+                // with the region gather cache, only from where this owner last gathered each region.
+                let cached = crate::config::region_gather_cache();
+                let starts = if cached { &meta.gather_starts } else { meta.ranges.key_starts() };
+                self.gather.run_ranges(cache, &meta.slots, &self.keys, starts, meta.ranges.key_ends(), stream)?;
+                if cached && crate::config::region_gather_check() {
+                    let mut by_start: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+                    for &(s, e) in &meta.host_ranges { if e > s { let x = by_start.entry(s).or_insert(e); *x = (*x).max(e); } }
+                    let ranges: Vec<(usize, usize)> = by_start.into_iter().collect();
+                    self.gather.check_ranges(cache, &meta.slots, &self.keys, meta.ranges.key_starts(),
+                        meta.ranges.key_ends(), &ranges, stream)?;
+                }
+            } else {
+                self.gather.run_with_bound(cache, &meta.slots, &self.keys,
+                    self.bounded_gather.then_some(meta.ranges.key_ends()), stream)?;
+            }
         }
         // Block maxima read the raw scores and consumers mask them, both
         // before top-k consumes the row slice.
@@ -677,7 +794,19 @@ impl Branch {
             self.compact_verifier.as_mut().expect("prepared compact verifier scorer").run(cache,&meta.slots,&meta.windows,
                 mask.ok_or_else(||anyhow::anyhow!("compact verifier source mask missing"))?,&self.selection,stream)?;
         }else{match &mut self.scorer {
+            Scorer::Dense(dense) | Scorer::Adaptive6{dense,active:false,..} if short => {
+                // Every row is no longer than k: the selector emits each row's keys in order and reads no score.
+                self.selection
+                    .run(dense.output_mut(), &meta.windows, stream)?;
+            }
             Scorer::Dense(dense) | Scorer::Adaptive6{dense,active:false,..} => {
+                dense.run(&meta.ranges, stream)?;
+                let stride = dense.stride();
+                level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
+                self.selection
+                    .run(dense.output_mut(), &meta.windows, stream)?;
+            }
+            Scorer::Adaptive6{dense,..} if region => {
                 dense.run(&meta.ranges, stream)?;
                 let stride = dense.stride();
                 level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
@@ -713,7 +842,7 @@ impl Branch {
         if let Some(rows) = &owned_rows {
             self.selection.gather_row_shard(rows.clone(), comm.expect("checked row-shard communicator"), stream)?;
         }
-        let already_sorted=self.sparse6_active() && self.fused_compact_publication();
+        let already_sorted=sparse6_active && self.fused_compact_publication();
         if let Some(module) = self.sort_selected.as_ref().filter(|_|!already_sorted) {
             let mut indices = self.selection.indices().ptr();
             // Only the lengths passed to the native selector establish its
@@ -727,7 +856,7 @@ impl Branch {
                 self.compact_verifier.as_ref().unwrap().selection_lengths()
             }else{match &self.scorer {
                 Scorer::Grouped(grouped)=>grouped.selection_lengths(),
-                Scorer::Sparse6(s)|Scorer::Adaptive6{sparse:s,active:true,..}=>
+                Scorer::Sparse6(s)|Scorer::Adaptive6{sparse:s,active:true,..} if !region=>
                     s.compact_selection_lengths().unwrap_or(meta.windows.lengths()),
                 _=>meta.windows.lengths(),
             }}.ptr();
@@ -739,7 +868,7 @@ impl Branch {
             unsafe {module.function(name)?.launch(
                 [meta.windows.rows() as u32,1,1],[512,1,1],0,stream,&mut args)?;}
         }
-        if let Scorer::Sparse6(sparse) | Scorer::Adaptive6{sparse,active:true,..} = &self.scorer {
+        if let Scorer::Sparse6(sparse) | Scorer::Adaptive6{sparse,active:true,..} = &self.scorer && sparse6_active {
             // Sorting normalizes negative padding to -1; poison afterwards so
             // the downstream mapper sees the deliberately invalid -2 marker.
             sparse.poison_selection_on_error(self.selection.indices(), stream)?;
@@ -750,6 +879,8 @@ impl Branch {
         if compact_verifier_active {
             self.compact_verifier.as_ref().unwrap().poison_selection_on_error(self.selection.indices(),stream)?;
         }
+        // A short step's consumers select every key as well: nothing reads this step's publication.
+        if short { return Ok(()); }
         if let Some(p) = &mut self.publisher {
             if key_sharded_active {
                 p.publish_selected(self.key_sharded.as_ref().and_then(|s|s.block_ids())

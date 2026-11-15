@@ -155,6 +155,8 @@ pub struct Candidates {
     capacity: usize,
     ready: Cell<bool>,
     stream: Cell<usize>,
+    /// config::index_fork: one more stream that may use this storage (see admit_reader).
+    reader: Cell<usize>,
 }
 impl Candidates {
     /// Host block-manager metadata only. Keep GPU output candidates on their
@@ -219,6 +221,7 @@ impl Candidates {
             capacity,
             ready: Cell::new(true),
             stream: Cell::new(0),
+            reader: Cell::new(0),
         })
     }
     pub(crate) fn device_output(
@@ -237,25 +240,36 @@ impl Candidates {
                 && lengths.iter().all(|&l| l >= 0 && (l as usize) <= width),
             "GPU candidate admission"
         );
+        // The lengths are uploaded once and persist; the ids are produced every chunk.
         let mut b = cuda.allocate(rows)?;
         b.upload(lengths)?;
         Ok(Self {
-            ids: cuda.allocate(rows * width)?,
+            ids: cuda.allocate_chunk_scratch(crate::cuda::ChunkScratch::CandidateIds, rows * width)?,
             lengths: b,
             rows,
             width,
             capacity,
             ready: Cell::new(false),
             stream: Cell::new(0),
+            reader: Cell::new(0),
         })
     }
     pub(crate) fn bind_stream(&self, stream: &Stream) -> Result<()> {
         let p = stream.raw() as usize;
+        if self.reader.get() != 0 && self.reader.get() == p { return Ok(()); }
         ensure!(
             self.stream.get() == 0 || self.stream.get() == p,
             "candidate storage requires one ordered stream"
         );
         self.stream.set(p);
+        Ok(())
+    }
+    /// config::index_fork: admit one more stream to this storage. The caller orders the two streams' uses with
+    /// fences (the index work writes the ids on its side stream and is joined before the owner's stream reads them).
+    pub(crate) fn admit_reader(&self, stream: &Stream) -> Result<()> {
+        let p = stream.raw() as usize;
+        ensure!(p != 0 && [0, p].contains(&self.reader.get()), "candidate storage reader stream");
+        self.reader.set(p);
         Ok(())
     }
     pub(crate) fn produced(&self) {

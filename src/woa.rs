@@ -22,8 +22,15 @@ pub struct Grouped {
     values: Buffer<u8>,
     output_scales: Buffer<u8>,
     stream: Cell<usize>,
+    /// ca_woa_partial_w8 in place of the exported partial kernel (config::woa_native), and whether it is on.
+    native: Option<crate::cuda::Module>,
+    native_on: Cell<bool>,
 }
 impl Grouped {
+    /// The immutable canonical WO-A bytes (weights, scales) and their owner, for L2 hints.
+    pub(crate) fn hint_regions(&self) -> (Rc<Weights>, [(u64, usize); 2]) {
+        (self._weights.clone(), [(self.weight, 2048 * 4096), (self.scales, 8192)])
+    }
     pub fn new(
         cuda: &Cuda,
         kernels: &Path,
@@ -109,7 +116,24 @@ impl Grouped {
             values,
             output_scales,
             stream: Cell::new(0),
+            native: None,
+            native_on: Cell::new(false),
         })
+    }
+    /// Install ca_woa_partial_w8 (same arithmetic as the exported partial kernel; see kernels/core.cu), on for
+    /// serving (CANADA_SCRATCH_WOA_NATIVE=1) or off until the plan screen switches it.
+    pub(crate) fn install_native(&mut self, module: &crate::cuda::Module, on: bool) -> Result<()> {
+        ensure!(self.native.is_none() && self.stream.get() == 0 && self.weight % 16 == 0 && self.scales != 0,
+            "native WO-A is installed once, before use, over aligned canonical bytes");
+        module.function("ca_woa_partial_w8")?;
+        self.native = Some(module.clone());
+        self.native_on.set(on);
+        Ok(())
+    }
+    pub(crate) fn set_native_for_probe(&self, on: bool) -> Result<()> {
+        ensure!(crate::config::woa_native_screen() && self.native.is_some(), "native WO-A screen");
+        self.native_on.set(on);
+        Ok(())
     }
     pub fn values(&self) -> &Buffer<u8> {
         &self.values
@@ -133,6 +157,14 @@ impl Grouped {
             "WO-A workspace needs one ordered stream"
         );
         self.stream.set(raw);
+        if let Some(module) = self.native.as_ref().filter(|_| self.native_on.get()) {
+            let (mut x, mut w, mut s, mut p, mut m) =
+                (input.ptr(), self.weight, self.scales, self.partial.ptr(), self.rows as i32);
+            let mut args: [*mut std::ffi::c_void; 5] = [(&mut x as *mut u64).cast(), (&mut w as *mut u64).cast(),
+                (&mut s as *mut u64).cast(), (&mut p as *mut u64).cast(), (&mut m as *mut i32).cast()];
+            // The exported kernel's grid: 16 column tiles of 64, 2 groups, 8 K splits; four warps.
+            unsafe { module.function("ca_woa_partial_w8")?.launch([16, 2, 8], [128, 1, 1], 0, stream, &mut args) }?;
+        } else {
         unsafe {
             self.partial_op.launch(
                 self.rows as u32,
@@ -140,6 +172,7 @@ impl Grouped {
                 stream,
             )
         }?;
+        }
         unsafe {
             self.quant_op.launch(
                 self.rows as u32,

@@ -305,7 +305,8 @@ impl Group {
                 engram = layer_engram;
             }
             if i == 0 {
-                source = Some(Source::new_rows_owner(
+                crate::memory::trace_profile_memory(cuda, num_rows, &format!("before source {id}"));
+                let build_source = || Source::new_rows_owner(
                     cuda,
                     stream,
                     weights,
@@ -321,13 +322,14 @@ impl Group {
                     num_rows,
                     phase,
                     (!independent).then_some(&self.source),
-                )?);
+                );
+                source = Some(match wide { Some(w) => w.source(cuda, build_source)?, None => build_source()? });
             }
         }
         let row_store = self.row_store.clone();
         let rows = row_store
             .as_ref()
-            .map(|s| Rows::new(cuda, num_rows, s))
+            .map(|s| match wide { Some(w) => w.scratch(cuda, || Rows::new(cuda, num_rows, s)), None => Rows::new(cuda, num_rows, s) })
             .transpose()?;
         Ok(Self {
             start: self.start,
@@ -495,11 +497,13 @@ impl Group {
         }
         Ok(())
     }
-    pub(crate) fn clear_state(&mut self, cuda: &Cuda, stream: &Stream) -> Result<()> {
-        for cache in &mut self.caches {
-            cache.clear(cuda, stream)?;
+    pub(crate) fn clear_state(&mut self, cuda: &Cuda, stream: &Stream, keep_caches: bool) -> Result<()> {
+        if !keep_caches {
+            for cache in &mut self.caches {
+                cache.clear(cuda, stream)?;
+            }
         }
-        self.source.clear_state(stream)
+        self.source.clear_state(stream, keep_caches)
     }
     pub(crate) fn row_store_stats(&self) -> Option<serde_json::Value> {
         self.row_store.as_ref().map(|s| s.stats())

@@ -205,6 +205,7 @@ pub struct Ranges {
 }
 impl Ranges {
     pub(crate) fn key_ends(&self) -> &Buffer<i32> { &self.ends }
+    pub(crate) fn key_starts(&self) -> &Buffer<i32> { &self.starts }
     pub(crate) fn key_ends_mut(&mut self) -> &mut Buffer<i32> { &mut self.ends }
     pub fn update(&mut self, starts: &[i32], lengths: &[i32]) -> Result<()> {
         ensure!(
@@ -373,6 +374,20 @@ impl Dense {
             )
         };
         ensure!(status == 0, "MQA launch: {status}");
+        Ok(())
+    }
+    /// Construction-only: bind another gathered-key matrix of the same geometry (one matrix shared by several
+    /// scorers that score the same keys in a pass). The descriptors are encoded again for its buffers.
+    pub(crate) fn rebind_keys(&mut self, keys: Rc<KeyMatrix>) -> Result<()> {
+        ensure!(self.stream.get() == 0 && keys.rows == self.keys.rows && self.cuda.owns_buffer(&keys.payload)
+            && self.cuda.owns_buffer(&keys.scales), "MQA key rebinding requires an unexecuted scorer and equal geometry");
+        let status = unsafe {
+            self.native.encode_maps(self.rows as i32, keys.rows as i32, self.queries.payload.ptr() as _,
+                self.queries.scales.ptr() as _, keys.payload.ptr() as _, keys.scales.ptr() as _,
+                self.queries.weights.ptr() as _, self.maps.0.as_mut_ptr() as _)
+        };
+        ensure!(status == 0, "MQA TMA/attribute preparation failed: {status}");
+        self.keys = keys;
         Ok(())
     }
     /// Construction-only scratch reuse. Q/K descriptors do not contain the

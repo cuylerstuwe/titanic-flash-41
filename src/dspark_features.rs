@@ -45,6 +45,12 @@ impl Features {
         );
         unsafe { self.enqueue(inputs.map(|b| b.ptr()), live, stream) }
     }
+    /// One batched session's rows: the taps start at that session's first row.
+    pub(crate) fn run_batched(&mut self, target: &Target, offset: usize, live: usize, stream: &Stream) -> Result<()> {
+        self.live = 0;
+        let inputs = target.batched_feature_inputs(offset, live, stream)?;
+        unsafe { self.enqueue(inputs, live, stream) }
+    }
     /// Safety: each pointer holds capacity*20480 BF16 words and remains alive
     /// until this ordered stream completes; output is separate and owned here.
     unsafe fn enqueue(&mut self, mut inputs: [u64; 3], live: usize, stream: &Stream) -> Result<()> {

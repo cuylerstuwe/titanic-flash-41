@@ -73,7 +73,7 @@ pub(crate) struct PrefillProgress {
 
 #[derive(serde::Serialize)]
 pub struct AppendMetrics {
-    live_rows: usize,
+    pub(crate) live_rows: usize,
     physical_rows: usize,
     phase: String,
     captured_new_graph: bool,
@@ -88,7 +88,7 @@ pub struct AppendMetrics {
     native_fp32_rows: Option<usize>,
     #[serde(skip_serializing_if="Option::is_none")]
     layer20_deferred_chunks: Option<usize>,
-    stages_ms: Vec<(&'static str, f64)>,
+    pub(crate) stages_ms: Vec<(&'static str, f64)>,
     total_ms: f64,
 }
 
@@ -151,6 +151,10 @@ impl EncoderPrefixImage {
     pub(crate) fn binding_bytes()->usize {
         if crate::config::bank_encoder_checkpoint_requested(){bank_encoder_lineage::Binding::HEAP_BYTES}else{0}
     }
+    pub(crate) fn region_digests_for_probe(&self)->Result<Vec<(String,usize,String)>> {
+        match &self.0.image {crate::state_image::Storage::Copy(image)=>image.region_digests_for_probe(),
+            _=>anyhow::bail!("region digests need an ordinary copied image")}
+    }
     pub(crate) fn digest_for_import_probe(&self)->Result<String> {
         ensure!(std::env::var("CANADA_SCRATCH_ENCODER_PREFIX_IMPORT_SCREEN").as_deref()==Ok("1"),
             "encoder image digest requires finite import screen");
@@ -163,6 +167,32 @@ impl EncoderPrefixImage {
 }
 /// The caller keeps the immutable parent through the entire save attempt.
 /// Never release it before a successor exists: optional allocation can refuse.
+/// What a prefill chunk overwrites, captured as of an earlier frontier inside that chunk
+/// (the inline encoder checkpoint): the pair sources' carry rings, the 128-row encoder tail
+/// and the host history at that frontier. The caches are append-only by position, so their
+/// pages at the frontier are still read from the live buffers when the image is saved.
+pub(crate) struct CheckpointAux {
+    tail: crate::decoder_tail::Cache,
+    rings: [crate::pair_prefill::Ring; 3],
+    captured: std::cell::RefCell<Option<History>>,
+}
+impl CheckpointAux {
+    /// The image regions this state replaces, under the live regions' names.
+    fn image_sources(&self, cuda: &Cuda) -> Result<Vec<crate::state_image::Region<'_>>> {
+        let mut sources = self.tail.image_regions()?;
+        // The same extent as the live carry regions: request slot 0 when the owner has several.
+        let slots = crate::config::session_slots()?;
+        for (layer, ring) in [2, 8, 14].into_iter().zip(&self.rings) {
+            sources.push(if slots > 1 {
+                crate::state_image::Region::byte_range(cuda, format!("compressed.{layer}.carry"), ring.values(),
+                    0..ring.values().bytes() / slots)?
+            } else {
+                crate::state_image::Region::new(cuda, format!("compressed.{layer}.carry"), ring.values())?
+            });
+        }
+        Ok(sources)
+    }
+}
 pub(crate) enum EncoderPrefixRestore<'a> {
     Borrowed(&'a EncoderPrefixImage,u64),
     Imported(&'a EncoderPrefixImage,&'a Target,u64),
@@ -236,6 +266,11 @@ impl StateImage {
 /// Encoder-tail publication reads only rows [live-128, live): gather just that window
 /// (single-owner rows summed exactly) instead of every SP row. 2 = unresolved.
 static TAIL_WINDOW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+thread_local! {
+    /// Probe only (replay_exact_probe): the fresh 128-row prefill's mode for the next calls instead of the environment's.
+    static CANONICAL_PREFILL_FOR_PROBE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn set_canonical_prefill_for_probe(mode: Option<bool>) { CANONICAL_PREFILL_FOR_PROBE.with(|c| c.set(mode)); }
 pub(crate) fn tail_window_enabled() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     match TAIL_WINDOW.load(Relaxed) {
@@ -284,7 +319,7 @@ pub(crate) fn layer20_projection_only(done: usize, live: usize, rows: usize, tot
     live == rows && done + live + 128 <= total
 }
 fn wide_arena_bytes_per_row(sequence_parallel: bool) -> usize {
-    (if sequence_parallel { 384 } else { 448 }) * 1024
+    crate::config::wide_arena_kib_per_row().unwrap_or(if sequence_parallel { 384 } else { 448 }) * 1024
 }
 pub const CONTEXT: usize = 128;
 const SWA_OFFSET: usize = crate::swa_layout::OFFSET;
@@ -312,6 +347,108 @@ fn saved_swa_pages(layout:crate::swa_layout::Layout,position:usize)->Vec<(usize,
     ranges
 }
 
+/// Graph slots: one per live-row count for a single session (slot = live rows),
+/// then one per executed-row count for each batched session count 2..=4. A step's
+/// verify compressor block size (rows / sessions) is a launch argument, so steps
+/// with different session counts never share a capture.
+const MAX_BATCHED_SESSIONS: usize = 4;
+/// One slot group per batched session count, plus one for one-session region steps: a step
+/// with batched rows runs in region mode (dense index scorers, full logits; set_region_step),
+/// so it never shares a capture with today's single-history step of the same live count.
+/// Steps of several sessions with padding routes (ca_route_padding_rows in every layer's routing)
+/// take a second copy of these slots.
+/// Tight blocks (config::batched_tight_blocks) add, after those, one slot per (padding routes, session count
+/// from two, block, executed rows): the block sets the compressors' grid, so it is part of a capture.
+fn graph_slots(rows: usize) -> usize {
+    // Only the decode owners (at most 32 rows) batch conversations; wide profiles keep the plain slots.
+    let tight = if rows <= 32 { 2 * (MAX_BATCHED_SESSIONS - 1) * (rows + 1) * (rows + 1) } else { 0 };
+    // The last rows + 1 slots: config::index_short_rows steps (short_index_slot).
+    2 * (rows + 1) * (MAX_BATCHED_SESSIONS + 1) + tight + (rows + 1)
+}
+/// config::index_short_rows: the slot of a single-conversation step of `executed` rows whose rows all have at most
+/// 512 index keys (its indexed layers enqueue no scoring, so it never shares a capture with an ordinary step).
+fn short_index_slot(rows: usize, executed: usize) -> usize {
+    debug_assert!(executed <= rows);
+    graph_slots(rows) - (rows + 1) + executed
+}
+/// Clears the index branches' short-rows switches when a step's enqueue ends, on every path out of it.
+struct ShortIndexRows(Vec<Rc<std::cell::Cell<bool>>>);
+impl Drop for ShortIndexRows {
+    fn drop(&mut self) { for flag in &self.0 { flag.set(false); } }
+}
+/// `block`: 0 for the fixed layout (rows / sessions); a tight layout's block otherwise.
+fn graph_slot(rows: usize, sessions: usize, executed: usize, region: bool, padded: bool, block: usize) -> usize {
+    debug_assert!((1..=MAX_BATCHED_SESSIONS).contains(&sessions) && executed <= rows && (region || sessions == 1)
+        && (!padded || (region && sessions > 1)) && block <= rows && (block == 0 || (region && sessions > 1)));
+    if block > 0 {
+        return 2 * (rows + 1) * (MAX_BATCHED_SESSIONS + 1)
+            + ((usize::from(padded) * (MAX_BATCHED_SESSIONS - 1) + (sessions - 2)) * (rows + 1) + block) * (rows + 1) + executed;
+    }
+    let slot = if region && sessions == 1 { MAX_BATCHED_SESSIONS * (rows + 1) + executed }
+        else { (sessions - 1) * (rows + 1) + executed };
+    if padded { slot + (rows + 1) * (MAX_BATCHED_SESSIONS + 1) } else { slot }
+}
+/// Rows a batched step executes (Plan::batched_extent).
+pub(crate) fn batched_extent(lives: &[usize], rows: usize) -> usize { Plan::batched_extent(lives, rows) }
+/// Rows per session block of a batched step (Plan::batched_block).
+pub(crate) fn batched_block(rows: usize, sessions: usize) -> usize { Plan::batched_block(rows, sessions) }
+/// Bumped whenever the shared key caches may change other than by appends at a conversation's
+/// frontier: image restores, resets, relocations, moved histories, and state handed over from a
+/// prefill owner. Region gathers (CANADA_SCRATCH_REGION_GATHER_CACHE=1) re-gather fully after any.
+static INDEX_CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Per owner: how far each serving region's pair and single index keys are gathered, as of an epoch.
+#[derive(Clone, Copy, Default)]
+struct RegionGather { epoch: u64, pair: [i32; MAX_BATCHED_SESSIONS], single: [i32; MAX_BATCHED_SESSIONS] }
+/// Key rows below a region's gathered end that a frontier step may rewrite (rejected rows, blocks
+/// still filling): re-gathered every step.
+const REGION_GATHER_MARGIN: i32 = 32;
+/// Batched steps of several sessions route their padding rows to a live row's experts
+/// (CANADA_SCRATCH_BATCHED_PADDING_ROUTES=1): padding rows then read no expert of their own.
+fn padding_routes_requested() -> bool {
+    std::env::var("CANADA_SCRATCH_BATCHED_PADDING_ROUTES").as_deref() == Ok("1")
+}
+/// Where one batched session lives in a verify owner's caches. Sessions occupy
+/// disjoint linear regions: window slots, pair and single raw addresses are
+/// offset, and since every key mapping is linear, a session's first visible
+/// logical keys are raw_pair / 2 and raw_single. `request` selects the
+/// session's pair-compression ring. All zero is today's single sequence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionBase {
+    pub(crate) request: i64,
+    pub(crate) window: usize,
+    pub(crate) raw_pair: usize,
+    pub(crate) raw_single: usize,
+    /// The region's window ring (None: the owner's layout).
+    pub(crate) layout: Option<crate::swa_layout::Layout>,
+}
+impl SessionBase {
+    /// Serving region `index` of `regions` (CANADA_SCRATCH_BATCHED_REGIONS): region 0 is today's
+    /// layout; region k >= 1 has a small ring after region 0's ring and the earlier small rings,
+    /// request slot k and the k-th share of the compressed address space.
+    pub(crate) fn serving_region(index: usize, regions: usize, context: usize,
+        layout: crate::swa_layout::Layout) -> Result<Self> {
+        ensure!(index < regions && regions <= 4 && layout.ring().is_some(), "serving region geometry");
+        if index == 0 { return Ok(Self::default()); }
+        let capacity = Self::region_capacity(context, regions);
+        let small = crate::swa_layout::Layout::Ring;
+        Ok(Self { request: index as i64,
+            window: layout.pages(context)? * 64 + (index - 1) * small.pages(context)? * 64,
+            raw_pair: index * capacity, raw_single: index * capacity, layout: Some(small) })
+    }
+    /// Positions one serving region holds: an equal share of the context, rounded down to 128
+    /// positions so every region's compressed and key addresses start on a 64-slot page.
+    pub(crate) fn region_capacity(context: usize, regions: usize) -> usize {
+        context / regions.max(1) / 128 * 128
+    }
+    /// Session `index` of `sessions`, each with `capacity` positions, where one
+    /// window region spans `window_slots` slots including the shared offset.
+    pub(crate) fn region(index: usize, capacity: usize, window_slots: usize) -> Result<Self> {
+        ensure!(capacity % 2 == 0 && window_slots > 0, "batched session region geometry");
+        Ok(Self { request: index as i64, window: index * window_slots, raw_pair: index * capacity,
+            raw_single: index * capacity, layout: None })
+    }
+}
+
 /// Integer scheduling only; numeric model execution remains on GPU.
 #[derive(Debug)]
 struct Plan {
@@ -324,6 +461,14 @@ struct Plan {
     single_lengths: Vec<i32>,
     swa_ids: Vec<i32>,
     swa_lengths: Vec<i32>,
+    /// Per row: the session's compressor request slot and first visible logical
+    /// pair/single keys. Zero for every row of a single sequence.
+    requests: Vec<i64>,
+    pair_starts: Vec<i32>,
+    single_starts: Vec<i32>,
+    /// Rows per verify compressor block: all rows for one session; a batched
+    /// step gives each session its own block of rows / sessions rows.
+    block: usize,
 }
 impl Plan {
     #[cfg(test)]
@@ -351,6 +496,80 @@ impl Plan {
         context: usize,
         swa_layout: crate::swa_layout::Layout,
     ) -> Result<Self> {
+        Self::append_session(position, live, rows, context, swa_layout, SessionBase::default())
+    }
+    /// Rows of several sessions in one verification step, in part order. Part k
+    /// (base, frontier position, live rows) occupies the block of rows
+    /// [k * block, k * block + live), block = rows / parts, laid out exactly as that
+    /// session's own append: the pair compressor's verify kernel runs one request
+    /// per block of `block` rows, with padding (no-write rows) as a block suffix.
+    /// Padding rows repeat their block's last live position and request.
+    /// Rows per session block of a batched step: rows / sessions, at most six (a session verifies
+    /// its anchor and at most five proposals), so two sessions on 16 rows take blocks of 6, not 8.
+    pub(crate) fn batched_block(rows: usize, sessions: usize) -> usize {
+        if sessions <= 1 { rows } else { (rows / sessions).min(crate::config::batched_block_cap()) }
+    }
+    /// The block a batched step is laid out in: the fixed share of the rows, or (tight blocks) the widest
+    /// conversation of this step, at least two rows and at most that share.
+    fn batched_layout_block(lives: &[usize], rows: usize) -> usize {
+        let share = Self::batched_block(rows, lives.len());
+        if lives.len() >= 2 && rows <= 32 && crate::config::batched_tight_blocks() {
+            lives.iter().copied().max().unwrap_or(share).clamp(2, share.max(2))
+        } else { share }
+    }
+    fn batched(parts: &[(SessionBase, u64, usize)], rows: usize, context: usize,
+        swa_layout: crate::swa_layout::Layout) -> Result<Self> {
+        // Blocks need not divide the rows (three sessions on 16 rows: blocks of 5); rows past
+        // the last block are padding, never executed (batched_extent) nor compressed.
+        ensure!(!parts.is_empty() && rows / parts.len() >= 1, "batched session block count");
+        let block = Self::batched_layout_block(&parts.iter().map(|p| p.2).collect::<Vec<_>>(), rows);
+        ensure!((parts.len() == 1 || (2..=16).contains(&block))
+            && parts.iter().all(|p| (1..=block).contains(&p.2)), "batched session rows");
+        let mut requests = std::collections::BTreeSet::new();
+        ensure!(parts.iter().all(|p| requests.insert(p.0.request)), "one part per session");
+        let mut o = Self { swa_layout, positions: vec![0; rows], locations: vec![-1; rows],
+            raw_pair: vec![0; rows], raw_single: vec![0; rows], pair_lengths: vec![0; rows],
+            single_lengths: vec![0; rows], swa_ids: vec![-1; rows * 128], swa_lengths: vec![0; rows],
+            requests: vec![0; rows], pair_starts: vec![0; rows], single_starts: vec![0; rows], block };
+        for (k, &(base, position, live)) in parts.iter().enumerate() {
+            let p = Self::append_session(position, live, rows, context, swa_layout, base)?;
+            for row in 0..block {
+                let d = k * block + row;
+                if row >= live {
+                    o.positions[d] = p.positions[live - 1]; o.requests[d] = p.requests[live - 1];
+                    // Empty key ranges at the part's own base: index scorers bound each block of query
+                    // rows by its rows' ranges, so a padding row at key 0 would widen a region's block
+                    // to span every region below it.
+                    o.pair_starts[d] = p.pair_starts[live - 1]; o.single_starts[d] = p.single_starts[live - 1];
+                    continue;
+                }
+                o.positions[d] = p.positions[row]; o.locations[d] = p.locations[row];
+                o.raw_pair[d] = p.raw_pair[row]; o.raw_single[d] = p.raw_single[row];
+                o.pair_lengths[d] = p.pair_lengths[row]; o.single_lengths[d] = p.single_lengths[row];
+                o.swa_ids[d * 128..(d + 1) * 128].copy_from_slice(&p.swa_ids[row * 128..(row + 1) * 128]);
+                o.swa_lengths[d] = p.swa_lengths[row]; o.requests[d] = p.requests[row];
+                o.pair_starts[d] = p.pair_starts[row]; o.single_starts[d] = p.single_starts[row];
+            }
+        }
+        Ok(o)
+    }
+    /// Rows a batched step executes: through the last part's live rows.
+    fn batched_extent(lives: &[usize], rows: usize) -> usize {
+        (lives.len() - 1) * Self::batched_layout_block(lives, rows) + lives[lives.len() - 1]
+    }
+    fn append_session(
+        position: u64,
+        live: usize,
+        rows: usize,
+        context: usize,
+        swa_layout: crate::swa_layout::Layout,
+        base: SessionBase,
+    ) -> Result<Self> {
+        ensure!(base.raw_pair % 2 == 0 && base.request >= 0
+            && (base == SessionBase::default() || swa_layout.ring().is_some()),
+            "batched session base parity/layout");
+        // A serving region may use its own (small) ring; slots are computed here only.
+        let swa_layout = base.layout.unwrap_or(swa_layout);
         ensure!(
             crate::config::target_rows(rows)
                 && rows <= swa_layout.max_rows()
@@ -376,17 +595,24 @@ impl Plan {
             single_lengths: vec![0; rows],
             swa_ids: vec![-1; rows * 128],
             swa_lengths: vec![0; rows],
+            requests: vec![0; rows],
+            pair_starts: vec![0; rows],
+            single_starts: vec![0; rows],
+            block: rows,
         };
         for row in 0..live {
             let pos = position + row;
             p.positions[row] = pos as i32;
-            p.locations[row] = swa_layout.slot(pos) as i32;
+            p.locations[row] = (base.window + swa_layout.slot(pos)) as i32;
             // Pair raw addresses retain absolute-position parity. Slot0 is
             // reserved by the compression kernel as the no-write sentinel.
-            p.raw_pair[row] = (SWA_OFFSET + pos) as i64;
-            p.raw_single[row] = (COMPRESSED_OFFSET + pos) as i64;
+            p.raw_pair[row] = (base.raw_pair + SWA_OFFSET + pos) as i64;
+            p.raw_single[row] = (base.raw_single + COMPRESSED_OFFSET + pos) as i64;
             p.pair_lengths[row] = ((pos + 1) / 2) as i32;
             p.single_lengths[row] = (pos + 1) as i32;
+            p.requests[row] = base.request;
+            p.pair_starts[row] = i32::try_from(base.raw_pair / 2)?;
+            p.single_starts[row] = i32::try_from(base.raw_single)?;
             let start = (pos + 1).saturating_sub(128);
             p.swa_lengths[row] = (pos + 1 - start) as i32;
             // Qualified BuildCausalSwaPageIndices visits newest to oldest.
@@ -394,7 +620,7 @@ impl Plan {
             // the attention reduction can change BF16 ties and downstream
             // routing. Keep the actual numeric-order contract.
             for (col, previous) in (start..=pos).rev().enumerate() {
-                p.swa_ids[row * 128 + col] = swa_layout.slot(previous) as i32;
+                p.swa_ids[row * 128 + col] = (base.window + swa_layout.slot(previous)) as i32;
             }
         }
         Ok(p)
@@ -539,6 +765,10 @@ impl Step {
         Ok(result)
     }
     fn update(&mut self, p: &Plan, stream:&Stream) -> Result<()> {
+        self.update_with(p, None, stream)
+    }
+    /// As update(), with region steps' per-row index gather starts (pair, single).
+    fn update_with(&mut self, p: &Plan, gathers: Option<(&[i32], &[i32])>, stream:&Stream) -> Result<()> {
         // Mapped control storage may be read by captured kernels. A single
         // completion boundary prevents CPU writes racing any previous replay.
         if self.mapped_metadata_bytes>0 || self.staged_metadata.is_some() {stream.synchronize()?;}
@@ -549,19 +779,26 @@ impl Step {
             .update(&p.positions, &p.locations)?;
         self.candidates.update(&p.swa_ids, &p.swa_lengths)?;
         for m in [&mut self.m2, &mut self.m8, &mut self.m14] {
-            m.update(
+            m.update_ranged_blocks(
                 &p.positions,
-                &vec![0; p.positions.len()],
+                &p.requests,
                 &p.raw_pair,
+                &p.pair_starts,
                 &p.pair_lengths,
+                p.block,
             )?;
         }
-        self.m20.update(
+        self.m20.update_ranged(
             &p.positions,
-            &vec![0; p.positions.len()],
+            &p.requests,
             &p.raw_single,
+            &p.single_starts,
             &p.single_lengths,
         )?;
+        if let Some((pair, single)) = gathers {
+            for m in [&mut self.m2, &mut self.m8, &mut self.m14] { m.set_gather_starts(pair)?; }
+            self.m20.set_gather_starts(single)?;
+        }
         if let Some(staging)=&self.staged_metadata {
             unsafe {staging.flush(Some(stream))?;}
         }
@@ -601,6 +838,30 @@ pub struct Target {
     // 1: qualified dense bounds; 2 also enables the experimental expert bound.
     prefill_partial1024_rows: u8,
     prefill_partial2048_dense: bool,
+    // Partial chunks on the 4,096/8,192-row profiles: bit 0 dense, bit 1 routed experts.
+    prefill_partial_wide: u8,
+    /// The selected L2 hint queue plan of the six-row decode layers (config::l2_queue_plans), shared with them.
+    hint_queue_selected: Rc<std::cell::Cell<Option<usize>>>,
+    /// Screens only: the routed experts' front-end kernel launches this many blocks in the verification graphs.
+    moe_front_grid: Option<u32>,
+    /// The routed experts' phase kernels (FC1 and FC2; 96 blocks each as exported) launch (FC1, FC2) blocks in
+    /// the verification graphs, with this shared-memory carve-out preference when given (cuda::Regrid).
+    moe_phase_grid: Option<(u32, u32, Option<i32>)>,
+    /// Kernel nodes the grid rules matched in the last verification graph capture.
+    moe_regridded: usize,
+    /// Exported front-end nodes replaced by the native kernel in the last verification graph capture (screens).
+    moe_swapped: usize,
+    /// dspark_generation::verify_sample_ahead: the next verification returns without waiting for the GPU or reading
+    /// its fault words; the caller queues its sampler behind the forward and then calls
+    /// complete_deferred_verification (`completion_owed` until it does).
+    defer_completion: bool,
+    completion_owed: std::cell::Cell<bool>,
+    /// The configured live-row floors of the experts' variants, remembered by the first screen toggle.
+    moe_live_floors: Option<(usize, usize, bool)>,
+    /// config::l2_queue_engram_lead: the switches of the Engram projection hints begun by layers 0 and 13 (shared
+    /// with those layers' queues) and the wanted state; layer 14's also follows the step's projection schedule.
+    engram_lead: Option<(Rc<std::cell::Cell<bool>>, Rc<std::cell::Cell<bool>>)>,
+    engram_lead_on: bool,
     prefill_wide_mhc_rows: bool,
     prefill_wide_mhc_norm: bool,
     prefill_short_merge: bool,
@@ -621,6 +882,11 @@ pub struct Target {
     alternate_index_graphs: Vec<Option<Graph>>,
     alternate_index_engram_graphs: Vec<Option<Vec<Graph>>>,
     adaptive_sparse_active: bool,
+    /// config::index_short_rows: the eight index branches' switches (collected at the first step), whether the
+    /// worker allows the short path for the current request (the alternate screen), and steps taken on it.
+    short_index_flags: Vec<Rc<std::cell::Cell<bool>>>,
+    short_index_allowed: bool,
+    short_index_steps: u64,
     engram_overlap: bool,
     engram_projection_ahead: bool,
     engram_projection_m3_only: bool,
@@ -648,6 +914,19 @@ pub struct Target {
     decoder_graph: Option<Graph>,
     tiny_append_graphs: Option<TinyAppendGraphs>,
     encoder_cache: Option<Rc<crate::decoder_tail::Cache>>,
+    /// Batched serving: the encoder tails of serving regions 1.. (region 0's is encoder_cache).
+    region_tails: Vec<Rc<crate::decoder_tail::Cache>>,
+    // Inline encoder checkpoint: side state (decoder-tail owner only) and, for the finite
+    // probe, the chunk plan of the next checkpoint prefill.
+    checkpoint_aux: Option<Rc<CheckpointAux>>,
+    // A second inline capture in the same last chunk (CANADA_SCRATCH_ENCODER_EXTRA_NEAR_END): its side state, the
+    // caller's request for the next prefill (rows from the restore point to the extra position, image bytes), and
+    // the image that prefill saved.
+    checkpoint_aux_extra: Option<Rc<CheckpointAux>>,
+    extra_checkpoint: Option<(usize, usize)>,
+    extra_image: Option<EncoderPrefixImage>,
+    checkpoint_plan_for_probe: Option<Vec<usize>>,
+    checkpoint_inline_for_probe: Option<bool>,
     replay: Option<crate::decoder_tail::Replay>,
     graph_replay: bool,
     prefill_last_head: bool,
@@ -673,6 +952,29 @@ pub struct Target {
     last_live: usize,
     last_append_metrics: Option<AppendMetrics>,
     pending: Option<PendingVerification>,
+    /// Finite batched screen (CANADA_SCRATCH_BATCH_SCREEN=1) only: the next
+    /// execute_rows lays out these sessions' rows in order instead of this
+    /// owner's single history; appends hand the advanced histories back and a
+    /// batched verification is only ever aborted (full carry restore).
+    batched_rows: Option<Vec<(SessionBase, History, usize)>>,
+    batched_done: Option<Vec<History>>,
+    batched_pending: bool,
+    /// The current step has batched rows and runs in region mode (set_region_step).
+    region_step: bool,
+    /// Batched serving: part 0 of the next batched verification is this owner's own conversation
+    /// (region 0); its commit also advances the owner's history and encoder tail.
+    batched_owner_part: bool,
+    /// The sessions of an in-flight batched verification, with their own hash batches.
+    batched_inflight: Option<Vec<(SessionBase, History, usize, HashBatch)>>,
+    /// While one session of a batched verification samples: its rows were moved
+    /// to row 0 and the logits accessors report its live count.
+    batched_staged: Option<(usize, usize, u64)>,
+    /// Rows per session block of the in-flight batched verification.
+    batched_block: usize,
+    /// Batched steps of several sessions use padding routes (see graph_slot).
+    padding_routes: bool,
+    /// Region-mode index gathers already done by this owner (CANADA_SCRATCH_REGION_GATHER_CACHE=1).
+    region_gather: RegionGather,
     early: Vec<SwaLayer>,
     early_caches: Vec<PagedKv>,
     source2: Source,
@@ -681,6 +983,8 @@ pub struct Target {
     late: crate::late_group::Group,
     step: Step,
     cached_decoder: Option<Step>,
+    /// The next short restored suffix runs as the qualified EXTEND (CANADA_SCRATCH_ENCODER_SHORT_SUFFIX=2).
+    short_restore_extend: bool,
     tokens: TokenRows,
     row_store1: Rc<RowStore>,
     rows1: Rows,
@@ -799,7 +1103,13 @@ impl Target {
         let single_slots = (COMPRESSED_OFFSET..COMPRESSED_OFFSET + context)
             .map(|s| s as i32)
             .collect::<Vec<_>>();
-        let swa_pages = swa_layout.pages(context)?;
+        // A finite batched screen keeps one window region per session (see SessionBase).
+        let sessions = crate::config::batch_screen_sessions()?;
+        ensure!(sessions == 1 || swa_layout.ring().is_some(), "batched sessions need a ring window layout");
+        let regions = crate::config::batched_regions()?;
+        ensure!(regions == 1 || swa_layout.ring().is_some(), "batched regions need a ring window layout");
+        let swa_pages = swa_layout.pages(context)? * sessions
+            + (regions - 1) * crate::swa_layout::Layout::Ring.pages(context)?;
         let page_tokens = if source_phase == Phase::Extend {
             64
         } else {
@@ -993,6 +1303,17 @@ impl Target {
                 _=>anyhow::bail!("M1024 partial rows must be 0,1 or2"),
             },
             prefill_partial2048_dense: experimental_prefill_flag("CANADA_SCRATCH_PREFILL_PARTIAL2048_DENSE",true)?,
+            prefill_partial_wide: crate::config::partial_wide_rows_requested()?,
+            hint_queue_selected: Rc::new(std::cell::Cell::new(None)),
+            moe_front_grid: None,
+            moe_phase_grid: None,
+            moe_regridded: 0,
+            moe_swapped: 0,
+            defer_completion: false,
+            completion_owed: std::cell::Cell::new(false),
+            moe_live_floors: None,
+            engram_lead: None,
+            engram_lead_on: false,
             prefill_wide_mhc_rows: experimental_prefill_flag("CANADA_SCRATCH_PREFILL_WIDE_MHC_ROWS",true)?,
             prefill_wide_mhc_norm: experimental_prefill_flag("CANADA_SCRATCH_PREFILL_WIDE_MHC_NORM",true)?,
             prefill_short_merge: experimental_prefill_flag("CANADA_SCRATCH_PREFILL_SHORT_MERGE",true)?,
@@ -1010,11 +1331,14 @@ impl Target {
                 && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1"),
             graph_retention: crate::graph_retention::Policy::new(rows,crate::config::execution_graph_cache_rows()?),
             graph_evictions: 0,
-            graphs: (0..=rows).map(|_| None).collect(),
-            engram_graphs: (0..=rows).map(|_| None).collect(),
-            alternate_index_graphs: (0..=rows).map(|_| None).collect(),
-            alternate_index_engram_graphs: (0..=rows).map(|_| None).collect(),
+            graphs: (0..graph_slots(rows)).map(|_| None).collect(),
+            engram_graphs: (0..graph_slots(rows)).map(|_| None).collect(),
+            alternate_index_graphs: (0..graph_slots(rows)).map(|_| None).collect(),
+            alternate_index_engram_graphs: (0..graph_slots(rows)).map(|_| None).collect(),
             adaptive_sparse_active: false,
+            short_index_flags: Vec::new(),
+            short_index_allowed: true,
+            short_index_steps: 0,
             engram_overlap: false,
             engram_projection_ahead: false,
             engram_projection_m3_only: false,
@@ -1060,6 +1384,13 @@ impl Target {
             decoder_graph: None,
             tiny_append_graphs: None,
             encoder_cache: None,
+            region_tails: Vec::new(),
+            checkpoint_aux: None,
+            checkpoint_plan_for_probe: None,
+            checkpoint_inline_for_probe: None,
+            checkpoint_aux_extra: None,
+            extra_checkpoint: None,
+            extra_image: None,
             replay: None,
             graph_replay: false,
             prefill_last_head: false,
@@ -1082,6 +1413,16 @@ impl Target {
             last_live: 0,
             last_append_metrics: None,
             pending: None,
+            batched_rows: None,
+            batched_done: None,
+            batched_pending: false,
+            region_step: false,
+            batched_owner_part: false,
+            batched_inflight: None,
+            batched_staged: None,
+            batched_block: 0,
+            padding_routes: padding_routes_requested(),
+            region_gather: RegionGather::default(),
             early,
             early_caches,
             source2,
@@ -1090,6 +1431,7 @@ impl Target {
             late,
             step,
             cached_decoder: None,
+            short_restore_extend: false,
             tokens: TokenRows::new(cuda, &vec![2; rows], 0)?,
             row_store1,
             rows1,
@@ -1115,6 +1457,10 @@ impl Target {
         target.enable_verify16_ffn_before_capture(stream)?;
         target.enable_engram_projection_before_capture(kernels)?;
         target.install_communication_hints(core, stream)?;
+        target.install_hint_queues(core, stream)?;
+        target.install_source_keys_fork(stream)?;
+        target.install_index_fork(stream)?;
+        target.install_narrow_qkv(kernels)?;
         Ok(target)
     }
 
@@ -1263,7 +1609,8 @@ impl Target {
         &self, core: &Module, core_bytes: &[u8], stream: &Stream, kernels: &Path,
         rows: usize, sequence_parallel: bool, share: Option<&Self>,
     ) -> Result<Self> {
-        self.fork_wide_with_arenas_in(core,core_bytes,stream,kernels,rows,sequence_parallel,share,false)
+        // The profile's rows decide which family its width-named bundles belong to (config::building_wide_profile).
+        crate::config::building_wide_profile(rows,||self.fork_wide_with_arenas_in(core,core_bytes,stream,kernels,rows,sequence_parallel,share,false))
     }
     /// Two private causal owners still prefill sequentially. Lend only the
     /// existing transient parity/candidate arenas, with one ordered stream;
@@ -1287,7 +1634,7 @@ impl Target {
             let donor=if std::env::var("CANADA_SCRATCH_PEER_WIDE_MOE_SHARE_SCREEN").as_deref()==Ok("1") {
                 peer.iter().find(|p|p.rows==rows).context("matching peer MoE geometry")?
             }else{largest};
-            self.fork_wide_with_arenas_in(core,core_bytes,stream,kernels,rows,true,Some(donor),true)
+            crate::config::building_wide_profile(rows,||self.fork_wide_with_arenas_in(core,core_bytes,stream,kernels,rows,true,Some(donor),true))
         }).collect()
     }
     #[allow(clippy::too_many_arguments)]
@@ -1437,6 +1784,7 @@ impl Target {
             && self.position()==0 && fresh_lineage.unwrap()>self.history.lineage),
             "independent profile geometry and lineage");
         let cuda = &self.cuda;
+        crate::memory::trace_profile_memory(cuda, rows, "start");
         let early_caches=if independent {self.early_caches.iter()
             .map(|c|PagedKv::new_layout(cuda,c.pages(),c.page_tokens(),c.layout())).collect::<Result<Vec<_>>>()?}
             else {self.early_caches.clone()};
@@ -1447,10 +1795,12 @@ impl Target {
             .map(|s| s as i32)
             .collect::<Vec<_>>();
         let medium_woa = if rows > 8 {
-            Some(crate::woa_medium::Scratch::new_on(cuda, core_bytes, rows,stream)?)
+            let build = || crate::woa_medium::Scratch::new_on(cuda, core_bytes, rows,stream);
+            Some(match wide.as_deref() { Some(w) => w.scratch(cuda, build)?, None => build()? })
         } else {
             None
         };
+        crate::memory::trace_profile_memory(cuda, rows, "after medium WO-A scratch");
         let share_narrow_during_build=match std::env::var("CANADA_SCRATCH_NARROW_MOE_CONSTRUCTION") {
             Ok(v)=>{ensure!(v=="0"||v=="1","invalid construction-time MoE sharing policy");v=="1"},
             Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
@@ -1493,7 +1843,8 @@ impl Target {
                 narrow_moe=Some(early[0].narrow_workspace());
             }
             if id == 2 {
-                source2 = Some(Source::new_rows_owner(
+                crate::memory::trace_profile_memory(cuda, rows, "before source 2");
+                let build_source = || Source::new_rows_owner(
                     cuda,
                     stream,
                     weights,
@@ -1509,9 +1860,11 @@ impl Target {
                     rows,
                     phase,
                     (!independent).then_some(&self.source2),
-                )?);
+                );
+                source2 = Some(match &wide { Some(w) => w.source(cuda, build_source)?, None => build_source()? });
             }
         }
+        crate::memory::trace_profile_memory(cuda, rows, "after early layers and source 2");
         let source2 = source2.ok_or_else(|| anyhow::anyhow!("shared source2 missing"))?;
         let group8 = self.group8.fork_profile(
             cuda,
@@ -1564,7 +1917,11 @@ impl Target {
             narrow_moe,
             independent,
         )?;
-        let rows1 = Rows::new(cuda, rows, &self.row_store1)?;
+        crate::memory::trace_profile_memory(cuda, rows, "after groups 8, 14 and late");
+        let rows1 = match wide.as_deref() {
+            Some(w) => w.scratch(cuda, || Rows::new(cuda, rows, &self.row_store1))?,
+            None => Rows::new(cuda, rows, &self.row_store1)?,
+        };
         let io_build=||if independent {self.io.fork_owner(cuda,core_bytes,stream,kernels,rows)}
             else {self.io.fork_profile(cuda,core_bytes,stream,kernels,rows)};
         let mut io=if let Some(arena)=wide.as_ref().and_then(|w|w.input_arena()) {
@@ -1576,7 +1933,9 @@ impl Target {
             ensure!(crate::config::append_last_gather_requested()?,"encoded append head requires final-only output");
             io.prepare_append_encoded(stream)?;
         }
-        let step = Step::new(
+        crate::memory::trace_profile_memory(cuda, rows, "after io");
+        // The step's pair-pool outputs are chunk scratch; its other buffers are unaffected.
+        let build_step = || Step::new(
             cuda,
             &source2,
             group8.source(),
@@ -1589,7 +1948,8 @@ impl Target {
             self.early_caches[0].capacity(),
             self.swa_layout,
             phase,
-        )?;
+        );
+        let step = match wide.as_deref() { Some(w) => w.scratch(cuda, build_step)?, None => build_step()? };
         let lease=if independent {crate::session_lease::Lease::new()} else {
             let mut lease=self.lease.fork();lease.adopt(&self.lease)?;lease
         };
@@ -1606,6 +1966,17 @@ impl Target {
             prefill_partial_moe_rows: self.prefill_partial_moe_rows,
             prefill_partial1024_rows: self.prefill_partial1024_rows,
             prefill_partial2048_dense: self.prefill_partial2048_dense,
+            prefill_partial_wide: self.prefill_partial_wide,
+            hint_queue_selected: Rc::new(std::cell::Cell::new(None)),
+            moe_front_grid: None,
+            moe_phase_grid: None,
+            moe_regridded: 0,
+            moe_swapped: 0,
+            defer_completion: false,
+            completion_owed: std::cell::Cell::new(false),
+            moe_live_floors: None,
+            engram_lead: None,
+            engram_lead_on: false,
             prefill_wide_mhc_rows: self.prefill_wide_mhc_rows,
             prefill_wide_mhc_norm: self.prefill_wide_mhc_norm,
             prefill_short_merge: self.prefill_short_merge,
@@ -1620,11 +1991,14 @@ impl Target {
                 && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1"),
             graph_retention: crate::graph_retention::Policy::new(rows,crate::config::execution_graph_cache_rows()?),
             graph_evictions: 0,
-            graphs: (0..=rows).map(|_| None).collect(),
-            engram_graphs: (0..=rows).map(|_| None).collect(),
-            alternate_index_graphs: (0..=rows).map(|_| None).collect(),
-            alternate_index_engram_graphs: (0..=rows).map(|_| None).collect(),
+            graphs: (0..graph_slots(rows)).map(|_| None).collect(),
+            engram_graphs: (0..graph_slots(rows)).map(|_| None).collect(),
+            alternate_index_graphs: (0..graph_slots(rows)).map(|_| None).collect(),
+            alternate_index_engram_graphs: (0..graph_slots(rows)).map(|_| None).collect(),
             adaptive_sparse_active: false,
+            short_index_flags: Vec::new(),
+            short_index_allowed: true,
+            short_index_steps: 0,
             engram_overlap: false,
             engram_projection_ahead: false,
             engram_projection_m3_only: false,
@@ -1648,6 +2022,13 @@ impl Target {
             decoder_graph: None,
             tiny_append_graphs: None,
             encoder_cache: if independent {None}else{self.encoder_cache.clone()},
+            region_tails: if independent {Vec::new()}else{self.region_tails.clone()},
+            checkpoint_aux: None,
+            checkpoint_plan_for_probe: None,
+            checkpoint_inline_for_probe: None,
+            checkpoint_aux_extra: None,
+            extra_checkpoint: None,
+            extra_image: None,
             replay: None,
             graph_replay: false,
             prefill_last_head: false,
@@ -1670,6 +2051,16 @@ impl Target {
             last_live: 0,
             last_append_metrics: None,
             pending: None,
+            batched_rows: None,
+            batched_done: None,
+            batched_pending: false,
+            region_step: false,
+            batched_owner_part: false,
+            batched_inflight: None,
+            batched_staged: None,
+            batched_block: 0,
+            padding_routes: padding_routes_requested(),
+            region_gather: RegionGather::default(),
             early,
             early_caches,
             source2,
@@ -1678,6 +2069,7 @@ impl Target {
             late,
             step,
             cached_decoder: None,
+            short_restore_extend: false,
             tokens: TokenRows::new(cuda, &vec![2; rows], 0)?,
             row_store1: self.row_store1.clone(),
             rows1,
@@ -1703,6 +2095,10 @@ impl Target {
         target.enable_verify16_ffn_before_capture(stream)?;
         target.enable_engram_projection_before_capture(kernels)?;
         target.install_communication_hints(core, stream)?;
+        target.install_hint_queues(core, stream)?;
+        target.install_source_keys_fork(stream)?;
+        target.install_index_fork(stream)?;
+        target.install_narrow_qkv(kernels)?;
         cuda.report_allocation_sites(&format!("rank{} forkM{rows} independent={independent}",self.rank))?;
         Ok(target)
     }
@@ -1715,6 +2111,9 @@ impl Target {
             _=>anyhow::bail!("Engram M3 projection policy must be0or1"),
         };
         if !enabled||self.rows!=6||self.source_phase!=Phase::Verify{return Ok(());}
+        // config::engram_split14_decode reads the layer-14 rows behind layers 1-13; a projection hoisted to layer 1
+        // would need them first. The split wins; the projection then runs at layer 14 as in every other step.
+        if crate::config::engram_split14_decode(){return Ok(());}
         ensure!(self.graph_captures==0&&!self.engram_split14&&!self.engram_split14_adaptive,
             "Engram M3 policy must precede graph capture");
         // Only row-sized values/scales/output and stream/module bookkeeping are
@@ -1744,6 +2143,15 @@ impl Target {
         Ok(())
     }
     fn share_index_scores_before_capture(&mut self,cuda:&Cuda,stream:&Stream)->Result<()> {
+        if (crate::config::sparse_union_share() || crate::config::sparse_union_share_screen()) && self.rows==6
+            && self.source_phase==Phase::Verify && self.adaptive_sparse_index_layers()==4 && self.late.sparse_union_linked()==0 {
+            ensure!(self.graph_captures==0 && self.pending.is_none() && self.position()==0
+                && self.stream==stream.raw()as usize && cuda.owns_stream(stream),
+                "candidate union sharing must precede target execution/capture");
+            ensure!(self.late.share_sparse_union(crate::config::sparse_union_share())?==3,"candidate union followers");
+            eprintln!("rank{} M6 consuming layers 28, 32, 36 linked to layer 24's candidate union and gathered keys (reuse {})",
+                self.rank,crate::config::sparse_union_share());
+        }
         let requested=match std::env::var("CANADA_SCRATCH_SHARED_INDEX_SCORES") {
             Ok(v)=>{ensure!(v=="0"||v=="1","invalid shared index scores policy");v=="1"},
             Err(std::env::VarError::NotPresent)=>false,Err(e)=>return Err(e.into()),
@@ -1810,6 +2218,453 @@ impl Target {
             }
         }
         stream.synchronize()?;
+        Ok(())
+    }
+    /// config::source_keys_fork (or its plan screen): the verify owners' source layers get their key-emission side
+    /// stream before any capture; the flag switches it on, the screen toggles it.
+    fn install_source_keys_fork(&mut self, stream: &Stream) -> Result<()> {
+        let on = crate::config::source_keys_fork();
+        if !(on || crate::config::source_keys_fork_screen()) || ![6, 16].contains(&self.rows)
+            || self.source_phase != Phase::Verify { return Ok(()); }
+        // Not usable as built (screen s1480 fork1): the vendor projection's handle draws on the cuBLAS workspace
+        // pooled per ordered stream, so it cannot run on a side stream without a private handle and workspace.
+        // config::l2_queue_index_lead reaches the same weights with hints instead. Refuse rather than fail mid-run.
+        anyhow::bail!("CANADA_SCRATCH_SOURCE_KEYS_FORK needs a private vendor workspace for the forked projection (not built); use CANADA_SCRATCH_L2_QUEUE_INDEX_LEAD");
+        #[allow(unreachable_code)]
+        ensure!(self.graph_captures == 0 && self.pending.is_none(), "the source key fork precedes execution/capture");
+        let cuda = self.cuda.clone();
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            layer.enable_source_keys_fork(&cuda, stream, on)?;
+        }
+        Ok(())
+    }
+    /// config::qkv_narrow_prequant (or its plan screen): the six-row verify owner's layers load the narrow lowering
+    /// of QKV-A beside the default one, before any capture; the flag makes it the active one.
+    fn install_narrow_qkv(&mut self, kernels: &Path) -> Result<()> {
+        let on = crate::config::qkv_narrow_prequant();
+        if !(on || crate::config::qkv_narrow_prequant_screen()) || self.rows != 6
+            || self.source_phase != Phase::Verify { return Ok(()); }
+        ensure!(self.graph_captures == 0 && self.pending.is_none(), "the narrow QKV lowering precedes execution/capture");
+        let mut installed = 0;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            if layer.install_narrow_qkv(kernels, on)? { installed += 1; }
+        }
+        eprintln!("rank{} M{} narrow QKV-A lowering: {installed} layers, active {on}", self.rank, self.rows);
+        Ok(())
+    }
+    /// Plan screen (CANADA_SCRATCH_QKV_NARROW_PREQUANT_SCREEN=1): QKV-A on the narrow lowering (on) or the default
+    /// one (off); graphs recaptured. Returns the number of layers switched.
+    pub(crate) fn set_narrow_qkv_for_probe(&mut self, on: bool, stream: &Stream) -> Result<usize> {
+        ensure!(crate::config::l2_queue_screen() && self.rows == 6 && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle narrow QKV screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        let mut switched = 0;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            if layer.set_narrow_qkv_for_probe(on)? { switched += 1; }
+        }
+        Ok(switched)
+    }
+    /// config::index_fork (or its plan screen): the verify owners' consuming layers get the side stream of their
+    /// index work before any capture, and source 20's key cache admits that stream as a reader.
+    fn install_index_fork(&mut self, stream: &Stream) -> Result<()> {
+        let on = crate::config::index_fork();
+        if !(on || crate::config::index_fork_screen()) || ![6, 16].contains(&self.rows)
+            || self.source_phase != Phase::Verify { return Ok(()); }
+        ensure!(self.graph_captures == 0 && self.pending.is_none(), "the index fork precedes execution/capture");
+        let cuda = self.cuda.clone();
+        let mut installed = 0;
+        for layer in self.late.layers_mut() {
+            if layer.enable_index_fork(&cuda, stream, on)? { installed += 1; }
+        }
+        ensure!(installed == 0 || installed == 4, "index fork on some consuming layers only");
+        if installed == 4 {
+            let side = cuda.hint_stream(stream)?;
+            self.late.source().keys().admit_follower(side.as_ref())?;
+        }
+        eprintln!("rank{} M{} index fork: {installed} consuming layers, start at the query fork {on}", self.rank, self.rows);
+        Ok(())
+    }
+    /// Plan screen (CANADA_SCRATCH_INDEX_FORK_SCREEN=1): the consuming layers' index work started where Q-B forks
+    /// (on) or behind the key store (off); graphs recaptured. Returns the number of layers switched.
+    pub(crate) fn set_index_fork_for_probe(&mut self, on: bool, stream: &Stream) -> Result<usize> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle index fork screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        let mut switched = 0;
+        for layer in self.late.layers_mut() {
+            if layer.set_index_fork_for_probe(on) { switched += 1; }
+        }
+        Ok(switched)
+    }
+    /// Plan screen (CANADA_SCRATCH_SOURCE_KEYS_FORK_SCREEN=1): the source layers' key-emission fork on or off;
+    /// graphs recaptured. Returns the number of layers switched.
+    pub(crate) fn set_source_keys_fork_for_probe(&mut self, on: bool, stream: &Stream) -> Result<usize> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle source key fork screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        let mut switched = 0;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()) {
+            if layer.set_source_keys_fork_for_probe(on) { switched += 1; }
+        }
+        // The projections change streams with the switch; everything they ran on is synchronized above.
+        for source in [&self.source2, self.group8.source(), self.group14.source(), self.late.source()] {
+            source.rebind_projection_stream_for_probe();
+        }
+        Ok(switched)
+    }
+    /// CANADA_SCRATCH_L2_QUEUE: the six-row decode owner's layers hint QKV-A, wq_b, wo_a and wo_b as one queue
+    /// over three windows (layer_attention::HintQueue). One plan is selected at once; serving selects its
+    /// only plan, the plan screen starts on the existing hints. Before any capture.
+    fn install_hint_queues(&mut self, core: &Module, stream: &Stream) -> Result<()> {
+        crate::moe::install_native_front(core)?;
+        let (plans, ffn_plans) = crate::config::l2_queue_plans_for(self.rows);
+        if plans.is_empty() || !crate::l2_prefetch::enabled_for_rows(self.rows, 2)? {
+            return Ok(());
+        }
+        crate::config::validate_l2_queue()?;
+        ensure!(self.graph_captures == 0 && self.pending.is_none(), "hint queues precede execution/capture");
+        let selected = self.hint_queue_selected.clone();
+        // config::l2_queue_index_lead (or its screen): what each indexed layer's index work reads cold before the
+        // attention needs wq_b: the compressor's projection weights in the source layers, then the index query's.
+        let mut leads: Vec<(Vec<(u64, usize)>, Vec<Rc<crate::blockscaled::Matrix>>)> = (0..40).map(|_| (Vec::new(), Vec::new())).collect();
+        if crate::config::l2_queue_index_lead() || crate::config::l2_queue_index_lead_screen() {
+            let weights: Vec<Rc<Weights>> = self.early.iter().chain(self.group8.layers()).chain(self.group14.layers())
+                .chain(self.late.layers()).map(|layer| layer.shared_weights()).collect();
+            ensure!(weights.len() == 40, "index lead layer weights");
+            let branches = self.index_queries();
+            for (slot, id) in [2usize, 8, 14, 20, 24, 28, 32, 36].into_iter().enumerate() {
+                let Some(branch) = branches[slot] else { continue };
+                let matrix = branch.query_matrix();
+                let mut regions = Vec::new();
+                let key = format!("layers.{id}.attn.compressor.wkv.weight");
+                if id <= 20 && let Ok(view) = weights[id].view(&key) {
+                    let mut bytes = view.bytes;
+                    if let Ok(gate) = weights[id].view(&format!("layers.{id}.attn.compressor.wgate.weight"))
+                        && view.offset + view.bytes == gate.offset { bytes += gate.bytes; }
+                    let address = weights[id].ptr(&key)?;
+                    if address % 16 == 0 && bytes >= 16 { regions.push((address, bytes / 16 * 16)); }
+                }
+                regions.extend(matrix.immutable_regions()?);
+                leads[id] = (regions, vec![matrix]);
+            }
+        }
+        if self.rank == 0 && leads.iter().any(|l| !l.0.is_empty()) {
+            eprintln!("rank0 M{} index lead bytes by indexed layer: {:?}", self.rows,
+                [2usize, 8, 14, 20, 24, 28, 32, 36].map(|id| leads[id].0.iter().map(|r| r.1).sum::<usize>()));
+        }
+        // config::l2_queue_engram_lead (or its screen): the Engram projections of layers 1 and 14 as the first
+        // window of those layers, begun by layers 0 and 13 while their gate is set.
+        let mut engram_matrices: [Option<Rc<crate::blockscaled::Matrix>>; 2] = [None, None];
+        if crate::config::l2_queue_engram_lead() || crate::config::l2_queue_engram_lead_screen() {
+            engram_matrices[0] = self.early.get(1).and_then(|layer| layer.engram()).map(|e| e.projection_matrix());
+            engram_matrices[1] = self.group14.engram().map(|(e, _)| e.projection_matrix());
+            if engram_matrices.iter().all(Option::is_some) {
+                self.engram_lead_on = crate::config::l2_queue_engram_lead();
+                self.engram_lead = Some((Rc::new(std::cell::Cell::new(self.engram_lead_on)),
+                    Rc::new(std::cell::Cell::new(self.engram_lead_on))));
+            } else { engram_matrices = [None, None]; }
+        }
+        let mut queues = Vec::with_capacity(40);
+        for (id, layer) in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()).enumerate() {
+            let engram = match (id, &self.engram_lead) {
+                (1, Some((gate, _))) => engram_matrices[0].clone().map(|m| (m, gate.clone())),
+                (14, Some((_, gate))) => engram_matrices[1].clone().map(|m| (m, gate.clone())),
+                _ => None,
+            };
+            // Engram runs before the QKV of layers 1 and 14: no W1 through that working set (as the QKV-A hint).
+            queues.push(layer.build_hint_queues(core, stream, plans, ffn_plans, selected.clone(),
+                id > 0 && ![1, 14].contains(&id), &leads[id].0, &leads[id].1, engram)?);
+        }
+        ensure!(queues.len() == 40, "hint queues cover the forty layers");
+        let engram_lead = self.engram_lead.is_some();
+        for (id, layer) in self.early.iter_mut().chain(self.group8.layers_mut())
+            .chain(self.group14.layers_mut()).chain(self.late.layers_mut()).enumerate() {
+            if id + 1 < 40 && (engram_lead || ![1, 14].contains(&(id + 1))) { layer.install_next_hint_queues(queues[id + 1].clone())?; }
+        }
+        stream.synchronize()?;
+        if plans.len() == 1 && !crate::config::l2_queue_screen() { selected.set(Some(0)); }
+        eprintln!("rank{} M{} L2 hint queues: {} plan(s), selected {:?}", self.rank, self.rows, plans.len(), selected.get());
+        Ok(())
+    }
+    /// Plan screen: select a hint queue plan (None: the existing separate hints). Graphs are recaptured.
+    pub(crate) fn set_l2_queue_for_probe(&mut self, plan: Option<usize>, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen()
+            && plan.is_none_or(|p| p < crate::config::l2_queue_plans_for(self.rows).0.len())
+            && self.source_phase == Phase::Verify && self.pending.is_none()
+            && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle L2 queue screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        self.hint_queue_selected.set(plan);
+        Ok(())
+    }
+    /// Plan screen: the native WO-A partial kernel on or off in every layer of this owner. Graphs are recaptured.
+    /// Plan screen only: the verification graphs captured from now on launch the routed experts' front-end
+    /// kernel (48 cooperating blocks by default) with `grid` blocks; None restores the exported grid.
+    pub(crate) fn set_moe_front_grid_for_probe(&mut self, grid: Option<u32>, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && grid.is_none_or(|g| (1..=48).contains(&g))
+            && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle front-end grid screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        self.moe_front_grid = grid;
+        Ok(())
+    }
+    /// Plan screen only: the verification graphs captured from now on launch the routed experts' phase kernels
+    /// with (FC1, FC2) blocks and that carve-out preference; None leaves the graphs as exported. A control arm that
+    /// follows a carve-out arm passes (96, 96, Some(-1)) so the function attribute is restored at its capture.
+    pub(crate) fn set_moe_phase_grid_for_probe(&mut self, grid: Option<(u32, u32, Option<i32>)>, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && grid.is_none_or(|(up, down, _)| (1..=1024).contains(&up) && (1..=1024).contains(&down))
+            && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle expert grid screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        self.moe_phase_grid = grid;
+        Ok(())
+    }
+    /// Kernel nodes the grid rules matched in the last verification graph capture (screens).
+    pub(crate) fn moe_regridded(&self) -> usize { self.moe_regridded }
+    /// Plan screen (CANADA_SCRATCH_MOE_NATIVE_FRONT_SCREEN=1): the verification graphs captured from now on run
+    /// the native expert front-end in place of the exported one, or not. Graphs are recaptured.
+    pub(crate) fn set_moe_native_front_for_probe(&mut self, on: bool, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle native front-end screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        crate::moe::set_native_front_for_probe(on)
+    }
+    /// Plan screen (CANADA_SCRATCH_MOE_ROUTE_FRONT_SCREEN=1): the verification graphs captured from now on leave
+    /// the router's top-k to the native expert front-end, or not. Graphs are recaptured.
+    pub(crate) fn set_moe_route_front_for_probe(&mut self, on: bool, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle fused routing screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        crate::moe::set_route_front_for_probe(on)
+    }
+    /// Exported front-end nodes the last verification graph capture replaced (screens).
+    pub(crate) fn moe_swapped(&self) -> usize { self.moe_swapped }
+    /// Plan screen (CANADA_SCRATCH_SPARSE_UNION_SHARE_SCREEN=1): layers 28, 32 and 36 reuse layer 24's candidate
+    /// union and gathered keys, or recompute them. Graphs are recaptured. Ok(false) on an owner without the link.
+    pub(crate) fn set_sparse_union_share_for_probe(&mut self, on: bool, stream: &Stream) -> Result<bool> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle candidate union screen");
+        if self.late.sparse_union_linked() != 3 { return Ok(false); }
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        self.late.set_sparse_union_follow_for_probe(on)?;
+        Ok(true)
+    }
+    /// Plan screen (CANADA_SCRATCH_BOUNDED_MASK_SCREEN=1): the candidate consumers of layers 24..36 with the bounded
+    /// mask kernel on or off; graphs recaptured. Returns how many consumers were switched.
+    pub(crate) fn set_bounded_mask_for_probe(&mut self, on: bool, stream: &Stream) -> Result<usize> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle bounded mask screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        let mut switched = 0;
+        for branch in self.index_queries().into_iter().flatten() {
+            if branch.set_bounded_mask_for_probe(on)? { switched += 1; }
+        }
+        Ok(switched)
+    }
+    /// Plan screen (CANADA_SCRATCH_L2_QUEUE_ENGRAM_LEAD_SCREEN): the Engram projection hints on or off; graphs recaptured.
+    pub(crate) fn set_l2_engram_lead_for_probe(&mut self, on: bool, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none() && self.engram_lead.is_some(),
+            "idle Engram lead hint screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        self.engram_lead_on = on;
+        if let Some((first, second)) = &self.engram_lead { first.set(on); second.set(on); }
+        Ok(())
+    }
+    /// Plan screen (CANADA_SCRATCH_L2_QUEUE_INDEX_LEAD_SCREEN): the indexed layers' second window with the index
+    /// work's cold weights first; graphs recaptured.
+    pub(crate) fn set_l2_index_lead_for_probe(&mut self, on: bool, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle index lead hint screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut()).chain(self.group14.layers_mut())
+            .chain(self.late.layers_mut()) {
+            layer.set_index_lead_for_probe(on);
+        }
+        Ok(())
+    }
+    /// Plan screen (CANADA_SCRATCH_L2_QUEUE_INDEX_EARLY_SCREEN): the third window before the index work; graphs recaptured.
+    pub(crate) fn set_l2_index_early_for_probe(&mut self, on: bool, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle early index hint screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut()).chain(self.group14.layers_mut())
+            .chain(self.late.layers_mut()) {
+            layer.attention().set_index_early_for_probe(on);
+        }
+        Ok(())
+    }
+    /// Plan screen (CANADA_SCRATCH_MHC_STATS_LATE_SCREEN): move every layer's statistics forks; graphs are recaptured.
+    pub(crate) fn set_mhc_stats_late_for_probe(&mut self, points: Option<(u8, u8)>, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle mHC late statistics screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        let (attention, ffn) = points.map_or(crate::mhc::stats_late_requested(self.rows)?, |p| p);
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut()).chain(self.group14.layers_mut())
+            .chain(self.late.layers_mut()) {
+            layer.set_mhc_stats_late_for_probe(attention, ffn)?;
+        }
+        Ok(())
+    }
+    /// Plan screen (CANADA_SCRATCH_KNOCKOUT_SCREEN): the kernel groups whose launches the next captures leave out
+    /// (crate::knockout; 0 = none). Graphs are recaptured.
+    pub(crate) fn set_knockout_for_probe(&mut self, mask: u32, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && self.rows == 6 && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle knockout screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        crate::knockout::set(mask);
+        Ok(())
+    }
+    /// Plan screen (CANADA_SCRATCH_WQB_DIRECT_SCREEN): every layer's wq_b on the direct-read GEMV or back on the
+    /// exported kernel; graphs are recaptured.
+    pub(crate) fn set_wqb_direct_for_probe(&mut self, on: Option<bool>, stream: &Stream) -> Result<()> {
+        ensure!((crate::config::wqb_direct_screen() || crate::config::qkva_direct_screen()) && self.rows == 6 && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle direct wq_b screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut()).chain(self.group14.layers_mut())
+            .chain(self.late.layers_mut()) {
+            layer.attention().set_wqb_direct_for_probe(on)?;
+        }
+        Ok(())
+    }
+    /// Plan screen (CANADA_SCRATCH_INJECT_SCREEN; crate::inject): the injection of the graphs captured from now on.
+    pub(crate) fn set_injection_for_probe(&mut self, arm: Option<crate::inject::Arm>, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && crate::inject::armed() && self.rows == 6 && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle injection screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        crate::inject::set(arm);
+        Ok(())
+    }
+    /// crate::head4_rescore on this six-row verify owner (before any graph is captured).
+    pub(crate) fn install_head4_rescore(&mut self, head: Rc<crate::nvfp4_head::Head>, cap: usize, window: f32, on: bool) -> Result<()> {
+        ensure!(self.rows == 6 && self.source_phase == Phase::Verify && self.pending.is_none() && self.graph_captures == 0,
+            "4-bit head rescoring installs on an idle six-row verify owner before its captures");
+        self.io.install_head4(head, cap, window, on)
+    }
+    /// Plan screen (CANADA_SCRATCH_HEAD4_RESCORE_SCREEN): the head by 4-bit copy + rescoring, or the exact head;
+    /// graphs are recaptured.
+    pub(crate) fn set_head4_for_probe(&mut self, on: bool, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::head4_rescore_screen() && self.rows == 6 && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle 4-bit head screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        self.io.set_head4(on)
+    }
+    /// Plan screen: the rows this rank rescored for each live row of the last completed pass, and the settings.
+    pub(crate) fn head4_counts_for_probe(&self, live: usize, stream: &Stream) -> Result<(Vec<i32>, Option<(usize, f32)>)> {
+        stream.synchronize()?;
+        Ok((self.io.head4_counts(live)?, self.io.head4_settings()))
+    }
+    /// Plan screen (CANADA_SCRATCH_MHC_QUARTER_STATS_SCREEN): every installed attention boundary's statistics by
+    /// rank quarter or back on the whole-residual kernel; graphs are recaptured. Returns the layers switched.
+    pub(crate) fn set_quarter_stats_for_probe(&mut self, on: bool, stream: &Stream) -> Result<usize> {
+        ensure!(crate::config::mhc_quarter_stats_screen() && self.rows == 6 && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle quarter statistics screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        let mut switched = 0;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut()).chain(self.group14.layers_mut())
+            .chain(self.late.layers_mut()) {
+            switched += usize::from(layer.attention().set_quarter_stats_for_probe(on)?);
+        }
+        Ok(switched)
+    }
+    /// Plan screen: the first layer's QKV-A and wq_b outputs after a completed step (its input is the embedding,
+    /// the same in every arm), so two arms' bytes compare the projection kernels alone.
+    pub(crate) fn direct_outputs_for_probe(&self, stream: &Stream) -> Result<[Vec<u8>; 2]> {
+        stream.synchronize()?;
+        self.early.first().context("no early layer")?.attention().direct_outputs_for_probe()
+    }
+    pub(crate) fn set_woa_native_for_probe(&mut self, on: bool, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::woa_native_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle native WO-A screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        for layer in self.early.iter_mut().chain(self.group8.layers_mut()).chain(self.group14.layers_mut())
+            .chain(self.late.layers_mut()) {
+            layer.attention().set_woa_native_for_probe(on)?;
+        }
         Ok(())
     }
     /// Finite component screen over two completed, independently owned M6
@@ -1879,6 +2734,17 @@ impl Target {
         Ok(serde_json::json!({"all_exact":true,"layers":reports,
             "modes":["separate_ab","pooled_ab","separate_ba","pooled_ba"],
             "scope":"Two real pending target M6 forwards. Original routers and shared experts; only routed expert work pooled into twelve live M16 rows. Includes packing and split addition. All local FFN output bits match the original whole-model forward. Excludes attention, TP4 reductions, residual boundaries and weight lookahead; not whole-model throughput."}))
+    }
+    /// Read-only (weight read census): the four sources' compressed KV caches and index key caches as
+    /// (name, address, bytes).
+    pub(crate) fn cache_arenas(&self) -> Vec<(String, u64, usize)> {
+        let mut out = Vec::new();
+        for source in [&self.source2, self.group8.source(), self.group14.source(), self.late.source()] {
+            let id = source.layer_id();
+            out.push((format!("kv{id}"), source.cache().data().ptr(), source.cache().data().bytes()));
+            out.push((format!("keys{id}"), source.keys().data().ptr(), source.keys().data().bytes()));
+        }
+        out
     }
     pub(crate) fn layer_owners(&self) -> Vec<&SwaLayer> {
         self.early
@@ -2066,7 +2932,15 @@ impl Target {
                 regions.push(Region::new(&self.cuda, format!("compressed.{layer}.keys"), source.keys().data())?);
             }
             if let Some(ring) = source.source().ring() {
-                regions.push(Region::new(&self.cuda, format!("compressed.{layer}.carry"), ring)?);
+                // With several request slots (serving regions, screens) an image is region 0's
+                // conversation: its carry is request slot 0 (the ring is request-major).
+                let slots = crate::config::session_slots()?;
+                if slots > 1 {
+                    regions.push(Region::byte_range(&self.cuda, format!("compressed.{layer}.carry"), ring,
+                        0..ring.bytes() / slots)?);
+                } else {
+                    regions.push(Region::new(&self.cuda, format!("compressed.{layer}.carry"), ring)?);
+                }
             }
         }
         let encoder = self.encoder_cache.as_ref()
@@ -2162,6 +3036,15 @@ impl Target {
     /// Finite mechanism screen only. An incomplete decoder owner never escapes
     /// this method: checkpoint creation is immediately followed by its suffix.
     #[allow(clippy::too_many_arguments)]
+    /// Finite inline-checkpoint screen: force the policy (None: the environment's) and the
+    /// chunk plan of the next checkpoint prefill's first pass (the prefix, or prefix and
+    /// suffix when inline).
+    pub(crate) fn set_inline_checkpoint_for_probe(&mut self,inline:Option<bool>,plan:Option<Vec<usize>>)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_ENCODER_CHECKPOINT_SCREEN").as_deref()==Ok("1")
+            &&std::env::var("CANADA_SCRATCH_INLINE_CHECKPOINT_SCREEN").as_deref()==Ok("1")
+            &&self.rows==128&&self.wide.is_none(),"inline checkpoint probe admission");
+        self.checkpoint_inline_for_probe=inline;self.checkpoint_plan_for_probe=plan;Ok(())
+    }
     pub(crate) fn prefill_encoder_checkpoint_for_probe(&mut self,wides:&mut[Self],prefix:&[u32],
         suffix:&[u32],budget:usize,comm:&Roce,stream:&Stream)
         ->Result<(EncoderPrefixImage,serde_json::Value)> {
@@ -2195,7 +3078,7 @@ impl Target {
         restore:Option<EncoderPrefixRestore<'_>>,prefix:&[u32],suffix:&[u32],budget:Option<usize>,
         comm:&Roce,stream:&Stream)->Result<(Option<EncoderPrefixImage>,serde_json::Value)> {
         let (image,details,progress)=self.prefill_with_encoder_checkpoint_interruptible(wides,
-            restore,prefix,suffix,budget,None,comm,stream,&mut |_|Ok(false),&mut |admit|Ok(admit))?;
+            restore,prefix,suffix,budget,None,comm,stream,&mut |_|Ok(false),&mut |admit|Ok(admit),&mut |_|Ok(()))?;
         ensure!(progress.done==prefix.len()+suffix.len(),"uninterrupted encoder checkpoint extent");
         Ok((image,details))
     }
@@ -2208,11 +3091,24 @@ impl Target {
         recycled:Option<crate::state_image::Image>,
         comm:&Roce,stream:&Stream,should_yield:&mut impl FnMut(usize)->Result<bool>,
         admit_image:&mut impl FnMut(bool)->Result<bool>,
+        prefilled:&mut impl FnMut(&mut Self)->Result<()>,
     )->Result<(Option<EncoderPrefixImage>,serde_json::Value,PrefillProgress)> {
+        // `prefilled` runs once the whole request is prefilled (never after an interruption): with the inline
+        // checkpoint before the image is saved, so the caller can sample and expose the first token first.
         let recycled_bytes=recycled.as_ref().map_or(0,crate::state_image::Image::bytes);
         ensure!(recycled.is_none()||budget==Some(recycled_bytes),"encoder recycled storage extent");
+        // The caller's request for a second (near-end) image; only the inline path below serves it.
+        let extra_request=self.extra_checkpoint.take();self.extra_image=None;
         let previous=restore.as_ref().map_or(self.history.position as usize,|r|r.image_and_lineage().0.position());
-        ensure!(encoder_checkpoint_enabled()&&suffix.len()>=128&&previous+prefix.len()>=128
+        // A short suffix after a restored image, saving no image (CANADA_SCRATCH_ENCODER_SHORT_SUFFIX): one
+        // ragged 128-row chunk whose decoder tail replays the image's retained encoder ring.
+        let short_restore=suffix.len()<128&&restore.is_some()&&prefix.is_empty()&&budget.is_none()
+            &&crate::config::encoder_short_suffix()?;
+        // A near-end checkpoint (CANADA_SCRATCH_ENCODER_NEAR_END): fewer than 128 rows follow it, so it is
+        // captured inline in the last encoder chunk, which then completes the request (checked below).
+        let near_end=suffix.len()<128&&!short_restore;
+        ensure!(encoder_checkpoint_enabled()&&!suffix.is_empty()&&previous+prefix.len()>=128
+            && (!near_end||(crate::config::encoder_near_end_checkpoint()?>0&&restore.is_some()))
             && prefix.len()+suffix.len()<=self.context.saturating_sub(previous)
             && prefix.iter().chain(suffix).all(|&id|id<129280),
             "encoder checkpoint requires a complete replacement suffix");
@@ -2231,13 +3127,61 @@ impl Target {
         let lookahead=std::env::var("CANADA_SCRATCH_ENGRAM_PREFETCH").as_deref()==Ok("1");
         let(encoder_graph,tiny_encoder_graph)=self.default_encoder_graph_policy()?;
         let prefix_at=Instant::now();
+        let forced_plan=self.checkpoint_plan_for_probe.take();
+        let inline_plan=self.inline_checkpoint_plan(wides,prefix.len(),suffix.len(),forced_plan.clone())?
+            .filter(|_|!encoder_graph);
+        ensure!(!near_end||inline_plan.is_some(),"near-end encoder checkpoint needs its inline capture plan");
+        if let Some(plan)=inline_plan {
+            // One prefill of prefix and suffix: its last encoder chunk runs through the
+            // checkpoint and captures the state as of it; the image is saved from that.
+            // A yield before the last chunk returns as an interrupted prefix does, and
+            // the resumed prefill takes the ordinary prefix/checkpoint/suffix path.
+            // Without an admitted image (a duplicate or a refused save) nothing is captured.
+            let aux=if budget.is_some(){Some(self.checkpoint_aux()?)}else{None};
+            let tail_graph=match std::env::var("CANADA_SCRATCH_PREFILL_TAIL_GRAPH") {
+                Ok(value)=>{ensure!(value=="0"||value=="1","invalid prefill tail graph policy");value=="1"},
+                Err(std::env::VarError::NotPresent)=>self.graph_replay,
+                Err(error)=>return Err(error.into()),
+            };
+            let all=[prefix,suffix].concat();
+            // The extra image lies in the same last chunk, after the checkpoint, 128 rows or more into the chunk.
+            let last_start:usize=plan[..plan.len()-1].iter().sum();
+            let extra=extra_request.filter(|&(rows,_)|aux.is_some()&&rows>prefix.len()&&rows<=all.len()&&rows>=last_start+128);
+            let aux_extra=if extra.is_some(){Some(self.checkpoint_aux_extra()?)}else{None};
+            let progress=self.prefill_wide_interruptible_checkpoint(wides,&all,comm,stream,lookahead,tail_graph,
+                encoder_graph,tiny_encoder_graph,false,Some(plan),aux.clone().map(|aux|(aux,prefix.len())),
+                aux_extra.clone().zip(extra).map(|(aux,(rows,_))|(aux,rows)),should_yield)?;
+            if progress.done<all.len() {
+                return Ok((None,serde_json::json!({"interrupted":true,"restore_seconds":restore_seconds,
+                    "consumed_parent":consumed_parent,"target_total_seconds":started.elapsed().as_secs_f64(),
+                    "partial_phases":self.append_metrics()?}),progress));
+            }
+            let prefix_seconds=prefix_at.elapsed().as_secs_f64();
+            prefilled(self)?;
+            let save_at=Instant::now();
+            let saved=if let (Some(budget),Some(aux))=(budget,&aux) {
+                self.save_inline_checkpoint(aux,previous+prefix.len(),budget,recycled,comm,stream,admit_image)?
+            }else{None};
+            let extra_at=Instant::now();
+            if let (Some((rows,bytes)),Some(aux))=(extra,&aux_extra) {
+                self.extra_image=self.save_inline_checkpoint(aux,previous+rows,bytes,None,comm,stream,admit_image)?;
+            }
+            let extra_seconds=extra_at.elapsed().as_secs_f64();
+            let save_seconds=save_at.elapsed().as_secs_f64();
+            return Ok((saved,serde_json::json!({"restore_seconds":restore_seconds,"consumed_parent":consumed_parent,
+                "prefix_seconds":prefix_seconds,"save_seconds":save_seconds-extra_seconds,"poisoned_decoder_bytes":0,
+                "extra_checkpoint":extra.map(|(rows,_)|serde_json::json!({"position":previous+rows,
+                    "saved":self.extra_image.is_some(),"seconds":extra_seconds})),
+                "finite_swa_poison":false,"inline_checkpoint":true,
+                "target_total_seconds":started.elapsed().as_secs_f64(),"suffix_phases":self.append_metrics()?}),progress));
+        }
         // The complete final suffix replaces every omitted decoder/MTP row.
         // s788/s796 each exercised the128 omission twice (the other requests
         // were controls). The one s785 sampled divergence remains unexplained.
         let defer128=defer_checkpoint_decoder128()?;
         let progress=if prefix.len()>=256 || (defer128&&prefix.len()>=128&&previous>0) {
             self.prefill_wide_interruptible_policy(wides,prefix,comm,stream,lookahead,
-                self.graph_replay,encoder_graph,tiny_encoder_graph,true,None,should_yield)?
+                self.graph_replay,encoder_graph,tiny_encoder_graph,true,forced_plan,should_yield)?
         }else if !prefix.is_empty(){
             // Retain the established small-increment numerical path. Its
             // intermediate decoder result is unused and the final suffix
@@ -2308,10 +3252,15 @@ impl Target {
         }
         // Report progress over the whole compound append, including the
         // already completed prefix. Scheduling uses the uncached remainder.
-        let mut progress=self.prefill_wide_interruptible(wides,suffix,comm,stream,None,
+        // A short restored suffix replays the image's ring (level 1), or runs as the qualified EXTEND over its new
+        // rows when the caller kept the drafter tail (level 2, short_restore_extend).
+        let extend=short_restore&&std::mem::take(&mut self.short_restore_extend);
+        let mut progress=self.prefill_wide_interruptible(wides,suffix,comm,stream,(short_restore&&!extend).then(||vec![128]),
             &mut |done|should_yield(prefix.len()+done))?;
         progress.done+=prefix.len();
+        if progress.done==prefix.len()+suffix.len() {prefilled(self)?;}
         Ok((saved,serde_json::json!({"restore_seconds":restore_seconds,"consumed_parent":consumed_parent,"prefix_seconds":prefix_seconds,"save_seconds":save_seconds,
+            "short_restore":short_restore,"short_restore_extend":extend,
             "poisoned_decoder_bytes":poisoned_decoder_bytes,
             "finite_swa_poison":finite_swa_poison,
             "target_total_seconds":started.elapsed().as_secs_f64(),"suffix_phases":self.append_metrics()?}),progress))
@@ -2513,7 +3462,13 @@ impl Target {
         );
         self.lease.adopt(&previous.lease)?;
         self.history = previous.history.clone();
-        self.invalidate_gather_caches();
+        // The single-sequence cached gather restarts after any handoff. Region gathers survive
+        // handoffs between the verify owners (their steps only append at frontiers); state from a
+        // prefill owner may have rewritten anything, so it starts a new epoch.
+        for q in self.index_queries().into_iter().flatten() {q.invalidate_gather_cache();}
+        if !matches!(previous.rows, 6 | 16) {
+            INDEX_CACHE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.comm_instance = previous.comm_instance;
         self.last_live = 0;
         self.last_append_metrics = None;
@@ -2969,6 +3924,21 @@ impl Target {
         for layer in self.layer_owners(){layer.narrow_workspace().set_cooperative_epilogues_for_probe(enabled,stream)?;}
         Ok(())
     }
+    /// Plan screen (CANADA_SCRATCH_MOE_LIVE_VARIANTS_SCREEN=1): from how many live rows the six-row owner's experts
+    /// take the cache-ca plan and the fused FFN sum; graphs recaptured. None restores the configured floors.
+    pub(crate) fn set_moe_live_variants_for_probe(&mut self,floors:Option<(usize,usize,bool)>,stream:&Stream)->Result<()> {
+        ensure!(crate::config::l2_queue_screen()&&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),"idle live variant screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        let configured=*self.moe_live_floors.get_or_insert_with(||self.early[0].narrow_workspace().live_variant_floors());
+        let (cache_ca,fuse,fc_pdl_other)=floors.unwrap_or(configured);
+        for layer in self.layer_owners(){layer.narrow_workspace().set_live_variant_floors_for_probe(cache_ca,fuse,fc_pdl_other,stream)?;}
+        Ok(())
+    }
     pub(crate) fn set_cache_ca_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_MOE_CACHE_CA_SCREEN").as_deref()==Ok("1")
             &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
@@ -3255,8 +4225,48 @@ impl Target {
     pub(crate) fn staged_metadata_transfer_bytes(&self)->usize {
         self.step.staged_metadata.as_ref().map_or(0,|s|s.transfer_bytes())
     }
+    /// Batched screen diagnostic: drop the incremental index-gather caches, which assume
+    /// one contiguous growing sequence (CANADA_SCRATCH_BATCH_SCREEN_INVALIDATE=1).
+    pub(crate) fn invalidate_gather_caches_for_probe(&self) -> Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_BATCH_SCREEN").as_deref() == Ok("1") && self.pending.is_none(),
+            "gather cache invalidation needs the idle batched screen owner");
+        self.invalidate_gather_caches(); Ok(())
+    }
+    /// Enter or leave region mode for a step (every index branch; query_index::set_region_mode).
+    fn set_region_step(&mut self, region: bool) -> Result<()> {
+        if region == self.region_step { return Ok(()); }
+        for q in self.index_queries().into_iter().flatten() { q.set_region_mode(region)?; }
+        self.region_step = region;
+        Ok(())
+    }
     fn invalidate_gather_caches(&self) {
+        INDEX_CACHE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for q in self.index_queries().into_iter().flatten() {q.invalidate_gather_cache();}
+    }
+    /// Per-row index gather starts of a region step (CANADA_SCRATCH_REGION_GATHER_CACHE=1): each row
+    /// gathers its region's keys from where this owner last gathered them, less a margin of rows a
+    /// frontier step may rewrite; everything after any cache change (INDEX_CACHE_EPOCH).
+    fn region_gather_starts(&mut self, p: &Plan, parts: &[(SessionBase, History, usize)]) -> Result<(Vec<i32>, Vec<i32>)> {
+        let epoch = INDEX_CACHE_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        if self.region_gather.epoch != epoch { self.region_gather = RegionGather { epoch, ..Default::default() }; }
+        let (mut pair, mut single) = (p.pair_starts.clone(), p.single_starts.clone());
+        let (mut next_pair, mut next_single) = (self.region_gather.pair, self.region_gather.single);
+        for (k, (base, _, live)) in parts.iter().enumerate() {
+            let r = usize::try_from(base.request)?;
+            ensure!(r < MAX_BATCHED_SESSIONS, "region gather region index");
+            for row in 0..*live {
+                let d = k * p.block + row;
+                let (ps, pe) = (p.pair_starts[d], p.pair_starts[d] + p.pair_lengths[d]);
+                let (ss, se) = (p.single_starts[d], p.single_starts[d] + p.single_lengths[d]);
+                pair[d] = (self.region_gather.pair[r] - REGION_GATHER_MARGIN).clamp(ps, pe.max(ps));
+                single[d] = (self.region_gather.single[r] - REGION_GATHER_MARGIN).clamp(ss, se.max(ss));
+                next_pair[r] = next_pair[r].max(pe);
+                next_single[r] = next_single[r].max(se);
+            }
+        }
+        self.region_gather.pair = next_pair;
+        self.region_gather.single = next_single;
+        Ok((pair, single))
     }
     fn prepare_gather_caches(&self,stream:&Stream)->Result<()> {
         for q in self.index_queries().into_iter().flatten() {q.prepare_gather_cache(stream)?;}
@@ -3335,7 +4345,7 @@ impl Target {
                 && std::env::var("CANADA_SCRATCH_TINY_APPEND_PHASE_SCREEN").as_deref()==Ok("1")))),
             "adaptive indexing requires all four Verify6 consumer layers");
         if layers==0 {return Ok(());}
-        let sparse=self.history.position>=65536;
+        let sparse=self.history.position>=crate::config::adaptive_sparse_min()?;
         if sparse!=self.adaptive_sparse_active {
             self.late.set_adaptive_sparse6(sparse);
             std::mem::swap(&mut self.graphs,&mut self.alternate_index_graphs);
@@ -3498,10 +4508,26 @@ impl Target {
             "isolated verification completion-polling owner");
         stream.synchronize()?;self.verification_poll_us=microseconds;Ok(())
     }
+    /// Screen only (CANADA_SCRATCH_INDEX_SHORT_ROWS_ALTERNATE=1): whether the next steps may take the short index
+    /// path (config::index_short_rows), set by the worker between requests.
+    pub(crate) fn set_short_index_allowed(&mut self, allowed: bool) -> Result<()> {
+        ensure!(self.pending.is_none(), "alternating short index rows");
+        self.short_index_allowed = allowed; Ok(())
+    }
+    /// config::index_short_rows: steps taken on the short path since the last call.
+    pub(crate) fn take_short_index_steps(&mut self) -> u64 { std::mem::take(&mut self.short_index_steps) }
+    /// Screen only (CANADA_SCRATCH_VERIFY_POLL_ALTERNATE=1): the completion wait of the next verify passes, set by the
+    /// worker between requests (1 = spin on the event query, 25 = sleep 25 us between queries).
+    pub(crate) fn set_verification_poll_alternate(&mut self,microseconds:u64)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_VERIFY_POLL_ALTERNATE").as_deref()==Ok("1")&&[1,25].contains(&microseconds)
+            &&self.pending.is_none(),"alternating verification poll");
+        self.verification_poll_us=microseconds;Ok(())
+    }
     pub(crate) fn verification_poll_us_requested()->Result<u64> {
         match std::env::var("CANADA_SCRATCH_VERIFY_POLL_US") {
-            Ok(value)=>match value.as_str(){"0"=>Ok(0),"25"=>Ok(25),
-                _=>anyhow::bail!("verification polling interval must be0or25microseconds")},
+            // "1": query the completion event in a spin loop (no sleep); "25": sleep 25 us between queries.
+            Ok(value)=>match value.as_str(){"0"=>Ok(0),"1"=>Ok(1),"25"=>Ok(25),
+                _=>anyhow::bail!("verification polling interval must be 0, 1 (spin) or 25 microseconds")},
             Err(std::env::VarError::NotPresent)=>Ok(0),Err(error)=>Err(error.into()),
         }
     }
@@ -3597,6 +4623,15 @@ impl Target {
             layer.set_query_overlap(query, stream)?;
         }
         self.engram_overlap = policy != "control";
+        // config::engram_split14_decode: three graphs a slot (layer 0 | layers 1-13 | layers 14-39); the step reads
+        // table 1's rows behind the first and table 14's behind the second.
+        if self.engram_overlap && crate::config::engram_split14_decode() {
+            ensure!(!self.engram_projection_ahead && !self.engram_split14_adaptive, "split Engram reads exclude the hoisted projection");
+            self.engram_split14 = true;
+            self.engram_split14_m3_only = false;
+        }
+        // config::index_fork follows the query fork, which this owner gets here rather than at construction.
+        if query { self.install_index_fork(stream)?; }
         Ok(if query { "combined" } else if self.engram_overlap { "engram" } else { "control" })
     }
     pub fn swa_storage_report(&self) -> Result<serde_json::Value> {
@@ -3707,7 +4742,7 @@ impl Target {
         if !self.graph_replay || live==0 || live>self.rows {return false;}
         if self.index_queries().into_iter().flatten().any(|q|q.key_sharded_transition(self.history.position).is_some()){return false;}
         let alternate=self.adaptive_sparse_index_layers()>0
-            && (self.history.position>=65536)!=self.adaptive_sparse_active;
+            && (self.history.position>=crate::config::adaptive_sparse_min().unwrap_or(65536))!=self.adaptive_sparse_active;
         if self.engram_overlap {
             if alternate {self.alternate_index_engram_graphs[live].is_some()}
             else {self.engram_graphs[live].is_some()}
@@ -3723,6 +4758,14 @@ impl Target {
             && self.graph_replay && self.wide.is_none(),
             "Engram overlap requires an idle graph-enabled verification owner");
         self.engram_overlap = enabled;
+        Ok(())
+    }
+    /// Batched serving (CANADA_SCRATCH_BATCHED_ENGRAM_OVERLAP=1): the 16-row owner, which only runs
+    /// batched steps, takes the Engram row overlap as the 6-row owner's ordinary steps do.
+    pub(crate) fn ensure_batched_engram_overlap(&mut self) -> Result<()> {
+        if crate::config::batched_engram_overlap() && !self.engram_overlap && self.rows == 16 {
+            self.set_engram_overlap_for_probe(true)?;
+        }
         Ok(())
     }
     pub(crate) fn set_engram_projection_ahead_for_probe(&mut self,mode:u8,kernels:&Path,stream:&Stream)->Result<()> {
@@ -3882,9 +4925,9 @@ impl Target {
                 let decoder=Step::new(&self.cuda,&self.source2,self.group8.source(),self.group14.source(),
                     self.late.source(),&pairs,&singles,self.rows,self.context,self.early_caches[0].capacity(),self.swa_layout,Phase::Extend)?;
                 self.tiny_append_graphs=Some(TinyAppendGraphs {
-                    graphs:(0..=self.rows).map(|_|None).collect(),engram_graphs:(0..=self.rows).map(|_|None).collect(),
-                    alternate_index_graphs:(0..=self.rows).map(|_|None).collect(),
-                    alternate_index_engram_graphs:(0..=self.rows).map(|_|None).collect(),
+                    graphs:(0..graph_slots(self.rows)).map(|_|None).collect(),engram_graphs:(0..graph_slots(self.rows)).map(|_|None).collect(),
+                    alternate_index_graphs:(0..graph_slots(self.rows)).map(|_|None).collect(),
+                    alternate_index_engram_graphs:(0..graph_slots(self.rows)).map(|_|None).collect(),
                     decoder_graph:None,adaptive_sparse_active:false,decoder:Some(decoder),
                 });
             }
@@ -4055,6 +5098,15 @@ impl Target {
         let previous=(self.prefill_partial2048_dense,self.prefill_wide_mhc_rows,self.prefill_wide_mhc_norm);
         self.prefill_partial2048_dense=dense;self.prefill_wide_mhc_rows=mhc;self.prefill_wide_mhc_norm=norm;Ok(previous)
     }
+    /// Plan-comparison screen only: bound partial 4,096/8,192-row chunks to live rows.
+    pub(crate) fn set_partial_wide_rows_for_probe(&mut self,mask:u8,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_FLEX_WIDTH_SCREEN").as_deref()==Ok("1")
+            && mask<=3 && self.wide.is_some() && self.pending.is_none()
+            && self.cuda.owns_stream(stream) && self.stream==stream.raw()as usize,
+            "partial wide rows require the finite plan-comparison screen");
+        // Only eager partial chunks read this; full-width captures are unaffected.
+        stream.synchronize()?;self.prefill_partial_wide=mask;Ok(())
+    }
     pub(crate) fn set_partial1024_rows_for_probe(&mut self,mode:u8,stream:&Stream)->Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_PARTIAL1024_SCREEN").as_deref()==Ok("1")
             && mode<=2 && self.rows==1024 && self.wide.is_some() && self.pending.is_none()
@@ -4120,7 +5172,7 @@ impl Target {
         .into_iter()
         .filter_map(|s| s.source().ring())
         .collect();
-        crate::carry_state::Snapshot::new(&self.cuda, rings)
+        crate::carry_state::Snapshot::with_requests(&self.cuda, rings, crate::config::session_slots()?)
     }
 
     /// Opt-in integration experiment until changed-metadata replay is proven.
@@ -4240,7 +5292,8 @@ impl Target {
     fn compact_sampling_active(&self)->bool {
         // The alternate M16 EXTEND bank still publishes full prompt logits.
         // Its graph topology remains independent of ordinary copy verification.
-        (self.compact_sampling_enabled||(self.local_target_enabled&&self.rows==6
+        // A region step samples every session from full logits (its drafted rows need them).
+        ((self.compact_sampling_enabled&&!self.region_step)||(self.local_target_enabled&&self.rows==6
             &&self.source_phase==Phase::Verify&&!self.prefill_last_head))&&self.cached_decoder.is_none()
     }
     pub(crate) fn local_target_enabled(&self)->bool {self.local_target_enabled}
@@ -4276,17 +5329,24 @@ impl Target {
                 && (self.comm_instance.is_none() || self.comm_instance == Some(comm.instance())),
             "target reset transport/stream owner changed"
         );
+        // With serving regions a reset clears region 0 only (carry slot 0; the caches are kept and
+        // overwritten by the next prefill), so the whole-cache clear is not available.
+        let keep_caches = crate::config::reset_keeps_caches()?;
+        ensure!(keep_caches || crate::config::batched_regions()? == 1,
+            "serving regions need the kept-cache reset (CANADA_SCRATCH_RESET_KEEP_CACHES=1)");
         stream.synchronize()?;
         comm.health()?;
         self.lease.begin()?;
         self.invalidate_gather_caches();
-        for cache in &mut self.early_caches {
-            cache.clear(&self.cuda, stream)?;
+        if !keep_caches {
+            for cache in &mut self.early_caches {
+                cache.clear(&self.cuda, stream)?;
+            }
         }
-        self.source2.clear_state(stream)?;
-        self.group8.clear_state(&self.cuda, stream)?;
-        self.group14.clear_state(&self.cuda, stream)?;
-        self.late.clear_state(&self.cuda, stream)?;
+        self.source2.clear_state(stream, keep_caches)?;
+        self.group8.clear_state(&self.cuda, stream, keep_caches)?;
+        self.group14.clear_state(&self.cuda, stream, keep_caches)?;
+        self.late.clear_state(&self.cuda, stream, keep_caches)?;
         if let Some(cache) = &self.encoder_cache {
             cache.clear(stream)?;
         }
@@ -4388,6 +5448,8 @@ impl Target {
             self.wide.is_none(),
             "the wide encoder profile executes only through prefill_wide"
         );
+        // A serving load with the layer clock armed marks the six-row verifier's forwards only (no effect otherwise).
+        let _clock_live = crate::layer_clock::live_scope(self.rows == 6 && self.source_phase == Phase::Verify && verification);
         ensure!(
             comm.rank() == self.rank
                 && self.cuda.owns_stream(stream)
@@ -4420,16 +5482,35 @@ impl Target {
         self.last_append_metrics = None;
         self.carry_saved_start = None;
         let begin = Instant::now();
+        // A step with batched rows (region mode) runs without the Engram overlap unless
+        // CANADA_SCRATCH_BATCHED_ENGRAM_OVERLAP=1: then its rows are looked up while layer 0 runs,
+        // as in ordinary steps, with split graphs kept per graph slot (an ordinary step's slot is
+        // its live count).
+        let overlap = self.engram_overlap && (self.batched_rows.is_none() || crate::config::batched_engram_overlap());
         // Live count is agreed by all ranks and is already a graph-cache key.
         // Keep both projections bound to their own stream so changing widths
         // does not destroy a warmed graph or rebind mutable scratch.
         if self.engram_projection_ahead {
-            self.engram_projection_active=self.engram_overlap&&self.graph_replay
+            self.engram_projection_active=overlap&&self.graph_replay
                 &&(!self.engram_projection_m3_only||ids.len()==3);
             self.group14.select_engram_projection_ahead(self.engram_projection_active)?;
+            // A projection that already runs ahead has read its weights before layer 13's FFN sum.
+            if let Some((_, gate14)) = &self.engram_lead { gate14.set(self.engram_lead_on && !self.engram_projection_active); }
         }
         self.select_index_graph_bank(stream)?;
-        if self.graph_replay {self.bound_execution_graphs(ids.len(),stream)?;}
+        // A batched step of several sessions replays graphs from its own slots
+        // (graph_slot) when CANADA_SCRATCH_BATCHED_GRAPHS=1; otherwise it runs eagerly.
+        let sessions = self.batched_rows.as_ref().map_or(1, |p| p.len());
+        // Region mode: any step with batched rows, one session included, has rows whose keys
+        // may start at a region base. It runs the dense index scorers and gathers full logits,
+        // from its own graph slots; the Engram overlap's per-live-count graphs are not used.
+        let region = self.batched_rows.is_some();
+        let padded_routes = region && sessions >= 2 && self.padding_routes;
+        ensure!(sessions <= MAX_BATCHED_SESSIONS && (!region || !overlap || crate::config::batched_engram_overlap()),
+            "batched sessions/Engram overlap");
+        self.set_region_step(region)?;
+        let graph_replay = self.graph_replay && (sessions == 1 || crate::config::batched_graphs_requested());
+        if graph_replay && !region {self.bound_execution_graphs(ids.len(),stream)?;}
         let mut marks = vec![("begin", begin)];
         let mut captured_new_graph = false;
         let mut split_engram14=self.engram_split14 && (!self.engram_split14_m3_only || ids.len()==3);
@@ -4437,20 +5518,86 @@ impl Target {
             && self.rows == 128 && self.source_phase == Phase::Extend;
         let retain_warm_result = retain_warm_prefill || (self.verification_capture_once
             && verification && [6,16].contains(&self.rows) && self.source_phase == Phase::Verify);
-        let p = Plan::append_with_layout(
-            self.history.position,
-            ids.len(),
-            self.rows,
-            self.context,
-            self.swa_layout,
-        )?;
+        let batched = self.batched_rows.take();
+        let p = if let Some(parts) = &batched {
+            // A shared encoder-tail cache belongs to the owner's own history; batched
+            // rows never publish into it or advance it.
+            ensure!(crate::config::batched_rows_admitted()
+                && self.cached_decoder.is_none()
+                && parts.iter().map(|x| x.2).sum::<usize>() == ids.len(),
+                "batched screen rows/owner");
+            Plan::batched(&parts.iter().map(|(b, h, live)| (*b, h.position, *live)).collect::<Vec<_>>(),
+                self.rows, self.context, self.swa_layout)?
+        } else {
+            Plan::append_with_layout(
+                self.history.position,
+                ids.len(),
+                self.rows,
+                self.context,
+                self.swa_layout,
+            )?
+        };
+        // The rows a batched step executes are its blocks through the last part's
+        // live rows: the concatenated ids are placed at each part's block, with
+        // padding token 2 in between (no cache writes; see Plan::batched).
+        let concatenated = ids;
+        let expanded = batched.as_ref().filter(|parts| parts.len() > 1).map(|parts| {
+            let lives = parts.iter().map(|x| x.2).collect::<Vec<_>>();
+            let mut v = vec![2u32; Plan::batched_extent(&lives, self.rows)];
+            let mut at = 0;
+            for (k, live) in lives.iter().enumerate() {
+                v[k * p.block..k * p.block + live].copy_from_slice(&concatenated[at..at + live]);
+                at += live;
+            }
+            v
+        });
+        let ids: &[u32] = expanded.as_deref().unwrap_or(concatenated);
+        let tight = if sessions >= 2 && self.rows <= 32 && crate::config::batched_tight_blocks() { p.block } else { 0 };
+        let slot = graph_slot(self.rows, sessions, ids.len(), region, padded_routes, tight);
+        // config::index_short_rows: an ordinary step whose rows all have at most 512 index keys enqueues no index
+        // scoring (query_index::Branch::short_step) and replays captures of its own slots.
+        let short_index = crate::config::index_short_rows() && self.short_index_allowed && self.rows == 6
+            && sessions == 1 && !region && self.source_phase == Phase::Verify && !self.adaptive_sparse_active
+            && p.pair_lengths.iter().chain(&p.single_lengths).all(|&l| (0..=512).contains(&l));
+        let slot = if short_index { short_index_slot(self.rows, ids.len()) } else { slot };
+        let _short_index_rows = if short_index {
+            if self.short_index_flags.is_empty() {
+                self.short_index_flags = self.index_queries().into_iter().flatten().map(|q| q.short_rows_flag()).collect();
+            }
+            for flag in &self.short_index_flags { flag.set(true); }
+            self.short_index_steps += 1;
+            Some(ShortIndexRows(self.short_index_flags.clone()))
+        } else { None };
         let mut padded = vec![2u32; self.rows];
         padded[..ids.len()].copy_from_slice(ids);
-        let batch = self.history.prepare_padded(&padded, ids.len(), &self.hashes)?;
+        // A batched step hashes each session's rows against its own history;
+        // padding rows repeat a valid row, as prepare_padded does for one.
+        let mut part_batches = Vec::new();
+        let batch = if let Some(parts) = &batched {
+            let mut at = 0;
+            let mut rows = Vec::with_capacity(self.rows);
+            for (k, (_, h, live)) in parts.iter().enumerate() {
+                if let Some(&last) = rows.last() { rows.resize(k * p.block, last); }
+                let mut part = vec![2u32; *live];
+                part.copy_from_slice(&concatenated[at..at + live]);
+                let b = h.prepare_padded(&part, *live, &self.hashes)?;
+                rows.extend_from_slice(&b.rows[..*live]);
+                part_batches.push(b);
+                at += live;
+            }
+            let last = *rows.last().unwrap();
+            rows.resize(self.rows, last);
+            let mut combined = self.history.prepare_padded(&padded, ids.len(), &self.hashes)?;
+            combined.rows = rows;
+            combined
+        } else {
+            self.history.prepare_padded(&padded, ids.len(), &self.hashes)?
+        };
         marks.push(("history_hash", Instant::now()));
-        ensure!(!self.engram_overlap || (verification && self.graph_replay && [6,16,32].contains(&self.rows)),
+        let mut engram_gap_recorded = false;
+        ensure!(!overlap || (verification && self.graph_replay && [6,16,32].contains(&self.rows)),
             "experimental Engram overlap is verification-only");
-        let deferred_rows = self.engram_overlap && self.engram_graphs[ids.len()].is_some();
+        let deferred_rows = overlap && self.engram_graphs[slot].is_some();
         if self.engram_split14_adaptive {
             // Both capture paths execute identical collectives in identical
             // stream order. Ranks may choose different graph boundaries based
@@ -4464,13 +5611,35 @@ impl Target {
         if !deferred_rows {
             self.prepare_engram_rows(&batch.rows)?;
             marks.push(("engram_rows", Instant::now()));
+        } else if crate::config::engram_early_submit() && self.rows == 6 && self.source_phase == Phase::Verify
+            && self.batched_rows.is_none() && self.paired_engram_io_enabled() {
+            // The missing rows' reads go out now; the lookup behind layer 0 publishes them (read_ahead_submit).
+            self.submit_engram_rows(&batch.rows, split_engram14)?;
+            marks.push(("engram_submit", Instant::now()));
         }
         self.io.update_tokens(&mut self.tokens, self.history.position as usize,
             &padded.iter().copied().map(i64::from).collect::<Vec<_>>(),
             ids.len(),
         )?;
+        if padded_routes {
+            // Rows between a session's live rows and the next block take that session's last live
+            // row's experts with zero weights: they read no expert of their own.
+            let parts = batched.as_ref().ok_or_else(|| anyhow::anyhow!("padding routes without batched parts"))?;
+            let mut sources = vec![-1i32; self.rows];
+            for (k, (_, _, live)) in parts.iter().enumerate() {
+                let start = k * p.block;
+                for source in sources.iter_mut().take(((k + 1) * p.block).min(ids.len())).skip(start + live) {
+                    *source = (start + live - 1) as i32;
+                }
+            }
+            self.tokens.set_padding_sources(&sources)?;
+        }
         marks.push(("token_upload", Instant::now()));
-        self.step.update(&p, stream)?;
+        let gathers = if region && crate::config::region_gather_cache() {
+            let parts = batched.as_ref().ok_or_else(|| anyhow::anyhow!("region step without batched parts"))?;
+            Some(self.region_gather_starts(&p, parts)?)
+        } else { None };
+        self.step.update_with(&p, gathers.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())), stream)?;
         if let Some(step) = &mut self.cached_decoder {
             let mut decoder = Plan::append_with_layout(
                 self.history.position,
@@ -4527,7 +5696,7 @@ impl Target {
         self.lease.begin()?;
         if verification
             || self.repeatable_frontier_measurement
-            || (self.graph_replay && self.graphs[ids.len()].is_none())
+            || (graph_replay && self.graphs[slot].is_none())
         {
             if self.carry_snapshot.is_none() {
                 self.carry_snapshot = Some(self.new_carry_snapshot()?);
@@ -4538,9 +5707,9 @@ impl Target {
             self.carry_saved_start = Some(self.history.position);
             marks.push(("carry_snapshot", Instant::now()));
         }
-        if self.graph_replay {
-            let missing = if self.engram_overlap { self.engram_graphs[ids.len()].is_none() }
-                else { self.graphs[ids.len()].is_none() };
+        if graph_replay {
+            let missing = if overlap { self.engram_graphs[slot].is_none() }
+                else { self.graphs[slot].is_none() };
             if missing {
                 // Warm AOT/vendor paths before capture. Six-row frontiers fit
                 // within ring8. M128 is restricted above to fresh pos0 full
@@ -4561,7 +5730,19 @@ impl Target {
                     }
                     stream.synchronize()?;
                 }
-                if self.engram_overlap {
+                let mut rules = Vec::new();
+                if let Some(to) = self.moe_front_grid {
+                    rules.push(crate::cuda::Regrid { name: "MoEDynamicKernelSilu", from: 48, to, grow: false, carveout: None });
+                }
+                // A screen's setting, else the owner's configured grids (verify owners of 6 and 16 rows).
+                let phase_grid = self.moe_phase_grid.or_else(|| (self.source_phase == Phase::Verify)
+                    .then(|| crate::config::moe_phase_grid(self.rows)).flatten());
+                if let Some((up, down, carveout)) = phase_grid {
+                    rules.push(crate::cuda::Regrid { name: "W4A8MaterializedPhase1Kernel", from: 96, to: up, grow: true, carveout });
+                    rules.push(crate::cuda::Regrid { name: "W4A8MaterializedPhase2Kernel", from: 96, to: down, grow: true, carveout });
+                }
+                let regrid = if rules.is_empty() { None } else { Some(crate::cuda::graph_regrid_scope(&rules)?) };
+                if overlap {
                     let initial = stream.capture(|| self.enqueue_initial(comm, stream))?;
                     let parts=if self.engram_split14_adaptive {
                         let combined=stream.capture(||self.enqueue_after_initial(comm,stream))?;
@@ -4577,11 +5758,17 @@ impl Target {
                         vec![initial,remaining]
                     };
                     self.graph_captures += parts.len();
-                    self.engram_graphs[ids.len()] = Some(parts);
+                    self.engram_graphs[slot] = Some(parts);
                 } else {
-                    self.graphs[ids.len()] = Some(stream.capture(|| self.enqueue(comm, stream))?);
+                    self.graphs[slot] = Some(stream.capture(|| self.enqueue(comm, stream))?);
                     self.graph_captures += 1;
                 }
+                if regrid.is_some() {
+                    drop(regrid);
+                    self.moe_regridded = crate::cuda::graph_regridded();
+                    ensure!(self.moe_front_grid.is_none() || self.moe_regridded >= 40, "front-end grid rule missed the experts' kernels");
+                }
+                self.moe_swapped = crate::cuda::graph_swapped();
                 marks.push(("graph_capture", Instant::now()));
             }
             if captured_new_graph && retain_warm_result {
@@ -4589,8 +5776,18 @@ impl Target {
                 // only existing graph replays may defer those uploads. Both
                 // ordinary and split graphs now describe the next execution.
                 ensure!(!deferred_rows, "first capture unexpectedly deferred Engram rows");
-            } else if self.engram_overlap {
-                unsafe { self.engram_graphs[ids.len()].as_ref().unwrap()[0].launch(stream)?; }
+            } else if overlap {
+                unsafe { self.engram_graphs[slot].as_ref().unwrap()[0].launch(stream)?; }
+                if engram_gap_probe() {
+                    // Fires when the initial graph (embedding and layer 0) completes.
+                    ENGRAM_GAP.with(|g| -> Result<()> {
+                        let mut g = g.borrow_mut();
+                        if g.is_none() { *g = Some(EngramGap { first: self.cuda.event()?, second: self.cuda.event()?,
+                            count: 0, total_ms: 0., max_ms: 0. }); }
+                        g.as_ref().unwrap().first.record(stream)
+                    })?;
+                    engram_gap_recorded = true;
+                }
                 marks.push(("initial_enqueue", Instant::now()));
                 if deferred_rows {
                     // Layer0 runs while the CPU gathers exact row bytes. No
@@ -4605,7 +5802,12 @@ impl Target {
                     marks.push(("engram_upload_order", Instant::now()));
                 }
                 let middle_index=if self.engram_split14_adaptive && split_engram14 {2}else{1};
-                unsafe { self.engram_graphs[ids.len()].as_ref().unwrap()[middle_index].launch(stream)?; }
+                if engram_gap_recorded {
+                    // Fires when the stream reaches the rest of the forward: later than the first event only if
+                    // the row lookup or its upload outlasted layer 0.
+                    ENGRAM_GAP.with(|g| g.borrow().as_ref().unwrap().second.record(stream))?;
+                }
+                unsafe { self.engram_graphs[slot].as_ref().unwrap()[middle_index].launch(stream)?; }
                 if split_engram14 {
                     marks.push(("middle_enqueue",Instant::now()));
                     if deferred_rows {
@@ -4617,10 +5819,10 @@ impl Target {
                         marks.push(("engram_upload_order",Instant::now()));
                     }
                     let tail_index=if self.engram_split14_adaptive {3}else{2};
-                    unsafe{self.engram_graphs[ids.len()].as_ref().unwrap()[tail_index].launch(stream)?;}
+                    unsafe{self.engram_graphs[slot].as_ref().unwrap()[tail_index].launch(stream)?;}
                 }
             } else {
-                unsafe { self.graphs[ids.len()].as_ref().unwrap().launch(stream)?; }
+                unsafe { self.graphs[slot].as_ref().unwrap().launch(stream)?; }
             }
         } else {
             self.enqueue(comm, stream)?;
@@ -4633,7 +5835,7 @@ impl Target {
         // This avoids retaining a duplicate forty-layer graph bank.
         let gathered_tail=self.local_target_enabled&&self.compact_sampling_active()&&!local_only;
         if gathered_tail {
-            if self.graph_replay {
+            if graph_replay {
                 if self.local_target_gather[ids.len()].is_none() {
                     self.io.gather_logits(comm,stream)?;stream.synchronize()?;comm.health()?;
                     self.local_target_gather[ids.len()]=Some(stream.capture(||self.io.gather_logits(comm,stream))?);
@@ -4641,18 +5843,59 @@ impl Target {
                 }else{unsafe{self.local_target_gather[ids.len()].as_ref().unwrap().launch(stream)?;}}
             }else{self.io.gather_logits(comm,stream)?;}
         }
-        if verification&&self.verification_poll_us>0&&self.cached_decoder.is_none() {
-            stream.synchronize_polling(self.verification_poll_us)?;
-        }else{stream.synchronize()?;}
-        comm.health()?;
+        // verify_sample_ahead: the caller queues its sampler behind this forward and runs the completion below after
+        // the sampler's own readout (complete_deferred_verification): no host wake-up between the head and the sampler.
+        let deferred = verification && self.defer_completion && batched.is_none() && !engram_gap_recorded
+            && self.cached_decoder.is_none() && !gathered_tail;
+        self.completion_owed.set(deferred);
+        if !deferred {
+            if verification&&self.verification_poll_us>0&&self.cached_decoder.is_none() {
+                stream.synchronize_polling(self.verification_poll_us)?;
+            }else{stream.synchronize()?;}
+            comm.health()?;
+        }
         marks.push(("gpu_completion", Instant::now()));
-        self.check_candidates()?;
-        if let Some(cache) = &self.encoder_cache {
-            ensure!(cache.error()? == 0, "encoder tail publication fault");
+        if engram_gap_recorded {
+            let rank = self.rank;
+            ENGRAM_GAP.with(|g| -> Result<()> {
+                let mut g = g.borrow_mut();
+                let s = g.as_mut().unwrap();
+                let ms = s.second.elapsed_since(&s.first)?;
+                s.count += 1; s.total_ms += f64::from(ms); s.max_ms = s.max_ms.max(ms);
+                if s.count % 64 == 0 {
+                    eprintln!("rank{rank} engram gap: mean {:.1} us over {} verifications (max {:.1} us)",
+                        1000. * s.total_ms / s.count as f64, s.count, 1000. * s.max_ms);
+                }
+                Ok(())
+            })?;
+        }
+        if !deferred {
+            self.check_candidates()?;
+            if let Some(cache) = &self.encoder_cache {
+                ensure!(cache.error()? == 0, "encoder tail publication fault");
+            }
         }
         marks.push(("candidate_checks", Instant::now()));
         self.last_head_local_only=self.compact_sampling_active()&&!gathered_tail;
-        if verification {
+        if let Some(parts) = batched {
+            if verification {
+                self.pending = Some(PendingVerification { hash_batch: batch, start: self.history.position, live: ids.len() });
+                self.batched_pending = true;
+                self.batched_block = p.block;
+                self.batched_inflight = Some(parts.into_iter().zip(part_batches)
+                    .map(|((base, h, live), b)| (base, h, live, b)).collect());
+            } else {
+                let mut done = Vec::with_capacity(parts.len());
+                for ((_, mut h, live), b) in parts.into_iter().zip(part_batches) {
+                    h.commit(b, live)?;
+                    done.push(h);
+                }
+                self.batched_done = Some(done);
+                self.last_live = ids.len();
+                self.lease.finish_write()?;
+                self.set_region_step(false)?;
+            }
+        } else if verification {
             self.pending = Some(PendingVerification {
                 hash_batch: batch,
                 start: self.history.position,
@@ -4715,7 +5958,8 @@ impl Target {
             ||std::env::var("CANADA_SCRATCH_WIDE_ENGRAM_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_FFN16_REFRESH_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_TRANSPORT_PLACEMENT_SCREEN").as_deref()==Ok("1")
-            ||std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_SCREEN").as_deref()==Ok("1"),
+            ||std::env::var("CANADA_SCRATCH_ENGRAM_PROJECTION_SCREEN").as_deref()==Ok("1")
+            ||crate::config::l2_queue_screen(),
             "local logit readout requires finite score storage screen");
         let pending=self.pending.as_ref().context("no completed verification")?;
         ensure!(self.lease.is_busy_revision(),"local logit readout lost writer revision");
@@ -4733,7 +5977,8 @@ impl Target {
             self.lease.is_busy_revision(),
             "pending verification lost writer revision"
         );
-        Ok((self.io.logits(), pending.live))
+        ensure!(!self.batched_pending || self.batched_staged.is_some(), "batched logits need a staged session");
+        Ok((self.io.logits(), self.batched_staged.map_or(pending.live, |s| s.1)))
     }
 
     pub(crate) fn gathered_rows_proof_for_probe(&self)->Result<serde_json::Value> {
@@ -4750,11 +5995,32 @@ impl Target {
             "local_sha256":format!("{:x}",Sha256::digest(&local)),
             "gathered_sha256":format!("{:x}",Sha256::digest(&gathered))}))
     }
+    /// Diagnostic only (CANADA_SCRATCH_CLAUDE_LOGIT_EXPORT): this rank's vocabulary shard of the
+    /// pending rows, which every head mode computes before any gather or sampler.
+    pub(crate) fn pending_local_rows_for_export(&self)->Result<(&Buffer<f32>,usize)> {
+        ensure!(crate::logit_export::dir().is_some(),"local row export requires the logit export diagnostic");
+        let pending=self.pending.as_ref().context("no completed verification")?;
+        ensure!(self.lease.is_busy_revision(),"logit export lost writer revision");
+        Ok((self.io.local_logits(),pending.live))
+    }
+    pub(crate) fn rank_for_export(&self)->usize {self.rank}
+    /// Diagnostic only (CANADA_SCRATCH_CLAUDE_HEAD4_EXPORT=2): the installed 4-bit-head scheme's logits of the
+    /// pending verification's head input (this rank's shard of the first `live` rows) and the rows it rescored.
+    pub(crate) fn head4_scheme_for_export(&self, live: usize, stream: &Stream) -> Result<Option<(Vec<u8>, Vec<i32>)>> {
+        ensure!(crate::logit_export::dir().is_some() && self.pending.is_some() && self.rows == 6, "4-bit scheme export owner");
+        self.io.head4_export(live.min(6), stream)
+    }
+    /// Diagnostic only (CANADA_SCRATCH_CLAUDE_HEAD4_EXPORT): the head's input rows of the pending verification.
+    pub(crate) fn head_input_for_export(&self)->Result<&Buffer<bf16>> {
+        ensure!(crate::logit_export::dir().is_some()&&self.pending.is_some(),"head input export requires the logit export diagnostic");
+        Ok(self.io.normalized())
+    }
     pub(crate) fn pending_local_target_logits(&self)->Result<(&Buffer<f32>,usize)> {
         let pending=self.pending.as_ref().context("no local target verification")?;
         ensure!(self.local_target_enabled&&self.rows==6&&self.last_head_local_only
             &&self.lease.is_busy_revision(),"local target logit ownership");
-        Ok((self.io.local_logits(),pending.live))
+        ensure!(!self.batched_pending||self.batched_staged.is_some(),"batched logits need a staged session");
+        Ok((self.io.local_logits(),self.batched_staged.map_or(pending.live,|s|s.1)))
     }
     pub fn verification_greedy(&mut self, stream: &Stream) -> Result<Vec<u32>> {
         let (_, live) = self.pending_logits()?;
@@ -4792,8 +6058,10 @@ impl Target {
         let (_, live) = self.pending_logits()?;
         ensure!(self.cuda.owns_stream(stream) && stream.raw() as usize == self.stream,
             "pending stochastic sampler ordered stream");
+        // A staged batched session samples at its own frontier.
+        let position = self.batched_staged.map_or(self.history.position, |s| s.2);
         let result = self.categorical.sample(self.io.logits(), 0, live, 1., seed,
-            crate::categorical::TARGET_DOMAIN, self.history.position + 1, stream);
+            crate::categorical::TARGET_DOMAIN, position + 1, stream);
         if result.is_err() { self.pending = None; } // Keep shared owner poisoned.
         result
     }
@@ -4812,12 +6080,275 @@ impl Target {
     /// index entries stay beyond logical lengths; subsequent causal metadata
     /// cannot expose them. Restore rejected C2 carry writes before publication.
     /// This is bounded speculation, not branching or full session parking.
+    /// Finite batched screen: lay out the next append or verification as these
+    /// sessions' rows (in order), each from its own history and cache region.
+    pub(crate) fn set_batched_rows_for_probe(&mut self, parts: Vec<(SessionBase, History, usize)>) -> Result<()> {
+        ensure!(crate::config::batched_rows_admitted()
+            && self.batched_rows.is_none() && !self.batched_pending && self.pending.is_none()
+            && !parts.is_empty() && parts.len() <= crate::config::session_slots()?,
+            "batched screen owner/sessions");
+        self.batched_rows = Some(parts);
+        Ok(())
+    }
+    /// The histories advanced by the last batched append, in part order.
+    pub(crate) fn take_batched_histories_for_probe(&mut self) -> Result<Vec<History>> {
+        self.batched_done.take().context("no completed batched append")
+    }
+    /// Discard a batched verification: every compressor ring returns to its
+    /// saved state and no session's history advances.
+    pub(crate) fn abort_batched_verification_for_probe(&mut self, stream: &Stream) -> Result<()> {
+        ensure!(self.batched_pending && self.pending.is_some() && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream, "batched verification abort owner");
+        self.pending = None;
+        self.batched_pending = false;
+        self.batched_inflight = None;
+        self.batched_staged = None;
+        self.batched_owner_part = false;
+        unsafe { self.carry_snapshot.as_ref().context("batched carry snapshot")?.restore(stream)?; }
+        stream.synchronize()?;
+        self.carry_saved_start = None;
+        self.last_live = 0;
+        self.lease.finish_write()?;
+        self.set_region_step(false)?;
+        Ok(())
+    }
+    /// Commit each session's accepted prefix of a batched verification, in part
+    /// order: its rejected compressor-ring rows are restored and only its own
+    /// history advances. The owner's own history and encoder tail are untouched.
+    /// Batched serving: the next batched verification's part 0 is this owner's own conversation.
+    pub(crate) fn set_batched_owner_part(&mut self, enabled: bool) -> Result<()> {
+        ensure!(self.batched_rows.is_none() && !self.batched_pending && self.pending.is_none(),
+            "batched owner part is set between steps");
+        self.batched_owner_part = enabled;
+        Ok(())
+    }
+    pub(crate) fn finish_batched_verification(&mut self, accepted: &[usize], stream: &Stream) -> Result<Vec<History>> {
+        ensure!(self.batched_pending && self.pending.is_some() && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream, "batched verification commit owner");
+        let parts = self.batched_inflight.take().context("batched verification sessions")?;
+        ensure!(parts.len() == accepted.len()
+            && parts.iter().zip(accepted).all(|(p, &a)| a <= p.2), "batched accepted prefixes");
+        let snapshot = self.carry_snapshot.as_ref().context("batched carry snapshot")?;
+        for ((base, h, live, _), &a) in parts.iter().zip(accepted) {
+            unsafe { snapshot.restore_rejected_request(usize::try_from(base.request)?, h.position, *live, a, stream)?; }
+        }
+        stream.synchronize()?;
+        // The owner's own conversation (part 0, region 0, at the owner's frontier) commits exactly
+        // as an ordinary verification does: its accepted rows (block 0 starts at row 0) enter the
+        // owner's encoder tail and its history becomes the owner's.
+        let owner = std::mem::take(&mut self.batched_owner_part) && parts.first()
+            .is_some_and(|p| p.0 == SessionBase::default() && p.1 == self.history);
+        if owner { self.publish_accepted_encoder(accepted[0], stream)?; }
+        // Region conversations keep their own encoder tails current (batched serving).
+        let mut region_tail_commits = Vec::new();
+        if !self.region_tails.is_empty() {
+            for (k, ((base, h, _, _), &a)) in parts.iter().zip(accepted).enumerate() {
+                if base.request == 0 { continue; }
+                let tail = self.tail_of(*base)?.clone();
+                ensure!(tail.position() == h.position as usize, "region encoder tail frontier");
+                if a > 0 {
+                    tail.publish_prefix_at(self.late.encoder_output(), self.late.encoder_pre(),
+                        self.late.source().candidates(), &self.tokens, &self.step.compressed_positions,
+                        self.late.source().query().candidate_mask(), k * self.batched_block, a, stream)?;
+                }
+                region_tail_commits.push((tail, h.position as usize + a));
+            }
+            stream.synchronize()?;
+            for (tail, _) in &region_tail_commits { ensure!(tail.error()? == 0, "region encoder tail publication fault"); }
+        }
+        self.pending = None;
+        self.batched_pending = false;
+        self.batched_staged = None;
+        self.carry_saved_start = None;
+        let mut out = Vec::with_capacity(parts.len());
+        for ((_, mut h, _, b), &a) in parts.into_iter().zip(accepted) {
+            h.commit(b, a)?;
+            out.push(h);
+        }
+        if owner {
+            self.history = out[0].clone();
+            if let Some(cache) = &self.encoder_cache { cache.commit(self.history.position as usize)?; }
+        }
+        for (tail, end) in region_tail_commits { tail.commit(end)?; }
+        self.last_live = accepted.iter().sum();
+        self.lease.finish_write()?;
+        self.set_region_step(false)?;
+        Ok(out)
+    }
+    /// Batched step: move one session's logits rows (gathered, or the rank-local
+    /// shard when the compact head ran) to row 0, where that session's captured
+    /// sampler reads them, and report its live count until the next staging.
+    /// Sessions are staged in part order, so rows already sampled are free;
+    /// rows are copied in increasing order, which is safe for overlap.
+    pub(crate) fn stage_batched_session(&mut self, offset: usize, live: usize, stream: &Stream) -> Result<()> {
+        let total = self.pending.as_ref().map(|p| p.live).context("no batched verification")?;
+        ensure!(self.batched_pending && live > 0 && offset + live <= total
+            && self.batched_staged.is_none_or(|(o, l, _)| o + l <= offset)
+            && self.cuda.owns_stream(stream) && stream.raw() as usize == self.stream, "batched session staging order");
+        // The staged rows must be exactly one session's rows (or, for a whole-step read, all of them);
+        // its frontier seeds the owner-side samplers instead of this owner's own history.
+        let mut start = None;
+        for (k, (_, h, part_live, _)) in self.batched_inflight.as_ref().context("batched verification sessions")?.iter().enumerate() {
+            if k * self.batched_block == offset && (*part_live == live || (offset == 0 && live == total)) { start = Some(h.position); }
+        }
+        let start = start.context("staged rows are not one session's rows")?;
+        if offset > 0 {
+            let (base, row) = if self.last_head_local_only { (self.io.local_logits().ptr(), 32320) }
+                else { (self.io.logits().ptr(), 129280) };
+            for r in 0..live {
+                unsafe { self.cuda.copy_device(base + (r * row * 4) as u64, base + ((offset + r) * row * 4) as u64, row * 4, stream)?; }
+            }
+        }
+        self.batched_staged = Some((offset, live, start));
+        Ok(())
+    }
+    /// Move one conversation's causal state, committed through `position`, from session region
+    /// `from` to `to` of these shared caches (CANADA_SCRATCH_BATCHED_REGIONS): the window entries of
+    /// its last 128 positions (whole 64-slot pages; both rings keep a position's offset in its page),
+    /// the four sources' compressed entries and index keys (a page-aligned shift of the region's
+    /// compressed addresses), and its pair-carry rings (request slot). `from`'s storage is left as is.
+    /// Not moved: the 128-row encoder tail (read only by a later prefill) and the drafter, which
+    /// belongs to the conversation's session. The caller owns ordering against other work.
+    pub(crate) fn relocate_session(&mut self, from: SessionBase, to: SessionBase, position: usize,
+        stream: &Stream) -> Result<serde_json::Value> {
+        ensure!(self.lease.is_current() && self.pending.is_none() && self.batched_rows.is_none()
+            && position >= 1 && position <= self.context
+            && self.cuda.owns_stream(stream) && stream.raw() as usize == self.stream,
+            "relocation needs an idle current owner");
+        let (fl, tl) = (from.layout.unwrap_or(self.swa_layout), to.layout.unwrap_or(self.swa_layout));
+        ensure!(fl.ring().is_some() && tl.ring().is_some() && from.window % 64 == 0 && to.window % 64 == 0,
+            "relocation window layouts");
+        let mut bytes = 0usize;
+        let mut copies = 0usize;
+        // Window: the pages holding positions [position - 128, position).
+        let first_block = position.saturating_sub(128) / 64;
+        let last_block = (position - 1) / 64;
+        let windows: Vec<&PagedKv> = self.early_caches.iter().chain(self.group8.caches())
+            .chain(self.group14.caches()).chain(self.late.caches()).collect();
+        ensure!(windows.len() == 40, "relocation window cache count");
+        for cache in &windows {
+            ensure!(cache.page_tokens() == 64, "relocation window page geometry");
+            let page = cache.page_bytes();
+            for block in first_block..=last_block {
+                let (src, dst) = ((from.window + fl.slot(block * 64)) / 64, (to.window + tl.slot(block * 64)) / 64);
+                ensure!(src < cache.pages() && dst < cache.pages(), "relocation window page bounds");
+                unsafe { self.cuda.copy_device(cache.data().ptr() + (dst * page) as u64,
+                    cache.data().ptr() + (src * page) as u64, page, stream)?; }
+                bytes += page; copies += 1;
+            }
+        }
+        // Compressed entries and index keys: slots [base, base + OFFSET + ceil(position / ratio)).
+        for (layer, source) in [2usize, 8, 14, 20].into_iter().zip([
+            &self.source2, self.group8.source(), self.group14.source(), self.late.source(),
+        ]) {
+            let ratio = if layer == 20 { 1 } else { 2 };
+            let (from_slot, to_slot) = if ratio == 2 { (from.raw_pair / 2, to.raw_pair / 2) } else { (from.raw_single, to.raw_single) };
+            let cache = source.cache();
+            let tokens = cache.page_tokens();
+            ensure!(from_slot % tokens == 0 && to_slot % tokens == 0 && from_slot % 64 == 0 && to_slot % 64 == 0,
+                "relocation compressed alignment");
+            let slots = COMPRESSED_OFFSET + position.div_ceil(ratio);
+            let pages = slots.div_ceil(tokens);
+            ensure!((to_slot / tokens + pages) <= cache.pages() && (from_slot / tokens + pages) <= cache.pages(),
+                "relocation compressed page bounds");
+            let page = cache.page_bytes();
+            unsafe { self.cuda.copy_device(cache.data().ptr() + (to_slot / tokens * page) as u64,
+                cache.data().ptr() + (from_slot / tokens * page) as u64, pages * page, stream)?; }
+            bytes += pages * page; copies += 1;
+            let keys = source.keys();
+            let key_slots = slots.div_ceil(64) * 64;
+            ensure!(to_slot + key_slots <= keys.capacity() && from_slot + key_slots <= keys.capacity(),
+                "relocation key bounds");
+            unsafe { self.cuda.copy_device(keys.data().ptr() + (to_slot * 68) as u64,
+                keys.data().ptr() + (from_slot * 68) as u64, key_slots * 68, stream)?; }
+            bytes += key_slots * 68; copies += 1;
+            if let Some(ring) = source.source().ring() {
+                let requests = crate::config::session_slots()?;
+                ensure!(ring.len() % requests == 0 && (from.request as usize) < requests && (to.request as usize) < requests,
+                    "relocation carry ring geometry");
+                let per = ring.len() / requests * 4;
+                unsafe { self.cuda.copy_device(ring.ptr() + (to.request as usize * per) as u64,
+                    ring.ptr() + (from.request as usize * per) as u64, per, stream)?; }
+                bytes += per; copies += 1;
+            }
+        }
+        // Region tails (batched serving): the conversation's 128-row encoder tail moves along.
+        let tail_moved = if !self.region_tails.is_empty() && from.request != to.request {
+            let (source, destination) = (self.tail_of(from)?.clone(), self.tail_of(to)?.clone());
+            ensure!(source.position() == position, "moved encoder tail frontier");
+            // Tail candidate ids are physical slots of the single-ratio source (layer 20).
+            destination.copy_from(&source, to.raw_single as i64 - from.raw_single as i64, stream)?;
+            true
+        } else { false };
+        self.invalidate_gather_caches();
+        stream.synchronize()?;
+        Ok(serde_json::json!({"position": position, "copies": copies, "bytes": bytes,
+            "window_blocks": last_block + 1 - first_block, "encoder_tail_moved": tail_moved}))
+    }
+    /// The DSpark feature taps of one batched session's rows (row-offset pointers).
+    pub(crate) fn batched_feature_inputs(&self, offset: usize, live: usize, stream: &Stream) -> Result<[u64; 3]> {
+        let (inputs, total) = self.dspark_feature_inputs(stream)?;
+        ensure!(self.batched_pending && live > 0 && offset + live <= total, "batched feature rows");
+        Ok(inputs.map(|b| b.ptr() + (offset * 20480 * 2) as u64))
+    }
+    pub(crate) fn history_for_probe(&self) -> History { self.history.clone() }
+    pub(crate) fn graph_capture_count(&self) -> usize { self.graph_captures }
+    /// Batched serving: a conversation moved back into region 0 (relocate_session, which also moved
+    /// its encoder tail) becomes this owner's own history.
+    pub(crate) fn adopt_moved_history(&mut self, history: History) -> Result<()> {
+        ensure!(self.lease.is_current() && self.pending.is_none() && self.batched_rows.is_none()
+            && !self.batched_pending && !self.region_tails.is_empty()
+            && self.encoder_cache.as_ref().is_some_and(|c| c.position() as u64 == history.position),
+            "moved history needs an idle region-0 owner and its encoder tail");
+        self.history = history;
+        self.invalidate_gather_caches();
+        Ok(())
+    }
+    pub(crate) fn batched_pending_for_probe(&self) -> bool { self.batched_pending }
+    /// Screens: padding routes for the following batched steps of several sessions (their graphs
+    /// use their own slots, so both settings stay captured).
+    pub(crate) fn set_padding_routes_for_probe(&mut self, on: bool) -> Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_BATCH_SCREEN").as_deref() == Ok("1")
+            && self.batched_rows.is_none() && !self.batched_pending, "padding routes screen toggle");
+        self.padding_routes = on;
+        Ok(())
+    }
+    /// Row offset of part `k` of the in-flight batched verification.
+    pub(crate) fn batched_offset(&self, k: usize) -> Result<usize> {
+        let parts = self.batched_inflight.as_ref().context("no batched verification")?;
+        ensure!(self.batched_pending && k < parts.len(), "batched part index");
+        Ok(k * self.batched_block)
+    }
+    /// Finite batched screen: replace this owner's own history (to run the
+    /// ordinary single-session path at a session's frontier) and get it back.
+    pub(crate) fn swap_history_for_probe(&mut self, history: History) -> Result<History> {
+        ensure!(std::env::var("CANADA_SCRATCH_BATCH_SCREEN").as_deref() == Ok("1")
+            && self.pending.is_none() && self.batched_rows.is_none(), "batched screen history swap");
+        Ok(std::mem::replace(&mut self.history, history))
+    }
+    pub(crate) fn swa_layout_for_probe(&self) -> crate::swa_layout::Layout { self.swa_layout }
+    /// verify_sample_ahead: whether the next verification defers its completion (see `defer_completion`).
+    pub(crate) fn defer_verification_completion(&mut self, on: bool) { self.defer_completion = on; }
+    /// The completion a deferred verification skipped: wait for the stream (already idle after the sampler's
+    /// readout), then the transport and fault checks, in the order execute_rows runs them. A no-op otherwise.
+    pub(crate) fn complete_deferred_verification(&self, comm: &Roce, stream: &Stream) -> Result<()> {
+        if !self.completion_owed.replace(false) { return Ok(()); }
+        stream.synchronize()?;
+        comm.health()?;
+        self.check_candidates()?;
+        if let Some(cache) = &self.encoder_cache {
+            ensure!(cache.error()? == 0, "encoder tail publication fault");
+        }
+        Ok(())
+    }
     pub fn finish_verification(
         &mut self,
         accepted: usize,
         comm: &Roce,
         stream: &Stream,
     ) -> Result<usize> {
+        ensure!(!self.batched_pending, "a batched screen verification is aborted, never committed");
+        ensure!(!self.completion_owed.get(), "a deferred verification was not completed before its commit");
         let pending = self
             .pending
             .as_ref()
@@ -4902,6 +6433,12 @@ impl Target {
             })
             .collect()
     }
+    /// Probe only: the raw rows the drafter's taps read after a prompt (three buffers, `live` rows of 20,480 BF16).
+    pub(crate) fn dspark_feature_rows_for_probe(&self, stream: &Stream) -> Result<Vec<Vec<u8>>> {
+        let (inputs, live) = self.dspark_feature_inputs(stream)?;
+        stream.synchronize()?;
+        inputs.iter().map(|b| unsafe { self.cuda.read_device(b.ptr(), live * 20480 * 2) }).collect()
+    }
     /// Canonical DSpark tap inputs, ordered by target attention layers37..39.
     /// A completed layer36..38 output is the raw residual at the next layer's
     /// attention input. Pending rows remain private to this writer transaction.
@@ -4937,6 +6474,10 @@ impl Target {
             ],
             live,
         ))
+    }
+    /// The last execute_rows' host stages, also while a batched verification is pending (diagnostic).
+    pub(crate) fn last_stages_ms(&self) -> Option<&[(&'static str, f64)]> {
+        self.last_append_metrics.as_ref().map(|m| m.stages_ms.as_slice())
     }
     pub fn append_metrics(&self) -> Result<Option<&AppendMetrics>> {
         ensure!(
@@ -4986,6 +6527,19 @@ impl Target {
         self.encoder_cache = Some(cache);
         Ok(())
     }
+    /// Batched serving (CANADA_SCRATCH_BATCHED_REGIONS > 1): one encoder tail per serving region
+    /// 1..R-1, of region 0's shape, on the M128 owner before its profiles fork (they share them).
+    pub(crate) fn enable_region_tails(&mut self, regions: usize) -> Result<()> {
+        ensure!(self.rows == 128 && (2..=4).contains(&regions) && self.region_tails.is_empty()
+            && self.graphs.iter().all(Option::is_none), "region tails need a fresh M128 owner");
+        let tail = self.encoder_cache.as_ref().context("region tails follow region 0's encoder tail")?;
+        for _ in 1..regions { self.region_tails.push(Rc::new(tail.twin()?)); }
+        Ok(())
+    }
+    fn tail_of(&self, base: SessionBase) -> Result<&Rc<crate::decoder_tail::Cache>> {
+        if base.request == 0 { return self.encoder_cache.as_ref().context("region 0 encoder tail"); }
+        self.region_tails.get(usize::try_from(base.request)? - 1).context("serving region encoder tail")
+    }
     /// Fresh bounded128-row prefill. The default qualified-recipe path runs
     /// encoder chunks then one decoder tail; the explicit canonical experiment
     /// advances every layer over every prompt token. Accepted encoder state
@@ -5020,7 +6574,8 @@ impl Target {
         self.last_append_metrics = None;
         self.carry_saved_start = None;
         self.comm_instance = Some(comm.instance());
-        let canonical = std::env::var("CANADA_SCRATCH_CANONICAL_PREFILL").as_deref() == Ok("1");
+        let canonical = CANONICAL_PREFILL_FOR_PROBE.with(|c| c.get())
+            .unwrap_or_else(|| std::env::var("CANADA_SCRATCH_CANONICAL_PREFILL").as_deref() == Ok("1"));
         // The full reference advances every layer over every prompt token.
         // Finish with128 rows so the draft receives its complete accepted tail,
         // including prompts whose length is not a multiple of128.
@@ -5202,6 +6757,24 @@ impl Target {
         resume_chunks:Option<Vec<usize>>,
         should_yield:&mut impl FnMut(usize)->Result<bool>,
     )->Result<PrefillProgress> {
+        self.prefill_wide_interruptible_checkpoint(wides,ids,comm,stream,lookahead,tail_graph,encoder_graph,
+            tiny_encoder_graph,defer_decoder,resume_chunks,None,None,should_yield)
+    }
+    /// As prefill_wide_interruptible_policy. With `checkpoint` = (side state, offset into
+    /// `ids`), the last encoder chunk also captures the state as of that offset
+    /// (capture_checkpoint_as_of); the offset must lie in that chunk, 128 rows or more in.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_wide_interruptible_checkpoint(
+        &mut self,wides:&mut [Self],ids:&[u32],comm:&Roce,stream:&Stream,
+        lookahead:bool,tail_graph:bool,encoder_graph:bool,tiny_encoder_graph:bool,defer_decoder:bool,
+        resume_chunks:Option<Vec<usize>>,
+        checkpoint:Option<(Rc<CheckpointAux>,usize)>,
+        extra:Option<(Rc<CheckpointAux>,usize)>,
+        should_yield:&mut impl FnMut(usize)->Result<bool>,
+    )->Result<PrefillProgress> {
+        ensure!(checkpoint.is_none() || (!defer_decoder && resume_chunks.is_some() && !encoder_graph),
+            "inline encoder checkpoint needs its admitted eager chunk plan");
+        ensure!(extra.is_none() || checkpoint.is_some(), "an extra inline capture accompanies the checkpoint's");
         ensure!(!defer_decoder || (encoder_checkpoint_enabled() && (ids.len()>=256
             || (ids.len()>=128&&self.history.position>0
                 &&defer_checkpoint_decoder128()?))),
@@ -5291,8 +6864,9 @@ impl Target {
         // without changing chunk planning, math, scheduling or cache ownership.
         let profile_start = std::env::var("CANADA_SCRATCH_PROFILE_ENCODER_CHUNK")
             .ok().map(|v|v.parse::<usize>()).transpose()?;
-        ensure!(profile_start.is_none() || (!encoder_graph && profile_start==Some(131072)),
-            "bounded encoder profile requires the current eager path at131072");
+        // Any full 8K chunk boundary (e.g. 131072, or 229376 near the end of a 245K prompt).
+        ensure!(profile_start.is_none() || (!encoder_graph && profile_start.is_some_and(|p| p >= 8192 && p % 8192 == 0)),
+            "bounded encoder profile requires the current eager path at an 8K chunk boundary");
         let chunks=if let Some(chunks)=resume_chunks {
             crate::config::validate_encoder_chunks(ids.len(),&chunks,&available)?;chunks
         }else{
@@ -5346,6 +6920,7 @@ impl Target {
                 && target.late.encoder_deferral_supported();
             let counters=record_stalls.then(crate::prefill_stall::Snapshot::read);
             let chunk_start=Instant::now();
+            let history_before=checkpoint.as_ref().map(|_|target.history.clone());
             let chunk_result=target.encoder_chunk(chunk, next.as_deref(), &cache, comm, stream, chunk_graph);
             target.layer20_projection_only=false;
             if let Some(counters)=counters {
@@ -5368,6 +6943,22 @@ impl Target {
             // precedes the GPU work of the same chunk.
             marks.push(("encoder_host", prepared));
             marks.push(("encoder_chunk", Instant::now()));
+            if let Some((aux,offset))=&checkpoint && done==ids.len() {
+                // The admitted plan put the checkpoint in this last chunk.
+                let start=done-chunk.len();
+                ensure!(profile.is_some() && !chunk_graph && *offset>=start+128 && *offset<=done,
+                    "inline encoder checkpoint lies outside the last chunk");
+                target.capture_checkpoint_as_of(aux,history_before.as_ref().unwrap(),chunk,*offset-start,comm,stream)?;
+                marks.push(("checkpoint_capture", Instant::now()));
+            }
+            if let Some((aux,offset))=&extra && done==ids.len() {
+                // A second capture from the same untouched chunk state, as of a later row (the near-end image).
+                let start=done-chunk.len();
+                ensure!(profile.is_some() && !chunk_graph && *offset>=start+128 && *offset<=done,
+                    "extra inline checkpoint lies outside the last chunk");
+                target.capture_checkpoint_as_of(aux,history_before.as_ref().unwrap(),chunk,*offset-start,comm,stream)?;
+                marks.push(("checkpoint_capture_extra", Instant::now()));
+            }
             if done<ids.len() && should_yield(done)? {
                 // This chunk now ends the turn, so its final rows feed the decoder
                 // tail: issue the deferred layer-20 work unchanged before stopping.
@@ -5490,6 +7081,28 @@ impl Target {
         store14.lookup_into(&flat14, staging14, 8)?;
         self.group14.engram_rows()?.0.upload_staged(&flat14)
     }
+    /// config::engram_early_submit: request, without waiting, every table row of this verification that the row
+    /// cache does not hold (table 14's too unless its rows are read behind layers 1-13). One submission a table;
+    /// a read-ahead still pending on a store (the anchor's) is published first.
+    fn submit_engram_rows(&mut self, hashes: &[[[u64; 24]; 2]], first_table_only: bool) -> Result<()> {
+        let first: Vec<u64> = hashes.iter().flat_map(|r| r[0]).collect();
+        self.row_store1.read_ahead_submit(&first)?;
+        if first_table_only { return Ok(()); }
+        let second: Vec<u64> = hashes.iter().flat_map(|r| r[1]).collect();
+        self.group14.engram_store()?.read_ahead_submit(&second)
+    }
+    /// config::engram_anchor_prefetch: the six-row verify owner's next verification starts at `anchor`, whose table
+    /// rows depend only on the committed history and that token. Request them now, without waiting; the lookup of
+    /// the verification finds them in the row cache. A hint: nothing here changes what the lookup returns.
+    pub(crate) fn prefetch_anchor_engram(&mut self, anchor: u32) -> Result<()> {
+        if !self.engram_overlap || self.rows != 6 || self.source_phase != Phase::Verify || self.pending.is_some()
+            || self.batched_rows.is_some() || !self.paired_engram_io_enabled() { return Ok(()); }
+        // At the very end of the context window the hash preparation refuses a row; the lookup will say so itself.
+        let Ok(batch) = self.history.prepare_padded(&[anchor], 1, &self.hashes) else { return Ok(()); };
+        let row = batch.rows[0];
+        self.row_store1.read_ahead_submit(&row[0])?;
+        self.group14.engram_store()?.read_ahead_submit(&row[1])
+    }
     /// Diagnostic cache reset only: invalidate immutable weight-row cache tags,
     /// never KV/model state. Every lookahead task is scoped and already joined.
     pub(crate) fn clear_engram_cache_for_probe(&self, stream: &Stream) -> Result<()> {
@@ -5539,7 +7152,15 @@ impl Target {
         let mut padded = vec![2u32; rows];
         padded[..chunk.len()].copy_from_slice(chunk);
         // Diagnostic split of the serial host preparation (CANADA_SCRATCH_CLAUDE_HOST_TIMING=1).
-        let host_timing=std::env::var("CANADA_SCRATCH_CLAUDE_HOST_TIMING").as_deref()==Ok("1");
+        // 1 = one line a chunk on every rank; 2 = also wait for layer 0 once this chunk's layer-1 rows are staged and
+        // print how long that took (0 = the GPU was already idle: the reads were exposed). Mode 2 delays the next
+        // launches by that wait, so it is a probe, not a serving setting.
+        let host_timing_mode=std::env::var("CANADA_SCRATCH_CLAUDE_HOST_TIMING").ok().and_then(|v|v.parse::<u8>().ok()).unwrap_or(0);
+        let host_timing=host_timing_mode>=1;
+        let (misses1_before,misses14_before)=if host_timing {
+            (self.row_store1.misses(),self.group14.engram_store()?.misses())
+        } else {(0,0)};
+        let (mut rows14_ms,mut layer0_wait_ms)=(0.0f64,-1.0f64);
         let behind_l0 = engram_behind_l0_enabled() && !(graph && !captured);
         let mut batch = None;
         let host_started=Instant::now();
@@ -5558,12 +7179,15 @@ impl Target {
         comm.select_prefill_rows(chunk.len(), rows, stream)?;
         stream.join_default()?;
         if let Some(wide)=&self.wide {wide.prepare_moe_scratch(stream)?;}
+        let partial_wide=crate::config::partial_wide_width(rows)&&chunk.len()<rows;
         let _partial_rows=crate::fp8_linear::LivePrefillRowsScope::new(
             self.prefill_partial_dense_rows && rows==512 && (129..512).contains(&chunk.len())
                 ||self.prefill_partial1024_rows>0&&rows==1024&&(513..1024).contains(&chunk.len())
-                ||self.prefill_partial2048_dense&&rows==2048&&(1025..2048).contains(&chunk.len()),
+                ||self.prefill_partial2048_dense&&rows==2048&&(1025..2048).contains(&chunk.len())
+                ||self.prefill_partial_wide&1!=0&&partial_wide,
             self.prefill_partial_moe_rows && rows==512 && (129..512).contains(&chunk.len())
-                ||self.prefill_partial1024_rows>1&&rows==1024&&(513..1024).contains(&chunk.len()),
+                ||self.prefill_partial1024_rows>1&&rows==1024&&(513..1024).contains(&chunk.len())
+                ||self.prefill_partial_wide&2!=0&&partial_wide,
             chunk.len(),rows,stream)?;
         let _mhc_rows=crate::mhc::ActiveRowsScope::new(
             self.prefill_mhc_live_rows&&rows==512&&(129..512).contains(&chunk.len())
@@ -5605,8 +7229,15 @@ impl Target {
                 // Layer-14 rows have no consumer before layer 14: stage them behind layers 1-13.
                 self.prepare_engram_rows1(&prepared_batch.rows)?;
                 behind_ms = behind_started.elapsed().as_secs_f64()*1000.;
+                if host_timing_mode>=2 {
+                    let waiting=Instant::now();
+                    stream.synchronize()?;
+                    layer0_wait_ms=waiting.elapsed().as_secs_f64()*1000.;
+                }
                 self.enqueue_before_engram14(comm, stream)?;
+                let rows14_started=Instant::now();
                 self.prepare_engram_rows14(&prepared_batch.rows)?;
+                rows14_ms=rows14_started.elapsed().as_secs_f64()*1000.;
                 batch = Some(prepared_batch);
                 self.enqueue_encoder_from_engram14(comm, stream)?;
             } else {
@@ -5619,10 +7250,11 @@ impl Target {
             self.enqueue_encoder(comm, stream)?;
         }
         let batch = batch.context("encoder chunk Engram batch")?;
-        if host_timing && self.rank==0 {
-            eprintln!("claude host rank0 rows={rows} live={} serial_engram_ms={:.3} rest_ms={:.3} behind_l0_engram_ms={:.3}",
-                chunk.len(), host_engram.duration_since(host_started).as_secs_f64()*1000.,
-                prepared.duration_since(host_engram).as_secs_f64()*1000., behind_ms);
+        if host_timing {
+            eprintln!("claude host rank{} rows={rows} live={} serial_engram_ms={:.3} rest_ms={:.3} behind_l0_engram_ms={:.3} rows14_ms={:.3} layer0_wait_ms={:.3} misses1={} misses14={}",
+                self.rank, chunk.len(), host_engram.duration_since(host_started).as_secs_f64()*1000.,
+                prepared.duration_since(host_engram).as_secs_f64()*1000., behind_ms, rows14_ms, layer0_wait_ms,
+                self.row_store1.misses()-misses1_before, self.group14.engram_store()?.misses()-misses14_before);
         }
         let lookahead_metrics=if let Some(next) = lookahead {
             // Clone only handles on the CUDA thread. Worker closures borrow
@@ -6083,7 +7715,7 @@ impl Target {
         Ok(())
     }
 
-    fn enqueue_initial(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
+    fn enqueue_initial_inner(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
         self.io.run_input(&self.tokens, comm, stream)?;
         // A sequence-parallel layer 0 takes its rank's rows of the full embedding.
         let shard;
@@ -6115,7 +7747,7 @@ impl Target {
         self.enqueue_before_engram14(comm,stream)?;
         self.enqueue_encoder_from_engram14(comm,stream)
     }
-    fn enqueue_before_engram14(&mut self, comm:&Roce, stream:&Stream)->Result<()> {
+    fn enqueue_before_engram14_inner(&mut self, comm:&Roce, stream:&Stream)->Result<()> {
         if self.engram_projection_active {
             // Moving this reduction earlier changes the collective order.
             // Rank-local split-I/O graph choices therefore cannot coexist
@@ -6273,6 +7905,190 @@ impl Target {
         ensure!(cache.error()? == 0, "deferred layer20 publication fault");
         self.lease.finish_write()
     }
+    /// Inline encoder checkpoint, on the wide profile that has just run `chunk` (all live
+    /// rows) from the history `before`. Capture into `aux` what a chunk ending at its row
+    /// `end` would have left behind: the pair carry rings, the candidate blocks and encoder
+    /// tail of rows [end-128, end), and the host history. Every input is still in place:
+    /// the pair projections, layer 20's output, the queries and the gathered keys are
+    /// per-chunk buffers and nothing has run since the chunk. No live state changes.
+    fn capture_checkpoint_as_of(&mut self, aux: &CheckpointAux, before: &History, chunk: &[u32], end: usize,
+        comm: &Roce, stream: &Stream) -> Result<()> {
+        ensure!(self.wide.is_some() && self.source_phase == Phase::Extend && self.pending.is_none()
+            && self.lease.is_current() && !self.layer20_pending
+            && self.late.encoder_sequence_parallel() && tail_window_enabled()
+            && self.encoder_cache.is_some() && self.tokens.active_rows() == chunk.len()
+            && (128..=chunk.len()).contains(&end)
+            && self.history.position == before.position + chunk.len() as u64
+            && comm.rank() == self.rank && self.cuda.owns_stream(stream) && stream.raw() as usize == self.stream,
+            "inline encoder checkpoint capture admission");
+        *aux.captured.borrow_mut() = None;
+        self.lease.begin()?;
+        aux.tail.clear(stream)?;
+        self.source2.publish_ring_as_of(&mut self.step.m2, &aux.rings[0], end, stream)?;
+        self.group8.source().publish_ring_as_of(&mut self.step.m8, &aux.rings[1], end, stream)?;
+        self.group14.source().publish_ring_as_of(&mut self.step.m14, &aux.rings[2], end, stream)?;
+        aux.tail.set_as_of_rows(end, stream)?;
+        // A compact mask holds only the newest 128 live rows' blocks: publish this window's.
+        let retained = self.late.source().query().candidate_mask_is_compact();
+        if retained {
+            self.late.source_mut().republish_retained_window(&self.step.m20, &aux.tail.as_of_rows(), end, comm, stream)?;
+        }
+        {
+            let (residual, pre) = self.sp_full.as_mut()
+                .context("inline encoder checkpoint needs the full-row gather storage")?;
+            let rows = residual.len() / 20480;
+            ensure!(rows % 4 == 0 && end <= rows && pre.len() == rows * 4, "inline encoder checkpoint tail geometry");
+            let (w0, w1) = (end - 128, end);
+            let local = rows / 4;
+            let rank = comm.rank();
+            let (a, b) = (w0.max(rank * local), w1.min((rank + 1) * local));
+            unsafe {
+                self.cuda.zero_device(residual.ptr() + (w0 * 40960) as u64, (w1 - w0) * 40960, stream)?;
+                if a < b {
+                    self.cuda.copy_device(residual.ptr() + (a * 40960) as u64,
+                        self.late.encoder_output().ptr() + ((a - rank * local) * 40960) as u64, (b - a) * 40960, stream)?;
+                }
+                let window = residual.view(w0 * 20480, (w1 - w0) * 20480)?;
+                let mut summed = residual.view(w0 * 20480, (w1 - w0) * 20480)?;
+                comm.sum_window_bf16(&window, &mut summed, stream)?;
+            }
+            // `pre` still holds every row from the chunk's own publication.
+            aux.tail.publish_as_of(&*residual, &*pre, self.late.source().candidates(), &self.tokens,
+                &self.step.compressed_positions, self.late.source().query().candidate_mask(),
+                self.late.source().query().candidate_mask_is_compact(), stream)?;
+        }
+        if retained {
+            // Leave the publisher as the chunk left it: the blocks of its own newest rows.
+            self.late.source_mut().republish_retained_window(&self.step.m20, self.tokens.live(), chunk.len(), comm, stream)?;
+        }
+        stream.synchronize()?;
+        comm.health()?;
+        ensure!(aux.tail.error()? == 0, "inline encoder checkpoint tail fault");
+        let mut history = before.clone();
+        let batch = history.prepare(&chunk[..end], &self.hashes)?;
+        history.commit(batch, end)?;
+        *aux.captured.borrow_mut() = Some(history);
+        self.lease.finish_read()
+    }
+    /// The decoder-tail owner's side state for inline encoder checkpoints, built on first use.
+    fn checkpoint_aux(&mut self) -> Result<Rc<CheckpointAux>> {
+        if self.checkpoint_aux.is_none() {
+            ensure!(self.rows == 128 && self.wide.is_none(), "inline checkpoint state belongs to the decoder-tail owner");
+            let ring = |source: &Source| source.ring_twin()?.context("pair source without a carry ring");
+            self.checkpoint_aux = Some(Rc::new(CheckpointAux {
+                tail: self.encoder_cache.as_ref().context("inline checkpoint needs the encoder tail")?.twin()?,
+                rings: [ring(&self.source2)?, ring(self.group8.source())?, ring(self.group14.source())?],
+                captured: std::cell::RefCell::new(None),
+            }));
+        }
+        Ok(self.checkpoint_aux.clone().unwrap())
+    }
+    /// A second set of the same side state, for the extra near-end capture of one request.
+    fn checkpoint_aux_extra(&mut self) -> Result<Rc<CheckpointAux>> {
+        if self.checkpoint_aux_extra.is_none() {
+            ensure!(self.rows == 128 && self.wide.is_none(), "inline checkpoint state belongs to the decoder-tail owner");
+            let ring = |source: &Source| source.ring_twin()?.context("pair source without a carry ring");
+            self.checkpoint_aux_extra = Some(Rc::new(CheckpointAux {
+                tail: self.encoder_cache.as_ref().context("inline checkpoint needs the encoder tail")?.twin()?,
+                rings: [ring(&self.source2)?, ring(self.group8.source())?, ring(self.group14.source())?],
+                captured: std::cell::RefCell::new(None),
+            }));
+        }
+        Ok(self.checkpoint_aux_extra.clone().unwrap())
+    }
+    /// Ask the next prefill_with_encoder_checkpoint for a second image, `rows` rows past its restore point (inside
+    /// the last chunk, 128 rows or more in), of `bytes` bytes; consumed by that call whatever path it takes.
+    pub(crate) fn set_extra_checkpoint(&mut self, request: Option<(usize, usize)>) -> Result<()> {
+        ensure!(request.is_none() || (self.rows == 128 && self.wide.is_none()), "extra checkpoint belongs to the decoder-tail owner");
+        self.extra_checkpoint = request; self.extra_image = None; Ok(())
+    }
+    /// The second image of the last prefill, if it was asked for, captured and admitted.
+    pub(crate) fn take_extra_checkpoint_image(&mut self) -> Option<EncoderPrefixImage> { self.extra_image.take() }
+    /// Save an inline-captured image from its side state (the caches' pages are read from the live buffers).
+    #[allow(clippy::too_many_arguments)]
+    fn save_inline_checkpoint(&mut self, aux: &CheckpointAux, position: usize, budget: usize,
+        recycled: Option<crate::state_image::Image>, comm: &Roce, stream: &Stream,
+        admit_image: &mut impl FnMut(bool) -> Result<bool>) -> Result<Option<EncoderPrefixImage>> {
+        let recycled_bytes = recycled.as_ref().map_or(0, crate::state_image::Image::bytes);
+        let history = aux.captured.borrow_mut().take().context("inline encoder checkpoint was not captured")?;
+        ensure!(history.position as usize == position, "inline encoder checkpoint frontier");
+        self.state_image_guard(comm, stream)?;
+        let fits = self.cuda.admission_memory()?.admitted_available
+            >= crate::memory::floor_bytes() + 16 * 1024usize.pow(2) + budget - recycled_bytes;
+        if !admit_image(fits)? { return Ok(None); }
+        let bank_retained = crate::config::bank_encoder_checkpoint_requested();
+        let regions = self.state_image_regions_for_layers_mode(history.position as usize, true, true, bank_retained)?;
+        let mut allocation = match recycled {
+            Some(retired) => retired.try_recycle(&regions, budget, stream)?,
+            None => crate::state_image::Image::try_allocate(&self.cuda, &regions, budget, stream)?,
+        };
+        let fits = allocation.is_some() && self.cuda.admission_memory()?.admitted_available
+            >= crate::memory::floor_bytes() + 16 * 1024usize.pow(2);
+        if !admit_image(fits)? { return Ok(None); }
+        let mut image = allocation.take().ok_or_else(|| anyhow::anyhow!("all-rank image admission differs"))?;
+        image.configure_copy_kernel(self.io.core_module())?;
+        stream.synchronize()?; comm.health()?; self.lease.begin()?;
+        ensure!(self.encoder_cache.as_ref().unwrap().error()? == 0, "encoder checkpoint cache fault");
+        let sources = aux.image_sources(&self.cuda)?;
+        image.save_with_sources(&regions, &sources, stream)?; comm.health()?; self.lease.finish_read()?;
+        Ok(Some(EncoderPrefixImage(StateImage { image: image.into(), owner: self.lease.fork(), history,
+            context: self.context, rank: self.rank, stream: self.stream, compact: true },
+            bank_retained.then(|| bank_encoder_lineage::Binding::new(self.history.lineage)))))
+    }
+    /// The chunk plan of an inline encoder checkpoint for `prefix` + `suffix` rows, if the
+    /// policy is on and the plan's last chunk can capture the checkpoint: a sequence-parallel
+    /// wide chunk that starts 128 rows or more before the checkpoint.
+    fn inline_checkpoint_plan(&self, wides: &[Self], prefix: usize, suffix: usize,
+        forced: Option<Vec<usize>>) -> Result<Option<Vec<usize>>> {
+        self.inline_checkpoint_plan_at(wides, prefix, suffix, forced, self.history.position > 0)
+    }
+    /// Whether a near-end checkpoint `prefix` rows past a restored encoder image, with `suffix` (< 128) rows
+    /// after it, is captured inline. The worker chooses a near-end position only then: without the inline
+    /// capture the checkpoint transaction needs a complete 128-row replacement suffix.
+    /// The next short restored suffix of prefill_with_encoder_checkpoint runs as the qualified EXTEND
+    /// (CANADA_SCRATCH_ENCODER_SHORT_SUFFIX=2); consumed by that call.
+    pub(crate) fn set_short_restore_extend(&mut self, extend: bool) -> Result<()> {
+        ensure!(!extend || (self.rows == 128 && self.cached_decoder.is_some()), "short restore EXTEND needs the cached floor profile");
+        self.short_restore_extend = extend; Ok(())
+    }
+    pub(crate) fn near_end_checkpoint_admitted(&self, wides: &[Self], prefix: usize, suffix: usize) -> Result<bool> {
+        Ok(!self.default_encoder_graph_policy()?.0
+            && self.inline_checkpoint_plan_at(wides, prefix, suffix, None, true)?.is_some())
+    }
+    /// Whether a request of `total` rows past its restore point (`retained`: there is one) with its checkpoint
+    /// `prefix` rows in takes the inline path and can also capture a second image `extra` rows in: both in the
+    /// plan's last chunk, 128 rows or more into it. The worker asks before it makes room for that image.
+    pub(crate) fn extra_checkpoint_admitted(&self, wides: &[Self], prefix: usize, extra: usize, total: usize,
+        retained: bool) -> Result<bool> {
+        if self.default_encoder_graph_policy()?.0 || extra <= prefix || extra > total || total <= prefix { return Ok(false); }
+        Ok(self.inline_checkpoint_plan_at(wides, prefix, total - prefix, None, retained)?
+            .is_some_and(|plan| extra >= plan[..plan.len() - 1].iter().sum::<usize>() + 128))
+    }
+    fn inline_checkpoint_plan_at(&self, wides: &[Self], prefix: usize, suffix: usize,
+        forced: Option<Vec<usize>>, retained: bool) -> Result<Option<Vec<usize>>> {
+        let requested = match self.checkpoint_inline_for_probe {
+            Some(inline) => inline,
+            None => crate::config::encoder_checkpoint_inline_requested()?,
+        };
+        if !requested || prefix < 128 || !tail_window_enabled() {
+            return Ok(None);
+        }
+        let total = prefix + suffix;
+        let available: Vec<usize> = std::iter::once(128).chain(wides.iter().map(|w| w.rows)).collect();
+        let plan = match forced {
+            Some(plan) => { crate::config::validate_encoder_chunks(total, &plan, &available)?; plan }
+            None => {
+                let merge = retained && self.prefill_short_merge && wides.iter().any(|w|
+                    w.rows == 2048 && w.prefill_partial2048_dense && w.prefill_wide_mhc_rows && w.prefill_wide_mhc_norm);
+                crate::config::plan_encoder_append(total, &available, merge)
+            }
+        };
+        let last = *plan.last().context("empty encoder plan")?;
+        let start: usize = plan[..plan.len() - 1].iter().sum();
+        let admitted = prefix >= start + 128 && wides.iter().any(|w| w.rows == last
+            && w.late.encoder_sequence_parallel() && w.sp_full.is_some());
+        Ok(admitted.then_some(plan))
+    }
     fn publish_encoder_tail(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
         let publishing = self.encoder_cache.is_some() && self.source_phase != Phase::Verify;
         let (output20, pre20) = match self.sp_full.as_mut() {
@@ -6330,11 +8146,28 @@ impl Target {
         self.enqueue_initial(comm, stream)?;
         self.enqueue_after_initial(comm, stream)
     }
+    // The three parts of a forward, each between the layer clock's first and last mark of that part
+    // (crate::layer_clock: no effect unless a screen armed it).
+    fn enqueue_initial(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
+        crate::layer_clock::part(stream, 0)?;
+        self.enqueue_initial_inner(comm, stream)?;
+        crate::layer_clock::end(stream)
+    }
+    fn enqueue_before_engram14(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
+        crate::layer_clock::part(stream, 1)?;
+        self.enqueue_before_engram14_inner(comm, stream)?;
+        crate::layer_clock::end(stream)
+    }
+    fn enqueue_after_engram14(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
+        crate::layer_clock::part(stream, 2)?;
+        self.enqueue_after_engram14_inner(comm, stream)?;
+        crate::layer_clock::end(stream)
+    }
     fn enqueue_after_initial(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
         self.enqueue_before_engram14(comm,stream)?;
         self.enqueue_after_engram14(comm,stream)
     }
-    fn enqueue_after_engram14(&mut self,comm:&Roce,stream:&Stream)->Result<()> {
+    fn enqueue_after_engram14_inner(&mut self,comm:&Roce,stream:&Stream)->Result<()> {
         self.enqueue_encoder_from_engram14(comm,stream)?;
         let decoder = self.cached_decoder.as_ref().unwrap_or(&self.step);
         // The append bank changes only decoder SWA visibility. Its source20
@@ -6360,6 +8193,10 @@ impl Target {
             if self.append_encoded_head&&self.cached_decoder.is_some() {
                 ensure!(self.append_last_gather,"final encoded head needs final-only publication");
                 self.io.run_append_encoded_last(self.late.output(),self.late.pre(),&self.tokens,stream)?;
+            } else if self.rows == 6 && self.io.head4_on() {
+                // crate::head4_rescore (an option, off by default; it approximates the model's own output head, see its
+                // module documentation): the 4-bit copy of the head, exact rescoring of the largest rows.
+                self.io.run_head4(self.late.output(), self.late.pre(), self.tokens.active_rows(), stream)?;
             } else {self.io.run_head(self.late.output(), self.late.pre(), stream)?;}
             if self.append_last_gather&&self.cached_decoder.is_some()&&self.tokens.active_rows()>1 {
                 self.io.gather_existing_last_logits(comm,&self.tokens,stream)?;
@@ -6907,6 +8744,30 @@ impl Target {
             "scope":"Common-first16 boundary hashes for all40 layers and four selected detailed layers of one ordinary forward, recorded after logits. No injected intermediates, cache dump, or serving policy. Hash differences locate arithmetic changes, not quality loss."}))?)?;
         Ok(())
     }
+    /// Probe only (CANADA_SCRATCH_MIDPASS_DUMP, Nov 12): the rows' embeddings (layer 0's input) and the residual
+    /// after layers 13, 25 and 39 of the forward that just ran; every layer keeps its output until the next
+    /// forward. Read-only; for the offline study of how early a draft's rejection shows in the target's state.
+    pub(crate) fn midpass_states_for_probe(&self) -> Result<Vec<Vec<u8>>> {
+        let mut layers = self.early.iter().collect::<Vec<_>>();
+        layers.extend(self.group8.layers().iter());
+        layers.extend(self.group14.layers().iter());
+        layers.extend(self.late.layers().iter());
+        ensure!(self.lease.is_current() && layers.len() == 40, "mid-pass probe needs the complete current target");
+        let mut out = vec![crate::layer_probe::bf16_bytes(self.io.input())?];
+        for id in [13usize, 25, 39] { out.push(crate::layer_probe::bf16_bytes(layers[id].output())?); }
+        Ok(out)
+    }
+    /// Probe only (restore layer diff, Nov 13): the residual after each listed layer of the forward that just ran
+    /// (every layer keeps its output until the next forward). Read-only.
+    pub(crate) fn layer_outputs_for_probe(&self, ids: &[usize]) -> Result<Vec<Vec<u8>>> {
+        let mut layers = self.early.iter().collect::<Vec<_>>();
+        layers.extend(self.group8.layers().iter());
+        layers.extend(self.group14.layers().iter());
+        layers.extend(self.late.layers().iter());
+        ensure!(self.lease.is_current() && layers.len() == 40 && ids.iter().all(|&id| id < 40),
+            "layer output probe needs the complete current target");
+        ids.iter().map(|&id| crate::layer_probe::bf16_bytes(layers[id].output())).collect()
+    }
     pub fn dump_layer_trace(&self, root: &Path) -> Result<serde_json::Value> {
         use sha2::{Digest, Sha256};
         ensure!(
@@ -7010,6 +8871,131 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn graph_slots_are_unique_per_session_count_and_rows() {
+        for rows in [6usize, 16, 32, 128] {
+            let mut seen = std::collections::BTreeSet::new();
+            for sessions in 1..=MAX_BATCHED_SESSIONS {
+                for region in [false, true] {
+                    for padded in [false, true] {
+                        if (sessions > 1 && !region) || (padded && !(region && sessions > 1)) { continue; }
+                        for executed in 0..=rows {
+                            let slot = graph_slot(rows, sessions, executed, region, padded, 0);
+                            assert!(slot < graph_slots(rows) && seen.insert(slot));
+                            if sessions >= 2 && rows <= 32 {
+                                for block in 2..=rows / sessions {
+                                    let slot = graph_slot(rows, sessions, executed, region, padded, block);
+                                    assert!(slot < graph_slots(rows) && seen.insert(slot), "{rows} {sessions} {executed} {block}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // One session keeps today's slot: the live-row count.
+            assert!((0..=rows).all(|live| graph_slot(rows, 1, live, false, false, 0) == live));
+        }
+    }
+    #[test]
+    fn serving_regions_are_disjoint_and_steps_stay_inside_them() {
+        use crate::swa_layout::Layout;
+        let context = 1048576;
+        // Relocation copies whole 64-slot pages: every ring keeps a position's offset in its page.
+        for layout in [Layout::Ring, Layout::WideRing, Layout::WideRing8192, Layout::WideRing16384] {
+            assert!((0..300000).step_by(37).all(|pos| layout.slot(pos) % 64 == pos % 64));
+        }
+        for layout in [Layout::WideRing, Layout::WideRing8192, Layout::WideRing16384] {
+            for regions in 2..=4 {
+                let pages = layout.pages(context).unwrap() + (regions - 1) * Layout::Ring.pages(context).unwrap();
+                let (mut windows, mut shares) = (Vec::new(), Vec::new());
+                for k in 0..regions {
+                    let b = SessionBase::serving_region(k, regions, context, layout).unwrap();
+                    assert_eq!(b.request as usize, k);
+                    let span = b.layout.unwrap_or(layout).pages(context).unwrap() * 64;
+                    windows.push((b.window, b.window + span));
+                    shares.push((b.raw_pair, b.raw_pair + SessionBase::region_capacity(context, regions)));
+                    for position in [0u64, 1, 127, 128, 1000, 65535, (SessionBase::region_capacity(context, regions) - 16) as u64] {
+                        let p = Plan::batched(&[(b, position, 6)], 16, context, layout).unwrap();
+                        for row in 0..6 {
+                            let inside = |slot: i32| (b.window..b.window + span).contains(&(slot as usize));
+                            assert!(inside(p.locations[row]));
+                            let reads = p.swa_lengths[row] as usize;
+                            assert!(reads >= 1 && p.swa_ids[row * 128..row * 128 + reads].iter().all(|&id| inside(id)));
+                            assert_eq!(p.pair_starts[row] as usize, b.raw_pair / 2);
+                            assert_eq!(p.requests[row], k as i64);
+                        }
+                    }
+                }
+                assert!(windows.windows(2).all(|w| w[0].1 <= w[1].0) && windows.last().unwrap().1 <= pages * 64);
+                assert!(shares.windows(2).all(|w| w[0].1 <= w[1].0) && shares.last().unwrap().1 <= context);
+            }
+        }
+    }
+    #[test]
+    fn batched_sessions_are_offset_copies_of_their_own_appends() {
+        use crate::swa_layout::Layout;
+        let layout = Layout::Ring;
+        let window = crate::swa_layout::OFFSET + layout.ring().unwrap();
+        // A single sequence at base zero is exactly today's plan.
+        for (pos, live) in [(0u64, 1usize), (5, 3), (129, 6), (4095, 6)] {
+            let legacy = Plan::append_with_layout(pos, live, 6, 262144, layout).unwrap();
+            let based = Plan::append_session(pos, live, 6, 262144, layout, SessionBase::default()).unwrap();
+            assert_eq!(format!("{legacy:?}"), format!("{based:?}"));
+            assert!(legacy.requests.iter().chain(&legacy.requests).all(|&r| r == 0));
+            assert!(legacy.pair_starts.iter().chain(&legacy.single_starts).all(|&s| s == 0));
+        }
+        // Two sessions of 131072 positions in one 262144-position owner.
+        let a = SessionBase::region(0, 131072, window).unwrap();
+        let b = SessionBase::region(1, 131072, window).unwrap();
+        assert_eq!(a, SessionBase::default());
+        let batch = Plan::batched(&[(a, 300, 3), (b, 4000, 3)], 6, 262144, layout).unwrap();
+        let alone_a = Plan::append_session(300, 3, 6, 262144, layout, a).unwrap();
+        let alone_b = Plan::append_session(4000, 3, 6, 262144, layout, b).unwrap();
+        for row in 0..3 {
+            assert_eq!(batch.positions[row], alone_a.positions[row]);
+            assert_eq!(batch.locations[row], alone_a.locations[row]);
+            assert_eq!(batch.positions[row + 3], alone_b.positions[row]);
+            assert_eq!(batch.locations[row + 3], alone_b.locations[row]);
+            assert_eq!(batch.raw_pair[row + 3], alone_b.raw_pair[row]);
+            assert_eq!(batch.swa_ids[(row + 3) * 128..(row + 4) * 128], alone_b.swa_ids[row * 128..(row + 1) * 128]);
+            // Same visible counts, disjoint regions: B's addresses are A's formulas plus its bases.
+            assert_eq!(batch.locations[row + 3] as usize, window + layout.slot(4000 + row));
+            assert_eq!(batch.raw_pair[row + 3] as usize, 131072 + SWA_OFFSET + 4000 + row);
+            assert_eq!(batch.raw_single[row + 3] as usize, 131072 + COMPRESSED_OFFSET + 4000 + row);
+            assert_eq!(batch.pair_lengths[row + 3], ((4000 + row + 1) / 2) as i32);
+            assert_eq!((batch.requests[row], batch.requests[row + 3]), (0, 1));
+            assert_eq!((batch.pair_starts[row + 3], batch.single_starts[row + 3]), (65536, 131072));
+        }
+        // B's key region [65536, 65536 + len) and A's [0, len) never overlap within capacity.
+        assert!(alone_a.pair_lengths.iter().all(|&l| (l as usize) < 65536));
+        // One part per session, total rows bounded, absolute layout refused for offsets.
+        assert!(Plan::batched(&[(a, 1, 3), (a, 9, 3)], 6, 262144, layout).is_err());
+        assert!(Plan::batched(&[(a, 1, 4), (b, 9, 3)], 6, 262144, layout).is_err());
+        assert!(Plan::append_session(1, 1, 6, 262144, Layout::Absolute, b).is_err());
+        // Short parts keep their blocks: A at rows [0, 2), B at row 3; the step
+        // executes rows [0, 4). Each block is one request with consecutive
+        // positions and no-write padding as a suffix (the pair verify kernel's rule).
+        let short = Plan::batched(&[(a, 300, 2), (b, 4000, 1)], 6, 262144, layout).unwrap();
+        assert_eq!((short.block, Plan::batched_extent(&[2, 1], 6)), (3, 4));
+        for row in 0..2 { assert_eq!(short.raw_pair[row], alone_a.raw_pair[row]); }
+        assert_eq!(short.raw_pair[3], alone_b.raw_pair[0]);
+        assert_eq!((short.raw_pair[2], short.locations[2], short.positions[2], short.requests[2]), (0, -1, 301, 0));
+        assert_eq!((short.raw_pair[4], short.raw_pair[5], short.positions[5], short.requests[5]), (0, 0, 4000, 1));
+        for plan in [&batch, &short] {
+            for start in (0..6).step_by(plan.block) {
+                let active = (0..plan.block).take_while(|i| plan.raw_pair[start + i] != 0).count();
+                assert!(active > 0 && plan.raw_pair[start + active..start + plan.block].iter().all(|&l| l == 0));
+                for i in 0..active {
+                    assert_eq!(plan.requests[start + i], plan.requests[start]);
+                    assert_eq!(plan.positions[start + i], plan.positions[start] + i as i32);
+                }
+            }
+        }
+        // One session keeps one block of every row; blocks must divide the rows.
+        assert_eq!(Plan::batched(&[(b, 9, 5)], 6, 262144, layout).unwrap().block, 6);
+        assert!(Plan::batched(&[(a, 1, 1), (b, 9, 1), (SessionBase::region(2, 65536, window).unwrap(), 5, 1),
+            (SessionBase::region(3, 65536, window).unwrap(), 5, 1)], 6, 262144, layout).is_err());
+    }
     #[test]
     fn compact_state_pages_cover_wraps_and_padding_without_aliases() {
         use crate::swa_layout::Layout;
@@ -7302,4 +9288,16 @@ impl Target {
     pub(crate) fn coalesced_codec_layers(&self)->usize {
         self.layer_owners().iter().filter(|layer|layer.coalesced_codec_active()).count()
     }
+}
+
+/// CANADA_SCRATCH_ENGRAM_GAP_PROBE=1 (diagnostic, default off): time the GPU idles between a verification's
+/// initial graph (embedding and layer 0) and the rest of its forward, which is enqueued after the Engram row
+/// lookup. Two timing events a step; each rank prints its running mean every 64 verifications.
+fn engram_gap_probe() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_ENGRAM_GAP_PROBE").as_deref() == Ok("1"))
+}
+struct EngramGap { first: crate::cuda::Event, second: crate::cuda::Event, count: u64, total_ms: f64, max_ms: f32 }
+thread_local! {
+    static ENGRAM_GAP: std::cell::RefCell<Option<EngramGap>> = const { std::cell::RefCell::new(None) };
 }

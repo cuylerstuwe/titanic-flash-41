@@ -28,7 +28,7 @@ pub(crate) struct DraftHead {
     integer_active: Cell<bool>,
     lossless: Option<crate::lossless_head::Head>,
     lossless_active: Cell<bool>,
-    nvfp4: Option<crate::nvfp4_head::Head>,
+    nvfp4: Option<Rc<crate::nvfp4_head::Head>>,
     nvfp4_active: Cell<bool>,
     // Immutable after construction. Request owners may share these bytes,
     // while precision switches, operators and every activation stay private.
@@ -195,6 +195,11 @@ impl DraftHead {
         }
         let reclaimed=if Rc::ptr_eq(&self.weights,&source.weights){0}else{self.weights.bytes()+self.scales.bytes()};
         self.weights=source.weights.clone();self.scales=source.scales.clone();
+        // The serving NVFP4 copy is one a rank: drafters on the same ordered stream share the source's head whole
+        // (its scratch is used by one pass at a time there).
+        if crate::config::draft_head_nvfp4()&&source.nvfp4_active.get()&&self.nvfp4.is_none() {
+            self.nvfp4=source.nvfp4.clone();self.nvfp4_active.set(true);
+        }
         Ok(reclaimed)
     }
     pub(crate) fn with_lossless(mut self,root:&Path,stream:&Stream)->Result<Self> {
@@ -211,9 +216,34 @@ impl DraftHead {
         self.integer_active.set(kind==1);self.lossless_active.set(kind==2);self.nvfp4_active.set(kind==3);Ok(())
     }
     pub(crate) fn nvfp4_enabled(&self)->bool {self.nvfp4_active.get()}
-    pub(crate) fn with_nvfp4(mut self,root:&Path,stream:&Stream)->Result<Self> {
+    /// Diagnostic export only: the active 4-bit head.
+    pub(crate) fn nvfp4_for_export(&self)->Option<Rc<crate::nvfp4_head::Head>> {self.nvfp4.clone().filter(|_|self.nvfp4_active.get())}
+    /// The NVFP4 copy is in use and holds a script-subset form.
+    pub(crate) fn nvfp4_subset_available(&self)->bool {self.nvfp4_active.get()&&self.nvfp4.as_ref().is_some_and(|h|h.subset_available())}
+    pub(crate) fn set_nvfp4_subset_mode(&self,subset:bool)->Result<()> {
+        match &self.nvfp4 {Some(head) if self.nvfp4_active.get()&&head.subset_available()=>head.set_subset_mode(subset),_=>Ok(())}
+    }
+    /// The NVFP4 copy is in use and can run one pass for several conversations (config::draft_head_pool).
+    pub(crate) fn nvfp4_pool_available(&self)->bool {self.nvfp4_active.get()&&self.nvfp4.as_ref().is_some_and(|h|h.pool_available())}
+    /// Both heads run the same NVFP4 copy (the serving copy is one a rank).
+    pub(crate) fn shares_nvfp4(&self,other:&Self)->bool {
+        self.nvfp4_active.get()&&other.nvfp4_active.get()
+            &&matches!((&self.nvfp4,&other.nvfp4),(Some(a),Some(b)) if Rc::ptr_eq(a,b))
+    }
+    /// One NVFP4 pass for several conversations' (normalized rows, FP32 logits), in the form last selected.
+    pub(crate) fn run_nvfp4_pooled(&self,parts:&[(&Buffer<bf16>,&Buffer<f32>)],stream:&Stream)->Result<()> {
+        ensure!(self.nvfp4_active.get()&&self.stream==stream.raw()as usize,"pooled NVFP4 draft head owner");
+        self.nvfp4.as_ref().expect("active private NVFP4 loaded").run_pooled(parts,stream)
+    }
+    pub(crate) fn with_nvfp4(mut self,root:&Path,stream:&Stream,core:&[u8],rank:usize)->Result<Self> {
         ensure!(self.stream==stream.raw()as usize&&self.nvfp4.is_none(),"private NVFP4 owner");
-        self.nvfp4=Some(crate::nvfp4_head::Head::new(&self.cuda,self.canonical.ptr("head.weight")?,root,stream)?);Ok(self)
+        self.nvfp4=Some(Rc::new(crate::nvfp4_head::Head::new(&self.cuda,self.canonical.ptr("head.weight")?,root,stream,core,rank)?));Ok(self)
+    }
+    /// Serving (config::draft_head_nvfp4): this head's own passes run the NVFP4 copy from now on (before any graph).
+    pub(crate) fn activate_nvfp4(&self)->Result<()> {
+        ensure!(crate::config::draft_head_nvfp4()&&self.nvfp4.is_some()&&!self.integer_active.get()&&!self.lossless_active.get(),
+            "NVFP4 draft head activation");
+        self.nvfp4_active.set(true);Ok(())
     }
     pub(crate) fn with_int8(mut self,root:&Path,stream:&Stream)->Result<Self> {
         ensure!(std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_INT8_SCREEN").as_deref()==Ok("1")

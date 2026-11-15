@@ -1,0 +1,6 @@
+Private experimental Marlin NVFP4 drafter head.
+CUDA Marlin sources are adapted from vllm-project/vllm at 784d1fff0c491b9add10ecd732de8f707a7e7dbe, under Apache-2.0.
+See upstream/LICENSE and retained per-file notices (including Marlin / Elias Frantar and Neural Magic).
+The adaptation removes Torch host wrappers, substitutes the scalar assertion include, and instantiates one BF16 M5 N32320 K5120 schedule. Kernel arithmetic is unchanged.
+native_quantize.cu is an original GPU encoder/publication adapter. The target head remains canonical BF16/FP32; exact rejection uses actual proposal probabilities.
+To rebuild in the pinned CUDA13/SM121 environment: python3 prepare_sources.py; python3 export.py. These write build/ and native-artifact/ next to the sources. Do not overwrite a qualified artifact.

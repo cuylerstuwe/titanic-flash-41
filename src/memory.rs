@@ -333,3 +333,22 @@ mod tests {
         );
     }
 }
+
+/// Diagnostic only (CANADA_SCRATCH_PROFILE_MEMORY_TRACE=1): host-available memory at one point of a wide
+/// profile's construction, to measure what each part holds outside the shared row arenas. Never changes
+/// any allocation.
+pub(crate) fn trace_profile_memory(cuda: &crate::cuda::Cuda, rows: usize, label: &str) {
+    if !crate::config::wide_rows(rows)
+        || std::env::var("CANADA_SCRATCH_PROFILE_MEMORY_TRACE").as_deref() != Ok("1") {
+        return;
+    }
+    if let Ok(a) = cuda.admission_memory() {
+        eprintln!("profile memory trace rows {rows} {label}: host_available {} cuda_free {}",
+            a.host_available, a.cuda_immediately_free);
+    }
+    // With CANADA_SCRATCH_ALLOCATION_SITES_SCREEN=1: the live ordinary allocations by call
+    // site once each profile is complete; consecutive reports show what a profile owns.
+    if label == "after io" {
+        let _ = cuda.report_allocation_sites(&format!("after wide profile {rows}"));
+    }
+}

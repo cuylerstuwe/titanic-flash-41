@@ -1,0 +1,45 @@
+{
+  "shape": [
+    16,
+    32320,
+    5120
+  ],
+  "cuda_arch": 121,
+  "sm_count": 48,
+  "projection_threads": 128,
+  "shared_bytes": 101376,
+  "artifact": "head16.cubin",
+  "artifact_sha256": "a73f73be79ea40bcdf150772d052c2af8ba9ff13be1a9bb02deba10c53ec4f60",
+  "functions": [
+    {
+      "name": "projection",
+      "symbol": "_ZN6marlin6MarlinILl1125899906909960ELl562949953487106ELl1125899906909960ELl2814749767172868ELi128ELi1ELi4ELi8ELb0ELi4ELi1ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+      "parameters": [
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u64",
+        "u32",
+        "u32",
+        "u32",
+        "u32",
+        "u64",
+        "u8",
+        "u8",
+        "u8",
+        "u32"
+      ]
+    }
+  ],
+  "source_revision": "784d1fff0c491b9add10ecd732de8f707a7e7dbe",
+  "upstream_license": "Apache-2.0",
+  "source_manifest_sha256": "87c6487883e3bd850f5bb486226b585a483c2e12a4247321fc1645a1416a3336",
+  "five_row_symbol": "_ZN6marlin6MarlinILl1125899906909960ELl562949953487106ELl1125899906909960ELl2814749767172868ELi128ELi1ELi4ELi8ELb1ELi4ELi1ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+  "compiler": "Build cuda_13.0.r13.0/compiler.36424714_0",
+  "contract": "Private proposal head only, batched draft passes: the m5 bundle's kernel with m_block_size_8=false (up to 16 BF16 activation rows a pass). Reads the m5 head's repacked E2M1 weights, E4M3/16 scales and FP32 global scale unchanged; FP32 Marlin reduction, no atomic. Target unchanged."
+}

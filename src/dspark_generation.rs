@@ -15,14 +15,235 @@ use crate::{
 use anyhow::{Result, ensure};
 use std::{path::Path, rc::Rc, time::Instant};
 
+/// Batched step accounting per conversation count: rows verified (live) and executed (through the
+/// last part's live rows), always; with CANADA_SCRATCH_BATCHED_PHASE_SYNC=1 (diagnostic) also the
+/// phase times: batched steps then synchronize the stream at their phase boundaries (each draft,
+/// the verification, the sessions' finishes, the owner's commit). Synchronizing removes host/GPU
+/// overlap, so synced phases sum to slightly more than an unsynchronized step.
+#[derive(Clone, Copy)]
+pub(crate) struct BatchedPhases { steps: usize, synced: usize, live_rows: usize, executed_rows: usize,
+    draft_ms: f64, draft_max_ms: f64, verify_ms: f64, finish_ms: f64, commit_ms: f64, groups: usize, lookups: usize }
+impl BatchedPhases {
+    const ZERO: Self = Self { steps: 0, synced: 0, live_rows: 0, executed_rows: 0, draft_ms: 0., draft_max_ms: 0.,
+        verify_ms: 0., finish_ms: 0., commit_ms: 0., groups: 0, lookups: 0 };
+}
+static BATCHED_PHASES: std::sync::Mutex<[BatchedPhases; 5]> = std::sync::Mutex::new([BatchedPhases::ZERO; 5]);
+/// 0: not read yet, 1: off, 2: on.
+static PHASE_SYNC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+fn phase_sync() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match PHASE_SYNC.load(Relaxed) {
+        0 => {
+            let on = std::env::var("CANADA_SCRATCH_BATCHED_PHASE_SYNC").as_deref() == Ok("1");
+            PHASE_SYNC.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+        state => state == 2,
+    }
+}
+/// Screens: phase syncs for the following batched steps only.
+pub(crate) fn set_batched_phase_sync_for_probe(on: bool) {
+    PHASE_SYNC.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+fn record_batched_phases(parts: usize, step: BatchedPhases) {
+    let Ok(mut all) = BATCHED_PHASES.lock() else { return; };
+    let a = &mut all[parts.min(4)];
+    a.steps += step.steps; a.synced += step.synced; a.live_rows += step.live_rows; a.executed_rows += step.executed_rows;
+    a.draft_ms += step.draft_ms; a.draft_max_ms += step.draft_max_ms; a.verify_ms += step.verify_ms;
+    a.finish_ms += step.finish_ms; a.commit_ms += step.commit_ms; a.groups += step.groups; a.lookups += step.lookups;
+}
+/// The accounting per conversation count since the last call: rows a step, and phase means over
+/// the synced steps.
+pub(crate) fn take_batched_phases() -> serde_json::Value {
+    let Ok(mut all) = BATCHED_PHASES.lock() else { return serde_json::Value::Null; };
+    let stages = BATCHED_STAGES.lock().ok().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+    let out: Vec<serde_json::Value> = (1..=4).filter(|&n| all[n].steps > 0).map(|n| {
+        let p = all[n]; let f = p.steps as f64; let s = p.synced.max(1) as f64;
+        let mut v = serde_json::json!({"conversations":n,"steps":p.steps,"live_rows_per_step":p.live_rows as f64 / f,
+            "executed_rows_per_step":p.executed_rows as f64 / f,"groups_per_step":p.groups as f64 / f,
+            "lookup_drafts_per_step":p.lookups as f64 / f,"synced_steps":p.synced});
+        if let Some(st) = stages.get(n).filter(|m| !m.is_empty()) {
+            v["host_stages_ms"] = serde_json::json!(st.iter().map(|(k, ms)| (k.to_string(), serde_json::json!(ms / f))).collect::<serde_json::Map<_, _>>());
+        }
+        if p.synced > 0 {
+            v["draft_ms"] = serde_json::json!(p.draft_ms / s); v["draft_max_ms"] = serde_json::json!(p.draft_max_ms / s);
+            v["verify_ms"] = serde_json::json!(p.verify_ms / s); v["finish_ms"] = serde_json::json!(p.finish_ms / s);
+            v["commit_ms"] = serde_json::json!(p.commit_ms / s);
+        }
+        v
+    }).collect();
+    *all = [BatchedPhases::ZERO; 5];
+    serde_json::Value::Array(out)
+}
+
+/// Batched verification host stages (Target::execute_rows marks) summed per conversation count.
+static BATCHED_STAGES: std::sync::Mutex<Vec<std::collections::BTreeMap<&'static str, f64>>> = std::sync::Mutex::new(Vec::new());
+fn record_batched_stages(parts: usize, stages: &[(&'static str, f64)]) {
+    let Ok(mut all) = BATCHED_STAGES.lock() else { return; };
+    if all.len() < 5 { all.resize(5, Default::default()); }
+    for &(name, ms) in stages { *all[parts.min(4)].entry(name).or_default() += ms; }
+}
+/// CANADA_SCRATCH_HOST_STAGES=1: the single-conversation verifier's host stages (the pending verification's
+/// `stages_ms`, read while it is still pending) summed since the last take, with the step count.
+static SINGLE_STAGES: std::sync::Mutex<(usize, std::collections::BTreeMap<&'static str, f64>)> =
+    std::sync::Mutex::new((0, std::collections::BTreeMap::new()));
+fn record_single_stages(stages: &[(&'static str, f64)]) {
+    let Ok(mut all) = SINGLE_STAGES.lock() else { return; };
+    all.0 += 1;
+    for &(name, ms) in stages { *all.1.entry(name).or_default() += ms; }
+}
+/// The sums since the last call (steps, ms by stage name).
+pub(crate) fn take_single_stages() -> (usize, std::collections::BTreeMap<&'static str, f64>) {
+    SINGLE_STAGES.lock().ok().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+}
+/// The draft gate of batched steps (two or more conversations; CANADA_SCRATCH_BATCHED_GATE): one
+/// survival threshold for every count, or three for two, three and four conversations (e.g.
+/// "0.45,off,0.3"); unset or "off" (for every count, or that count) keeps each conversation's own
+/// serving gate. With a threshold, a
+/// conversation's neural draft verifies draft j while the running product of its confidences
+/// through j stays at or above it (always the first draft, at most its row limit). Only confidences
+/// of included proposals decide, so it is a causal stopping rule: the sampled distribution is
+/// unchanged; only the number of drafts a step verifies is.
+static BATCHED_GATE: std::sync::Mutex<Option<[Option<f32>; 5]>> = std::sync::Mutex::new(None);
+pub(crate) fn batched_gate_from_env() -> Result<[Option<f32>; 5]> {
+    let v = match std::env::var("CANADA_SCRATCH_BATCHED_GATE") {
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => return Ok([None; 5]),
+        Err(e) => return Err(e.into()),
+    };
+    let t = v.split(',').map(|s| match s.trim() {
+        "off" => Ok(None),
+        x => x.parse::<f32>().map(Some).map_err(anyhow::Error::from),
+    }).collect::<Result<Vec<Option<f32>>>>()?;
+    ensure!((t.len() == 1 || t.len() == 3) && t.iter().flatten().all(|x| (0.0..=1.0).contains(x)),
+        "batched gate: one threshold, or three (two, three, four conversations), each in [0, 1] or off");
+    let mut out = [None; 5];
+    for (n, slot) in out.iter_mut().enumerate().skip(2) { *slot = if t.len() == 1 { t[0] } else { t[n - 2] }; }
+    Ok(out)
+}
+fn batched_gate(parts: usize) -> Result<Option<f32>> {
+    let mut g = BATCHED_GATE.lock().map_err(|_| anyhow::anyhow!("batched gate lock"))?;
+    if g.is_none() { *g = Some(batched_gate_from_env()?); }
+    Ok(g.and_then(|t| t[parts.min(4)]))
+}
+/// Diagnostic trace of batched steps (CANADA_SCRATCH_BATCHED_TRACE=1, or a screen's setter): per step
+/// and conversation, its draft confidences, produced proposals, its own gate's rows, the rows
+/// verified and the drafts accepted; for offline gate studies. None: off.
+static BATCHED_TRACE: std::sync::Mutex<Option<Vec<serde_json::Value>>> = std::sync::Mutex::new(None);
+static BATCHED_TRACE_READ: std::sync::Once = std::sync::Once::new();
+fn trace_batched_step(entry: impl FnOnce() -> serde_json::Value) {
+    BATCHED_TRACE_READ.call_once(|| {
+        if std::env::var("CANADA_SCRATCH_BATCHED_TRACE").as_deref() == Ok("1") {
+            if let Ok(mut g) = BATCHED_TRACE.lock() { *g = Some(Vec::new()); }
+        }
+    });
+    if let Ok(mut g) = BATCHED_TRACE.lock() {
+        if let Some(v) = g.as_mut() { if v.len() < 1 << 14 { v.push(entry()); } }
+    }
+}
+/// Screens: start (true) or stop (false) the batched step trace.
+pub(crate) fn set_batched_trace_for_probe(on: bool) {
+    BATCHED_TRACE_READ.call_once(|| {});
+    if let Ok(mut g) = BATCHED_TRACE.lock() { *g = on.then(Vec::new); }
+}
+/// The traced entries since the last call (the trace stays on).
+pub(crate) fn take_batched_trace() -> Vec<serde_json::Value> {
+    BATCHED_TRACE.lock().ok().and_then(|mut g| g.as_mut().map(std::mem::take)).unwrap_or_default()
+}
+/// Screens: the batched draft gate for the following steps (None: each conversation's own gate).
+pub(crate) fn set_batched_gate_for_probe(threshold: Option<f32>) {
+    if let Ok(mut g) = BATCHED_GATE.lock() { *g = Some([threshold; 5]); }
+}
+
 /// Validated before loading and applied when preparing each serving owner.
 /// The explicit control preserves the established0.20recipe. Both admitted
 /// cutoffs use the same causal stopping rule and exact rejection sampler.
+/// Data collection (Nov 11, default off): one stderr line a neural step with the verified rows, the proposals the
+/// target accepted, the tokens emitted and the drafter's five confidences. No token ids.
+/// CANADA_SCRATCH_DRAFT_PRELAUNCH=1 (default off): an ordinary step that will be followed by a neural draft launches
+/// that draft pass (body and head, a pure function of the drafter's state and the anchor) right after its feature
+/// injection, before the host's bookkeeping and the return to the worker; the next step finds it running or done.
+/// Proposals, confidences and every random draw stay in the next step. The next step uses it only if it starts at
+/// the same frontier and anchor, the drafter still reports that pass as its last operation, and the collective
+/// policies are the drafter's; otherwise it drafts again as before.
+pub(crate) fn draft_prelaunch() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    STEP_ARM.with(|arm| arm.get()).map_or_else(
+        || *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_DRAFT_PRELAUNCH").as_deref() == Ok("1")), |arm| arm.0)
+}
+thread_local! {
+    /// Decode profile probe only (CANADA_SCRATCH_CLAUDE_DECODE_ARMS): (draft pre-launch, sampler ahead) for the
+    /// steps that follow, replacing the two environment flags, so both settings alternate within one load.
+    static STEP_ARM: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+}
+pub(crate) fn set_step_arm_for_probe(arm: Option<(bool, bool)>) { STEP_ARM.with(|cell| cell.set(arm)); }
+/// CANADA_SCRATCH_VERIFY_SAMPLE_AHEAD=1 (default off): an ordinary seeded step with the sharded block sampler
+/// queues the sampler (its staged inputs and its captured graph) directly behind the verification forward and
+/// waits once, at the sampler's readout; the forward's transport and fault checks run right after instead of
+/// between the head and the sampler. Same kernels on the same inputs in the same stream order.
+pub(crate) fn verify_sample_ahead() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    STEP_ARM.with(|arm| arm.get()).map_or_else(
+        || *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_VERIFY_SAMPLE_AHEAD").as_deref() == Ok("1")), |arm| arm.1)
+}
+pub(crate) fn step_confidence_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_STEP_CONFIDENCE_LOG").as_deref() == Ok("1"))
+}
+/// Diagnostic (CANADA_SCRATCH_DRAFT_SEED_LOG=1, default off): after every prompt, what the drafter's 128-row window is
+/// seeded with: per row the L2 norm of its three target taps and the sum of each tap's first 64 values, and a digest
+/// of all rows. A cold prefill and a cache restore of the same prompt should print the same rows up to rounding.
+pub(crate) fn draft_seed_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_DRAFT_SEED_LOG").as_deref() == Ok("1"))
+}
+pub(crate) fn log_step_confidence(path: &str, step: &Step, emitted: usize) {
+    if let Some(c) = step.draft_confidence.filter(|_| step_confidence_log()) {
+        eprintln!("stepconf {path} rows={} accepted={} emitted={} source={} c={:.4},{:.4},{:.4},{:.4},{:.4}",
+            step.verified_rows, step.matching_proposals, emitted, step.proposal_source, c[0], c[1], c[2], c[3], c[4]);
+    }
+}
+/// CANADA_SCRATCH_CAUSAL_LADDER=t2,t4,t5 (default off; single-conversation steps): beside the three-row cutoff t3
+/// (CANADA_SCRATCH_CAUSAL_THREE_THRESHOLD), thresholds for the other depths, each on the running product of the
+/// drafter's confidences. Proposal 1 is always verified; proposal j >= 2 only while every product c1..ci, i <= j, is
+/// at least t_i (first failure stops), so a step verifies 2..6 rows instead of 3 or 6. t2 <= t3 is required: the
+/// drafter draws proposals 3..5 exactly when c1 c2 c3 >= t3, and that must imply c1 c2 >= t2.
+pub(crate) fn serving_causal_ladder() -> Result<Option<[f32; 3]>> {
+    match std::env::var("CANADA_SCRATCH_CAUSAL_LADDER") {
+        Ok(spec) => {
+            let t = spec.split(',').map(|v| Ok(v.trim().parse::<f32>()?)).collect::<Result<Vec<f32>>>()?;
+            ensure!(t.len() == 3 && t.iter().all(|v| v.is_finite() && (0. ..=1.).contains(v))
+                && t[0] <= serving_causal_three_threshold()?, "causal ladder must be t2,t4,t5 in [0,1] with t2 <= the three-row cutoff");
+            Ok(Some([t[0], t[1], t[2]]))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+/// Rows of a step under the ladder: `three` is the drafter's own cutoff (proposals 3..5 exist iff c1 c2 c3 >= three),
+/// `ladder` = [t2, t4, t5]. Each confidence precedes the proposal it admits and the first failed threshold stops, so
+/// whether proposal j is verified depends on confidences 1..j only: later confidences and excluded proposals cannot
+/// change the length. A NaN stops.
+fn causal_ladder_rows(confidence: &[f32; 5], three: f32, ladder: [f32; 3], limit: usize) -> usize {
+    let thresholds = [ladder[0], three, ladder[1], ladder[2]];
+    let mut cumulative = confidence[0];
+    let mut drafts = 1;
+    for (probability, threshold) in confidence[1..].iter().zip(thresholds) {
+        cumulative *= probability;
+        if !(cumulative >= threshold) { break; }
+        drafts += 1;
+    }
+    limit.min(1 + drafts)
+}
 pub(crate) fn serving_causal_three_threshold() -> Result<f32> {
     match std::env::var("CANADA_SCRATCH_CAUSAL_THREE_THRESHOLD").as_deref() {
         Ok("0.2" | "0.20") | Err(std::env::VarError::NotPresent) => Ok(0.20),
         Ok("0.25") => Ok(0.25),
-        _ => anyhow::bail!("serving causal-three threshold must be0.20or0.25"),
+        // Data collection only (Nov 11): 0 verifies all six rows in every step, so each step shows how many of the
+        // five proposals the target accepts beside the drafter's confidences; 2 always verifies three rows.
+        Ok("0") => Ok(0.),
+        Ok("2") => Ok(2.),
+        _ => anyhow::bail!("serving causal-three threshold must be0.20or0.25(0or2for data collection)"),
     }
 }
 
@@ -66,7 +287,37 @@ fn causal_full_prefix_rows(confidence: &[f32; 5], threshold: f32, limit: usize) 
 
 #[cfg(test)]
 mod causal_depth_tests {
-    use super::{causal_prefix_rows, causal_full_prefix_rows, causal_two_three_rows};
+    use super::{causal_prefix_rows, causal_full_prefix_rows, causal_two_three_rows, causal_ladder_rows};
+    #[test]
+    fn ladder_length_uses_only_confidences_before_each_admitted_proposal() {
+        let (three, ladder) = (0.2f32, [0.15f32, 0.2, 0.2]);
+        let grid = [0.05f32, 0.3, 0.45, 0.6, 0.8, 1.0];
+        for a in grid { for b in grid { for c in grid { for d in grid { for e in grid {
+            let rows = causal_ladder_rows(&[a, b, c, d, e], three, ladder, 6);
+            assert!((2..=6).contains(&rows));
+            // Changing any confidence after the last one that admitted a proposal, or after the one that stopped,
+            // cannot change the length: confidence j (1-based) decides proposal j, so rows r read confidences 1..r.
+            let decided = rows.min(5);
+            for tail in [0.0f32, 1.0, f32::NAN] {
+                let mut other = [a, b, c, d, e];
+                for x in other.iter_mut().skip(decided) { *x = tail; }
+                assert_eq!(causal_ladder_rows(&other, three, ladder, 6), rows);
+            }
+            // The drafter's own stop (c1 c2 c3 < three) never admits a third proposal, and going on implies depth 2.
+            if a * b * c < three { assert!(rows <= 3); } else { assert!(rows >= 4); }
+            assert_eq!(causal_ladder_rows(&[a, b, c, d, e], three, ladder, 3), rows.min(3));
+        }}}}}
+        // With every extra threshold at zero the ladder is today's three-or-six rule.
+        for c in [[0.9f32, 0.9, 0.9, 0.1, 0.1], [0.5, 0.5, 0.5, 0.9, 0.9], [1.0, 0.2, 1.0, 1.0, 1.0]] {
+            assert_eq!(causal_ladder_rows(&c, 0.25, [0., 0., 0.], 6), causal_prefix_rows(&c, 0.25, 3, 6));
+        }
+        assert_eq!(causal_ladder_rows(&[0.1, 0.9, 0.9, 0.9, 0.9], 0.2, [0.15, 0.2, 0.2], 6), 2);
+        assert_eq!(causal_ladder_rows(&[0.6, 0.5, 0.5, 0.9, 0.9], 0.2, [0.15, 0.2, 0.2], 6), 3);
+        assert_eq!(causal_ladder_rows(&[0.9, 0.9, 0.9, 0.2, 0.9], 0.2, [0.15, 0.2, 0.2], 6), 4);
+        assert_eq!(causal_ladder_rows(&[0.9, 0.9, 0.9, 0.9, 0.3], 0.2, [0.15, 0.2, 0.2], 6), 5);
+        assert_eq!(causal_ladder_rows(&[0.9, 0.9, 0.9, 0.9, 0.9], 0.2, [0.15, 0.2, 0.2], 6), 6);
+        assert_eq!(causal_ladder_rows(&[0.9, 0.9, 0.9, 0.9, 0.9], 0.2, [0.15, 0.2, 0.2], 1), 1);
+    }
     #[test]
     fn two_three_stopping_boundary_ignores_excluded_draws_and_future_confidences() {
         for tail in [[0.,0.,0.],[1.,1.,1.],[f32::NAN,f32::INFINITY,-1.]] {
@@ -129,6 +380,8 @@ pub(crate) struct GreedySession {
     draft: QueryNetwork,
     features: Features,
     prefill_features: Features,
+    /// The 128-row drafter window built after an EXTEND that followed an encoder-image restore.
+    extend_window: Option<crate::cuda::Buffer<half::bf16>>,
     poisoned: bool,
     target_seed: Option<u64>,
     rejection: Option<Rejection>,
@@ -137,8 +390,18 @@ pub(crate) struct GreedySession {
     causal_two_threshold: Option<f32>,
     causal_full_threshold: Option<f32>,
     causal_short_rows: usize,
+    /// Process policy (serving_causal_ladder): not part of session images; applies to a conversation's own steps.
+    causal_ladder: Option<[f32; 3]>,
+    /// draft_prelaunch: the (frontier, anchor) of a draft pass launched at the end of the previous step.
+    prelaunched: Option<(u64, u32)>,
     stop_token: Option<u32>,
     history_lookup: Option<HistoryLookup>,
+    /// config::batched_proposal_launch: this step's proposals, already drawn by the batched step's shared launch.
+    batched_proposals: Option<[u32; 5]>,
+    /// Guarded draft-head subset: the worker's verdict on this step's context (config::draft_head_subset_guard).
+    head_subset_ok: bool,
+    /// CANADA_SCRATCH_DRAFT_HEAD_SUBSET=1 (read once at construction).
+    head_subset_guarded: bool,
     draft_warmed: bool,
     /// Process policy, independent of accepted causal state and cache images.
     skip_unused_draft: bool,
@@ -151,6 +414,9 @@ pub(crate) struct GreedySession {
     root_feedback: Option<crate::root_feedback::RootFeedback>,
     encoder_cache_trace:Option<(std::path::PathBuf,u64,Option<u32>)>,
     buffered_draw_trace:Option<Rc<std::cell::RefCell<crate::draw_trace::DrawTrace>>>,
+    /// Diagnostic only (logit export in a batched step): this conversation's rows of the rank's logit shard,
+    /// captured by the step before staging; finish_phase commits the accepted ones.
+    batched_export:Option<Vec<u8>>,
 }
 /// Static session allocations and loaded CUDA modules, with no accepted prompt
 /// or sampled output. Serving can prepare these before advertising readiness;
@@ -280,9 +546,22 @@ impl ProposalPolicyImage {
 }
 pub(crate) struct PreparedSession(GreedySession);
 impl PreparedSession {
+    /// The drafter's active 4-bit vocabulary head (for crate::head4_rescore).
+    pub(crate) fn nvfp4_head(&self)->Option<std::rc::Rc<crate::nvfp4_head::Head>> {self.0.draft.nvfp4_head_for_export()}
     pub(crate) fn independent_for_probe(&self,target:&Target,core:&[u8],stream:&Stream,kernels:&Path)->Result<Self> {
         Self::new(&self.0.cuda,core,self.0.draft.independent_for_probe(target,core,stream,kernels)?)?
             .with_serving_policy(stream)
+    }
+    /// Batched serving: a drafter of identical shape that shares this one's image identity, so a
+    /// session image saved by any of them restores into any other (region 0's drafter changes when
+    /// its conversation moves to a serving region, and cached images must still restore there).
+    /// Images carry only drafter-shaped device state and host settings.
+    pub(crate) fn serving_fork(&self,target:&Target,core:&[u8],stream:&Stream,kernels:&Path)->Result<GreedySession> {
+        let mut fork=self.independent_for_probe(target,core,stream,kernels)?.detached_for_probe()?;
+        fork.image_owner=self.0.image_owner.clone();
+        // The session identity above admits the image; the drafter's own state inside it needs the same.
+        fork.draft.join_image_family(&self.0.draft)?;
+        Ok(fork)
     }
     pub(crate) fn prepare_copy_conditioning(&mut self,buffers:&LongHistoryBuffers,comm:&Roce,stream:&Stream)->Result<bool> {
         let Some(input)=&buffers.wide else{return Ok(false)};
@@ -310,6 +589,7 @@ impl PreparedSession {
             "serving causal policy requires the admitted categorical sampler");
         self.0.causal_three_threshold = enabled.then_some(serving_causal_three_threshold()?);
         self.0.causal_short_rows = 3;
+        self.0.causal_ladder = if enabled { serving_causal_ladder()? } else { None };
         self.0.block_verification=match std::env::var("CANADA_SCRATCH_BLOCK_VERIFY") {
             Ok(v)=>{ensure!(v=="0"||v=="1","invalid block verification policy");v=="1"},
             // Carry the block candidate forward: s381 long-context timing and
@@ -339,9 +619,12 @@ impl PreparedSession {
             profiled_verify: false, draft,
             features: Features::new(cuda, core, 6)?,
             prefill_features: Features::new(cuda, core, 128)?,
+            extend_window: None,
             poisoned: false, target_seed: None, stochastic_prefix_schedule,
             causal_three_threshold: None, causal_two_threshold: None, causal_full_threshold: None,
-            causal_short_rows: 3, stop_token: None, history_lookup: None,
+            causal_short_rows: 3, causal_ladder: None, prelaunched: None, stop_token: None, history_lookup: None,
+            batched_proposals: None,
+            head_subset_ok: false, head_subset_guarded: crate::config::draft_head_subset()? == 1,
             draft_warmed: false,
             skip_unused_draft: match std::env::var("CANADA_SCRATCH_SKIP_UNUSED_DRAFT") {
                 Ok(value) => { ensure!(value=="0"||value=="1","skip-unused-draft flag"); value=="1" },
@@ -354,6 +637,7 @@ impl PreparedSession {
             acceptance_temperature_frontiers: 0,
             encoder_cache_trace:None,
             buffered_draw_trace:None,
+            batched_export:None,
             root_feedback: if std::env::var("CANADA_SCRATCH_ROOT_FEEDBACK_SCREEN").as_deref()==Ok("1") {
                 Some(crate::root_feedback::RootFeedback::new(cuda,core)?)
             } else {None},
@@ -367,6 +651,13 @@ impl PreparedSession {
                 Some(Rejection::new(cuda, core, 6)?)
             } else { None },
         }))
+    }
+    /// Finite batched screen: a session whose drafter starts empty. Its prompt is
+    /// absorbed append by append (GreedySession::absorb_batched_append_for_probe).
+    pub(crate) fn detached_for_probe(self) -> Result<GreedySession> {
+        ensure!(crate::config::batched_rows_admitted()
+            && self.0.draft.position()? == 0, "detached screen session needs a fresh drafter");
+        Ok(self.0)
     }
     pub(crate) fn attach(mut self, target: &Target, stream: &Stream) -> Result<GreedySession> {
         ensure!(target.physical_rows() == 128 && target.position() > 0
@@ -424,6 +715,37 @@ impl StateImage {
 pub(crate) struct ExchangePrepared {
     target:crate::state_image::exchange::Prepared,
     draft:crate::dspark_kv::StateImage,
+}
+/// One session of a batched decode step: its generation state, cache region, owner-side
+/// history (Engram hashes and frontier), pending anchor and row limit.
+pub(crate) struct BatchedSession<'a> {
+    pub(crate) session: &'a mut GreedySession,
+    pub(crate) base: crate::target::SessionBase,
+    pub(crate) history: crate::hash_history::History,
+    pub(crate) anchor: u32,
+    pub(crate) limit: usize,
+    /// Screen diagnostic (CANADA_SCRATCH_BATCH_SCREEN_TRACE=1): one record per step with
+    /// hashes of the staged target logits and the drafter's proposal probabilities as the
+    /// sampler is about to read them, then the step's outcome.
+    pub(crate) trace: Option<Vec<serde_json::Value>>,
+}
+/// The state an ordinary or batched step carries from drafting to its finish.
+pub(crate) struct Drafted {
+    start: u64,
+    begin: Instant,
+    drafted: Instant,
+    round_seed: Option<u64>,
+    lookup: Option<crate::history_lookup::Proposal>,
+    target_only: bool,
+    context_tail: bool,
+    draft_tokens: [u32; 5],
+    draft_confidence: Option<[f32; 5]>,
+    produced_proposals: usize,
+    live: usize,
+    verify: [u32; 6],
+    acceptance_temperature_probe: Option<serde_json::Value>,
+    local_history: bool,
+    local_target: bool,
 }
 #[derive(serde::Serialize)]
 pub(crate) struct Step {
@@ -626,6 +948,10 @@ impl GreedySession {
         self.local_history_sampling=active;Ok(())
     }
     pub(crate) fn block_verification(&self)->bool {self.block_verification}
+    /// Probe only (CANADA_SCRATCH_MIDPASS_DUMP): see Rejection::block_weights_for_probe.
+    pub(crate) fn midpass_weights_for_probe(&self,drafts:usize)->Result<Option<Vec<f64>>> {
+        self.rejection.as_ref().map(|r|r.block_weights_for_probe(drafts)).transpose()
+    }
     pub(crate) fn conditioning_split(&self)->bool{self.draft.conditioning_split()}
     pub(crate) fn set_markov_cache_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()>{
         ensure!(!self.poisoned,"Markov cache switch on poisoned session");
@@ -1422,12 +1748,19 @@ impl GreedySession {
         let result=(|| {
             longer.handoff_from(target)?;let drafted=Instant::now();
             longer.begin_verification(&inputs,comm,stream)?;
+            // Diagnostic only (CANADA_SCRATCH_CLAUDE_LOGIT_EXPORT): this path's rows join the exported decode chain.
+            let exported_rows=if crate::logit_export::dir().is_some() {
+                Some(crate::logit_export::capture(&self.cuda,longer,ROWS,stream)?)} else {None};
             let predictions=longer.verification_history_sample(self.target_seed.unwrap(),comm,stream)?;
             let verify_host_ms=longer.verification_host_ms()?;let verified=Instant::now();
             ensure!(predictions.len()==ROWS,"long history target draws");
             let mut matched=0;
             while matched<ROWS-1 && proposals[matched]==predictions[matched] {matched+=1;}
             let accepted=stop_frontier(&predictions,1+matched,self.stop_token);
+            if let (Some(rows),Some(dir))=(exported_rows.as_ref(),crate::logit_export::dir()) {
+                crate::logit_export::commit(&dir,longer.rank_for_export(),start,&inputs[..accepted],
+                    predictions[accepted-1],ROWS,rows)?;
+            }
             buffers.features.run(longer,stream)?;
             longer.finish_verification(accepted,comm,stream)?;let committed=Instant::now();
             let (features,live)=buffers.features.values()?;ensure!(live==ROWS,"long feature capture extent");
@@ -1465,6 +1798,10 @@ impl GreedySession {
         })();
         if result.is_ok(){self.poisoned=false;}result.map(Some)
     }
+    /// The worker's verdict for the next single-conversation step (guarded draft-head subset only).
+    pub(crate) fn set_head_subset_ok(&mut self, ok: bool) { self.head_subset_ok = ok; }
+    /// Draft passes by head form [whole, subset] since the last call (diagnostic).
+    pub(crate) fn take_draft_head_passes(&mut self) -> [u64; 2] { self.draft.take_head_passes() }
     pub(crate) fn step(
         &mut self,
         target: &mut Target,
@@ -1504,6 +1841,70 @@ impl GreedySession {
             "DSpark session frontier/visibility"
         );
         let start = target.position();
+        self.poisoned = true;
+        let result = (|| {
+            // draft_prelaunch: the previous step launched this draft pass and nothing touched the drafter since.
+            let ran = self.prelaunched.take() == Some((start, anchor)) && self.draft.ready_for(anchor)
+                && comm.query_policy_current(crate::dspark_kv::QUERY_ROWS);
+            let drafted = self.draft_phase_ran(target, start, anchor, limit, ran, true, comm, stream)?;
+            self.finish_phase(target, drafted, anchor, limit, comm, stream, profile_barrier, None).map(|(step, _)| step)
+        })();
+        if result.is_ok() {
+            self.poisoned = false;
+        }
+        result
+    }
+    /// Everything before verification: text lookup or the drafter, and the causal
+    /// row count. `start` is this session's frontier (the owner's own position
+    /// for an ordinary step, the session's history for a batched one).
+    #[allow(clippy::too_many_arguments)]
+    /// Whether draft_phase with these arguments runs the neural drafter (not a target-only step and
+    /// no history-lookup proposal); the same decisions draft_phase makes, without side effects.
+    /// config::batched_proposal_launch: the round seed and prefix threshold, if `draft_phase_ran` with a pooled
+    /// pass already run would take the prefix-stop proposal path for this step (the same conditions, in order).
+    fn batched_proposal_plan(&self, target: &Target, start: u64, limit: usize) -> Option<(u64, f32)> {
+        let context_tail = target.context_capacity().saturating_sub(start as usize) < crate::dspark_kv::QUERY_ROWS;
+        if context_tail || (self.skip_unused_draft && limit == 1) || self.reasoning_temperature_probe.is_some()
+            || self.launch_flags.acceptance_temperature_screen || self.rejection.is_none() { return None; }
+        let seed = self.target_seed.map(|seed| if self.block_verification {
+            crate::categorical::block_round_seed(seed, start) } else { seed })?;
+        let threshold = self.causal_three_threshold.filter(|_| self.causal_full_threshold.is_none() && self.causal_short_rows == 3)?;
+        Some((seed, threshold))
+    }
+    fn neural_draft_needed(&self, target: &Target, start: u64, anchor: u32, limit: usize) -> Result<bool> {
+        let context_tail = target.context_capacity().saturating_sub(start as usize) < crate::dspark_kv::QUERY_ROWS;
+        let target_only = context_tail || (self.skip_unused_draft && limit==1);
+        if target_only { return Ok(false); }
+        let fallback_warm=self.draft_warmed || (self.target_seed.is_some() && self.draft.sampled_graphs_ready());
+        let lookup = if fallback_warm {
+            self.history_lookup.as_ref().map(|history| history.propose(start, anchor)).transpose()?.flatten()
+        } else { None };
+        Ok(lookup.is_none() && self.reasoning_temperature_probe.is_none())
+    }
+    fn draft_phase(
+        &mut self,
+        target: &mut Target,
+        start: u64,
+        anchor: u32,
+        limit: usize,
+        comm: &Roce,
+        stream: &Stream,
+    ) -> Result<Drafted> {
+        self.draft_phase_ran(target, start, anchor, limit, false, true, comm, stream)
+    }
+    /// As draft_phase; `ran`: a pooled pass (QueryNetwork::run_paired) already drafted from `anchor`.
+    #[allow(clippy::too_many_arguments)]
+    fn draft_phase_ran(
+        &mut self,
+        target: &mut Target,
+        start: u64,
+        anchor: u32,
+        limit: usize,
+        ran: bool,
+        own_step: bool,
+        comm: &Roce,
+        stream: &Stream,
+    ) -> Result<Drafted> {
         // The fixed five-row bidirectional drafter cannot query past the
         // advertised context. Finish the last four positions with ordinary
         // target draws instead; no draft probabilities are used at this edge.
@@ -1513,8 +1914,6 @@ impl GreedySession {
         // context-tail target draw, still committing target features into
         // drafter KV below so a cached continuation has complete causal state.
         let target_only = context_tail || (self.skip_unused_draft && limit==1);
-        self.poisoned = true;
-        let result = (|| {
             let begin = Instant::now();
             let round_seed=self.target_seed.map(|seed|if self.block_verification {
                 crate::categorical::block_round_seed(seed,start)
@@ -1525,7 +1924,8 @@ impl GreedySession {
             // be reused without an otherwise unnecessary neural draft.
             let fallback_warm=self.draft_warmed
                 || (self.target_seed.is_some() && self.draft.sampled_graphs_ready());
-            let lookup = if fallback_warm && !target_only {
+            // A pooled pass already chose the neural drafter (neural_draft_needed); keep that choice.
+            let lookup = if fallback_warm && !target_only && !ran {
                 self.history_lookup.as_ref()
                     .map(|history| history.propose(start, anchor)).transpose()?.flatten()
             } else { None };
@@ -1537,7 +1937,16 @@ impl GreedySession {
                 // No draft result or stale confidence is consumed on this path.
                 (proposal.tokens, None, 6, 5)
             } else {
-                self.draft.run(anchor, comm, stream)?;
+                if ran { ensure!(self.draft.ready_for(anchor), "pooled draft pass for another anchor"); }
+                else {
+                    if self.head_subset_guarded { self.draft.select_head_subset(self.head_subset_ok, stream)?; }
+                    self.draft.run(anchor, comm, stream)?;
+                    // config::engram_anchor_prefetch: the verification after this draft pass starts at `anchor`. Its
+                    // table rows are requested here, behind the drafter's launch, and read while the drafter runs.
+                    if own_step && crate::config::engram_anchor_prefetch() && target.position() == start {
+                        target.prefetch_anchor_engram(anchor)?;
+                    }
+                }
                 if self.reasoning_temperature_probe.is_some() && self.acceptance_temperature_frontiers<8
                     && start>=262117+64*self.acceptance_temperature_frontiers as u64 {
                     acceptance_temperature_probe=Some(self.probe_reasoning_temperatures(target,anchor,
@@ -1548,7 +1957,10 @@ impl GreedySession {
                     acceptance_temperature_probe=Some(self.probe_acceptance_temperatures(target,anchor,
                         round_seed.ok_or_else(||anyhow::anyhow!("temperature probe needs seeded sampling"))?,comm,stream)?);
                 }
-                let tokens = if self.rejection.is_some() && self.target_seed.is_some() {
+                let tokens = if let Some(tokens) = self.batched_proposals.take() {
+                    ensure!(ran && !own_step, "shared proposal launch outside a batched step");
+                    tokens
+                } else if self.rejection.is_some() && self.target_seed.is_some() {
                     let seed=round_seed.ok_or_else(||anyhow::anyhow!("stochastic draft needs target seed"))?;
                     if let Some(threshold)=self.causal_three_threshold.filter(|_|
                         self.causal_full_threshold.is_none()&&self.causal_short_rows==3) {
@@ -1558,6 +1970,11 @@ impl GreedySession {
                     self.draft.greedy_proposals(comm, stream)?
                 };
                 let (confidence, scheduled) = self.draft.confidence_schedule()?;
+                if step_confidence_log() {
+                    // One line before the step's own: the probability the drafter gave each proposal it drew.
+                    let q = self.draft.selected_q_for_log()?;
+                    eprintln!("stepq q={:.6},{:.6},{:.6},{:.6},{:.6}", q[0], q[1], q[2], q[3], q[4]);
+                }
                 self.draft_warmed = true;
                 (tokens, Some(confidence), scheduled, self.draft.produced_proposals()?)
             };
@@ -1580,6 +1997,11 @@ impl GreedySession {
                     .ok_or_else(|| anyhow::anyhow!("causal depth needs current draft confidence"))?;
                 if let Some(two)=self.causal_two_threshold {
                     causal_two_three_rows(&confidence,two,threshold,limit)
+                } else if let Some(ladder) = self.causal_ladder.filter(|l| own_step && self.causal_short_rows == 3
+                    && l[0] <= threshold) {
+                    // The drafter stopped after two proposals iff c1 c2 c3 < threshold; the ladder then stops at
+                    // depth 2 or 3 and never asks for a proposal that was not drawn.
+                    causal_ladder_rows(&confidence, threshold, ladder, limit).min(produced_proposals + 1)
                 } else {
                     causal_prefix_rows(&confidence, threshold, self.causal_short_rows, limit)
                 }
@@ -1592,7 +2014,32 @@ impl GreedySession {
             ensure!(live-1<=produced_proposals,"verification would consume an unproduced draft");
             let mut verify = [anchor; 6];
             verify[1..].copy_from_slice(&draft_tokens);
-            let profile_now = self.profile_verify
+            let local_history=self.local_history_sampling&&lookup.is_some();
+            let local_target=target.local_target_enabled()&&self.draft.hierarchical_active()
+                &&self.block_verification&&self.target_seed.is_some()&&(lookup.is_none()||local_history)&&!target_only&&live>1;
+            Ok(Drafted { start, begin, drafted, round_seed, lookup, target_only, context_tail, draft_tokens,
+                draft_confidence, produced_proposals, live, verify, acceptance_temperature_probe, local_history, local_target })
+    }
+    /// Verification (unless a batched step already ran it), sampling, acceptance,
+    /// feature capture, the owner's commit (ordinary steps only), drafter
+    /// injection and the lookup commit. `batched` is this session's first row in
+    /// a batched verification; its commit is the owner's finish_batched_verification.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_phase(
+        &mut self,
+        target: &mut Target,
+        drafted: Drafted,
+        anchor: u32,
+        limit: usize,
+        comm: &Roce,
+        stream: &Stream,
+        profile_barrier: &mut dyn FnMut() -> Result<()>,
+        batched: Option<usize>,
+    ) -> Result<(Step, usize)> {
+        let Drafted { start, begin, drafted, round_seed, lookup, target_only, context_tail, draft_tokens,
+            draft_confidence, produced_proposals, live, verify, acceptance_temperature_probe, local_history, local_target } = drafted;
+        let _ = (anchor, round_seed, local_history);
+            let profile_now = batched.is_none() && self.profile_verify
                 && !self.profiled_verify
                 && lookup.is_none()
                 && start >= 640
@@ -1613,12 +2060,36 @@ impl GreedySession {
             let mut block_prefix=None;
             let mut acceptance_expected_lengths=None;
             let mut next_root_temperature=None;
-            let local_history=self.local_history_sampling&&lookup.is_some();
-            let local_target=target.local_target_enabled()&&self.draft.hierarchical_active()
-                &&self.block_verification&&self.target_seed.is_some()&&(lookup.is_none()||local_history)&&!target_only&&live>1;
-            let verified_result = if local_target {
+            let mut exported_rows:Option<Vec<u8>>=if batched.is_some() {self.batched_export.take()} else {None};
+            let mut exported_head4:Option<Vec<u8>>=None;
+            let mut exported_scheme:Option<(Vec<u8>,Vec<i32>)>=None;
+            // A batched step already ran one verification over every session's rows
+            // and staged this session's rows at row 0 (Target::stage_batched_session).
+            // verify_sample_ahead: exactly the path that ends in sample_block_sharded below.
+            let ahead = verify_sample_ahead() && batched.is_none() && !profile_now && self.target_seed.is_some()
+                && lookup.is_none() && !target_only && live > 1 && self.block_verification
+                && self.rejection.is_some() && self.draft.hierarchical_active() && crate::logit_export::dir().is_none();
+            if batched.is_none() { target.defer_verification_completion(ahead); }
+            let verified_result = if batched.is_some() {
+                    Ok(())
+                } else if local_target {
                     target.begin_local_verification(&verify[..live],comm,stream)
                 }else{target.begin_verification(&verify[..live],comm,stream)}
+                .and_then(|_| {
+                    // Diagnostic only: copy this rank's logit shard before any sampler runs. (A batched step
+                    // captured every conversation's rows once, before staging: batched_export above.)
+                    if crate::logit_export::dir().is_some() && batched.is_none() {
+                        exported_rows=Some(crate::logit_export::capture(&self.cuda,target,live,stream)?);
+                        // The same head input through the drafter's 4-bit head (diagnostic; see logit_export).
+                        if crate::logit_export::head4_enabled() && let Some(head)=self.draft.nvfp4_head_for_export() {
+                            exported_head4=Some(head.export_logits(target.head_input_for_export()?,stream)?);
+                        }
+                        if crate::logit_export::head4_scheme_enabled() {
+                            exported_scheme=target.head4_scheme_for_export(live,stream)?;
+                        }
+                    }
+                    Ok(())
+                })
                 .and_then(|_| {
                     if self.target_seed.is_none() {
                         // Greedy p is a point mass: accept exactly the matching
@@ -1645,6 +2116,7 @@ impl GreedySession {
                             let(q,selected)=self.draft.sharded_probabilities(live-1)?;
                             let result=rejection.sample_block_sharded(logits,q,selected,&draft_tokens[..live-1],live,
                                 round_seed.unwrap(),start+1,local_target,comm,stream)?;
+                            target.complete_deferred_verification(comm,stream)?;
                             if local_target {rejection.capture_root_branch_for_probe(q,live,
                                 self.target_seed.unwrap(),start+1,comm.rank())?;}
                             result
@@ -1721,12 +2193,15 @@ impl GreedySession {
                 self.profiled_verify = true;
             }
             let predictions = verified_result?;
+            // verify_sample_ahead: a no-op after the sharded sampler completed it; any other path completes it here.
+            if batched.is_none() { target.complete_deferred_verification(comm, stream)?; }
             let profile_append_metrics = if profile_now {
                 Some(serde_json::to_value(target.verification_metrics()?)?)
             } else {
                 None
             };
             let verify_host_ms = target.verification_host_ms()?;
+            if crate::config::host_stages() && batched.is_none() { record_single_stages(&target.verification_metrics()?.stages_ms); }
             ensure!(predictions.len() == live, "DSpark verifier rows");
             let verified = Instant::now();
             let mut matched = 0;
@@ -1736,19 +2211,46 @@ impl GreedySession {
             if let Some(prefix)=block_prefix { matched=prefix; }
             let accepted = stop_frontier(&predictions, (1 + matched).min(limit), self.stop_token);
             matched = accepted - 1;
+            if let (Some(rows),Some(dir))=(exported_rows.take(),crate::logit_export::dir()) {
+                crate::logit_export::commit(&dir,target.rank_for_export(),start,&verify[..accepted],
+                    predictions[accepted-1],live,&rows)?;
+                if let Some(head4)=exported_head4.take() {
+                    crate::logit_export::commit_head4(&dir,target.rank_for_export(),start,accepted.min(live).min(5),&head4)?;
+                }
+                if let Some((scheme,counts))=exported_scheme.take() {
+                    crate::logit_export::commit_head4_scheme(&dir,target.rank_for_export(),start,accepted.min(live).min(6),&scheme,&counts)?;
+                }
+                if crate::logit_export::q_enabled() && batched.is_none() {
+                    // The drafter's rank-local proposal rows of this step are intact until its next pass.
+                    let q=if lookup.is_none()&&!target_only&&live>1&&self.block_verification
+                        &&self.rejection.is_some()&&self.draft.hierarchical_active() {
+                        let (q,_)=self.draft.sharded_probabilities(live-1)?;
+                        Some(crate::logit_export::capture_q(&self.cuda,q,live-1,stream)?)
+                    } else {None};
+                    crate::logit_export::commit_q(&dir,target.rank_for_export(),start,accepted,
+                        &draft_tokens[..live-1],q.as_deref())?;
+                }
+            }
             // Capture before publication; rejected feature rows remain private.
-            self.features.run(target, stream)?;
-            target.finish_verification(accepted, comm, stream)?;
+            if let Some(offset) = batched {
+                self.features.run_batched(target, offset, live, stream)?;
+            } else {
+                self.features.run(target, stream)?;
+                target.finish_verification(accepted, comm, stream)?;
+            }
+            // A batched session's frontier is its own; the owner commits every
+            // session together after all of them sampled (finish_batched_verification).
+            let frontier = if batched.is_some() { start + accepted as u64 } else { target.position() };
             let committed = Instant::now();
             let (features, live) = self.features.values()?;
             self.draft.inject_distributed(features, live, accepted, start, comm, stream)?;
             if let Some(history) = &mut self.history_lookup {
                 history.commit(start, &verify[..accepted])?;
-                ensure!(history.position() == target.position(), "lookup/target commit frontiers disagree");
+                ensure!(history.position() == frontier, "lookup/target commit frontiers disagree");
             }
             ensure!(
-                target.position() == start + accepted as u64
-                    && self.draft.position()? == target.position(),
+                frontier == start + accepted as u64
+                    && self.draft.position()? == frontier,
                 "DSpark commit frontiers disagree"
             );
             // The just-verified q remains intact through acceptance and commit.
@@ -1756,7 +2258,15 @@ impl GreedySession {
             if let Some(warmer)=next_root_temperature {
                 self.draft.set_draft_schedule(if warmer{3}else{0},stream)?;
             }
-            Ok(Step {
+            // draft_prelaunch: the next ordinary step would draft from this anchor at this frontier (no stop token,
+            // no context tail, no text-lookup proposal): start that pass now, behind the injection on the stream.
+            let next_anchor = predictions[accepted - 1];
+            if draft_prelaunch() && batched.is_none() && self.stop_token != Some(next_anchor)
+                && self.neural_draft_needed(target, frontier, next_anchor, 6)? {
+                self.draft.run(next_anchor, comm, stream)?;
+                self.prelaunched = Some((frontier, next_anchor));
+            }
+            Ok((Step {
                 tokens: verify[..accepted].to_vec(),
                 next_anchor: predictions[accepted - 1],
                 draft_tokens: draft_tokens[..produced_proposals].to_vec(),
@@ -1773,19 +2283,315 @@ impl GreedySession {
                 verify_host_ms,
                 acceptance_expected_lengths,
                 acceptance_temperature_probe,
-                position: target.position(),
+                position: frontier,
                 phase_ms: [
                     drafted.duration_since(begin).as_secs_f64() * 1000.,
                     verified.duration_since(drafted).as_secs_f64() * 1000.,
                     committed.duration_since(verified).as_secs_f64() * 1000.,
                     committed.elapsed().as_secs_f64() * 1000.,
                 ],
-            })
-        })();
-        if result.is_ok() {
-            self.poisoned = false;
+            }, accepted))
+    }
+    /// Finite batched screen: after a batched append of `tokens` at `start` for this
+    /// session, capture that append's feature taps, inject them into this session's
+    /// drafter (as a decode commit does) and commit them to its text lookup.
+    pub(crate) fn absorb_batched_append_for_probe(&mut self, target: &Target, start: u64, tokens: &[u32],
+        comm: &Roce, stream: &Stream) -> Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_BATCH_SCREEN").as_deref() == Ok("1") && !self.poisoned
+            && self.draft.position()? == start, "batched screen prompt absorption");
+        self.features.run(target, stream)?;
+        let (features, live) = self.features.values()?;
+        ensure!(live == tokens.len(), "batched screen absorbed rows");
+        self.draft.inject_distributed(features, live, live, start, comm, stream)?;
+        if let Some(history) = &mut self.history_lookup { history.commit(start, tokens)?; }
+        Ok(())
+    }
+    /// Screen: separate drafter passes of committed sessions against one batched body pass
+    /// (QueryNetwork::probe_batched_body). Nothing is proposed or accepted.
+    pub(crate) fn probe_batched_draft_body(sessions: &mut [&mut GreedySession], anchors: &[u32], comm: &Roce,
+        stream: &Stream) -> Result<serde_json::Value> {
+        ensure!(sessions.iter().all(|s| !s.poisoned), "batched drafter screen requires committed sessions");
+        let mut nets: Vec<&mut QueryNetwork> = sessions.iter_mut().map(|s| &mut s.draft).collect();
+        QueryNetwork::probe_batched_body(&mut nets, anchors, comm, stream)
+    }
+    /// Finite batched screen: one decode step for several sessions sharing one verify
+    /// owner. Each drafts on its own; one verification runs over every session's rows
+    /// when their verification heads agree (otherwise one per session); each then
+    /// samples its own staged rows with its own seed and drafts, captures and injects
+    /// its features, and the owner commits every session of the group together.
+    pub(crate) fn batched_step(parts: &mut [BatchedSession<'_>], target: &mut Target, comm: &Roce,
+        stream: &Stream) -> Result<Vec<Step>> {
+        ensure!(crate::config::batched_rows_admitted() && !parts.is_empty(), "batched decode screen");
+        // Each session verifies in its own block of rows / sessions rows.
+        let block = crate::target::batched_block(target.physical_rows(), parts.len());
+        // Guarded draft-head subset: each conversation's own verdict (set by the worker from its committed tokens
+        // before the step). Batched passes run the heads eagerly after the body graph, a conversation's own pass
+        // from its own graph of that form; pooled FP8 heads are not used while the NVFP4 copy is active.
+        for p in parts.iter_mut() {
+            if p.session.head_subset_guarded { p.session.draft.select_head_subset(p.session.head_subset_ok, stream)?; }
         }
-        result
+        for p in parts.iter() {
+            let s = &*p.session;
+            ensure!(!s.poisoned && (1..=6).contains(&p.limit) && p.limit <= block && target.profile_is_current()
+                && p.history.position == s.draft.position()?
+                && !s.profile_verify && s.reasoning_temperature_probe.is_none()
+                && !s.launch_flags.acceptance_temperature_screen
+                && s.buffered_draw_trace.is_none() && s.encoder_cache_trace.is_none()
+                && s.root_feedback.as_ref().is_none_or(|f| !f.enabled()), "batched session frontier/probes");
+        }
+        // Diagnostics: CANADA_SCRATCH_BATCH_SCREEN_DRAFT_REVERSE=1 drafts the sessions in
+        // reverse order; CANADA_SCRATCH_BATCH_SCREEN_INVALIDATE=1 drops the incremental
+        // index-gather caches before every verification.
+        let reverse = std::env::var("CANADA_SCRATCH_BATCH_SCREEN_DRAFT_REVERSE").as_deref() == Ok("1");
+        let invalidate = std::env::var("CANADA_SCRATCH_BATCH_SCREEN_INVALIDATE").as_deref() == Ok("1");
+        let sync = phase_sync();
+        let mut timing = BatchedPhases::ZERO;
+        let mut drafted: Vec<Option<Drafted>> = (0..parts.len()).map(|_| None).collect();
+        let order: Vec<usize> = if reverse { (0..parts.len()).rev().collect() } else { (0..parts.len()).collect() };
+        // Pooled draft heads (CANADA_SCRATCH_BATCHED_POOLED_HEAD=1): the conversations that will run the
+        // neural drafter go in pairs, each pair's bodies and one pooled ten-row head in one pass.
+        let mut ran = vec![false; parts.len()];
+        // One body pass for the conversations that run the neural drafter (CANADA_SCRATCH_BATCHED_DRAFT_BODY=1):
+        // at most three a pass, four as two and two; a single one left over drafts alone as before.
+        let batch_bodies = crate::config::batched_draft_body() && parts.len() >= 2 && !reverse;
+        if batch_bodies {
+            let mut needs = Vec::new();
+            for (i, p) in parts.iter().enumerate() {
+                if p.session.neural_draft_needed(target, p.history.position, p.anchor, p.limit)? { needs.push(i); }
+            }
+            let groups: Vec<Vec<usize>> = if crate::config::batched_draft_fixed_groups() {
+                // Stable composition (config::batched_draft_fixed_groups): the step's conversations 0-1 and 2-3
+                // draft together only when both need the drafter (all three of a three-conversation step when
+                // all three do), so each group's graph is captured once. Groups picked from whoever needs a
+                // draft change with every text lookup, and every new set captures a graph.
+                if parts.len() == 3 && needs.len() == 3 { vec![vec![0, 1, 2]] }
+                else { (0..parts.len() / 2).map(|k| vec![2 * k, 2 * k + 1])
+                    .filter(|g| g.iter().all(|i| needs.contains(i))).collect() }
+            } else if needs.len() == 4 { vec![needs[..2].to_vec(), needs[2..].to_vec()] }
+                else { needs.chunks(3).map(<[usize]>::to_vec).collect() };
+            for group in groups.into_iter().filter(|g| g.len() >= 2) {
+                let first = &parts[group[0]].session.draft;
+                let Some(bodies) = first.batch_bodies() else { continue; };
+                if !group.iter().all(|&i| parts[i].session.draft.shares_batch_bodies(first)) { continue; }
+                let anchors: Vec<u32> = group.iter().map(|&i| parts[i].anchor).collect();
+                let draft_began = Instant::now();
+                let mut nets: Vec<&mut QueryNetwork> = Vec::with_capacity(group.len());
+                for (i, p) in parts.iter_mut().enumerate() {
+                    if group.contains(&i) { p.session.poisoned = true; nets.push(&mut p.session.draft); }
+                }
+                bodies.get().ok_or_else(|| anyhow::anyhow!("batched drafter bodies"))?.borrow_mut().run(&mut nets, &anchors, comm, stream)?;
+                if sync {
+                    stream.synchronize()?;
+                    timing.draft_ms += draft_began.elapsed().as_secs_f64() * 1000.;
+                }
+                for &i in &group { ran[i] = true; }
+            }
+        }
+        // With fixed body groups, the conversations no group took still pair their heads as before.
+        if (!batch_bodies || crate::config::batched_draft_fixed_groups()) && crate::config::batched_pooled_head()
+            && parts.len() >= 2 && !reverse {
+            let mut needs = Vec::new();
+            for (i, p) in parts.iter().enumerate() {
+                if !ran[i] && p.session.neural_draft_needed(target, p.history.position, p.anchor, p.limit)? { needs.push(i); }
+            }
+            for pair in needs.chunks(2).filter(|c| c.len() == 2) {
+                let (i, j) = (pair[0], pair[1]);
+                let (lo, hi) = parts.split_at_mut(j);
+                let (a, b) = (&mut lo[i], &mut hi[0]);
+                if !a.session.draft.can_pool_query_head(&b.session.draft) { continue; }
+                a.session.poisoned = true; b.session.poisoned = true;
+                let draft_began = Instant::now();
+                a.session.draft.run_paired(&mut b.session.draft, [a.anchor, b.anchor], comm, stream)?;
+                if sync {
+                    stream.synchronize()?;
+                    timing.draft_ms += draft_began.elapsed().as_secs_f64() * 1000.;
+                }
+                ran[i] = true; ran[j] = true;
+            }
+        }
+        // config::batched_proposal_launch: the conversations whose pass ran above launch the first segment of
+        // their proposals back to back and share one wait; those past the prefix stop launch the rest and share a
+        // second one. Each conversation's own draft phase below then finds its proposals drawn.
+        if crate::config::batched_proposal_launch() && parts.len() >= 2 && !reverse {
+            let draft_began = Instant::now();
+            let mut plans: Vec<Option<f32>> = vec![None; parts.len()];
+            for (i, p) in parts.iter_mut().enumerate() {
+                if !ran[i] { continue; }
+                let Some((seed, threshold)) = p.session.batched_proposal_plan(target, p.history.position, p.limit) else { continue; };
+                ensure!(p.session.draft.ready_for(p.anchor), "pooled draft pass for another anchor");
+                if p.session.draft.launch_causal_three_prefix(seed, comm, stream)? { plans[i] = Some(threshold); }
+            }
+            if plans.iter().any(Option::is_some) {
+                stream.synchronize()?;
+                let mut rest = vec![false; parts.len()];
+                for (i, p) in parts.iter_mut().enumerate() {
+                    let Some(threshold) = plans[i] else { continue; };
+                    match p.session.draft.finish_causal_three_prefix(threshold, comm, stream)? {
+                        Some(tokens) => p.session.batched_proposals = Some(tokens),
+                        None => rest[i] = true,
+                    }
+                }
+                if rest.iter().any(|&r| r) {
+                    stream.synchronize()?;
+                    for (i, p) in parts.iter_mut().enumerate() {
+                        if rest[i] { p.session.batched_proposals = Some(p.session.draft.finish_causal_three_rest(comm)?); }
+                    }
+                }
+                if sync { timing.draft_ms += draft_began.elapsed().as_secs_f64() * 1000.; }
+            }
+        }
+        for i in order {
+            let p = &mut parts[i];
+            p.session.poisoned = true;
+            let draft_began = Instant::now();
+            drafted[i] = Some(p.session.draft_phase_ran(target, p.history.position, p.anchor, p.limit, ran[i], false, comm, stream)?);
+            ensure!(p.session.batched_proposals.is_none(), "shared proposals were drawn and not used");
+            if sync {
+                stream.synchronize()?;
+                let ms = draft_began.elapsed().as_secs_f64() * 1000.;
+                timing.draft_ms += ms;
+                timing.draft_max_ms = timing.draft_max_ms.max(ms);
+            }
+        }
+        timing.lookups = drafted.iter().filter(|d| d.as_ref().is_some_and(|d| d.lookup.is_some())).count();
+        let step_began = Instant::now();
+        let own: Vec<(usize, usize, bool, Option<[f32; 5]>)> = drafted.iter().map(|d| {
+            let d = d.as_ref().unwrap(); (d.live, d.produced_proposals, d.lookup.is_some(), d.draft_confidence) }).collect();
+        // The batched draft gate: in a step of several conversations a row costs more than in a
+        // conversation's own step, so low-survival drafts are left out (causal; see batched_gate).
+        if parts.len() >= 2 {
+            if let Some(threshold) = batched_gate(parts.len())? {
+                for (d, p) in drafted.iter_mut().zip(parts.iter()) {
+                    let d = d.as_mut().unwrap();
+                    if d.lookup.is_some() || d.target_only { continue; }
+                    let Some(confidence) = d.draft_confidence else { continue; };
+                    // The drafter may have stopped early under the conversation's own causal rule
+                    // (prefix draft stop): never verify a proposal it did not produce. That stop
+                    // also used only confidences of included proposals, so the clamp stays causal.
+                    let live = causal_full_prefix_rows(&confidence, threshold, p.limit)
+                        .min(d.produced_proposals + 1);
+                    ensure!(live >= 1, "batched gate rows");
+                    d.live = live;
+                }
+            }
+        }
+        let lives: Vec<usize> = drafted.iter().map(|d| d.as_ref().unwrap().live).collect();
+        timing.steps = 1;
+        timing.live_rows = lives.iter().sum();
+        timing.executed_rows = crate::target::batched_extent(&lives, target.physical_rows());
+        let head = drafted[0].as_ref().unwrap().local_target;
+        let groups: Vec<Vec<usize>> = if drafted.iter().all(|d| d.as_ref().unwrap().local_target == head) {
+            vec![(0..parts.len()).collect()]
+        } else { (0..parts.len()).map(|i| vec![i]).collect() };
+        let mut steps: Vec<Option<Step>> = (0..parts.len()).map(|_| None).collect();
+        for group in groups {
+            let local = drafted[group[0]].as_ref().unwrap().local_target;
+            let rows = group.iter().map(|&i| (parts[i].base, parts[i].history.clone(),
+                drafted[i].as_ref().unwrap().live)).collect::<Vec<_>>();
+            let ids = group.iter().flat_map(|&i| { let d = drafted[i].as_ref().unwrap(); d.verify[..d.live].to_vec() })
+                .collect::<Vec<u32>>();
+            // First traced step of a pair: the same rows verified alone, as a pair and as
+            // the swapped pair (each aborted), hashed per row, before the real step.
+            let mut first_step = None;
+            // Once per process: the screen hands in a fresh trace vector every step.
+            static FIRST_PAIR_CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if group.len() == 2 && parts[group[0]].trace.is_some()
+                && !FIRST_PAIR_CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                use sha2::{Digest, Sha256};
+                let cuda = parts[group[0]].session.cuda.clone();
+                let mut out = serde_json::Map::new();
+                for (name, order) in [("solo_first", vec![0usize]), ("solo_second", vec![1]), ("pair", vec![0, 1]),
+                    ("pair_swapped", vec![1, 0]), ("solo_first_again", vec![0])] {
+                    let rows = order.iter().map(|&g| (parts[group[g]].base, parts[group[g]].history.clone(),
+                        drafted[group[g]].as_ref().unwrap().live)).collect::<Vec<_>>();
+                    let ids = order.iter().flat_map(|&g| { let d = drafted[group[g]].as_ref().unwrap(); d.verify[..d.live].to_vec() })
+                        .collect::<Vec<u32>>();
+                    if invalidate { target.invalidate_gather_caches_for_probe()?; }
+                    target.set_batched_rows_for_probe(rows)?;
+                    if local { target.begin_local_verification(&ids, comm, stream)?; } else { target.begin_verification(&ids, comm, stream)?; }
+                    let mut hashes = Vec::new();
+                    for (k, &g) in order.iter().enumerate() {
+                        let live = drafted[group[g]].as_ref().unwrap().live;
+                        target.stage_batched_session(target.batched_offset(k)?, live, stream)?;
+                        stream.synchronize()?;
+                        let (logits, n) = if local { target.pending_local_target_logits()? } else { target.pending_logits()? };
+                        let row_bytes = if local { 32320 * 4 } else { 129280 * 4 };
+                        let bytes = unsafe { cuda.read_device(logits.ptr(), n * row_bytes) }?;
+                        hashes.push(bytes.chunks(row_bytes).map(|r| format!("{:x}", Sha256::digest(r))[..12].to_owned()).collect::<Vec<_>>());
+                    }
+                    target.abort_batched_verification_for_probe(stream)?;
+                    out.insert(name.into(), serde_json::json!(hashes));
+                }
+                first_step = Some(serde_json::Value::Object(out));
+            }
+            if invalidate { target.invalidate_gather_caches_for_probe()?; }
+            let verify_began = Instant::now();
+            target.set_batched_rows_for_probe(rows)?;
+            if local { target.begin_local_verification(&ids, comm, stream)?; }
+            else { target.begin_verification(&ids, comm, stream)?; }
+            if sync { stream.synchronize()?; timing.verify_ms += verify_began.elapsed().as_secs_f64() * 1000.; }
+            // Diagnostic only (CANADA_SCRATCH_CLAUDE_LOGIT_EXPORT): this rank's shard of every conversation's rows,
+            // read once before any conversation's rows are staged; each finish_phase commits its accepted rows.
+            let exported = if crate::logit_export::dir().is_some() {
+                Some(crate::logit_export::capture_all(&parts[group[0]].session.cuda, target, stream)?) } else { None };
+            if let Some(stages) = target.last_stages_ms() { record_batched_stages(parts.len(), stages); }
+            let finish_began = Instant::now();
+            let mut accepted = Vec::with_capacity(group.len());
+            for (k, &i) in group.iter().enumerate() {
+                let d = drafted[i].take().unwrap(); let live = d.live;
+                let offset = target.batched_offset(k)?;
+                target.stage_batched_session(offset, live, stream)?;
+                if let Some((rows, total)) = exported.as_ref() {
+                    ensure!(offset + live <= *total, "batched logit export rows");
+                    parts[i].session.batched_export = Some(rows[offset * 32320 * 4..(offset + live) * 32320 * 4].to_vec());
+                }
+                let mut record = None;
+                if parts[i].trace.is_some() {
+                    use sha2::{Digest, Sha256};
+                    let s = &*parts[i].session;
+                    stream.synchronize()?;
+                    let (logits, rows) = if d.local_target { target.pending_local_target_logits()? } else { target.pending_logits()? };
+                    let row_bytes = if d.local_target { 32320 * 4 } else { 129280 * 4 };
+                    let l = unsafe { s.cuda.read_device(logits.ptr(), rows * row_bytes) }?;
+                    let row_hashes = l.chunks(row_bytes).map(|r| format!("{:x}", Sha256::digest(r))[..12].to_owned()).collect::<Vec<_>>();
+                    let q = if d.lookup.is_none() && !d.target_only && live > 1 && s.draft.hierarchical_active() {
+                        let (q, _) = s.draft.sharded_probabilities(live - 1)?;
+                        Some(format!("{:x}", Sha256::digest(unsafe { s.cuda.read_device(q.ptr(), q.len() * 8) }?)))
+                    } else { None };
+                    record = Some(serde_json::json!({"position": d.start, "group": group.len(), "offset": offset, "live": live,
+                        "local_target": d.local_target, "lookup": d.lookup.is_some(), "draft_tokens": &d.draft_tokens[..live.saturating_sub(1)],
+                        "draft_confidence": d.draft_confidence, "logits_sha256": format!("{:x}", Sha256::digest(&l)), "q_sha256": q,
+                        "logits_rows": row_hashes, "verify": &d.verify[..live],
+                        "first_step": if k == 0 { first_step.take() } else { None }}));
+                }
+                let (step, a) = parts[i].session.finish_phase(target, d, parts[i].anchor, parts[i].limit,
+                    comm, stream, &mut || Ok(()), Some(offset))?;
+                if let (Some(mut r), Some(trace)) = (record, parts[i].trace.as_mut()) {
+                    r["accepted"] = serde_json::json!(a); r["tokens"] = serde_json::json!(step.tokens);
+                    r["next_anchor"] = serde_json::json!(step.next_anchor);
+                    trace.push(r);
+                }
+                steps[i] = Some(step); accepted.push(a);
+            }
+            if sync { stream.synchronize()?; timing.finish_ms += finish_began.elapsed().as_secs_f64() * 1000.; }
+            let commit_began = Instant::now();
+            let histories = target.finish_batched_verification(&accepted, stream)?;
+            if sync { stream.synchronize()?; timing.commit_ms += commit_began.elapsed().as_secs_f64() * 1000.; }
+            timing.groups += 1;
+            for (&i, h) in group.iter().zip(histories) { parts[i].history = h; parts[i].session.poisoned = false; }
+        }
+        timing.synced = usize::from(sync);
+        record_batched_phases(parts.len(), timing);
+        if comm.rank() == 0 { trace_batched_step(|| {
+            let parts_json: Vec<serde_json::Value> = parts.iter().zip(&own).zip(&steps).map(|((p, o), s)| {
+                let s = s.as_ref().unwrap();
+                serde_json::json!({"limit":p.limit,"own_live":o.0,"produced":o.1,"lookup":o.2,"confidence":o.3,
+                    "live":s.verified_rows,"accepted":s.matching_proposals,"tokens":s.tokens.len()})
+            }).collect();
+            serde_json::json!({"conversations":parts.len(),"rows":target.physical_rows(),
+                "after_draft_ms":step_began.elapsed().as_secs_f64() * 1000.,"parts":parts_json})
+        }); }
+        Ok(steps.into_iter().map(|s| s.unwrap()).collect())
     }
     /// Resume the retained drafter after a new target EXTEND request. The
     /// caller includes the previous pending emitted anchor in `ids` exactly
@@ -1884,6 +2690,43 @@ impl GreedySession {
         self.poisoned=false;
         Ok(())
     }
+    /// A copy of the drafter feature rows of the last prefill's 128-row tail (positions [position-128, position)),
+    /// kept beside a near-end encoder image (CANADA_SCRATCH_ENCODER_SHORT_SUFFIX=2).
+    pub(crate) fn copy_prefill_tail_features(&self, stream: &Stream) -> Result<crate::cuda::Buffer<half::bf16>> {
+        let (values, live) = self.prefill_features.values()?;
+        ensure!(!self.poisoned && live == 128 && values.len() == 128 * 15360, "prefill tail feature rows");
+        let copy = self.cuda.allocate::<half::bf16>(128 * 15360)?;
+        unsafe { self.cuda.copy_device(copy.ptr(), values.ptr(), 128 * 15360 * 2, stream) }?;
+        Ok(copy)
+    }
+    /// After the qualified short EXTEND that followed an encoder-image restore (no drafter state survives a
+    /// restore): seed the drafter window from the image's saved tail features for the rows before the restore
+    /// point and this EXTEND's own features for its rows. The tail's last row (the restore point's old token)
+    /// is replaced by the EXTEND's first row. Drafts only; the target is unaffected.
+    pub(crate) fn reset_from_extend_with_tail(&mut self, target: &Target, tail: &crate::cuda::Buffer<half::bf16>,
+        tail_end: u64, stream: &Stream) -> Result<()> {
+        let position = target.position();
+        ensure!(!self.poisoned && target.physical_rows() == 128 && target.profile_is_current()
+            && tail.len() == 128 * 15360 && tail_end >= 128 && tail_end <= position && position < tail_end + 127,
+            "DSpark EXTEND-after-restore window");
+        self.poisoned = true;
+        self.history_lookup = None;
+        self.draft.reset(stream)?;
+        self.prefill_features.run(target, stream)?;
+        let (values, live) = self.prefill_features.values()?;
+        ensure!(live < 128 && tail_end == position - live as u64 + 1, "DSpark EXTEND feature rows");
+        let old = 128 - live;
+        let first = (position - tail_end) as usize;
+        if self.extend_window.is_none() { self.extend_window = Some(self.cuda.allocate::<half::bf16>(128 * 15360)?); }
+        let window = self.extend_window.as_ref().unwrap();
+        unsafe {
+            self.cuda.copy_device(window.ptr(), tail.ptr() + (first * 15360 * 2) as u64, old * 15360 * 2, stream)?;
+            self.cuda.copy_device(window.ptr() + (old * 15360 * 2) as u64, values.ptr(), live * 15360 * 2, stream)?;
+        }
+        self.draft.inject_prefill_tail(window, 128, position, stream)?;
+        self.poisoned = false;
+        Ok(())
+    }
     pub(crate) fn reset_from_prefill(
         &mut self,
         target: &Target,
@@ -1910,6 +2753,17 @@ impl GreedySession {
             live == target.position().min(128) as usize,
             "DSpark reset features"
         );
+        if draft_seed_log() {
+            stream.synchronize()?;
+            let raw = unsafe { cuda.read_device(values.ptr(), live * 15360 * 2) }?;
+            let value = |b: &[u8]| f64::from(half::bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32());
+            let rows: Vec<String> = raw.chunks_exact(15360 * 2).map(|row| {
+                let norm = row.chunks_exact(2).map(|b| value(b) * value(b)).sum::<f64>().sqrt();
+                let head = |tap: usize| row[tap * 10240..tap * 10240 + 128].chunks_exact(2).map(value).sum::<f64>();
+                format!("{norm:.2}/{:.3}/{:.3}/{:.3}", head(0), head(1), head(2))
+            }).collect();
+            eprintln!("draftseed end={} live={live} sha={:x} rows={}", target.position(), <sha2::Sha256 as sha2::Digest>::digest(&raw), rows.join(","));
+        }
         self.draft
             .inject_prefill_tail(values, live, target.position(), stream)?;
         self.poisoned = false;
@@ -1936,6 +2790,26 @@ impl GreedySession {
         ensure!(self.draft.position()?==0,"startup draft reset retained a frontier");
         self.poisoned=false;
         Ok(true)
+    }
+}
+
+impl GreedySession {
+    /// Batched serving: this drafter takes region 0 as its conversation leaves for a serving region. Region 0's
+    /// target is reset there, and its drafter starts empty beside it: a spare may still hold the conversation
+    /// it last served, while a session image (a paused or cached conversation) restores only where drafter and
+    /// target stand at the same frontier. Allocations and captured graphs stay.
+    pub(crate) fn clear_for_region0(&mut self, stream: &Stream) -> Result<()> {
+        ensure!(!self.poisoned, "a drafter taking region 0 must be healthy");
+        self.poisoned=true;
+        self.draft.reset(stream)?;
+        self.history_lookup=None;
+        self.draft_warmed=false;
+        self.target_seed=None;
+        self.stop_token=None;
+        stream.synchronize()?;
+        ensure!(self.draft.position()?==0,"region 0's drafter kept a frontier");
+        self.poisoned=false;
+        Ok(())
     }
 }
 

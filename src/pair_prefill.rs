@@ -36,6 +36,10 @@ impl Ring {
     pub(crate) fn values_mut(&mut self) -> &mut Buffer<f32> {
         &mut self.values
     }
+    /// A second ring of the same shape (for a state captured beside the live one).
+    pub(crate) fn twin(&self) -> Result<Self> {
+        Self::new(&self.cuda, self.requests, self.width)
+    }
     pub(crate) fn bind(&self, stream: &Stream) -> Result<()> {
         ensure!(self.cuda.owns_stream(stream), "pair ring stream/context");
         let p = stream.raw() as usize;
@@ -122,6 +126,8 @@ pub struct Schedule {
     requests: Buffer<i64>,
     previous: Buffer<i32>,
     keep: Buffer<i32>,
+    // Keep mask of an earlier frontier inside the same chunk (Pool::publish_as_of).
+    keep_as_of: Option<Buffer<i32>>,
     rows: usize,
     request_slots: usize,
     ring: usize,
@@ -153,6 +159,7 @@ impl Schedule {
             requests: requests_gpu,
             previous,
             keep,
+            keep_as_of: None,
             rows: pos.len(),
             request_slots: requests,
             ring,
@@ -178,6 +185,17 @@ impl Schedule {
         self.requests.upload(req)?;
         self.previous.upload(&p.previous)?;
         self.keep.upload(&p.keep)
+    }
+}
+impl Schedule {
+    /// The ring window a chunk ending before its row `end` would publish: the `ring`
+    /// rows before `end`. They must be consecutive rows of the chunk's one request.
+    fn set_keep_as_of(&mut self, cuda: &Cuda, end: usize) -> Result<()> {
+        ensure!(end >= self.ring && end <= self.rows, "as-of ring window extent");
+        let mut keep = vec![0i32; self.rows];
+        keep[end - self.ring..end].fill(1);
+        if self.keep_as_of.is_none() { self.keep_as_of = Some(cuda.allocate(self.rows)?); }
+        self.keep_as_of.as_mut().unwrap().upload(&keep)
     }
 }
 pub struct Pool {
@@ -216,7 +234,7 @@ impl Pool {
             publish,
             rows,
             ring,
-            output: cuda.allocate(rows * 512)?,
+            output: cuda.allocate_chunk_scratch(crate::cuda::ChunkScratch::PairPool, rows * 512)?,
         })
     }
     pub fn run(
@@ -270,6 +288,31 @@ impl Pool {
     }
     pub fn output(&self) -> &Buffer<bf16> {
         &self.output
+    }
+    /// Publish into `state` (a ring of this shape beside the live one) the carried window
+    /// as of the chunk's row `end`, from the same `input` the chunk pooled. The live ring
+    /// and the chunk's schedule are not touched.
+    pub(crate) fn publish_as_of(&self, input: &Buffer<f32>, state: &Ring, meta: &mut Schedule, end: usize,
+        stream: &Stream) -> Result<()> {
+        ensure!(input.len() == self.rows * 1024 && meta.rows == self.rows && meta.ring == self.ring
+            && state.width == self.ring && state.requests == meta.request_slots
+            && self.cuda.owns_buffer(input) && self.cuda.owns_buffer(state.values())
+            && self.cuda.owns_stream(stream), "as-of ring publication state/metadata/context");
+        meta.set_keep_as_of(&self.cuda, end)?;
+        state.bind(stream)?;
+        unsafe {
+            self.publish.launch(
+                self.rows as u32,
+                &[
+                    input.ptr(),
+                    state.values.ptr(),
+                    meta.positions.ptr(),
+                    meta.requests.ptr(),
+                    meta.keep_as_of.as_ref().unwrap().ptr(),
+                ],
+                stream,
+            )
+        }
     }
 }
 #[cfg(test)]

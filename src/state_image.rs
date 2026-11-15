@@ -217,8 +217,19 @@ impl Image {
         );
         let descriptors: Vec<_> = regions.iter().map(|r| r.descriptor.clone()).collect();
         let (offsets, total) = layout(&descriptors, budget)?;
-        if cuda.admission_memory()?.admitted_available < crate::memory::floor_bytes() + total { return Ok(None); }
-        let storage = ImageBuffer::allocate(cuda, total)?;
+        // Admit against the line the allocator itself enforces (the floor plus its allowance for untracked host
+        // activity, Cuda::allocation_reserve_bytes), not the bare floor. With the bare floor an image inside the
+        // 512 MiB between the two was admitted here and then refused inside the allocation, which is not a
+        // CapacityRefused and retired the worker group: the release stress panel of Nov 14 2026, first pause of
+        // a 974K-token conversation with 8.99 GiB available on the vision rank (0.84 GiB image). A refusal by
+        // the guard itself (memory moved between this reading and the allocation) is the same refusal.
+        let reserve = crate::memory::floor_bytes().max(cuda.allocation_reserve_bytes());
+        if cuda.admission_memory()?.admitted_available < reserve + total { return Ok(None); }
+        let storage = match ImageBuffer::allocate(cuda, total) {
+            Ok(storage) => storage,
+            Err(error) if crate::cuda::allocation_floor_refused(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if cuda.admission_memory()?.admitted_available < crate::memory::floor_bytes() {
             drop(storage);
             return Ok(None);
@@ -345,11 +356,50 @@ impl Image {
         let copies=self.copy_regions(destination.iter().map(|r|&r.descriptor),false,stream);
         let completed=stream.synchronize();copies.and(completed)
     }
+    /// Restore into another owner's regions of the same layout: the same names and extents in the same
+    /// order, at addresses that overlap neither the regions the image was saved from nor the image. It
+    /// is for state whose bytes mean the same in any owner of one shape (the drafter's KV caches: rows
+    /// addressed by position only), where the caller has established that both owners are of one family;
+    /// `restore` keeps its exact-address contract and `import` its proof of the source regions.
+    /// Safety: as `restore`, for the destination regions.
+    pub(crate) unsafe fn restore_relocated(&self,destination:&[Region<'_>],stream:&Stream)->Result<()> {
+        ensure!(self.saved&&self.cuda.owns_stream(stream)&&destination.iter().all(|r|r.cuda.owns_stream(stream)),
+            "relocated restore needs a captured image in its original context");
+        let descriptors=destination.iter().map(|r|r.descriptor.clone()).collect::<Vec<_>>();
+        import_layout(&self.descriptors,&descriptors)?;
+        ensure!(descriptors.iter().all(|r|r.pointer+r.bytes as u64<=self.storage.ptr()
+            ||self.storage.ptr()+self.storage.bytes()as u64<=r.pointer),"relocated restore would overwrite its image");
+        let copies=self.copy_regions(descriptors.iter(),false,stream);
+        let completed=stream.synchronize();copies.and(completed)
+    }
     /// The owning model must exclude writers on every participating stream.
     pub(crate) fn save(&mut self, regions: &[Region<'_>], stream: &Stream) -> Result<()> {
         self.validate(regions, stream)?;
         ensure!(!self.saved, "state images are immutable after capture");
         let copies=self.copy_regions(self.descriptors.iter(),true,stream);
+        let completed = stream.synchronize();
+        copies.and(completed)?;
+        self.saved = true;
+        Ok(())
+    }
+    /// As `save`, reading each region named in `sources` from that source's buffer (a
+    /// state captured beside the live one, of the same extent) instead of the live region.
+    /// The image keeps the live descriptors, so it restores exactly as a saved one does.
+    pub(crate) fn save_with_sources(&mut self, regions: &[Region<'_>], sources: &[Region<'_>],
+        stream: &Stream) -> Result<()> {
+        self.validate(regions, stream)?;
+        ensure!(!self.saved, "state images are immutable after capture");
+        let mut from = self.descriptors.clone();
+        for source in sources {
+            ensure!(source.cuda.owns_stream(stream), "state image source stream");
+            let mut live = from.iter_mut().filter(|d| d.name == source.descriptor.name);
+            let (Some(d), None) = (live.next(), live.next()) else {
+                anyhow::bail!("state image source {} names no single region", source.descriptor.name);
+            };
+            ensure!(d.bytes == source.descriptor.bytes, "state image source {} extent", d.name);
+            d.pointer = source.descriptor.pointer;
+        }
+        let copies=self.copy_regions(from.iter(),true,stream);
         let completed = stream.synchronize();
         copies.and(completed)?;
         self.saved = true;
@@ -364,6 +414,19 @@ impl Image {
         let copies=self.copy_regions(self.descriptors.iter(),false,stream);
         let completed = stream.synchronize();
         copies.and(completed)
+    }
+    /// Finite inline-checkpoint screen: a digest of each saved region's bytes, by name.
+    pub(crate) fn region_digests_for_probe(&self) -> Result<Vec<(String, usize, String)>> {
+        ensure!(std::env::var("CANADA_SCRATCH_INLINE_CHECKPOINT_SCREEN").as_deref()==Ok("1") && self.saved,
+            "region digests require the finite inline checkpoint screen");
+        self.descriptors.iter().zip(&self.offsets).map(|(d, offset)| {
+            let mut hash = Sha256::new();
+            for at in (0..d.bytes).step_by(16 << 20) {
+                let bytes = (d.bytes - at).min(16 << 20);
+                hash.update(unsafe { self.cuda.read_device(self.storage.ptr() + (*offset + at) as u64, bytes) }?);
+            }
+            Ok((d.name.clone(), d.bytes, format!("{:x}", hash.finalize())))
+        }).collect()
     }
     pub(crate) fn bytes(&self) -> usize {
         self.storage.bytes()

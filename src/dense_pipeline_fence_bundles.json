@@ -65,6 +65,7 @@
   "fp8-flashinfer-compact-q_b-m16-v1": "fp8-flashinfer-compact-q_b-m16-v1-pipeline-fence-v1",
   "fp8-flashinfer-compact-qkv-m16-v1": "fp8-flashinfer-compact-qkv-m16-v1-pipeline-fence-v1",
   "fp8-flashinfer-compact-w13-m16-v1": "fp8-flashinfer-compact-w13-m16-v1-pipeline-fence-v1",
+  "fp8-flashinfer-narrow-qkv-m6-v1": "fp8-flashinfer-narrow-qkv-m6-v1-pipeline-fence-v1",
   "fp8-flashinfer-pdl-q-b-m6-rust-v2": "fp8-flashinfer-pdl-q-b-m6-rust-v2-pipeline-fence-v1",
   "fp8-index-q-m1024-v1": "fp8-index-q-m1024-v1-pipeline-fence-v1",
   "fp8-index-q-m128-v1": "fp8-index-q-m128-v1-pipeline-fence-v1",
@@ -101,5 +102,9 @@
   "fp8-split-qkv-m4096-v1": "fp8-split-qkv-m4096-v1-pipeline-fence-v1",
   "fp8-split-qkv-m512-v1": "fp8-split-qkv-m512-v1-pipeline-fence-v1",
   "fp8-split-qkv-m6-v1": "fp8-split-qkv-m6-v1-producer-fence-v1",
-  "fp8-split-qkv-m8192-v1": "fp8-split-qkv-m8192-v1-pipeline-fence-v1"
+  "fp8-split-qkv-m8192-v1": "fp8-split-qkv-m8192-v1-pipeline-fence-v1",
+  "claude-fp8-engram-wkv-full-m4096-v1": "claude-fp8-engram-wkv-full-m4096-v1-pipeline-fence-v1",
+  "claude-fp8-wob-full-m4096-v1": "claude-fp8-wob-full-m4096-v1-pipeline-fence-v1",
+  "claude-fp8-shared-w13-full-m4096-v1": "claude-fp8-shared-w13-full-m4096-v1-pipeline-fence-v1",
+  "claude-fp8-shared-w2-full-m4096-v1": "claude-fp8-shared-w2-full-m4096-v1-pipeline-fence-v1"
 }

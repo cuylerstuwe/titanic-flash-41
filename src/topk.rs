@@ -190,6 +190,12 @@ impl Selection {
         self.bind_stream(stream)?;
         Ok(&self.indices)
     }
+    /// As `new`, with the indices as chunk scratch (Cuda::allocate_chunk_scratch): for a
+    /// selection that every chunk recomputes before its consumers read it.
+    pub(crate) fn new_chunk_scratch(cuda: &Cuda, native: Rc<Native>, rows: usize, width: usize,
+        stride: usize, topk: usize) -> Result<Self> {
+        Self::new_with(cuda, native, rows, width, stride, topk, true)
+    }
     pub fn new(
         cuda: &Cuda,
         native: Rc<Native>,
@@ -197,6 +203,17 @@ impl Selection {
         width: usize,
         stride: usize,
         topk: usize,
+    ) -> Result<Self> {
+        Self::new_with(cuda, native, rows, width, stride, topk, false)
+    }
+    fn new_with(
+        cuda: &Cuda,
+        native: Rc<Native>,
+        rows: usize,
+        width: usize,
+        stride: usize,
+        topk: usize,
+        chunk_scratch: bool,
     ) -> Result<Self> {
         ensure!(
             (1..=crate::config::MAX_WIDE_ROWS).contains(&rows)
@@ -215,7 +232,7 @@ impl Selection {
             width,
             stride,
             topk,
-            indices: cuda.allocate(rows * topk)?,
+            indices: if chunk_scratch { cuda.allocate_chunk_scratch(crate::cuda::ChunkScratch::TopkIndices, rows * topk)? } else { cuda.allocate(rows * topk)? },
             stream: Cell::new(0),
             ready: Cell::new(false),
         })

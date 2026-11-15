@@ -17,6 +17,16 @@ def digest(path):
     with path.open('rb') as f:
         return hashlib.file_digest(f, 'sha256').hexdigest()
 
+# Fenced builds named by the loader's registry that this package does not carry: options that are off in every
+# shipped profile (the narrow six-row QKV lowering; the 4,096-row per-rank bundles of a 16,384-row prefill profile).
+UNPACKAGED_OPTIONAL_FENCES = {
+    'fp8-flashinfer-narrow-qkv-m6-v1-pipeline-fence-v1',
+    'claude-fp8-engram-wkv-full-m4096-v1-pipeline-fence-v1',
+    'claude-fp8-wob-full-m4096-v1-pipeline-fence-v1',
+    'claude-fp8-shared-w13-full-m4096-v1-pipeline-fence-v1',
+    'claude-fp8-shared-w2-full-m4096-v1-pipeline-fence-v1',
+}
+
 def validate_fenced_bundles(inventory):
     """Require every compiled projection replacement before copying runtime data."""
     # The M6 expert cache policy defaults on in the Rust loader even without an
@@ -29,6 +39,11 @@ def validate_fenced_bundles(inventory):
     assert inventory['files'][library] == 'e68e2711f1603e0b2261c939e67650ea00ae1f9dfffb2b344ea49792214554de', 'default MoE library differs from the Rust loader pin'
     registry = json.loads((ROOT/'src/dense_pipeline_fence_bundles.json').read_text())
     for directory in set(registry.values()):
+        if directory in UNPACKAGED_OPTIONAL_FENCES:
+            # The loader resolves these options to their fenced build and fails at load when it is absent;
+            # it never falls back to an unfenced one.
+            assert not any(name.startswith(f'kernels/{directory}/') for name in inventory['files']), directory
+            continue
         for name in ('manifest.json', 'bindings.json', 'libcanada_primitives.so'):
             relative = f'kernels/{directory}/{name}'
             assert relative in inventory['files'], f'missing fenced projection artifact: {relative}'

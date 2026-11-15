@@ -169,6 +169,20 @@ impl Metadata {
         m.update(positions, requests, locations)?;
         Ok(m)
     }
+    /// Verify-phase pair metadata only: the rows form blocks of `draft` rows, one
+    /// request per block (the verify kernel's grid is draft x rows/draft). An
+    /// ordinary verification is one block of every row; a batched verification
+    /// gives each session its own block. Decode and ratio-1 metadata keep draft 1.
+    pub fn set_blocks(&mut self, draft: usize) -> Result<()> {
+        if self.ratio != 2 || self.draft == 1 { return Ok(()); }
+        // A batched step's blocks may leave trailing padding rows (rows % draft != 0);
+        // run() then compresses only the whole blocks. An ordinary verification is one block of
+        // every row, up to the 32-row owner's.
+        ensure!((2..=32).contains(&draft) && draft <= self.rows && self.ring > draft,
+            "verify block geometry");
+        if draft != self.draft { self.ready = false; self.draft = draft; }
+        Ok(())
+    }
     pub fn update(&mut self, positions: &[i32], requests: &[i64], locations: &[i64]) -> Result<()> {
         self.ready = false;
         ensure!(
@@ -205,7 +219,11 @@ impl Metadata {
         }
         if self.ratio == 2 {
             let mut active_requests = std::collections::BTreeSet::new();
-            for start in (0..self.rows).step_by(self.draft) {
+            // Whole blocks only: rows past the last whole block (blocks that do not divide the rows,
+            // e.g. three sessions on 16 rows) are padding and never compressed (Source::run).
+            let whole = self.rows / self.draft * self.draft;
+            ensure!(locations[whole..].iter().all(|loc| *loc == 0), "verify padding must be a suffix");
+            for start in (0..whole).step_by(self.draft) {
                 let active = (0..self.draft)
                     .take_while(|i| locations[start + i] != 0)
                     .count();
@@ -561,7 +579,7 @@ impl Source {
             (1..=crate::config::MAX_WIDE_ROWS).contains(&rows) && self._weights.in_context(cuda),
             "shared compressor context/rows"
         );
-        let mut latent = cuda.allocate::<bf16>(rows * 512)?;
+        let mut latent = cuda.allocate_chunk_scratch::<bf16>(crate::cuda::ChunkScratch::CompressorLatent, rows * 512)?;
         latent.zero()?;
         let native = Native::open(root)?;
         ensure!(native.layout == self.cache.layout(), "shared compressor writes {:?} into a {:?} cache",
@@ -648,7 +666,9 @@ impl Source {
         })
     }
     pub fn run(&mut self, input: Input<'_>, meta: &Metadata, stream: &Stream) -> Result<()> {
-        let rows = self.rows;
+        // Verify blocks: the kernel takes whole blocks of `draft` rows (the trailing rows of a
+        // batched step whose blocks do not divide the rows are padding).
+        let rows = if meta.draft > 1 { self.rows / meta.draft * meta.draft } else { self.rows };
         self.run_rows(input, meta, rows, stream)
     }
     pub(crate) fn run_single_decode(
@@ -742,6 +762,7 @@ impl Source {
         Ok(())
     }
     pub(crate) fn ring_size(&self) -> usize { self.ring_size }
+    pub(crate) fn request_slots(&self) -> usize { self.request_slots }
     pub fn latent(&self) -> &Buffer<bf16> {
         &self.latent
     }
@@ -865,20 +886,25 @@ impl Source {
         }
         Ok(())
     }
-    pub(crate) fn clear_state(&mut self, stream: &Stream) -> Result<()> {
+    pub(crate) fn clear_state(&mut self, stream: &Stream, keep_cache: bool) -> Result<()> {
         ensure!(
             self.cuda.owns_stream(stream)
                 && (self.stream.get() == 0 || self.stream.get() == stream.raw() as usize),
             "compressor reset stream"
         );
-        self.cache.clear(&self.cuda, stream)?;
+        if keep_cache { self.cache.bind_stream(stream)?; } else { self.cache.clear(&self.cuda, stream)?; }
         unsafe {
             self.cuda
                 .zero_device(self.latent.ptr(), self.latent.bytes(), stream)?;
             if let Some(ring) = &self.ring {
                 ring.bind(stream)?;
-                self.cuda
-                    .zero_device(ring.values().ptr(), ring.values().bytes(), stream)?;
+                // Serving regions (CANADA_SCRATCH_BATCHED_REGIONS > 1): a reset starts region 0's
+                // next conversation, so only request slot 0 is cleared; the other slots hold
+                // conversations resident in their own regions. The ring is request-major
+                // (row = request x width + position mod width).
+                let bytes = ring.values().bytes();
+                let bytes = if crate::config::batched_regions()? > 1 { bytes / crate::config::session_slots()? } else { bytes };
+                self.cuda.zero_device(ring.values().ptr(), bytes, stream)?;
             }
         }
         Ok(())
@@ -894,6 +920,22 @@ impl Source {
     }
     pub fn ring(&self) -> Option<&Buffer<f32>> {
         self.ring.as_ref().map(|r| r.values())
+    }
+    /// A second carry ring of the live one's shape (none for a ratio-1 source).
+    pub(crate) fn ring_twin(&self) -> Result<Option<crate::pair_prefill::Ring>> {
+        self.ring.as_ref().map(|r| r.twin()).transpose()
+    }
+    /// After a prefill chunk: publish into `ring` the carry as of the chunk's row `end`,
+    /// from the pair projection `input` the chunk pooled. The live ring is not touched.
+    pub(crate) fn publish_ring_as_of(&self, input: &Buffer<f32>, plan: &mut PairPrefill,
+        ring: &crate::pair_prefill::Ring, end: usize, stream: &Stream) -> Result<()> {
+        ensure!(self.ratio == 2 && plan.ratio == 2 && self.rows == plan.rows
+            && plan.owner_ring == self.ring.as_ref().unwrap().values().ptr()
+            && self.cuda.owns_stream(stream)
+            && (self.stream.get() == 0 || self.stream.get() == stream.raw() as usize),
+            "as-of ring publication owner/stream");
+        let (pool, schedule) = (plan.pool.as_ref().unwrap(), plan.schedule.as_mut().unwrap());
+        pool.publish_as_of(input, ring, schedule, end, stream)
     }
     pub(crate) fn ring_mut(&mut self) -> Option<&mut Buffer<f32>> {
         self.ring

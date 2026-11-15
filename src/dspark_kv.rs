@@ -57,6 +57,8 @@ pub fn query_layout(frontier: u64, frequency_rows: usize) -> Result<Layout> {
 pub(crate) struct StateImage {
     image: crate::state_image::Image,
     owner: Rc<()>,
+    /// The saving drafter's image family (State::join_image_family): any drafter of the family restores it.
+    family: Rc<()>,
     frontier: u64,
 }
 impl StateImage {
@@ -65,8 +67,16 @@ impl StateImage {
     pub(crate) fn bytes(&self) -> usize { self.image.bytes() }
 }
 
+/// State images restored into another drafter of their family, this process (diagnostics: the scheduler's
+/// records carry it, and the release bar's regions panel checks that the path ran).
+static RELOCATED_RESTORES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn relocated_restores() -> u64 { RELOCATED_RESTORES.load(std::sync::atomic::Ordering::Relaxed) }
+
 pub struct State {
     image_owner: Rc<()>,
+    /// Drafters of one shape whose state images are interchangeable (join_image_family). A drafter alone is
+    /// its own family.
+    image_family: Rc<()>,
     cuda: Cuda,
     stream: usize,
     frequencies: Rc<FrequencyTable>,
@@ -125,6 +135,7 @@ impl State {
         };
         Ok(Self {
             image_owner: Rc::new(()),
+            image_family: Rc::new(()),
             cuda: cuda.clone(),
             stream: stream.raw() as usize,
             frequencies,
@@ -203,15 +214,38 @@ impl State {
         self.poisoned = true;
         image.save(&self.image_regions()?, stream)?;
         self.poisoned = false;
-        Ok(StateImage { image, owner: self.image_owner.clone(), frontier: self.frontier })
+        Ok(StateImage { image, owner: self.image_owner.clone(), family: self.image_family.clone(), frontier: self.frontier })
+    }
+    /// Batched serving: this fresh drafter and `origin` are forks of one prepared drafter, and a state image
+    /// saved by either restores into the other. An image holds the three KV caches whole, and their rows are
+    /// addressed by position only, so its bytes mean the same in any drafter of this shape. Region 0's drafter
+    /// changes whenever its conversation moves to a serving region, and the images of paused and cached
+    /// conversations are restored into whichever drafter region 0 holds then. Until Nov 14 2026 an image
+    /// restored only into the drafter that saved it: the first paused conversation resumed after another one
+    /// had moved out of region 0 stopped the engine (release stress panel, s1582).
+    pub(crate) fn join_image_family(&mut self, origin: &Self) -> Result<()> {
+        let same_shape = {
+            let (a, b) = (self.image_regions()?, origin.image_regions()?);
+            a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.bytes() == y.bytes())
+        };
+        ensure!(!self.poisoned && self.frontier == 0 && !self.query_ready && !self.query_prepared && same_shape
+            && self.independent_from(origin)?, "an image family takes fresh drafters of one shape and separate storage");
+        self.image_family = origin.image_family.clone();
+        Ok(())
     }
     pub(crate) fn restore_state_image(&mut self, saved: &StateImage, stream: &Stream) -> Result<()> {
         self.guard(stream)?;
-        ensure!(Rc::ptr_eq(&self.image_owner, &saved.owner), "foreign draft state image");
-        saved.image.validate(&self.image_regions()?, stream)?;
+        let own = Rc::ptr_eq(&self.image_owner, &saved.owner);
+        ensure!(own || Rc::ptr_eq(&self.image_family, &saved.family), "foreign draft state image");
+        if own { saved.image.validate(&self.image_regions()?, stream)?; }
         stream.synchronize()?;
         self.poisoned = true;
-        unsafe { saved.image.restore(&self.image_regions()?, stream) }?;
+        if own { unsafe { saved.image.restore(&self.image_regions()?, stream) }?; }
+        // Another drafter of the family saved it: the same layout at this drafter's addresses.
+        else {
+            unsafe { saved.image.restore_relocated(&self.image_regions()?, stream) }?;
+            RELOCATED_RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.frontier = saved.frontier;
         self.query_ready = false;
         self.query_prepared = false;

@@ -99,15 +99,15 @@ impl Paired {
             };
             let side=shared.map_or(stream,|branch|branch.stream.as_ref());
             pool.run(&a.shared_up,aq,asc,a_live,&b.shared_up,bq,bsc,b_live,side)?;
-            a.finish_shared(side)?;b.finish_shared(side)?;
+            a.finish_shared(side, None)?;b.finish_shared(side, None)?;
             if let Some(branch)=shared {branch.output_ready.record(side)?;branch.output_ready.wait(stream)?;}
         }else{for (ffn,input,quantized) in [(a,a_input,a_quant),(b,b_input,b_quant)] {
             if let Some(branch)=&ffn.shared_branch {
                 branch.input_ready.wait(&branch.stream)?;
-                ffn.run_shared_quantized_input(input,quantized,&branch.stream)?;
+                ffn.run_shared_quantized_input(input,quantized,&branch.stream,None)?;
                 branch.output_ready.record(&branch.stream)?;
                 branch.output_ready.wait(stream)?;
-            }else{ffn.run_shared_quantized_input(input,quantized,stream)?;}
+            }else{ffn.run_shared_quantized_input(input,quantized,stream,None)?;}
         }}
         for (offset,live,ffn) in [(0,a_live,a),(a_live,b_live,b)] {
             ensure!(unsafe{(ffn.native.add)(live as i32,

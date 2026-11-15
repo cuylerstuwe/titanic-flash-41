@@ -1,0 +1,819 @@
+{
+  "release": "s1585",
+  "date": "2026-11-15",
+  "base": "s1399",
+  "failed_start_fallback": "s1399",
+  "changes": {
+    "conversations and cache": "one-bank shared inactive image budget up to 8 GiB (native production: 7 GiB shared, 6 GiB session cache, 16 entries); checkpoints for conversations shorter than 8,192 tokens and for a prefix shared by several conversations; a displaced conversation's image is reclaimed before a new one is refused; right-sized wide arenas",
+    "prefill": "12 wide encoder widths instead of 5 (a chunk plan fitted to the prompt), a partially filled last wide chunk, the encoder checkpoint taken inside the chunk, the first token sampled before the tail of an append completes, and tokenization that reuses the cached ids of an unchanged prefix of a long message",
+    "decode": "paced L2 prefetch hints for the expert weights, later routing statistics, a native expert front end, direct QKV projection reads, table rows read with O_DIRECT instead of through the page cache, a three-threshold draft ladder, and the drafter's vocabulary head in 4 bits over a script subset with pooled rows (drafts are verified against the unchanged target, so the sampled distribution does not depend on the drafter)",
+    "several conversations at once": "batched decode: up to four conversations share one verification step, each in a serving region of 262,144 positions. A conversation shares only if its prompt plus its whole token limit (max_tokens; 262,144 when the request gives none) fits a region and it carries no image; every other conversation takes turns through paused images, and waits while regions are occupied. A paused or cached conversation restores into whichever drafter holds the first region, a resumed request keeps the checkpoints of the conversation it displaces, and a conversation in its first run yields after 16 tokens to one that has not started",
+    "option, off by default": "CANADA_SCRATCH_HEAD4_RESCORE (the model's own output head read from a 4-bit copy with exact rescoring of the likely tokens): it changes the sampled distribution slightly by design and is in no default profile"
+  },
+  "unchanged": [
+    "weights",
+    "the target model's output head and sampler",
+    "memory floor (8 GiB)",
+    "2350 MHz clock policy",
+    "portable profile"
+  ],
+  "reference_quality": {
+    "measured_on": "s1585 with the release settings",
+    "positions": 2499,
+    "kl": 0.009325392849739931,
+    "kl_ci95": [
+      0.00814229524266305,
+      0.010598958210404472
+    ],
+    "yardstick": 0.009537610223259073,
+    "kl_minus_yardstick_ci95": [
+      -0.0009862300175128823,
+      0.00036526078701479433
+    ],
+    "top1_agree": 0.9595838335334134,
+    "yardstick_top1_agree": 0.9591836734693877,
+    "clear_flips": 0
+  },
+  "reference_quality_note": "teacher-forced comparison of the release build with the release settings against DeepSeek's reference forward over the same tokens; the yardstick is the reference against itself with a different summation split. Inside the band = the lower end of the difference's 95 % interval at or below zero",
+  "residency_check": {
+    "flags": "release: 16 slots, 6 GiB session cache, 7 GiB shared image budget, 8 GiB floor",
+    "sizes_k": [
+      980,
+      980,
+      980,
+      980
+    ],
+    "rounds": 3,
+    "return_turns": 8,
+    "return_cached_fraction": 1.0,
+    "return_seconds_median": 0.382,
+    "min_available_gib": [
+      11.49,
+      12.36,
+      12.35,
+      10.63
+    ]
+  },
+  "stress_panel": {
+    "passed": true,
+    "requests": 70,
+    "max_prompt_tokens": 974076,
+    "max_temperature_c": [
+      88.6,
+      90.0,
+      89.5,
+      90.4
+    ],
+    "approx_seconds_at_or_above_90c": {
+      "0": 0.0,
+      "1": 2.0,
+      "2": 0.0,
+      "3": 8.0
+    },
+    "min_available_gib": [
+      10.968,
+      11.225,
+      11.302,
+      9.788
+    ],
+    "kernel_driver_large_page_retry_lines": 0,
+    "engine_allocation_failures": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 0
+    }
+  },
+  "serving_gate": {
+    "passed": true,
+    "requests": 15,
+    "min_available_gib": [
+      15.402,
+      15.717,
+      15.778,
+      14.353
+    ],
+    "criterion": "functional (tool-call behavior, cache reuse, cancel/resume)"
+  },
+  "cancellation_check": {
+    "passed": true,
+    "min_available_gib": [
+      14.566,
+      14.764,
+      15.03,
+      13.18
+    ]
+  },
+  "several_conversations_panel": {
+    "what": "17 synthetic conversations, each with three code words planted at 10 / 50 / 95 % of its text; every answer must name its own and none of another conversation's. Phases: a paused image conversation resumed beside a moved text request; five conversations for four regions; a conversation longer than one region arriving while two short ones share steps, then a short request arriving while it decodes; three requests without max_tokens taking turns, then a follow-up turn of each at once",
+    "passed": true,
+    "conversations_checked": 17,
+    "drafter_images_restored_into_another_drafter": 1,
+    "longest_prompt_tokens": 296940,
+    "follow_up_reuse_of_first_prompt": {
+      "30": 1.0,
+      "31": 1.0,
+      "32": 1.0
+    },
+    "min_available_gib": [
+      16.03,
+      15.953,
+      15.941,
+      14.261
+    ]
+  },
+  "install_recovery_fixtures": {
+    "passed": true,
+    "cases": 10
+  },
+  "cpu_tests": {
+    "passed": true,
+    "tests_passed": 258,
+    "failed": 0,
+    "ignored": 28
+  },
+  "against_production_s1399": {
+    "protocol": "one restart of the four machines; production's composition measured on its first loads, the release build on later loads of the same boot (a later load reads up to 1-2.5 % slower than a first one); temperature 1, top-p 1, reasoning high; every decode cell a new turn; client-side timing on the head. Single-conversation cells were measured on the build before the last scheduler change (the same decode code); the cells with several conversations on the release build itself",
+    "new_turns_tok_s": {
+      "prose": {
+        "candidate": 71.64,
+        "production": 65.77,
+        "n_candidate": 10,
+        "n_production": 10,
+        "candidate_first_token_ms": 154.9,
+        "production_first_token_ms": 165.94
+      },
+      "code": {
+        "candidate": 94.35,
+        "production": 88.2,
+        "n_candidate": 10,
+        "n_production": 10,
+        "candidate_first_token_ms": 149.18,
+        "production_first_token_ms": 159.74
+      },
+      "agentic": {
+        "candidate": 92.38,
+        "production": 85.32,
+        "n_candidate": 10,
+        "n_production": 10,
+        "candidate_first_token_ms": 163.96,
+        "production_first_token_ms": 173.21
+      },
+      "json": {
+        "candidate": 102.06,
+        "production": 94.26,
+        "n_candidate": 10,
+        "n_production": 10,
+        "candidate_first_token_ms": 163.08,
+        "production_first_token_ms": 173.92
+      },
+      "prose-at-128k": {
+        "candidate": 73.21,
+        "production": 66.21,
+        "n_candidate": 10,
+        "n_production": 10,
+        "candidate_first_token_ms": 268.15,
+        "production_first_token_ms": 369.06
+      },
+      "code-at-128k": {
+        "candidate": 93.41,
+        "production": 88.57,
+        "n_candidate": 10,
+        "n_production": 10,
+        "candidate_first_token_ms": 263.1,
+        "production_first_token_ms": 362.42
+      },
+      "agentic-at-128k": {
+        "candidate": 101.55,
+        "production": 93.27,
+        "n_candidate": 10,
+        "n_production": 10,
+        "candidate_first_token_ms": 272.55,
+        "production_first_token_ms": 371.38
+      },
+      "json-at-128k": {
+        "candidate": 98.88,
+        "production": 90.23,
+        "n_candidate": 10,
+        "n_production": 10,
+        "candidate_first_token_ms": 271.7,
+        "production_first_token_ms": 365.02
+      },
+      "prose-at-4k": {
+        "candidate": 72.26,
+        "production": 66.09,
+        "n_candidate": 5,
+        "n_production": 5,
+        "candidate_first_token_ms": 242.18,
+        "production_first_token_ms": 652.33
+      },
+      "prose-at-16k": {
+        "candidate": 71.99,
+        "production": 65.59,
+        "n_candidate": 5,
+        "n_production": 5,
+        "candidate_first_token_ms": 236.95,
+        "production_first_token_ms": 259.18
+      },
+      "prose-at-64k": {
+        "candidate": 72.51,
+        "production": 66.36,
+        "n_candidate": 5,
+        "n_production": 5,
+        "candidate_first_token_ms": 267.84,
+        "production_first_token_ms": 297.5
+      },
+      "prose-at-256k": {
+        "candidate": 74.88,
+        "production": 65.86,
+        "n_candidate": 5,
+        "n_production": 5,
+        "candidate_first_token_ms": 270.58,
+        "production_first_token_ms": 454.84
+      },
+      "prose-at-512k": {
+        "candidate": 71.75,
+        "production": 66.22,
+        "n_candidate": 5,
+        "n_production": 5,
+        "candidate_first_token_ms": 327.37,
+        "production_first_token_ms": 805.16
+      },
+      "prose-at-900k": {
+        "candidate": 75.72,
+        "production": 68.32,
+        "n_candidate": 5,
+        "n_production": 5,
+        "candidate_first_token_ms": 410.63,
+        "production_first_token_ms": 1134.13
+      }
+    },
+    "several_conversations_16k_small_limit": {
+      "1": {
+        "candidate_decode": [
+          81.84
+        ],
+        "production_decode": [
+          77.55
+        ],
+        "candidate_prefill": [
+          7478.8
+        ],
+        "production_prefill": [
+          5626.0
+        ]
+      },
+      "2": {
+        "candidate_decode": [
+          115.52
+        ],
+        "production_decode": [
+          78.99
+        ],
+        "candidate_prefill": [
+          8526.7
+        ],
+        "production_prefill": [
+          7801.9
+        ]
+      },
+      "3": {
+        "candidate_decode": [
+          132.9
+        ],
+        "production_decode": [
+          78.9
+        ],
+        "candidate_prefill": [
+          8018.9
+        ],
+        "production_prefill": [
+          7487.9
+        ]
+      },
+      "4": {
+        "candidate_decode": [
+          122.15
+        ],
+        "production_decode": [
+          84.01
+        ],
+        "candidate_prefill": [
+          7938.0
+        ],
+        "production_prefill": [
+          7298.7
+        ]
+      }
+    },
+    "tool_loop": {
+      "16k/+27": {
+        "candidate": {
+          "n": 4,
+          "first_token_ms": 169.38053600006242,
+          "turn_s": 0.6788995980000436,
+          "tok_s": 133.66443641977128
+        },
+        "production": {
+          "n": 4,
+          "first_token_ms": 172.38029050008663,
+          "turn_s": 0.6948314065000432,
+          "tok_s": 124.21845835190663
+        }
+      },
+      "16k/+75": {
+        "candidate": {
+          "n": 3,
+          "first_token_ms": 206.09299599982478,
+          "turn_s": 0.8444585819997883,
+          "tok_s": 134.86951846715473
+        },
+        "production": {
+          "n": 3,
+          "first_token_ms": 205.31887200013443,
+          "turn_s": 0.7535021329999836,
+          "tok_s": 120.79960385557094
+        }
+      },
+      "16k/+254": {
+        "candidate": {
+          "n": 3,
+          "first_token_ms": 254.79768999957741,
+          "turn_s": 0.8567667930001335,
+          "tok_s": 138.25499902641596
+        },
+        "production": {
+          "n": 3,
+          "first_token_ms": 265.59393399975306,
+          "turn_s": 0.7314657009997063,
+          "tok_s": 144.12695397678348
+        }
+      },
+      "200k/+27": {
+        "candidate": {
+          "n": 4,
+          "first_token_ms": 163.0753065001045,
+          "turn_s": 0.5492879319999702,
+          "tok_s": 147.29050592062293
+        },
+        "production": {
+          "n": 4,
+          "first_token_ms": 166.79622399988148,
+          "turn_s": 0.5697774524999204,
+          "tok_s": 136.04016763796923
+        }
+      },
+      "200k/+75": {
+        "candidate": {
+          "n": 3,
+          "first_token_ms": 223.08947200053808,
+          "turn_s": 0.6515003250005975,
+          "tok_s": 131.83063393858603
+        },
+        "production": {
+          "n": 3,
+          "first_token_ms": 221.51059499992698,
+          "turn_s": 0.6952007830000184,
+          "tok_s": 118.77131588047412
+        }
+      },
+      "200k/+254": {
+        "candidate": {
+          "n": 3,
+          "first_token_ms": 273.9601430002949,
+          "turn_s": 0.716567455000586,
+          "tok_s": 148.82586581474922
+        },
+        "production": {
+          "n": 3,
+          "first_token_ms": 274.45153300004677,
+          "turn_s": 0.7779917600000772,
+          "tok_s": 129.46689588836938
+        }
+      }
+    }
+  },
+  "with_a_harness_sized_limit": {
+    "note": "requests carrying max_tokens 262,144, as agent harnesses that send the model's maximum do: no conversation fits a serving region, so both compositions take turns; same boot, production first",
+    "streams_16k": {
+      "production": {
+        "1": {
+          "aggregate_tok_s": 79.91,
+          "per_stream_tok_s": [
+            82.7
+          ],
+          "completion_tokens": [
+            599
+          ],
+          "first_token_s": [
+            0.231
+          ],
+          "wall_s": 7.496
+        },
+        "2": {
+          "aggregate_tok_s": 83.92,
+          "per_stream_tok_s": [
+            42.7,
+            51.16
+          ],
+          "completion_tokens": [
+            1094,
+            1668
+          ],
+          "first_token_s": [
+            0.717,
+            0.326
+          ],
+          "wall_s": 32.913
+        },
+        "3": {
+          "aggregate_tok_s": 83.63,
+          "per_stream_tok_s": [
+            43.37,
+            43.72,
+            73.98
+          ],
+          "completion_tokens": [
+            878,
+            719,
+            1255
+          ],
+          "first_token_s": [
+            0.945,
+            0.395,
+            17.15
+          ],
+          "wall_s": 34.103
+        },
+        "4": {
+          "aggregate_tok_s": 87.32,
+          "per_stream_tok_s": [
+            43.88,
+            45.27,
+            50.49,
+            44.01
+          ],
+          "completion_tokens": [
+            901,
+            1252,
+            583,
+            1560
+          ],
+          "first_token_s": [
+            0.561,
+            21.53,
+            1.004,
+            12.857
+          ],
+          "wall_s": 49.199
+        }
+      },
+      "candidate": {
+        "1": {
+          "aggregate_tok_s": 86.86,
+          "per_stream_tok_s": [
+            88.18
+          ],
+          "completion_tokens": [
+            1075
+          ],
+          "first_token_s": [
+            0.162
+          ],
+          "wall_s": 12.377
+        },
+        "2": {
+          "aggregate_tok_s": 92.11,
+          "per_stream_tok_s": [
+            47.13,
+            48.1
+          ],
+          "completion_tokens": [
+            856,
+            920
+          ],
+          "first_token_s": [
+            0.564,
+            0.174
+          ],
+          "wall_s": 19.28
+        },
+        "3": {
+          "aggregate_tok_s": 94.7,
+          "per_stream_tok_s": [
+            105.59,
+            33.93,
+            47.61
+          ],
+          "completion_tokens": [
+            554,
+            685,
+            1197
+          ],
+          "first_token_s": [
+            1.056,
+            0.249,
+            0.603
+          ],
+          "wall_s": 25.724
+        },
+        "4": {
+          "aggregate_tok_s": 94.01,
+          "per_stream_tok_s": [
+            119.47,
+            20.35,
+            94.55,
+            33.83
+          ],
+          "completion_tokens": [
+            597,
+            636,
+            1071,
+            1283
+          ],
+          "first_token_s": [
+            12.757,
+            0.638,
+            1.168,
+            0.256
+          ],
+          "wall_s": 38.154
+        }
+      }
+    },
+    "three_conversations_taking_turns": {
+      "production": {
+        "all_answers_correct": true,
+        "first_turn": {
+          "completion_tokens": [
+            483,
+            377,
+            545
+          ],
+          "first_token_s": [
+            1.056,
+            1.646,
+            7.81
+          ],
+          "seconds": [
+            11.138,
+            8.029,
+            12.139
+          ]
+        },
+        "follow_up": {
+          "reuse_of_first_prompt": {
+            "30": 0.0,
+            "31": 0.0,
+            "32": 0.0
+          },
+          "cached_tokens": [
+            0,
+            0,
+            0
+          ],
+          "first_token_s": [
+            4.477,
+            0.823,
+            1.854
+          ],
+          "seconds": [
+            5.659,
+            4.177,
+            3.335
+          ]
+        }
+      },
+      "candidate": {
+        "all_answers_correct": true,
+        "first_turn": {
+          "completion_tokens": [
+            353,
+            480,
+            527
+          ],
+          "first_token_s": [
+            0.75,
+            0.972,
+            1.815
+          ],
+          "seconds": [
+            12.397,
+            11.89,
+            5.901
+          ]
+        },
+        "follow_up": {
+          "reuse_of_first_prompt": {
+            "30": 1.0,
+            "31": 1.0,
+            "32": 1.0
+          },
+          "cached_tokens": [
+            4724,
+            4495,
+            4908
+          ],
+          "first_token_s": [
+            0.19,
+            0.848,
+            0.513
+          ],
+          "seconds": [
+            1.79,
+            1.21,
+            2.525
+          ]
+        }
+      }
+    }
+  },
+  "activation": {
+    "runtime": "s1585",
+    "fresh_boots": true,
+    "model_loads_per_device": 1,
+    "worker_starts_since_boot": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "kernel_allocation_or_xid_messages": 0,
+    "clock_cap_mhz": [
+      2350,
+      2350,
+      2350,
+      2350
+    ],
+    "reservation_released": true,
+    "smoke_test": {
+      "passed": true,
+      "text": true,
+      "prompt_reuse": true,
+      "continuation": true,
+      "image": true,
+      "unchanged_generation": true
+    },
+    "first_load_benchmark": {
+      "protocol": "the live service on the first model load after the restart, head-local client; temperature 1, top-p 1, no top-k, reasoning high; every cell a new turn of 512 tokens. s1399: its production settings on the first loads after a restart about five hours earlier (grid: load 1; ladder: load 2). The release ran the grid as its first requests and the ladder later on the same load, after the smoke test",
+      "grid_ten_seeds": {
+        "prose": {
+          "release_tok_s": 72.1,
+          "s1399_tok_s": 65.8,
+          "ratio": 1.097,
+          "release_first_token_ms": 156,
+          "s1399_first_token_ms": 166,
+          "n": [
+            10,
+            10
+          ]
+        },
+        "code": {
+          "release_tok_s": 94.8,
+          "s1399_tok_s": 88.2,
+          "ratio": 1.075,
+          "release_first_token_ms": 151,
+          "s1399_first_token_ms": 160,
+          "n": [
+            10,
+            10
+          ]
+        },
+        "agentic": {
+          "release_tok_s": 92.7,
+          "s1399_tok_s": 85.3,
+          "ratio": 1.086,
+          "release_first_token_ms": 163,
+          "s1399_first_token_ms": 173,
+          "n": [
+            10,
+            10
+          ]
+        },
+        "json": {
+          "release_tok_s": 102.8,
+          "s1399_tok_s": 94.3,
+          "ratio": 1.091,
+          "release_first_token_ms": 160,
+          "s1399_first_token_ms": 174,
+          "n": [
+            10,
+            10
+          ]
+        },
+        "prose-at-128k": {
+          "release_tok_s": 73.0,
+          "s1399_tok_s": 66.2,
+          "ratio": 1.103,
+          "release_first_token_ms": 270,
+          "s1399_first_token_ms": 369,
+          "n": [
+            10,
+            10
+          ]
+        },
+        "code-at-128k": {
+          "release_tok_s": 94.9,
+          "s1399_tok_s": 88.6,
+          "ratio": 1.072,
+          "release_first_token_ms": 261,
+          "s1399_first_token_ms": 362,
+          "n": [
+            10,
+            10
+          ]
+        },
+        "agentic-at-128k": {
+          "release_tok_s": 102.8,
+          "s1399_tok_s": 93.3,
+          "ratio": 1.102,
+          "release_first_token_ms": 273,
+          "s1399_first_token_ms": 371,
+          "n": [
+            10,
+            10
+          ]
+        },
+        "json-at-128k": {
+          "release_tok_s": 98.2,
+          "s1399_tok_s": 90.2,
+          "ratio": 1.089,
+          "release_first_token_ms": 271,
+          "s1399_first_token_ms": 365,
+          "n": [
+            10,
+            10
+          ]
+        }
+      },
+      "prose_after_a_document_five_seeds": {
+        "prose-at-4k": {
+          "release_tok_s": 73.3,
+          "s1399_tok_s": 66.1,
+          "ratio": 1.109,
+          "release_first_token_ms": 241,
+          "s1399_first_token_ms": 652,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose-at-16k": {
+          "release_tok_s": 73.5,
+          "s1399_tok_s": 65.6,
+          "ratio": 1.12,
+          "release_first_token_ms": 233,
+          "s1399_first_token_ms": 259,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose-at-64k": {
+          "release_tok_s": 75.4,
+          "s1399_tok_s": 66.4,
+          "ratio": 1.136,
+          "release_first_token_ms": 262,
+          "s1399_first_token_ms": 298,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose-at-256k": {
+          "release_tok_s": 77.4,
+          "s1399_tok_s": 65.9,
+          "ratio": 1.176,
+          "release_first_token_ms": 272,
+          "s1399_first_token_ms": 455,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose-at-512k": {
+          "release_tok_s": 73.3,
+          "s1399_tok_s": 66.2,
+          "ratio": 1.107,
+          "release_first_token_ms": 320,
+          "s1399_first_token_ms": 805,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose-at-900k": {
+          "release_tok_s": 75.7,
+          "s1399_tok_s": 68.3,
+          "ratio": 1.108,
+          "release_first_token_ms": 412,
+          "s1399_first_token_ms": 1134,
+          "n": [
+            5,
+            5
+          ]
+        }
+      }
+    }
+  }
+}

@@ -37,7 +37,9 @@ impl LivePrefillRowsScope {
                 ensure!((capacity==128 && (17..128).contains(&live))
                     || (capacity==512 && (129..512).contains(&live))
                     || (capacity==1024 && (513..1024).contains(&live))
-                    || (capacity==2048 && (1025..2048).contains(&live)),
+                    || (capacity==2048 && (1025..2048).contains(&live))
+                    // Partial chunks on the widest profiles (config::partial_wide_rows_requested).
+                    || (crate::config::partial_wide_width(capacity) && (1..capacity).contains(&live)),
                     "qualified short or partial prefill row geometry");
                 slot.set(Some(PrefillRows{live,capacity,stream:stream.raw()as usize,dense,experts}));
             }
@@ -132,9 +134,14 @@ pub struct Linear {
     scale_mma: Buffer<u8>,
     alpha: Buffer<f32>,
     output: Buffer<bf16>,
+    direct: Option<Direct>,
 }
 /// One row shard, aligned to complete 128-row MMA scale tiles. Concatenating
 /// four such buffers in rank order produces the existing full-row operands.
+/// The direct-read GEMV's module (kernels/direct_gemv_fp8.cu built for compute_121a; provenance beside the
+/// artifact) and whether this projection uses it (config::wqb_direct; the plan screen toggles it).
+static DIRECT_GEMV_CUBIN: &[u8] = include_bytes!("../kernels/prebuilt/direct_gemv_fp8.cubin");
+struct Direct { module: crate::cuda::Module, on: Cell<bool>, output: Cell<u64> }
 pub(crate) struct RowShard {
     rows: usize,
     values: Buffer<u8>,
@@ -177,6 +184,14 @@ fn pipeline_flag(name: &str) -> Result<bool> {
         Err(std::env::VarError::NotPresent) => Ok(true),
         Err(error) => Err(error.into()),
     }
+}
+/// The 8,192-row sibling of a 16,384-row dense bundle when that sibling has a pipeline-fenced build (which the
+/// caller then resolves and runs at 16,384 rows); None for every other bundle or with the fence switched off.
+fn widened_fenced_root(root: &Path) -> Result<Option<std::path::PathBuf>> {
+    let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if !name.contains("-m16384-") { return Ok(None); }
+    let sibling = root.with_file_name(name.replace("-m16384-", "-m8192-"));
+    Ok(pipeline_fenced_root(&sibling)?.map(|_| sibling))
 }
 fn pipeline_fenced_root(root: &Path) -> Result<Option<std::path::PathBuf>> {
     // s894 traced a bad output exactly to a future ring-buffer fragment.
@@ -232,13 +247,54 @@ impl Linear {
         let root=compact_root.as_deref().unwrap_or(root);
         Self::load_shared(cuda,root,matrix)
     }
+    /// A 16-row projection bundle run at `rows` (10 or 15) on the drafter's own matrix of the same shape
+    /// (CANADA_SCRATCH_BATCHED_DRAFT_BODY): as a flex width, a larger bundle of one kernel library at its own
+    /// row count. The canonical bundle only; never the compact 16-row substitutes.
+    pub(crate) fn new_rc_at_rows(cuda:&Cuda,root:&Path,matrix:Rc<Matrix>,rows:usize)->Result<Self> {
+        ensure!(crate::config::batched_draft_body()&&[10,15].contains(&rows),"batched drafter projection rows");
+        Self::load_shared_rows(cuda,root,matrix,Some(rows))
+    }
     fn load_shared(cuda:&Cuda,root:&Path,matrix:Rc<Matrix>)->Result<Self> {
+        Self::load_shared_rows(cuda,root,matrix,None)
+    }
+    fn load_shared_rows(cuda:&Cuda,root:&Path,matrix:Rc<Matrix>,at_rows:Option<usize>)->Result<Self> {
+        // A flex encoder width runs a larger bundle of the same kernel library
+        // at its own row count (config::resolve_flex_bundle).
+        let (flex_root, flex_rows) = crate::config::resolve_flex_bundle(root)?;
+        let root = flex_root.as_path();
+        // A native 16,384-row profile's dense bundles (...-m16384-...) carry the very kernel library of the
+        // 8,192-row ones (the row count is a launch argument), but only the 8,192-row ones were rebuilt with the
+        // pipeline fence (s894). Load the fenced 8,192-row bundle and run it at 16,384 rows.
+        let widened_root = widened_fenced_root(root)?;
+        let widened_rows = widened_root.as_ref().map(|_| 16384usize);
+        let root = widened_root.as_deref().unwrap_or(root);
         // Resolve after compact/backend selection so every qualified dense
         // path, including direct diagnostic loads, gets its ordering fix.
         // Missing artifacts fail normally; never silently use an unfenced one.
         let fenced_root = pipeline_fenced_root(root)?;
         let root = fenced_root.as_deref().unwrap_or(root);
         let mut m: Manifest = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        if let Some(rows) = flex_rows {
+            // Buffers, the quantizer grid and the dense `m` all follow the row
+            // count, so only single-pass, non-clearing B12x lowerings qualify.
+            ensure!(matches!(m.backend, Backend::B12x)
+                && m.geometry.dense_policy.as_ref().is_some_and(|p| p.split_k_slices == 1 && !p.output_clear)
+                && [2048, 8192].contains(&m.geometry.rows) && rows % 32 == 0 && rows < m.geometry.rows,
+                "flex width projection lowering");
+            m.geometry.rows = rows;
+        }
+        if let Some(rows) = widened_rows {
+            ensure!(flex_rows.is_none() && at_rows.is_none() && fenced_root.is_some() && matches!(m.backend, Backend::B12x)
+                && m.geometry.dense_policy.as_ref().is_some_and(|p| p.split_k_slices == 1 && !p.output_clear)
+                && m.geometry.rows == 8192, "16,384-row projection on the fenced 8,192-row lowering");
+            m.geometry.rows = rows;
+        }
+        if let Some(rows) = at_rows {
+            ensure!(flex_rows.is_none() && matches!(m.backend, Backend::B12x)
+                && m.geometry.dense_policy.as_ref().is_some_and(|p| p.split_k_slices == 1 && !p.output_clear)
+                && m.geometry.rows == 16 && (9..16).contains(&rows), "batched drafter projection lowering");
+            m.geometry.rows = rows;
+        }
         if std::env::var("CANADA_SCRATCH_VERIFY16_QKV_NO_PDL").as_deref()==Ok("1")
             && m.geometry.rows==16 && (matrix.n,matrix.k)==(448,5120) {
             ensure!(std::env::var("CANADA_SCRATCH_GROUPED_SPARSE16_SCREEN").as_deref()==Ok("1")
@@ -453,6 +509,7 @@ impl Linear {
             quant,
             dense,
             prepared_dense,
+            direct: None,
             values,
             scale_rows,
             scale_mma,
@@ -460,10 +517,54 @@ impl Linear {
             output,
         })
     }
+    /// Install the direct-read GEMV as this projection's dense consumer, switched `on` or off (six rows, wq_b's
+    /// shape, the checkpoint's own layout).
+    pub(crate) fn install_direct(&mut self, on: bool) -> Result<()> {
+        // wq_b (8192 x 1280) or this rank's QKV-A slice (448 x 5120); every caller of launch_dense passes activation
+        // scales in the MMA byte layout (the projection's own quantizer and the boundary's alike).
+        let shape = (self.matrix.n, self.matrix.k, self.matrix.padded_k);
+        ensure!(self.geometry.rows == 6 && self.matrix.unpadded()
+            && ((shape == (8192, 1280, 1280) && matches!(self.backend, Backend::FlashInfer { .. }) && self.prepared_dense.is_none())
+                || shape == (448, 5120, 5120)),
+            "direct-read GEMV geometry");
+        if self.direct.is_none() {
+            self.direct = Some(Direct { module: self.cuda.module(DIRECT_GEMV_CUBIN)?, on: Cell::new(on), output: Cell::new(0) });
+        }
+        Ok(())
+    }
+    pub(crate) fn set_direct_for_probe(&self, on: bool) -> Result<()> {
+        self.direct.as_ref().context("direct-read GEMV not installed")?.on.set(on);
+        Ok(())
+    }
+    pub(crate) fn direct_installed(&self) -> bool { self.direct.is_some() }
+    pub(crate) fn direct_on(&self) -> bool { self.direct.as_ref().is_some_and(|d| d.on.get()) }
+    /// The direct kernel writes its [rows][n] BF16 output at `pointer` (a caller-owned block of at least that size
+    /// that outlives this projection's captured work) instead of this projection's own output buffer.
+    pub(crate) fn set_direct_output(&self, pointer: u64) -> Result<()> {
+        ensure!(pointer != 0 && pointer % 16 == 0, "direct-read GEMV output pointer");
+        self.direct.as_ref().context("direct-read GEMV not installed")?.output.set(pointer);
+        Ok(())
+    }
+    /// Plan screen: this projection's BF16 output as bytes (the caller has synchronized the stream).
+    pub(crate) fn output_bytes_for_probe(&self) -> Result<Vec<u8>> {
+        let pointer = self.direct.as_ref().filter(|d| d.on.get() && d.output.get() != 0).map_or(self.output.ptr(), |d| d.output.get());
+        unsafe { self.cuda.read_device(pointer, self.output.bytes()) }
+    }
     pub(crate) fn narrow_projection(&self) -> bool {
         matches!(self.backend, Backend::FlashInfer { .. })
             && self.geometry.flashinfer.as_ref().is_some_and(|f| f.mma_tiler_mn == [16, 64])
             && [448, 1152].contains(&self.matrix.n) && self.matrix.k == 5120
+    }
+    /// config::qkv_narrow_prequant: the qualified 16x64-tile lowering of the six-row split QKV-A product over this
+    /// projection's own matrix (resolved to its pipeline-fenced bundle like every served dense lowering).
+    pub(crate) fn narrow_qkv_alternate(&self, kernels: &Path) -> Result<Self> {
+        ensure!(self.geometry.rows == 6 && (self.matrix.n, self.matrix.k) == (448, 5120)
+            && matches!(self.backend, Backend::B12x), "narrow QKV alternate geometry");
+        ensure!(pipeline_fenced_root(&kernels.join("fp8-flashinfer-narrow-qkv-m6-v1"))?.is_some(),
+            "the narrow QKV lowering is served only with its pipeline fence");
+        let result = Self::load_shared(&self.cuda, &kernels.join("fp8-flashinfer-narrow-qkv-m6-v1"), self.matrix.clone())?;
+        ensure!(result.narrow_projection() && result.geometry.rows == 6, "narrow QKV alternate lowering");
+        Ok(result)
     }
     pub(crate) fn legacy_qkv_for_probe(&self,kernels:&Path)->Result<Self> {
         ensure!(std::env::var("CANADA_SCRATCH_QKV_SCHEDULE_SCREEN").as_deref()==Ok("1")
@@ -565,12 +666,12 @@ impl Linear {
             && self.matrix.n == 1792 && self.matrix.k == 5120
             && self.matrix.padded_k == self.matrix.k
             && crate::config::wide_rows(self.geometry.rows)
-            && self.geometry.rows % 512 == 0,
+            && self.geometry.rows % 128 == 0 && (self.geometry.rows % 512 == 0 || projection_root.is_some()),
             "quantized row gather requires an aligned wide fused QKV projection");
         let rows = self.geometry.rows / 4;
         let projection = projection_root.map(|root| Self::new_shared(&self.cuda, root, self.matrix.clone())).transpose()?;
         if let Some(local) = &projection {
-            ensure!([8192,16384].contains(&self.geometry.rows)
+            ensure!(crate::config::packed_wide_width(self.geometry.rows)
                 && local.geometry.rows == rows && matches!(local.backend, Backend::B12x)
                 && !local.geometry.dense_policy.as_ref().is_some_and(|p| p.output_clear),
                 "local QKV projection requires the screened row geometry and reduction");
@@ -590,10 +691,14 @@ impl Linear {
         self.guard_stream(stream)?;
         ensure!(matches!(self.backend, Backend::B12x)
             && self.matrix.n == 1792 && self.matrix.k == self.matrix.padded_k
-            && shard.rows % 128 == 0 && shard.rows * 4 == self.geometry.rows
+            // A shard that is not whole 128-row scale tiles (a flex width that is not a multiple of 512) may
+            // only take the local projection below: its swizzled scale bytes would not concatenate.
+            && shard.rows % 32 == 0 && shard.rows * 4 == self.geometry.rows
             && input.len() == shard.rows * self.matrix.k
-            && shard.values.len() * 4 == self.values.len()
-            && shard.scale_mma.len() * 4 == self.scale_mma.len()
+            // The gathered operands' sizes and tiling only matter to the quantized gather itself (scale bytes
+            // are sized in whole 128-row tiles, so an odd shard's do not add up to the full rows').
+            && (project_local || (shard.rows % 128 == 0 && shard.values.len() * 4 == self.values.len()
+                && shard.scale_mma.len() * 4 == self.scale_mma.len()))
             && self.cuda.owns_buffer(input) && self.cuda.owns_buffer(&shard.values)
             && self.cuda.owns_buffer(&shard.scale_rows) && self.cuda.owns_buffer(&shard.scale_mma),
             "quantized row gather geometry/context");
@@ -655,7 +760,7 @@ impl Linear {
     /// full-row operands, including its minimum-amax rounding corrections.
     pub(crate) fn wide_shared_quantization_buffers(&self) -> Result<(&Buffer<u8>, &Buffer<u8>, &Buffer<u8>)> {
         ensure!(matches!(self.backend, Backend::B12x)
-            && [8192,16384].contains(&self.geometry.rows)
+            && crate::config::packed_wide_width(self.geometry.rows)
             && (self.matrix.n,self.matrix.k,self.matrix.padded_k) == (1152,5120,5120),
             "packed shared input projection geometry");
         Ok((&self.values,self.scale_rows.as_ref().context("shared row scales absent")?,&self.scale_mma))
@@ -726,6 +831,20 @@ impl Linear {
     }
     unsafe fn launch_dense(&self, values: u64, scales: u64, stream: &Stream) -> Result<()> {
         self.guard_stream(stream)?;
+        if let Some(direct) = self.direct.as_ref().filter(|d| d.on.get()) {
+            // One tile of 8 weight rows a block, 16 warps over K; activations as the quantizer left them (scales in
+            // the MMA byte layout), weights and their 32x32 scales in the checkpoint's layout.
+            let (mut xq, mut xs, mut w, mut s, mut y) = (values, scales, self.matrix.values(), self.matrix.canonical_scales(),
+                if direct.output.get() != 0 { direct.output.get() } else { self.output.ptr() });
+            let (mut m, mut n, mut k, mut ldq, mut wk, mut mma) = (self.geometry.rows as i32, self.matrix.n as i32,
+                self.matrix.k as i32, self.matrix.padded_k as i32, 16i32, 1i32);
+            let mut args: [*mut std::ffi::c_void; 11] = [(&mut xq as *mut u64).cast(), (&mut xs as *mut u64).cast(),
+                (&mut w as *mut u64).cast(), (&mut s as *mut u64).cast(), (&mut y as *mut u64).cast(),
+                (&mut m as *mut i32).cast(), (&mut n as *mut i32).cast(), (&mut k as *mut i32).cast(),
+                (&mut ldq as *mut i32).cast(), (&mut wk as *mut i32).cast(), (&mut mma as *mut i32).cast()];
+            return unsafe { direct.module.function("ca_direct_gemv_fp8")?
+                .launch_pdl([(self.matrix.n / 8) as u32, 1, 1], [512, 1, 1], 4096, stream, &mut args) };
+        }
         if let Some(dense)=self.prepared_dense.as_ref().filter(|d|d.enabled()) {
             return unsafe{dense.launch(values,self.matrix.values(),scales,self.matrix.scales(),
                 self.output.ptr(),self.alpha.ptr(),stream)};
@@ -767,7 +886,8 @@ impl Linear {
         unsafe { self.primitives.launch_words(self.dense as i32, &da, stream) }
     }
     fn effective_rows(&self,stream:&Stream)->usize {
-        if [128,512,1024,2048].contains(&self.geometry.rows) && matches!(self.backend,Backend::B12x)
+        if ([128,512,1024,2048].contains(&self.geometry.rows) || crate::config::partial_wide_width(self.geometry.rows))
+            && matches!(self.backend,Backend::B12x)
             && self.geometry.dense_policy.as_ref().is_some_and(|p|p.split_k_slices==1 && !p.output_clear) {
             LIVE_PREFILL_ROWS.with(|slot|slot.get().filter(|p|p.dense && p.capacity==self.geometry.rows
                 && p.stream==stream.raw()as usize).map_or(self.geometry.rows,|p|p.live))

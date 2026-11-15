@@ -442,7 +442,7 @@ pub fn run(path: &Path) -> Result<Value> {
         }
         if let Some(t) = third.as_mut() {
             t.cache.clear(&cuda, &stream)?;
-            t.source.clear_state(&stream)?;
+            t.source.clear_state(&stream, false)?;
         }
         let start = cuda.event()?;
         let end = cuda.event()?;

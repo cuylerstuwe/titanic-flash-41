@@ -39,6 +39,24 @@ impl Group {
         for index in &mut self.indices {index.enable_compact_sparse6()?;}
         Ok(())
     }
+    /// config::sparse_union_share: layers 28, 32 and 36 reuse layer 24's candidate union and gathered keys.
+    /// Before any execution; the followers.
+    pub(crate) fn share_sparse_union(&mut self, follow: bool) -> Result<usize> {
+        let Some((first, rest)) = self.indices.split_first_mut() else { return Ok(0) };
+        for index in rest.iter_mut() { index.share_sparse_union_from(first, follow)?; }
+        Ok(rest.len())
+    }
+    pub(crate) fn sparse_union_linked(&self) -> usize {
+        self.indices.iter().filter(|index| index.sparse_union_linked()).count()
+    }
+    /// Plan screen: the linked layers reuse layer 24's union or recompute it.
+    pub(crate) fn set_sparse_union_follow_for_probe(&self, on: bool) -> Result<()> {
+        for index in self.indices.iter().filter(|index| index.sparse_union_linked()) { index.set_sparse_union_follow_for_probe(on)?; }
+        Ok(())
+    }
+    pub(crate) fn sparse_union_followers(&self) -> usize {
+        self.indices.iter().filter(|index| index.follows_sparse_union()).count()
+    }
     pub(crate) fn set_adaptive_sparse6(&mut self, enabled: bool) {
         for index in &mut self.indices {index.set_adaptive_sparse6(enabled);}
     }
@@ -274,7 +292,8 @@ impl Group {
                 None => build(narrow_moe.clone(), None)?,
             });
             if i == 0 {
-                source = Some(Source::new_rows_owner(
+                crate::memory::trace_profile_memory(cuda, num_rows, &format!("before source {id}"));
+                let build_source = || Source::new_rows_owner(
                     cuda,
                     stream,
                     weights,
@@ -290,7 +309,8 @@ impl Group {
                     num_rows,
                     phase,
                     (!independent).then_some(&self.source),
-                )?);
+                );
+                source = Some(match wide { Some(w) => w.source(cuda, build_source)?, None => build_source()? });
             } else if id % 4 == 0 {
                 indices.push(ReadIndex::new(
                     cuda,
@@ -617,10 +637,12 @@ impl Group {
         }
         Ok(())
     }
-    pub(crate) fn clear_state(&mut self, cuda: &Cuda, stream: &Stream) -> Result<()> {
-        for cache in &mut self.caches {
-            cache.clear(cuda, stream)?;
+    pub(crate) fn clear_state(&mut self, cuda: &Cuda, stream: &Stream, keep_caches: bool) -> Result<()> {
+        if !keep_caches {
+            for cache in &mut self.caches {
+                cache.clear(cuda, stream)?;
+            }
         }
-        self.source.clear_state(stream)
+        self.source.clear_state(stream, keep_caches)
     }
 }

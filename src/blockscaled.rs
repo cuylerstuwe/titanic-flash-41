@@ -122,6 +122,10 @@ impl Matrix {
     pub fn scales(&self) -> u64 {
         self.scales.ptr()
     }
+    /// The checkpoint's own [N/32][K/32] UE8M0 scales (the direct-read GEMV reads them where the atlas holds them).
+    pub(crate) fn canonical_scales(&self) -> u64 { self.source_scales }
+    /// Whether values() is the checkpoint's row-major [N][K] itself (no K padding copy).
+    pub(crate) fn unpadded(&self) -> bool { self.values.is_none() && self.k == self.padded_k }
     /// Shared gate/up concatenation over original canonical row blocks.
     /// Source order is [gate; up], distinct from the routed expert layout.
     pub fn prepare_shared(

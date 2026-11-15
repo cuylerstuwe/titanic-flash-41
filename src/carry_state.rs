@@ -11,10 +11,15 @@ struct Ring {
 pub(crate) struct Snapshot {
     cuda: Cuda,
     rings: Vec<Ring>,
+    /// Compressor request rings per buffer, laid out [request][row][1024].
+    requests: usize,
 }
 impl Snapshot {
     pub(crate) fn new(cuda: &Cuda, rings: Vec<&Buffer<f32>>) -> Result<Self> {
-        ensure!(rings.len() <= 4, "too many canonical carry owners");
+        Self::with_requests(cuda, rings, 1)
+    }
+    pub(crate) fn with_requests(cuda: &Cuda, rings: Vec<&Buffer<f32>>, requests: usize) -> Result<Self> {
+        ensure!(rings.len() <= 4 && (1..=128).contains(&requests), "too many canonical carry owners");
         let mut saved = Vec::new();
         for ring in rings {
             ensure!(
@@ -32,6 +37,7 @@ impl Snapshot {
         Ok(Self {
             cuda: cuda.clone(),
             rings: saved,
+            requests,
         })
     }
     pub(crate) fn bytes(&self) -> usize {
@@ -71,14 +77,27 @@ impl Snapshot {
         accepted: usize,
         stream: &Stream,
     ) -> Result<usize> {
+        unsafe { self.restore_rejected_request(0, start, live, accepted, stream) }
+    }
+    /// As restore_rejected, for one compressor request ring (a batched session).
+    pub(crate) unsafe fn restore_rejected_request(
+        &self,
+        request: usize,
+        start: u64,
+        live: usize,
+        accepted: usize,
+        stream: &Stream,
+    ) -> Result<usize> {
+        let width = self.rings.first().map_or(0, |r| r.saved.len() / 1024 / self.requests);
         ensure!(
             live > 0
                 && live <= 32
                 && accepted <= live
+                && request < self.requests
                 && self.rings.len() == 3
-                && self.rings.iter().all(|r| [8 * 1024, 32 * 1024, 64 * 1024].contains(&r.saved.len())
-                    && live < r.saved.len() / 1024)
-                && self.rings.iter().all(|r| r.saved.len() == self.rings[0].saved.len()),
+                && self.rings.iter().all(|r| r.saved.len() == self.requests * width * 1024)
+                && [8, 32, 64].contains(&width)
+                && live < width,
             "canonical verification carry geometry"
         );
         let mut restored = 0;
@@ -89,7 +108,7 @@ impl Snapshot {
             if position % 2 != 0 {
                 continue;
             }
-            let row = position as usize % (self.rings[0].saved.len() / 1024);
+            let row = request * width + position as usize % width;
             for ring in &self.rings {
                 unsafe {
                     self.cuda.copy_device(

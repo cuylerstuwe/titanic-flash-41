@@ -53,10 +53,26 @@ impl Metadata {
         raw_locations: &[i64],
         lengths: &[i32],
     ) -> Result<()> {
+        let starts = vec![0; self.rows];
+        self.update_ranged(positions, requests, raw_locations, &starts, lengths)
+    }
+    /// As update(), with each row's first visible logical key index. A batched
+    /// session occupies a disjoint linear region of every cache: its rows start
+    /// at the region's base instead of zero (all zero is the single sequence).
+    pub(crate) fn update_ranged(
+        &mut self,
+        positions: &[i32],
+        requests: &[i64],
+        raw_locations: &[i64],
+        starts: &[i32],
+        lengths: &[i32],
+    ) -> Result<()> {
         ensure!(
             positions.len() == self.rows
                 && raw_locations.len() == self.rows
                 && lengths.len() == self.rows
+                && starts.len() == self.rows
+                && starts.iter().all(|&s| s >= 0)
                 && positions
                     .iter()
                     .all(|&p| p >= 0 && (p as usize) < self.frequency_rows),
@@ -78,7 +94,25 @@ impl Metadata {
             CompressionMetadata::Extend(m) => m.update(positions, requests, raw_locations)?,
         }
         self.keys.update(positions, &key_locations)?;
-        self.query.update(positions, &vec![0; self.rows], lengths)
+        self.query.update(positions, starts, lengths)
+    }
+    /// Region steps: each row's first index key row to gather (CANADA_SCRATCH_REGION_GATHER_CACHE=1).
+    pub(crate) fn set_gather_starts(&mut self, starts: &[i32]) -> Result<()> {
+        self.query.set_gather_starts(starts)
+    }
+    /// As update_ranged(), with the verify compressor's block size for this step
+    /// (all rows for one session; rows / sessions for a batched step).
+    pub(crate) fn update_ranged_blocks(
+        &mut self,
+        positions: &[i32],
+        requests: &[i64],
+        raw_locations: &[i64],
+        starts: &[i32],
+        lengths: &[i32],
+        block: usize,
+    ) -> Result<()> {
+        if let CompressionMetadata::Verify(m) = &mut self.compression { m.set_blocks(block)?; }
+        self.update_ranged(positions, requests, raw_locations, starts, lengths)
     }
     pub fn new(
         cuda: &Cuda,
@@ -123,7 +157,9 @@ impl Metadata {
                         cuda,
                         ratio,
                         source.source.cache().capacity(),
-                        1,
+                        // One request ring in serving; a batched screen sizes the
+                        // compressor for its sessions (config::batch_screen_sessions).
+                        source.source.request_slots(),
                         source.source.ring_size(),
                         if ratio == 1 || source.phase == Phase::Decode {
                             1
@@ -381,7 +417,7 @@ impl Layer {
                 weights.clone(),
                 layer,
                 rows,
-                1,
+                crate::config::session_slots()?,
                 crate::config::verification_carry_rows(),
                 kv_pages,
                 if phase == Phase::Extend { 64 } else { 32 },
@@ -516,6 +552,14 @@ impl Layer {
         stream: &Stream) -> Result<()> {
         self.prepare_keys(hidden, meta, stream)
     }
+    /// The remainder of run_distributed after prepare_keys_only, in the same order.
+    pub(crate) fn select_distributed(&mut self, hidden: &Buffer<bf16>, q_lora: &Buffer<bf16>,
+        meta: &Metadata, live: &Buffer<i32>, comm: &crate::roce::Roce, stream: &Stream) -> Result<()> {
+        ensure!(meta.owner_keys == self.keys.data().ptr() && meta.phase == self.phase && meta.rows == self.rows,
+            "source metadata belongs to another key owner");
+        self.query.run_distributed(hidden, q_lora, &self.keys, &meta.query, live, comm, stream)?;
+        self.mapping.run(self.query.selection(), meta.query.windows(), stream)
+    }
     pub(crate) fn select_quantized_distributed(&mut self, hidden: &Buffer<bf16>, q: &Buffer<u8>,
         scales: &Buffer<u8>, meta: &Metadata, live: &Buffer<i32>,
         comm: &crate::roce::Roce, stream: &Stream) -> Result<()> {
@@ -536,9 +580,36 @@ impl Layer {
                 && meta.rows == self.rows,
             "source metadata belongs to another key owner"
         );
+        self.prepare_keys_split(Some(hidden), meta, stream)
+    }
+    /// The projection of the layer input alone (config::source_keys_fork runs it on a side stream): a pure function
+    /// of `hidden` into this projection's own output buffer. emit_keys_after_projection issues the rest.
+    pub(crate) fn project_only(&self, hidden: &Buffer<bf16>, stream: &Stream) -> Result<()> {
+        match &self.projection {
+            SourceProjection::Pair(p) => p.run(hidden, stream),
+            SourceProjection::Single(p) => p.run(hidden, stream),
+        }
+    }
+    /// The remainder of prepare_keys after project_only, in the same order, on the owner's ordered stream.
+    pub(crate) fn emit_keys_after_projection(&mut self, meta: &Metadata, stream: &Stream) -> Result<()> {
+        ensure!(
+            meta.owner_keys == self.keys.data().ptr() && meta.phase == self.phase && meta.rows == self.rows,
+            "source metadata belongs to another key owner"
+        );
+        self.prepare_keys_split(None, meta, stream)
+    }
+    /// Plan screen: let the projection bind another stream (every stream it ran on has been synchronized).
+    pub(crate) fn rebind_projection_stream_for_probe(&self) {
+        match &self.projection {
+            SourceProjection::Pair(p) => p.rebind_stream_for_probe(),
+            SourceProjection::Single(p) => p.rebind_stream_for_probe(),
+        }
+    }
+    /// `hidden`: Some runs the projection here; None takes its output as already issued (project_only).
+    fn prepare_keys_split(&mut self, hidden: Option<&Buffer<bf16>>, meta: &Metadata, stream: &Stream) -> Result<()> {
         match &self.projection {
             SourceProjection::Pair(p) => {
-                p.run(hidden, stream)?;
+                if let Some(hidden) = hidden { p.run(hidden, stream)?; }
                 match &meta.compression {
                     CompressionMetadata::Verify(m) => {
                         if self.phase == Phase::Decode {
@@ -558,7 +629,7 @@ impl Layer {
                 }
             }
             SourceProjection::Single(p) => {
-                p.run(hidden, stream)?;
+                if let Some(hidden) = hidden { p.run(hidden, stream)?; }
                 match &meta.compression {
                     CompressionMetadata::Verify(m) => {
                         if self.phase == Phase::Decode {
@@ -584,9 +655,11 @@ impl Layer {
     pub fn cache(&self) -> &PagedKv {
         self.source.cache()
     }
-    pub(crate) fn clear_state(&mut self, stream: &Stream) -> Result<()> {
-        self.source.clear_state(stream)?;
-        self.keys.clear_state(stream)
+    /// `keep_caches`: leave the compressed cache and the index keys as they are (entries
+    /// past the new, empty frontier are unreachable); the carry ring and latent are cleared.
+    pub(crate) fn clear_state(&mut self, stream: &Stream, keep_caches: bool) -> Result<()> {
+        self.source.clear_state(stream, keep_caches)?;
+        if keep_caches { self.keys.bind(stream) } else { self.keys.clear_state(stream) }
     }
     pub fn layer_id(&self) -> usize {
         self.layer
@@ -630,6 +703,35 @@ impl Layer {
     pub(crate) fn enable_retained_publication(&mut self) -> Result<()> {
         self.query.enable_retained_publication()
     }
+    /// A second carry ring of this source's shape (None for the ratio-1 source).
+    pub(crate) fn ring_twin(&self) -> Result<Option<crate::pair_prefill::Ring>> {
+        self.source.ring_twin()
+    }
+    /// After a prefill chunk of a pair source: publish into `ring` the carry as of the
+    /// chunk's row `end`, from the projection output the chunk left in place.
+    pub(crate) fn publish_ring_as_of(&self, meta: &mut Metadata, ring: &crate::pair_prefill::Ring,
+        end: usize, stream: &Stream) -> Result<()> {
+        ensure!(meta.owner_keys == self.keys.data().ptr() && meta.phase == self.phase
+            && meta.rows == self.rows && self.phase == Phase::Extend,
+            "as-of ring publication belongs to another key owner or phase");
+        let SourceProjection::Pair(p) = &self.projection else {
+            anyhow::bail!("as-of ring publication needs a pair source");
+        };
+        let CompressionMetadata::Extend(plan) = &mut meta.compression else {
+            anyhow::bail!("as-of ring publication needs prefill metadata");
+        };
+        self.source.publish_ring_as_of(p.output(), plan, ring, end, stream)
+    }
+    /// After a prefill chunk of the candidate source: republish the retained candidate
+    /// blocks for the 128 rows before the chunk's row `end` (`live` holds `end`), from
+    /// the queries and gathered keys the chunk left in place.
+    pub(crate) fn republish_retained_window(&mut self, meta: &Metadata, live: &Buffer<i32>,
+        end: usize, comm: &crate::roce::Roce, stream: &Stream) -> Result<()> {
+        ensure!(meta.owner_keys == self.keys.data().ptr() && meta.phase == self.phase
+            && meta.rows == self.rows && self.phase == Phase::Extend && end <= self.rows,
+            "retained window republication belongs to another key owner or phase");
+        self.query.republish_retained_window(&meta.query, comm, live, end, stream)
+    }
 }
 
 /// A later index source owns queries/selection, while borrowing source20's
@@ -644,6 +746,14 @@ pub struct ReadIndex {
     mapping: Map,
 }
 impl ReadIndex {
+    /// See query_index::Branch::share_sparse_union_from; both read indices consume the same source's keys.
+    pub(crate) fn share_sparse_union_from(&mut self, owner: &Self, follow: bool) -> Result<()> {
+        ensure!(self.owner_keys == owner.owner_keys, "shared candidate union across different key caches");
+        self.query.share_sparse_union_from(&owner.query, follow)
+    }
+    pub(crate) fn follows_sparse_union(&self) -> bool { self.query.follows_sparse_union() }
+    pub(crate) fn sparse_union_linked(&self) -> bool { self.query.sparse_union_linked() }
+    pub(crate) fn set_sparse_union_follow_for_probe(&self, on: bool) -> Result<()> { self.query.set_sparse_union_follow_for_probe(on) }
     pub(crate) fn enable_compact_sparse6(&mut self)->Result<()> {
         self.query.enable_compact_sparse6()
     }

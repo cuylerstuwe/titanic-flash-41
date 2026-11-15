@@ -55,7 +55,7 @@ fn retain_incident(event: &serde_json::Value) -> bool {
         // The first token record carries the complete prefill/cache receipt.
         Some("tokens") => event.get("prompt_tokens").is_some(),
         Some("prefill_progress") => event["request_started"] == true || event["cancelled"] == true,
-        Some("idle" | "hold" | "output_wait") => false,
+        Some("idle" | "hold" | "output_wait" | "batched_tokens") => false,
         // Preserve new operational event types unless explicitly high-volume.
         _ => true,
     }

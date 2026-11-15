@@ -361,6 +361,13 @@ impl Rejection {
             stream,
         )
     }
+    /// Probe only (CANADA_SCRATCH_MIDPASS_DUMP): the block test's running ratio products w[0..=drafts] of the step
+    /// that just ran (w[0] = 1; w[i] = min(1, w[i-1] p(x_i) / q(x_i))). Read-only.
+    pub(crate) fn block_weights_for_probe(&self, drafts: usize) -> Result<Vec<f64>> {
+        let all = self.block_weights.download()?;
+        ensure!(drafts < all.len(), "block weights probe range");
+        Ok(all[..=drafts].to_vec())
+    }
     pub(crate) fn sample_block(
         &mut self,
         logits: &Buffer<f32>,

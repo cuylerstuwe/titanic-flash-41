@@ -13,6 +13,73 @@ use std::{
 };
 
 pub const ROW_BYTES: usize = 264;
+/// CANADA_SCRATCH_HOST_STAGES=1 (diagnostic): totals of the row reads since the last take: paired lookups, ns in
+/// them, read batches, rows read, ns in the batches, ns of those spent in the submission call.
+pub(crate) static IO_STATS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+pub(crate) fn take_io_stats() -> [u64; 6] {
+    std::array::from_fn(|i| IO_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+/// CANADA_SCRATCH_ENGRAM_MISS_THREADS=N (2..=64; default 0 = the bounded io_uring batches): storage reads of a
+/// lookup's cache misses run on N scoped threads. First-seen text misses most of a chunk's rows (about six owned
+/// rows a token and table on each rank), and those reads sit in front of layer 1.
+pub(crate) fn miss_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| validate_miss_threads().unwrap_or(0))
+}
+/// Fills each listed row of `out` (`rows` = (id, row position), positions ascending) with `read(id, row)` on up to
+/// `threads` scoped threads. Every thread owns one contiguous range of positions, so no row is shared.
+fn read_rows_threaded(rows:&[(u64,usize)],out:&mut[u8],threads:usize,
+    read:&(impl Fn(u64,&mut [u8])->std::io::Result<()>+Sync))->Result<()> {
+    ensure!(threads>0 && rows.windows(2).all(|w|w[0].1<w[1].1)
+        && rows.last().is_none_or(|last|(last.1+1)*ROW_BYTES<=out.len()),"Engram threaded read geometry");
+    if rows.is_empty() {return Ok(());}
+    let per=rows.len().div_ceil(threads);
+    std::thread::scope(|scope|->Result<()> {
+        let mut jobs=Vec::new();
+        let (mut rest,mut base)=(out,0usize);
+        for slice in rows.chunks(per) {
+            let (low,high)=(slice[0].1,slice[slice.len()-1].1+1);
+            let (_,tail)=rest.split_at_mut((low-base)*ROW_BYTES);
+            let (mine,tail)=tail.split_at_mut((high-low)*ROW_BYTES);
+            rest=tail;base=high;
+            jobs.push(scope.spawn(move||->std::io::Result<()> {
+                for &(id,position) in slice {
+                    read(id,&mut mine[(position-low)*ROW_BYTES..(position-low+1)*ROW_BYTES])?;
+                }
+                Ok(())
+            }));
+        }
+        for job in jobs {
+            job.join().map_err(|_|anyhow::anyhow!("Engram miss reader panicked"))?.context("Engram miss read")?;
+        }
+        Ok(())
+    })
+}
+/// CANADA_SCRATCH_ENGRAM_DIRECT=1 (default 0): a row that misses the row cache is read with O_DIRECT (its one or two
+/// 4 KiB blocks, crate::engram_io) instead of through the page cache. Same bytes. A buffered miss allocates a
+/// page-cache page; with the boxes near their memory floor that allocation waits for reclaim, and the step waits
+/// with it (Nov 14: a first-seen answer stepped 2-5 ms longer with four long conversations resident). The
+/// threaded reader (CANADA_SCRATCH_ENGRAM_MISS_THREADS) stays buffered.
+pub(crate) fn direct_reads() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| validate_direct_reads().unwrap_or(false))
+}
+pub(crate) fn validate_direct_reads() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_ENGRAM_DIRECT") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "Engram direct reads: 0 or 1"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+pub(crate) fn validate_miss_threads() -> Result<usize> {
+    match std::env::var("CANADA_SCRATCH_ENGRAM_MISS_THREADS") {
+        Ok(v) => { let n: usize = v.parse()?; ensure!(n == 0 || (2..=64).contains(&n), "Engram miss threads: 0 or 2..=64"); Ok(n) }
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
 const HEADER_BYTES: u64 = 4096;
 const MAGIC: u64 = 0x31344e4531565344;
 const EMPTY: u64 = u64::MAX;
@@ -33,6 +100,8 @@ pub(crate) fn target_cache_bytes() -> Result<usize> {
 
 pub struct PackedShard {
     file: File,
+    /// The same file opened with O_DIRECT (crate::engram::direct_reads), for cache-miss reads through io_uring.
+    direct: Option<File>,
     pub layer: u64,
     pub start: u64,
     pub end: u64,
@@ -64,13 +133,27 @@ impl PackedShard {
             f.metadata()?.len() == HEADER_BYTES + (end - start) * ROW_BYTES as u64,
             "packed Engram truncated or wrong size"
         );
+        #[cfg(target_os = "linux")]
+        let direct = if direct_reads() {
+            use std::os::unix::fs::OpenOptionsExt;
+            Some(std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path)
+                .context("Engram direct reads need O_DIRECT on the shard's file system")?)
+        } else { None };
+        #[cfg(not(target_os = "linux"))]
+        let direct = None;
         Ok(Self {
             file: f,
+            direct,
             layer,
             start,
             end,
             global_rows,
         })
+    }
+    /// The handle for io_uring miss reads and whether it is the O_DIRECT one.
+    #[cfg(target_os = "linux")]
+    fn io(&self) -> (&File, bool) {
+        match &self.direct { Some(file) => (file, true), None => (&self.file, false) }
     }
     fn read(&self, id: u64, out: &mut [u8; ROW_BYTES]) -> Result<bool> {
         ensure!(id < self.global_rows, "Engram hash outside table");
@@ -144,8 +227,64 @@ pub struct RowStore {
     nonowned: AtomicU64,
     prefetch_calls: AtomicU64,
     prefetched_rows: AtomicU64,
+    /// Rows of a read-ahead that was submitted on this store's reader and is not yet in the cache, in submission
+    /// order (`read_ahead_submit`); empty otherwise. Every lookup publishes them before it looks.
+    #[cfg(target_os = "linux")]
+    read_ahead: Mutex<Vec<u64>>,
+    read_ahead_rows: AtomicU64,
 }
 impl RowStore {
+    /// config::engram_anchor_prefetch: request, WITHOUT waiting, the rows of `ids` that this shard owns and the cache
+    /// does not hold. They are read while the caller does other work (the drafter's pass) and are published into
+    /// the cache by the next lookup on this store, which stays authoritative: a row that failed or was evicted
+    /// meanwhile is simply read again there. Immutable row bytes; a speed hint only.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn read_ahead_submit(&self, ids: &[u64]) -> Result<()> {
+        let Some(reader) = &self.io_reader else { return Ok(()); };
+        ensure!(ids.len() <= crate::engram_io::ENTRIES && ids.iter().all(|&id| id < self.shard.global_rows),
+            "Engram read-ahead extent/domain");
+        let mut reader = reader.lock().map_err(|_| anyhow::anyhow!("Engram I/O reader poisoned"))?;
+        self.publish_read_ahead(&mut reader)?;
+        let mut want: Vec<u64> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if id < self.shard.start || id >= self.shard.end || want.contains(&id) { continue; }
+            let cache = self.segments[self.segment(id)].lock().map_err(|_| anyhow::anyhow!("Engram cache poisoned"))?;
+            let start = cache.bucket(id) * WAYS;
+            if !cache.tags[start..start + WAYS].contains(&id) { want.push(id); }
+        }
+        if want.is_empty() { return Ok(()); }
+        let offsets: Vec<u64> = want.iter().map(|id| HEADER_BYTES + (id - self.shard.start) * ROW_BYTES as u64).collect();
+        let (file, direct) = self.shard.io();
+        reader.submit(file, direct, &offsets)?;
+        *self.read_ahead.lock().map_err(|_| anyhow::anyhow!("Engram read-ahead list poisoned"))? = want;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn read_ahead_submit(&self, _ids: &[u64]) -> Result<()> { Ok(()) }
+    /// Publish a submitted read-ahead (waiting for reads still in flight). The caller holds the reader.
+    #[cfg(target_os = "linux")]
+    fn publish_read_ahead(&self, reader: &mut crate::engram_io::Reader) -> Result<()> {
+        let ids = std::mem::take(&mut *self.read_ahead.lock().map_err(|_| anyhow::anyhow!("Engram read-ahead list poisoned"))?);
+        ensure!(ids.is_empty() != reader.has_submitted(), "Engram read-ahead list and reader disagree");
+        if ids.is_empty() { return Ok(()); }
+        if let Some(rows) = reader.finish_submitted()? {
+            ensure!(rows.len() == ids.len() * ROW_BYTES, "Engram read-ahead geometry");
+            for (&id, row) in ids.iter().zip(rows.chunks_exact(ROW_BYTES)) {
+                self.segments[self.segment(id)].lock().map_err(|_| anyhow::anyhow!("Engram cache poisoned"))?
+                    .insert(id, row.try_into().unwrap());
+            }
+            self.read_ahead_rows.fetch_add(ids.len() as u64, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    /// Before any lookup on this store: a pending read-ahead goes into the cache first (and frees the reader).
+    #[cfg(target_os = "linux")]
+    fn drain_read_ahead(&self) -> Result<()> {
+        let Some(reader) = &self.io_reader else { return Ok(()); };
+        if self.read_ahead.lock().map_err(|_| anyhow::anyhow!("Engram read-ahead list poisoned"))?.is_empty() { return Ok(()); }
+        let mut reader = reader.lock().map_err(|_| anyhow::anyhow!("Engram I/O reader poisoned"))?;
+        self.publish_read_ahead(&mut reader)
+    }
     /// Scheduling hint only: inspect immutable-row cache tags without copying
     /// bytes, changing replacement state, or issuing storage reads. A racing
     /// prefetch/eviction may change this hint; the subsequent lookup remains
@@ -181,8 +320,50 @@ impl RowStore {
         #[cfg(target_os = "linux")]
         if uring {
             store.io_reader = Some(Mutex::new(crate::engram_io::Reader::new()?));
+            store.check_direct_reads()?;
+            store.check_read_ahead()?;
         }
         Ok(store)
+    }
+    /// config::engram_anchor_prefetch: before serving, eight rows spread over this shard go through the read-ahead
+    /// path (submit without waiting, publish at the drain) and must be in the cache with the bytes a plain
+    /// positional read returns.
+    #[cfg(target_os = "linux")]
+    fn check_read_ahead(&self) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let (start, end) = (self.shard.start, self.shard.end);
+        if !crate::config::engram_anchor_prefetch() || end == start { return Ok(()); }
+        let span = end - start;
+        let ids: Vec<u64> = (0..8u64).map(|i| start + (span - 1) * i / 7).collect();
+        self.read_ahead_submit(&ids)?;
+        self.drain_read_ahead()?;
+        for id in ids {
+            let (mut got, mut expected) = ([0u8; ROW_BYTES], [0u8; ROW_BYTES]);
+            ensure!(self.segments[self.segment(id)].lock().map_err(|_| anyhow::anyhow!("Engram cache poisoned"))?.find(id, &mut got),
+                "Engram read-ahead did not publish a row");
+            self.shard.file.read_exact_at(&mut expected, HEADER_BYTES + (id - start) * ROW_BYTES as u64)?;
+            ensure!(got == expected, "Engram read-ahead differs from the positional read");
+        }
+        Ok(())
+    }
+    /// With direct reads on: eight rows spread over the shard read both ways must be the same bytes.
+    #[cfg(target_os = "linux")]
+    fn check_direct_reads(&self) -> Result<()> {
+        let (file, direct) = self.shard.io();
+        let (start, end) = (self.shard.start, self.shard.end);
+        if !direct || end == start { return Ok(()); }
+        let span = end - start;
+        let ids: Vec<u64> = (0..8u64).map(|i| start + (span - 1) * i / 7).collect();
+        let offsets: Vec<u64> = ids.iter().map(|id| HEADER_BYTES + (id - start) * ROW_BYTES as u64).collect();
+        let mut reader = self.io_reader.as_ref().context("direct Engram reads need the io_uring reader")?
+            .lock().map_err(|_| anyhow::anyhow!("Engram I/O reader poisoned"))?;
+        let rows = reader.read(file, true, &offsets)?;
+        for (i, offset) in offsets.iter().enumerate() {
+            let mut expected = [0u8; ROW_BYTES];
+            self.shard.file.read_exact_at(&mut expected, *offset)?;
+            ensure!(rows[i * ROW_BYTES..(i + 1) * ROW_BYTES] == expected, "Engram direct read differs from the buffered read");
+        }
+        Ok(())
     }
     fn new_with_pool(shard: PackedShard, budget: usize, pool: bool) -> Result<Self> {
         let stripes = 16;
@@ -223,8 +404,13 @@ impl RowStore {
             nonowned: AtomicU64::new(0),
             prefetch_calls: AtomicU64::new(0),
             prefetched_rows: AtomicU64::new(0),
+            #[cfg(target_os = "linux")]
+            read_ahead: Mutex::new(Vec::new()),
+            read_ahead_rows: AtomicU64::new(0),
         })
     }
+    /// Rows read from storage so far (diagnostic).
+    pub(crate) fn misses(&self) -> u64 { self.misses.load(Ordering::Relaxed) }
     fn segment(&self, id: u64) -> usize {
         let a = id.wrapping_mul(0xd6e8feb86659fd93);
         ((a ^ (a >> 32)) as usize) % self.segments.len()
@@ -393,6 +579,7 @@ impl RowStore {
         out: &mut [u8],
         reader: &Mutex<crate::engram_io::Reader>,
     ) -> Result<()> {
+        self.drain_read_ahead()?;
         let plan=self.find_misses(ids,out)?;
         self.read_misses(&plan,out,reader)?;
         self.complete_lookup(plan,out);
@@ -400,13 +587,33 @@ impl RowStore {
     }
     #[cfg(target_os = "linux")]
     fn read_misses(&self,plan:&Misses,out:&mut[u8],reader:&Mutex<crate::engram_io::Reader>)->Result<()> {
+        let threads=miss_threads();
+        if threads>0 && plan.rows.len()>=4*threads {
+            return self.read_misses_threaded(plan,out,threads);
+        }
         if !plan.rows.is_empty() {
             let mut reader=reader.lock().map_err(|_|anyhow::anyhow!("Engram I/O reader poisoned"))?;
             for batch in plan.rows.chunks(crate::engram_io::ENTRIES) {
                 let offsets=self.offsets(batch);
-                let rows=reader.read(&self.shard.file,&offsets)?;
+                let (file,direct)=self.shard.io();
+                let rows=reader.read(file,direct,&offsets)?;
                 self.publish_misses(batch,rows,out)?;
             }
+        }
+        Ok(())
+    }
+    /// CANADA_SCRATCH_ENGRAM_MISS_THREADS: the misses of one lookup read by scoped threads of positional reads.
+    /// The same immutable row bytes as the io_uring batches; only the I/O concurrency differs.
+    #[cfg(target_os = "linux")]
+    fn read_misses_threaded(&self,plan:&Misses,out:&mut[u8],threads:usize)->Result<()> {
+        use std::os::unix::fs::FileExt;
+        let (file,start)=(&self.shard.file,self.shard.start);
+        read_rows_threaded(&plan.rows,out,threads,&|id,row|file.read_exact_at(row,HEADER_BYTES+(id-start)*ROW_BYTES as u64))?;
+        for &(id,position) in &plan.rows {
+            let row:&[u8;ROW_BYTES]=out[position*ROW_BYTES..(position+1)*ROW_BYTES].try_into().unwrap();
+            self.segments[self.segment(id)].lock()
+                .map_err(|_|anyhow::anyhow!("Engram cache poisoned"))?
+                .insert(id,row);
         }
         Ok(())
     }
@@ -518,11 +725,23 @@ impl RowStore {
     /// submitting both files' misses together, with no transient worker thread.
     #[cfg(target_os = "linux")]
     pub(crate) fn lookup_pair_into(a:&Self,ids_a:&[u64],out_a:&mut[u8],b:&Self,ids_b:&[u64],out_b:&mut[u8])->Result<()> {
+        // Diagnostic (CANADA_SCRATCH_HOST_STAGES=1): how long a paired lookup takes, cache search and reads together.
+        let started = crate::config::host_stages().then(std::time::Instant::now);
+        let result = Self::lookup_pair_into_inner(a,ids_a,out_a,b,ids_b,out_b);
+        if let Some(t) = started {
+            IO_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            IO_STATS[1].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
+    }
+    #[cfg(target_os = "linux")]
+    fn lookup_pair_into_inner(a:&Self,ids_a:&[u64],out_a:&mut[u8],b:&Self,ids_b:&[u64],out_b:&mut[u8])->Result<()> {
         for (store,ids,out) in [(a,ids_a,&*out_a),(b,ids_b,&*out_b)] {
             ensure!(ids.len()<=32*24 && out.len()==ids.len()*ROW_BYTES
                 && ids.iter().all(|&id|id<store.shard.global_rows),"paired Engram input extent/domain");
             ensure!(store.io_reader.is_some(),"paired Engram requires io_uring stores");
         }
+        a.drain_read_ahead()?;b.drain_read_ahead()?;
         let first=a.find_misses(ids_a,out_a)?;
         let second=b.find_misses(ids_b,out_b)?;
         if first.rows.len()+second.rows.len()>crate::engram_io::ENTRIES
@@ -546,7 +765,9 @@ impl RowStore {
                 let nb=(second.rows.len()-j).min(crate::engram_io::ENTRIES-na);
                 let ra=&first.rows[i..i+na];let rb=&second.rows[j..j+nb];
                 let oa=a.offsets(ra);let ob=b.offsets(rb);
-                let rows=reader.read_pair(&a.shard.file,&oa,&b.shard.file,&ob)?;
+                let ((file_a,direct_a),(file_b,direct_b))=(a.shard.io(),b.shard.io());
+                ensure!(direct_a==direct_b,"paired Engram stores differ in read mode");
+                let rows=reader.read_pair(file_a,&oa,file_b,&ob,direct_a)?;
                 a.publish_misses(ra,&rows[..na*ROW_BYTES],out_a)?;
                 b.publish_misses(rb,&rows[na*ROW_BYTES..],out_b)?;
                 i+=na;j+=nb;
@@ -568,6 +789,7 @@ impl RowStore {
             "persistent_io_workers":self.io_pool.as_ref().map_or(0,|p|p.current_num_threads()),
             "resident_bytes":self.resident_bytes,"zero_pages_committed_at_creation":true,"hits":self.hits.load(Ordering::Relaxed),
             "misses":self.misses.load(Ordering::Relaxed),"nonowned":self.nonowned.load(Ordering::Relaxed),
+            "read_ahead_rows":self.read_ahead_rows.load(Ordering::Relaxed),
             "prefetch_calls":self.prefetch_calls.load(Ordering::Relaxed),
             "prefetched_rows":self.prefetched_rows.load(Ordering::Relaxed)})
     }
@@ -575,6 +797,31 @@ impl RowStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn threaded_miss_reads_fill_exactly_their_rows() {
+        for (count,threads) in [(1usize,2usize),(5,2),(64,3),(257,64),(1000,64),(1000,7)] {
+            // every third position is a miss; the others must stay untouched
+            let rows:Vec<(u64,usize)>=(0..count).map(|i|(1_000+7*i as u64,3*i+1)).collect();
+            let mut out=vec![0xEEu8;(3*count+2)*ROW_BYTES];
+            super::read_rows_threaded(&rows,&mut out,threads,&|id,row|{
+                for (j,b) in row.iter_mut().enumerate() {*b=(id as usize+j) as u8;}
+                Ok(())
+            }).unwrap();
+            for (position,row) in out.chunks_exact(ROW_BYTES).enumerate() {
+                match rows.iter().find(|r|r.1==position) {
+                    Some(&(id,_))=>assert!(row.iter().enumerate().all(|(j,b)|*b==(id as usize+j) as u8),"row {position}"),
+                    None=>assert!(row.iter().all(|b|*b==0xEE),"untouched row {position}"),
+                }
+            }
+        }
+        // positions out of order are refused; a failing read is reported
+        let mut out=vec![0u8;4*ROW_BYTES];
+        assert!(super::read_rows_threaded(&[(1,2),(2,1)],&mut out,2,&|_,_|Ok(())).is_err());
+        assert!(super::read_rows_threaded(&[(1,0),(2,1)],&mut out,2,&|id,_|if id==2 {
+            Err(std::io::Error::other("short"))} else {Ok(())}).is_err());
+        assert!(super::read_rows_threaded(&[(1,4)],&mut out,2,&|_,_|Ok(())).is_err());
+    }
+
     use super::*;
     use std::io::Write;
     #[cfg(target_os = "linux")]
@@ -640,13 +887,14 @@ mod tests {
                 reader
                     .read(
                         &store.shard.file,
+                        false,
                         &[HEADER_BYTES, HEADER_BYTES + 1023 * ROW_BYTES as u64]
                     )
                     .is_err()
             );
             // A short read still consumes every CQE and allows safe reuse.
             let rows = reader
-                .read(&store.shard.file, &[HEADER_BYTES, HEADER_BYTES])
+                .read(&store.shard.file, false, &[HEADER_BYTES, HEADER_BYTES])
                 .unwrap();
             for row in rows.chunks_exact(ROW_BYTES) {
                 assert!(row.iter().enumerate().all(|(j, &b)| b == (j % 251) as u8));

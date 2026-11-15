@@ -278,6 +278,8 @@ pub struct KeyCache {
     capacity: usize,
     data: Rc<Buffer<u8>>,
     stream: Rc<Cell<usize>>,
+    /// config::index_fork: one more stream that may read this cache (see admit_follower).
+    follower: Rc<Cell<usize>>,
 }
 impl KeyCache {
     pub fn new(
@@ -319,6 +321,7 @@ impl KeyCache {
             capacity: pages * 64,
             data: Rc::new(data),
             stream: Rc::new(Cell::new(0)),
+            follower: Rc::new(Cell::new(0)),
         })
     }
     pub(crate) fn share_rows(&self, rows: usize) -> Result<Self> {
@@ -334,6 +337,7 @@ impl KeyCache {
             capacity: self.capacity,
             data: self.data.clone(),
             stream: self.stream.clone(),
+            follower: self.follower.clone(),
         })
     }
     pub fn run(&self, input: &Buffer<bf16>, schedule: &Schedule, stream: &Stream) -> Result<()> {
@@ -386,7 +390,18 @@ impl KeyCache {
     }
     pub(crate) fn bind(&self, stream: &Stream) -> Result<()> {
         ensure!(self.cuda.owns_stream(stream), "index cache reader context");
+        if self.follower.get() != 0 && self.follower.get() == stream.raw() as usize { return Ok(()); }
         bind(&self.stream, stream)
+    }
+    /// config::index_fork: admit one side stream as a reader of this cache. Its reads are ordered against the
+    /// cache's writer by the caller's fences (a consuming layer's index work begins after a fence recorded on the
+    /// owner's stream behind source 20's key emission of the step, and is joined inside its own layer).
+    pub(crate) fn admit_follower(&self, stream: &Stream) -> Result<()> {
+        let raw = stream.raw() as usize;
+        ensure!(self.cuda.owns_stream(stream) && raw != self.stream.get() && [0, raw].contains(&self.follower.get()),
+            "index cache follower stream");
+        self.follower.set(raw);
+        Ok(())
     }
     pub(crate) fn upload(&mut self, data: &[u8]) -> Result<()> {
         Rc::get_mut(&mut self.data)
@@ -482,7 +497,14 @@ impl KeyGather {
             Err(std::env::VarError::NotPresent)=>true,
             Err(error)=>return Err(error.into()),
         };
-        let cached=if requested && (query_rows==6 || (query_rows==16 && requested16)) {
+        // The cache keeps one gathered frontier with a six-row dirty suffix before the
+        // largest key range end of a step: it assumes one contiguous growing sequence.
+        // With several screen sessions in one owner only the session in the highest region
+        // would get its new keys gathered, so such an owner gathers without the cache. Serving
+        // regions keep it: their batched steps gather their own key ranges (run_ranges) and every
+        // owner handoff marks the cache dirty, so it only ever serves region 0's ordinary steps.
+        let single_sequence=crate::config::batch_screen_sessions()?==1;
+        let cached=if requested && single_sequence && (query_rows==6 || (query_rows==16 && requested16)) {
             let root=kernels.join(if query_rows==16 {"index-gather-cached16-v1"}else{"index-gather-cached-v1"});
             let manifest:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
             let raw=std::fs::read(root.join("gather.cubin"))?;
@@ -542,6 +564,57 @@ impl KeyGather {
         stream: &Stream,
     ) -> Result<()> {
         self.run_with_bound(cache, slots, output, None, stream)
+    }
+    /// Region steps (batched serving): gather only the key rows inside some query's [start, end)
+    /// (whole 128-row tiles), not every row below the last end.
+    pub(crate) fn run_ranges(&self, cache: &KeyCache, slots: &KeySlots, output: &crate::mqa::KeyMatrix,
+        starts: &Buffer<i32>, ends: &Buffer<i32>, stream: &Stream) -> Result<()> {
+        ensure!(starts.len() == ends.len() && (1..=32).contains(&ends.len())
+            && self.cuda.owns_buffer(starts) && self.cuda.owns_buffer(ends)
+            && slots.capacity == cache.capacity && slots.rows == output.rows()
+            && self.cuda.owns_buffer(cache.data()) && self.cuda.owns_buffer(&slots.values)
+            && self.cuda.owns_buffer(&output.payload) && self.cuda.owns_buffer(&output.scales)
+            && self.cuda.owns_stream(stream), "ranged index gather cache/output/context");
+        cache.bind(stream)?;
+        output.bind(stream)?;
+        let (mut source, mut ids) = (cache.data.ptr(), slots.values.ptr());
+        let (mut payload, mut scales) = (output.payload.ptr(), output.scales.ptr());
+        let mut rows = slots.rows as i32;
+        let (mut first, mut last, mut queries) = (starts.ptr(), ends.ptr(), ends.len() as i32);
+        let mut args: Vec<*mut c_void> = vec![
+            (&mut source as *mut u64).cast(), (&mut ids as *mut u64).cast(),
+            (&mut payload as *mut u64).cast(), (&mut scales as *mut u64).cast(),
+            (&mut rows as *mut i32).cast(), (&mut first as *mut u64).cast(),
+            (&mut last as *mut u64).cast(), (&mut queries as *mut i32).cast(),
+        ];
+        // config::region_gather_by_query: the same rows, visited range by range instead of over the ranges' hull.
+        let name = if crate::config::region_gather_by_query() { "ca_gather_index_k_ranges_q" } else { "ca_gather_index_k_ranges" };
+        unsafe { self.module.function(name)?.launch([192, 1, 1], [128, 1, 1], 0, stream, &mut args) }?;
+        output.ready.set(true);
+        Ok(())
+    }
+    /// Diagnostic (CANADA_SCRATCH_REGION_GATHER_CHECK=1, eager only): the key rows of every range
+    /// as gathered incrementally must equal a full gather of the same ranges, which then replaces them.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn check_ranges(&self, cache: &KeyCache, slots: &KeySlots, output: &crate::mqa::KeyMatrix,
+        full_starts: &Buffer<i32>, ends: &Buffer<i32>, ranges: &[(usize, usize)], stream: &Stream) -> Result<()> {
+        ensure!(!crate::config::batched_graphs_requested(), "region gather check needs eager steps");
+        let read = || -> Result<Vec<u8>> {
+            let mut out = Vec::new();
+            for &(s, e) in ranges {
+                ensure!(s <= e && e <= output.rows(), "region gather check range");
+                out.extend(unsafe { self.cuda.read_device(output.payload.ptr() + (s * 64) as u64, (e - s) * 64) }?);
+                out.extend(unsafe { self.cuda.read_device(output.scales.ptr() + (s * 4) as u64, (e - s) * 4) }?);
+            }
+            Ok(out)
+        };
+        stream.synchronize()?;
+        let incremental = read()?;
+        self.run_ranges(cache, slots, output, full_starts, ends, stream)?;
+        stream.synchronize()?;
+        ensure!(incremental == read()?, "incremental region gather diverged from a full gather");
+        crate::config::REGION_GATHER_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
     pub(crate) fn run_with_bound(
         &self,
@@ -635,9 +708,9 @@ impl QueryRows {
         Ok(Self {
             cuda: cuda.clone(),
             rows,
-            payload: cuda.allocate(rows * 32 * 64)?,
-            scales: cuda.allocate(rows * 32)?,
-            weights: cuda.allocate(rows * 32)?,
+            payload: cuda.allocate_chunk_scratch(crate::cuda::ChunkScratch::QueryRows, rows * 32 * 64)?,
+            scales: cuda.allocate_chunk_scratch(crate::cuda::ChunkScratch::QueryRows, rows * 32)?,
+            weights: cuda.allocate_chunk_scratch(crate::cuda::ChunkScratch::QueryRows, rows * 32)?,
             stream: Cell::new(0),
             ready: Cell::new(false),
         })

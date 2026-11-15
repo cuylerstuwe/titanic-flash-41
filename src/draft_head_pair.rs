@@ -3,10 +3,13 @@
 use super::*;
 use crate::cuda::Graph;
 
+/// Captured pairings kept per pooled head: in batched steps an owner's partner changes whenever a
+/// conversation drafts by lookup instead, so each pairing keeps its own graph.
+const PAIR_GRAPHS: usize = 6;
+
 pub(crate) struct Pair {
     // Captured pointers must retire before their backing storage.
-    graph:Option<Graph>,
-    bindings:Option<[u64;6]>,
+    graphs:Vec<([u64;6],Graph)>,
     cuda:Cuda,
     projection:Operator,
     input:Buffer<bf16>,
@@ -35,7 +38,7 @@ impl Pair {
             "paired draft head must use the qualified M10/FP32 operator");
         ensure!(cuda.owns_stream(stream)&&cuda.admission_memory()?.admitted_available
             >=crate::memory::floor_bytes()+2*M*(K*2+N*4),"paired draft head reserve");
-        Ok(Self{graph:None,bindings:None,cuda:cuda.clone(),projection,
+        Ok(Self{graphs:Vec::new(),cuda:cuda.clone(),projection,
             input:cuda.allocate(2*M*K)?,output:cuda.allocate(2*M*N)?,stream:stream.raw()as usize})
     }
     pub(crate) fn run(&mut self,heads:[&DraftHead;2],inputs:[&Buffer<bf16>;2],
@@ -48,12 +51,17 @@ impl Pair {
             "paired head source/context/private output contract");
         let bindings=[inputs[0].ptr(),inputs[1].ptr(),outputs[0].ptr(),outputs[1].ptr(),
             heads[0].weights.ptr(),heads[0].scales.ptr()];
-        if self.bindings!=Some(bindings) {
-            stream.synchronize()?;self.graph=None;
-            self.graph=Some(stream.capture(||self.enqueue(bindings,stream))?);
-            self.bindings=Some(bindings);
-        }
-        unsafe{self.graph.as_ref().expect("bound paired head graph").launch(stream)}
+        let index=match self.graphs.iter().position(|(b,_)|*b==bindings) {
+            Some(index)=>index,
+            None=>{
+                stream.synchronize()?;
+                if self.graphs.len()>=PAIR_GRAPHS {self.graphs.remove(0);}
+                let graph=stream.capture(||self.enqueue(bindings,stream))?;
+                self.graphs.push((bindings,graph));
+                self.graphs.len()-1
+            }
+        };
+        unsafe{self.graphs[index].1.launch(stream)}
     }
     fn enqueue(&self,p:[u64;6],stream:&Stream)->Result<()> {
         unsafe {

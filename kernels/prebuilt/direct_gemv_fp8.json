@@ -1,0 +1,11 @@
+{
+ "artifact": "direct_gemv_fp8.cubin",
+ "sha256": "74ed44cd81993666798a62d032b2ff819f98d4f41a085279692ed3afa4239077",
+ "source": "kernels/direct_gemv_fp8.cu",
+ "source_sha256_at_compile": "e3b872441f8d22e7eb57acc8fb2f2df99db2662bbc2393eadc1cff897c39a7d6",
+ "source_note": "the tree's copy differs from the compiled one in one comment line (where the license notice is kept)",
+ "command": "nvcc --cubin -gencode arch=compute_121a,code=sm_121a --std=c++17 -O3 direct_gemv_fp8.cu",
+ "built": "2026-11-13 on the head in the engine image (component job 11777c1, directgemv/run1); the pinned build script compiles core.cu and vision.cu only (-arch=sm_121), and the block-scaled MMA needs compute_121a",
+ "license": "adapted from pico-dgx-ds4 (MIT, Copyright (c) 2026 Andy Shu); notice in licenses/pico-dgx-ds4-MIT.txt",
+ "component_check": "wq_b and wo_b shapes, 2 and 6 rows: 99.994-100 % of outputs equal the BF16 rounding of a float64 reference, largest error 1 BF16 step; cold 235-247 GB/s"
+}

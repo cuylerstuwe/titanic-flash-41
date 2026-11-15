@@ -287,7 +287,29 @@ pub(crate) struct Job {
     _background_permit: Option<OwnedSemaphorePermit>,
     _execution_permit: Option<OwnedSemaphorePermit>,
 }
+/// A second handle on one job's ordered output (CANADA_SCRATCH_EARLY_FIRST_TOKEN=1): the worker sends Ready and
+/// the first token as soon as every rank agrees on it, before the drafter attaches. Same channel and fail-closed
+/// rule as Job::emit.
+pub(crate) struct EarlyEmitter {
+    output: tokio::sync::mpsc::Sender<BackendEvent>,
+    cancelled: Arc<AtomicBool>,
+}
+impl EarlyEmitter {
+    pub(crate) fn emit(&self, event: BackendEvent) {
+        if self.output.try_send(event).is_err() {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+}
 impl Job {
+    pub(crate) fn early_emitter(&self) -> EarlyEmitter {
+        EarlyEmitter { output: self.output.clone(), cancelled: self.cancelled.clone() }
+    }
+    /// Positions this request can reach: its prompt and its whole token limit (a bound from before its start;
+    /// the token list itself moves to the worker when the request starts).
+    pub(crate) fn extent(&self) -> usize {
+        self.prompt_tokens.max(self.tokens.len()).saturating_add(self.limit)
+    }
     /// Transitions only: no timer, lock or notification on an unchanged step.
     pub(crate) fn set_executing(&self, executing: bool) {
         if self.executing.replace(executing) != executing {

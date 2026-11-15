@@ -1,5 +1,124 @@
 # Validation status
 
+## November 15 decode, checkpoint and concurrency release (s1585)
+
+s1585 is s1399 with the work of November 10-14 enabled in native production: five settings changed, 58 added, and
+twelve encoder widths instead of five. The [operations guide](OPERATIONS.md#november-15-release-settings) lists
+every setting by what it does. In short:
+
+- **Decode.** Paced L2 prefetch hints for the expert weights, a native front end for the routed experts, direct
+  QKV-A reads, a three-threshold draft ladder (two to six verified rows a step), and the drafter's vocabulary head
+  in 4 bits over a script subset.
+- **Checkpoints.** Conversations shorter than 8,192 tokens and system prompts shared by several conversations get
+  reusable checkpoints; a checkpoint is taken near the end of every prompt; a long message that changed only at
+  its end keeps the token ids of its unchanged prefix; the first token is sent before the prompt image is saved.
+- **Memory.** A 7 GiB shared image budget with a 6 GiB session cache (4 GiB effective before), right-sized encoder
+  arenas, and table rows read with `O_DIRECT` instead of through the page cache.
+- **Several conversations at once.** Up to four are admitted (two before). Conversations whose prompt and token
+  limit fit one serving region decode in the same steps; the others take turns through paused images.
+
+No weight, sampler, memory floor or clock policy changes. The model's own output head is unchanged; a 4-bit variant
+exists as an option and is off. The portable profile is unchanged.
+
+**Numerics.** The quality bar is the reference itself, not bit-equality with s1399. Most settings change which rows
+a kernel reads or when work is launched and leave results bit-identical; direct QKV-A uses another summation
+order; the drafter's head changes proposals only, and every draft is verified against the unchanged target.
+- **Model.** The release build with the release settings, teacher-forced against the reference forward on 2,499
+  positions of a 7,203-token text:
+  - The divergence is 0.0093 nats per token (95% CI 0.0081-0.0106), median 0.0033. Top-1 agreement is 96.0%, with
+    no clear flips.
+  - The reference with its sums reordered (the split-K yardstick) diverges from itself by 0.0095 on the same
+    positions.
+  - The difference has a 95% CI of [-0.0010, +0.0004]: s1585 is inside the reference's own summation noise.
+
+**Speed against s1399, one boot.** The four machines were restarted once. Production's settings ran first, as the
+first loads of the boot; the release build ran as later loads of the same boot, which read up to 1-2.5% slower than
+a first load. Temperature 1, top-p 1, no top-k, reasoning high; every decode cell is a new turn of 512 tokens;
+client-side timing. The single-conversation cells were measured on the build before the last scheduler change
+(the same decode code); the cells with several conversations on s1585 itself.
+
+- **Decode, tokens/s, ten seeds:**
+
+  | New turn | s1399 | Release build | After a 128K document | s1399 | Release build |
+  |---|---|---|---|---|---|
+  | Prose | 65.8 | 71.6 | Prose | 66.2 | 73.2 |
+  | Code | 88.2 | 94.4 | Code | 88.6 | 93.4 |
+  | Agentic | 85.3 | 92.4 | Agentic | 93.3 | 101.5 |
+  | JSON | 94.3 | 102.1 | JSON | 90.2 | 98.9 |
+
+- **Prose after a document of each length, five seeds** (tokens/s; first token of the new turn):
+
+  | Document | s1399 | Release build | s1399 first token | Release build first token |
+  |---|---|---|---|---|
+  | 4K | 66.1 | 72.3 | 0.65 s | 0.24 s |
+  | 16K | 65.6 | 72.0 | 0.26 s | 0.24 s |
+  | 64K | 66.4 | 72.5 | 0.30 s | 0.27 s |
+  | 256K | 65.9 | 74.9 | 0.46 s | 0.27 s |
+  | 512K | 66.2 | 71.8 | 0.81 s | 0.33 s |
+  | 900K | 68.3 | 75.7 | 1.13 s | 0.41 s |
+
+  The 4K row is the short-conversation checkpoint; the long rows are the reused token ids.
+- **Tool loop** (ten turns after a 16K and a 200K document): first tokens are equal, 163-274 ms against 167-274 ms.
+- **Appended file excerpts** of 600-7,842 tokens on a 16K conversation: the first token arrives 122-232 ms earlier
+  at every size (mean 513 ms against 691 ms).
+- **Cold prompts.** A 16K prompt prefills at 7,480 tokens/s against 5,630. Long cold prompts are unchanged: 482K
+  tokens in 54.6 s against 54.1 s, 837K in 98.5 s against 98.2 s.
+- **Several conversations, small token limit** (384 tokens; they share decode steps), aggregate tokens/s at one to
+  four conversations: 81.8, 115.5, 132.9, 122.2 against 77.6, 79.0, 78.9, 84.0. In the four-conversation run one
+  conversation was prefilled again (see the eviction note below).
+- **Several conversations, token limit 262,144** (as agent harnesses that send the model's maximum do; they take
+  turns in both builds): 86.9, 92.1, 94.7, 94.0 against 79.9, 83.9, 83.6, 87.3. The longest wait for a first token
+  was 0.16, 0.56, 1.06 and 12.8 s against 0.23, 0.72, 17.2 and 21.5 s.
+- **Follow-up turns after three conversations took turns:** all three reused their prompt (none did before);
+  first tokens 0.19, 0.85 and 0.51 s against 4.48, 0.82 and 1.85 s.
+
+**Residency.** Four conversations of about 980K tokens took turns for three rounds under the release budgets. All
+eight return turns were served from the cache, with a median time to first token of 0.38 s. Lowest available memory
+was 10.6 GiB.
+
+**Known behavior that differs from s1399.**
+- With three or four conversations that take turns, the first two stay paused while the later ones run to their
+  end; s1399 ran them as FIFO pairs. Total time and the longest wait for a first token are better; an early
+  conversation can finish later.
+- Many different follow-ups to one prompt each save a checkpoint. Once the 16 cache entries are full they can push
+  out a conversation that stayed idle meanwhile, which is then prefilled again when it returns (2.2 s for 15K
+  tokens in the stream benchmark above; s1399, with one coarser checkpoint per prompt, kept it).
+- With batched decode on, a foreground request that cannot pause a background request waits for it instead of
+  getting a capacity error.
+
+**Qualification of s1585, all release settings on:**
+- **Stress panel.** It passed: 70 requests reaching 974,076 prompt tokens. Lowest available memory was 9.79 GiB.
+  The hottest device read 90.4°C, with about 8 s at or above 90°C. There were no `allocation_failure` lines and no
+  driver messages.
+- **Several-conversations panel.** It passed: 17 synthetic conversations, each with its own planted code words;
+  every answer named its own and none of another conversation's, through a paused image conversation resumed
+  beside a moved request, five conversations for four regions, and a 296,940-token conversation arriving while
+  two short ones shared steps.
+- **Near-1M cancellation check** and **serving gate.** Both passed; every tool turn had the expected tool-call
+  behavior, and cancel/resume worked.
+- **Other checks.** The native Arm64 build passed 258 CPU tests, and ten installation interruption and rollback
+  fixtures passed.
+
+**Installation.** s1585 was installed in one journaled transaction that falls back to s1399. The first attempt
+stopped in its own preflight and was rolled back by the journal: the list of pinned kernel files had grown past
+what the service passes to each machine in one argument. The release now pins the kernel files the build opens,
+not every file beside them.
+
+**Activation.** It was activated on fresh boots with one production model load per device.
+- A head-local smoke test passed text, prompt reuse, continuation, image input and text after an image.
+- **First load against first load.** The decode grid above ran as the live service's first requests: 72.1 tokens/s
+  for prose, 94.8 for code, 92.7 for agentic text and 102.8 for JSON; after a 128K document 73.0, 94.9, 102.8 and
+  98.2. s1399 on the first load after its own restart: 65.8, 88.2, 85.3 and 94.3; 66.2, 88.6, 93.3 and 90.2. Every
+  cell is 7-10% faster. First tokens of those new turns took 151-163 ms against 160-174 ms, and 261-273 ms against
+  362-371 ms after the document.
+- **Prose after 4K-900K documents**, later on the same load (s1399's was the first pass of a load, which reads
+  slower): 73.3, 73.5, 75.4, 77.4, 73.3 and 75.7 tokens/s against 66.1, 65.6, 66.4, 65.9, 66.2 and 68.3.
+- **Cold prompts on those loads**, time to the first token: 3.65K tokens 0.71 s against 0.87 s; 31K 3.52 against
+  3.95; 59K 6.70 against 6.84; 233K 25.7 against 25.8; 482K 54.2 against 54.1; 837K 98.1 against 98.2.
+- Runtime hashes, clocks, APST guards and health checks passed, and the reservation was released.
+
+See the [sanitized qualification record](../validation/decode-checkpoints-concurrency-2026-11-15.json).
+
 ## November 10 cache-format and attention release (s1399)
 
 s1399 is s1394 plus two options, both enabled in native production, and one test-only setting:

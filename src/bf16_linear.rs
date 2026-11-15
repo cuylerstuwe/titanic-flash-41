@@ -215,6 +215,9 @@ impl<T: Output> Projection<T> {
         self.head_gemv_active.set(active);
         Ok(())
     }
+    /// Plan screen: forget the ordered stream so the next run may bind another one. The caller has synchronized
+    /// every stream this projection ran on.
+    pub(crate) fn rebind_stream_for_probe(&self) { self.stream.set(0); }
     pub fn run(&self, input: &Buffer<bf16>, stream: &Stream) -> Result<()> {
         ensure!(
             self.cuda.owns_buffer(input)

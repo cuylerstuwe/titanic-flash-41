@@ -89,8 +89,53 @@ fn write_frame(stream: &mut impl Write, kind: u8, sequence: u64, body: &[u8]) ->
     Ok(())
 }
 
-fn read_frame(stream: &mut impl Read, kind: u8, sequence: u64, bound: usize) -> Result<Vec<u8>> {
+/// Wait for the next control frame without sleeping (CANADA_SCRATCH_CONTROL_SPIN_US=N, 0-20000; default 0). A
+/// blocking read puts the thread to sleep once the kernel's busy-poll budget (500 us) is spent; the box's cores
+/// then drop into idle states with exit latencies of 231 and 433 us, and the frame that starts the next step is
+/// acted on that much later on this rank while every other rank waits at its first collective. With a budget the
+/// receive first polls the socket from user space (peek, no wait) for up to N microseconds, then blocks as before.
+/// Framing, sequence and failure semantics are the blocking read's.
+pub(crate) fn control_spin_us() -> u64 {
+    static BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| validate_control_spin_us().unwrap_or(0))
+}
+pub(crate) fn validate_control_spin_us() -> Result<u64> {
+    parse_control_spin(std::env::var("CANADA_SCRATCH_CONTROL_SPIN_US").ok().as_deref())
+}
+fn parse_control_spin(value: Option<&str>) -> Result<u64> {
+    let Some(value) = value else { return Ok(0) };
+    let micros: u64 = value.parse()?;
+    ensure!(micros <= 20_000, "CANADA_SCRATCH_CONTROL_SPIN_US must be at most 20000");
+    Ok(micros)
+}
+pub(crate) trait FrameSource: Read {
+    fn spin_until_readable(&self) {}
+}
+impl<T> FrameSource for std::io::Cursor<T> where std::io::Cursor<T>: Read {}
+impl FrameSource for TcpStream {
+    fn spin_until_readable(&self) {
+        let budget = control_spin_us();
+        if budget == 0 { return; }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let (fd, until, mut byte) = (self.as_raw_fd(), Instant::now() + Duration::from_micros(budget), 0u8);
+            loop {
+                // One byte peeked without waiting: data (or the peer's close) ends the spin; the blocking read
+                // below then returns at once (or reports the close as it always did).
+                let n = unsafe { libc::recv(fd, (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+                if n != -1 { return; }
+                let error = std::io::Error::last_os_error().raw_os_error();
+                if !matches!(error, Some(libc::EAGAIN) | Some(libc::EINTR)) || Instant::now() >= until { return; }
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+fn read_frame(stream: &mut impl FrameSource, kind: u8, sequence: u64, bound: usize) -> Result<Vec<u8>> {
     let mut header = [0; 21];
+    stream.spin_until_readable();
     stream.read_exact(&mut header)?;
     ensure!(
         &header[..8] == MAGIC
@@ -375,6 +420,14 @@ impl ControlChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn control_spin_budget_is_bounded() {
+        assert_eq!(parse_control_spin(None).unwrap(), 0);
+        assert_eq!(parse_control_spin(Some("0")).unwrap(), 0);
+        assert_eq!(parse_control_spin(Some("5000")).unwrap(), 5000);
+        assert_eq!(parse_control_spin(Some("20000")).unwrap(), 20000);
+        for bad in ["20001", "-1", "x", ""] { assert!(parse_control_spin(Some(bad)).is_err(), "{bad}"); }
+    }
     #[test]
     fn kernel_poll_budget_is_explicit_and_bounded() {
         assert_eq!(parse_kernel_poll(None).unwrap(),0);

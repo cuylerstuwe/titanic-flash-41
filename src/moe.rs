@@ -113,6 +113,12 @@ impl Expert {
         crate::l2_prefetch::Window::new_expert(cuda,module,stream,self.weights.clone(),&regions)
     }
     pub(crate) fn layout_layer(&self) -> usize { self.layout.layer }
+    /// The layer's contiguous up/gate expert weights and their owner, for the routed L2 window.
+    pub(crate) fn routed_hint_region(&self) -> Result<(Rc<Weights>, (u64, usize))> {
+        ensure!((self.layout.experts, self.layout.hidden, self.layout.intermediate) == (384, 5120, 576),
+            "routed L2 window covers the target's experts");
+        Ok((self.weights.clone(), self.region("w13")?))
+    }
     pub(crate) fn same_layer_weights(&self,other:&Self)->bool {
         self.layout.layer==other.layout.layer && Rc::ptr_eq(&self.weights,&other.weights)
     }
@@ -146,6 +152,84 @@ impl Expert {
         Ok((self.weights.pointer_at(offset, bytes)?, bytes))
     }
 }
+/// CANADA_SCRATCH_MOE_CACHE_CA_MIN_LIVE / CANADA_SCRATCH_MOE_FUSED_SUM_MIN_LIVE (2..=6, default 6): see Workspace.
+fn live_variant_floor(name: &str) -> Result<usize> {
+    match std::env::var(name) {
+        Ok(v) => { let n = v.parse::<usize>()?; ensure!((2..=6).contains(&n), "{name} must be 2..=6"); Ok(n) }
+        Err(std::env::VarError::NotPresent) => Ok(6),
+        Err(e) => Err(e.into()),
+    }
+}
+thread_local! {
+    /// ca_moe_frontend of the core module (kept loaded here) and whether captures replace the exported
+    /// front-end's node by it (config::moe_native_front, or a plan screen's arm).
+    static NATIVE_FRONT: std::cell::RefCell<Option<(crate::cuda::Module, usize)>> = const { std::cell::RefCell::new(None) };
+    static NATIVE_FRONT_ON: Cell<bool> = const { Cell::new(false) };
+    /// ca_moe_route_frontend (the front-end with the router's top-k in its first block), whether captures use it
+    /// (config::moe_route_front, or a plan screen's arm), and the routing operands a router left for the
+    /// front-end node of the launch that follows it.
+    static ROUTE_FRONT: Cell<usize> = const { Cell::new(0) };
+    static ROUTE_FRONT_ON: Cell<bool> = const { Cell::new(false) };
+    static ROUTE_OPERANDS: Cell<Option<RouteOperands>> = const { Cell::new(None) };
+    static ROUTE_PLACED: Cell<usize> = const { Cell::new(0) };
+}
+/// What the router's top-k reads and writes: the gate's logits [owner rows x 384], the two biases, the rows'
+/// token ids (i64), the live row count, the padding sources (0: none), and the ids / weights it must leave.
+#[derive(Clone, Copy)]
+pub(crate) struct RouteOperands {
+    pub logits: u64, pub bias: u64, pub bias_alt: u64, pub tokens: u64, pub live: u64, pub padding: u64,
+    pub ids: u64, pub weights: u64, pub owner_rows: usize,
+}
+/// Whether a router may leave its top-k to the front-end node of the experts' launch that follows on this thread.
+pub(crate) fn route_front_ready() -> bool {
+    crate::cuda::capturing() && ROUTE_FRONT_ON.with(Cell::get) && ROUTE_FRONT.with(Cell::get) != 0 && native_front().is_some()
+}
+/// The router's operands for the next front-end node (the caller checked `route_front_ready` and the workspace's
+/// `route_front_admits`, launched the gate product, and launches no routing kernel).
+pub(crate) fn offer_route(operands: RouteOperands) -> Result<()> {
+    ensure!(route_front_ready() && ROUTE_OPERANDS.with(|r| r.replace(Some(operands))).is_none(), "fused routing offered twice");
+    Ok(())
+}
+/// After the experts' launch: the offered routing must have been placed in its front-end node (fails closed).
+pub(crate) fn route_taken() -> Result<()> {
+    ensure!(ROUTE_OPERANDS.with(|r| r.take()).is_none(), "fused routing was not placed in the experts' front-end");
+    Ok(())
+}
+/// Front-end nodes that took the routing since the last call (screens).
+pub(crate) fn route_placed() -> usize { ROUTE_PLACED.with(|n| n.replace(0)) }
+/// Plan screen: fused routing on or off for graphs captured from now on (the caller drops its graphs).
+pub(crate) fn set_route_front_for_probe(on: bool) -> Result<()> {
+    ensure!(crate::config::moe_route_front_screen() && ROUTE_FRONT.with(Cell::get) != 0, "fused routing screen admission");
+    ROUTE_FRONT_ON.with(|flag| flag.set(on));
+    Ok(())
+}
+/// Make the native front-end available to this thread's captures; on when configured. Idempotent.
+pub(crate) fn install_native_front(core: &crate::cuda::Module) -> Result<()> {
+    if !(crate::config::moe_native_front() || crate::config::moe_native_front_screen()) { return Ok(()); }
+    if NATIVE_FRONT.with(|f| f.borrow().is_some()) { return Ok(()); }
+    let handle = core.function("ca_moe_frontend")?.handle();
+    NATIVE_FRONT.with(|f| *f.borrow_mut() = Some((core.clone(), handle)));
+    NATIVE_FRONT_ON.with(|on| on.set(crate::config::moe_native_front()));
+    if crate::config::moe_route_front() || crate::config::moe_route_front_screen() {
+        ensure!(crate::config::moe_native_front() || crate::config::moe_native_front_screen(),
+            "fused routing needs the native expert front-end");
+        ROUTE_FRONT.with(|f| -> Result<()> { f.set(core.function("ca_moe_route_frontend")?.handle()); Ok(()) })?;
+        ROUTE_FRONT_ON.with(|on| on.set(crate::config::moe_route_front()));
+    }
+    Ok(())
+}
+/// Plan screen: the native front-end on or off for graphs captured from now on (the caller drops its graphs).
+pub(crate) fn set_native_front_for_probe(on: bool) -> Result<()> {
+    ensure!(crate::config::moe_native_front_screen() && NATIVE_FRONT.with(|f| f.borrow().is_some()),
+        "native expert front-end screen admission");
+    NATIVE_FRONT_ON.with(|flag| flag.set(on));
+    Ok(())
+}
+pub(crate) fn native_front_enabled() -> bool { NATIVE_FRONT_ON.with(Cell::get) }
+fn native_front() -> Option<usize> {
+    if !NATIVE_FRONT_ON.with(Cell::get) { return None; }
+    NATIVE_FRONT.with(|f| f.borrow().as_ref().map(|(_, handle)| *handle))
+}
 pub struct Workspace {
     cuda: Cuda,
     primitives: Primitives,
@@ -167,6 +251,13 @@ pub struct Workspace {
     late_fc_pdl_enabled: Cell<bool>,
     cache_ca: Option<PackedInput>,
     cache_ca_enabled: Cell<bool>,
+    /// Fewest live rows (2..=6) at which the six-row owner takes its cache-ca plan / hands the FFN a fused sum.
+    /// Both were qualified at six live rows only (default 6); steps of 2, 4 and 5 rows run the plain plan.
+    cache_ca_min_live: Cell<usize>,
+    fuse_min_live: Cell<usize>,
+    /// CANADA_SCRATCH_MOE_FC_PDL_OTHER_LIVES=1 (default off): the FC PDL plan the three-row steps use (mode 3) also at
+    /// 2, 4 and 5 live rows. It precedes the cache-ca plan in the selection.
+    fc_pdl_other_lives: Cell<bool>,
     cooperative_epilogues: [Option<PackedInput>; 2],
     // 0: original; 1: six-row shared quad; 2: both experimental variants.
     // s1285 retained only the six-row variant; three-row register conversion lost.
@@ -195,16 +286,61 @@ impl Workspace {
             "sequential MoE scratch experiment admission");
         Self::new_in(cuda,root,donor,true)
     }
+    /// The drafter's 16-row contract run at `rows` (10 or 15: the five-row blocks of two or three conversations
+    /// in one pass, CANADA_SCRATCH_BATCHED_DRAFT_BODY). As for a flex width only the token counts change; the
+    /// capacity scalars and the scratch layout stay the 16-row contract's.
+    pub(crate) fn new_draft_rows(cuda:&Cuda,root:&Path,rows:usize)->Result<Self> {
+        ensure!(crate::config::batched_draft_body()&&[10,15].contains(&rows),"batched drafter expert rows");
+        Self::new_with(cuda,root,None,false,Some(rows))
+    }
     fn new_in(cuda:&Cuda,root:&Path,donor:Option<&Self>,sequential:bool)->Result<Self> {
-        let c: Contract =
+        Self::new_with(cuda,root,donor,sequential,None)
+    }
+    fn new_with(cuda:&Cuda,root:&Path,donor:Option<&Self>,sequential:bool,draft_rows:Option<usize>)->Result<Self> {
+        // A flex encoder width runs the 8192-row contract (config::resolve_flex_bundle).
+        let (flex_root, flex_rows) = crate::config::resolve_flex_bundle(root)?;
+        let root = flex_root.as_path();
+        let mut c: Contract =
             serde_json::from_slice(&std::fs::read(root.join("runtime-contract.json"))?)?;
+        if let Some(rows) = flex_rows {
+            // Same rule as the qualified live-row bounds: the kernels take the
+            // token count at launch, while the capacity scalars (max_rows,
+            // rows_padded, task and tile bounds) and the scratch layout stay the
+            // 8192-row contract's, which cover any smaller count. The logical
+            // rows become the flex width, so operands and the output are sized
+            // to it and a width change clears the shared scratch.
+            ensure!(sequential && c.rows == 8192 && rows < c.rows && rows % 128 == 0
+                && c.kernel_library_sha256 == "4de5f4062e986b6a555130d09d7dc9b02ed9611dc71469a2ac5cbd35bd5489fb"
+                && c.nodes.iter().map(|n| n.kernel_id.as_str()).eq(["integration.tp_moe.dynamic", "moe.w4a16.topk_sum"]),
+                "flex width expert contract");
+            c.rows = rows;
+            for node in &mut c.nodes {
+                let key = if node.kernel_id == "integration.tp_moe.dynamic" { "num_tokens" } else { "active_m" };
+                let value = node.scalars.get_mut(key).context("flex width expert scalar")?;
+                ensure!(*value == 8192, "flex width expert scalar capacity");
+                *value = rows as i32;
+            }
+        }
+        if let Some(rows) = draft_rows {
+            ensure!(flex_rows.is_none() && !sequential && (c.experts, c.topk, c.rows) == (128, 3, 16) && rows < c.rows
+                && c.kernel_library_sha256 == "694bd48e262fe00c77683274e953ee7fe2b4eaef6b8d58023ab8930ab687cafd"
+                && c.nodes.iter().map(|n| n.kernel_id.as_str()).eq(["integration.tp_moe.dynamic", "moe.w4a16.topk_sum"]),
+                "batched drafter expert contract");
+            c.rows = rows;
+            for node in &mut c.nodes {
+                let key = if node.kernel_id == "integration.tp_moe.dynamic" { "num_tokens" } else { "active_m" };
+                let value = node.scalars.get_mut(key).context("batched drafter expert scalar")?;
+                ensure!(*value == 16, "batched drafter expert scalar capacity");
+                *value = rows as i32;
+            }
+        }
         ensure!(c.input_format.is_none(), "BF16 MoE workspace cannot consume a packed-input contract");
         ensure!(
             c.abi == 1
                 && c.hidden == 5120
                 && c.intermediate == 576
                 && (((c.experts, c.topk) == (384, 6) && crate::config::target_rows(c.rows))
-                    || ((c.experts, c.topk, c.rows) == (128, 3, 5)))
+                    || ((c.experts, c.topk) == (128, 3) && (c.rows == 5 || draft_rows == Some(c.rows))))
                 && c.deterministic
                 && c.swiglu_limit == 10.,
             "unsupported MoE precision/geometry contract"
@@ -302,7 +438,7 @@ impl Workspace {
         };
         let mut ones = cuda.allocate::<f32>(c.experts)?;
         ones.upload(&vec![1.; c.experts])?;
-        let mut output = cuda.allocate::<bf16>(c.rows * c.hidden)?;
+        let mut output = cuda.allocate_chunk_scratch::<bf16>(crate::cuda::ChunkScratch::MoeOutput, c.rows * c.hidden)?;
         output.zero()?;
         let mut workspace=Self {
             cuda: cuda.clone(),
@@ -325,6 +461,9 @@ impl Workspace {
             late_fc_pdl_enabled: Cell::new(false),
             cache_ca: None,
             cache_ca_enabled: Cell::new(false),
+            cache_ca_min_live: Cell::new(live_variant_floor("CANADA_SCRATCH_MOE_CACHE_CA_MIN_LIVE")?),
+            fuse_min_live: Cell::new(live_variant_floor("CANADA_SCRATCH_MOE_FUSED_SUM_MIN_LIVE")?),
+            fc_pdl_other_lives: Cell::new(std::env::var("CANADA_SCRATCH_MOE_FC_PDL_OTHER_LIVES").as_deref()==Ok("1")),
             cooperative_epilogues: [None, None],
             cooperative_epilogue_mode: Cell::new(0),
             fc_pdl_mode: Cell::new(0),
@@ -364,9 +503,28 @@ impl Workspace {
     /// A second launch plan shares the existing scratch/output allocation.
     /// Packed bytes never enter the ordinary BF16 operand API.
     pub(crate) fn enable_packed(&mut self, root: &Path) -> Result<()> {
-        let c: Contract = serde_json::from_slice(&std::fs::read(root.join("runtime-contract.json"))?)?;
+        // A flex encoder width runs the 8192-row packed contract at its own row count,
+        // exactly as the ordinary contract does (new_in): one packed record per row,
+        // token counts at launch, capacity scalars and scratch layout unchanged. The packed plan is the profile's
+        // full-row bundle (its name carries the profile's rows).
+        let (flex_root, flex_rows) = crate::config::building_wide_profile(self.contract.rows, || crate::config::resolve_flex_bundle(root))?;
+        let root = flex_root.as_path();
+        let mut c: Contract = serde_json::from_slice(&std::fs::read(root.join("runtime-contract.json"))?)?;
+        if let Some(rows) = flex_rows {
+            ensure!(c.rows == 8192 && rows == self.contract.rows && c.input_bytes == c.rows * c.hidden * 37 / 32
+                && c.nodes.iter().map(|n| n.kernel_id.as_str()).eq(["integration.tp_moe.dynamic", "moe.w4a16.topk_sum"]),
+                "flex width packed expert contract");
+            c.rows = rows;
+            c.input_bytes = rows * c.hidden * 37 / 32;
+            for node in &mut c.nodes {
+                let key = if node.kernel_id == "integration.tp_moe.dynamic" { "num_tokens" } else { "active_m" };
+                let value = node.scalars.get_mut(key).context("flex width packed expert scalar")?;
+                ensure!(*value == 8192, "flex width packed expert scalar capacity");
+                *value = rows as i32;
+            }
+        }
         let patch = c.prequantized_input_overlay.as_ref().context("packed MoE provenance absent")?;
-        ensure!(self.packed.is_none() && [8192,16384].contains(&self.contract.rows)
+        ensure!(self.packed.is_none() && crate::config::packed_wide_width(self.contract.rows)
             && c.abi == 1 && (c.rows,c.hidden,c.intermediate,c.experts,c.topk) == (self.contract.rows,5120,576,384,6)
             && c.deterministic && c.swiglu_limit == 10. && c.scratch_initializer == "zero"
             && c.scratch_bytes == self.contract.scratch_bytes && c.scratch_bytes<=self.scratch.len()
@@ -658,6 +816,15 @@ impl Workspace {
             "unqualified MoE cache-ca ABI");
         self.cache_ca=Some(PackedInput{primitives:alternate.primitives,contract:alternate.contract});Ok(())
     }
+    /// Plan screen: the live-row floors of the cache-ca plan and of the fused FFN sum (6 = as qualified).
+    pub(crate) fn set_live_variant_floors_for_probe(&self,cache_ca:usize,fuse:usize,fc_pdl_other:bool,stream:&Stream)->Result<()> {
+        ensure!(self.contract.rows==6&&self.live_bounds&&(2..=6).contains(&cache_ca)&&(2..=6).contains(&fuse)
+            &&(!fc_pdl_other||(self.fc_pdl.is_some()&&self.fc_pdl_mode.get()==3)),"live variant floor screen admission");
+        self.guard_stream(stream)?;self.cache_ca_min_live.set(cache_ca);self.fuse_min_live.set(fuse);
+        self.fc_pdl_other_lives.set(fc_pdl_other);Ok(())
+    }
+    pub(crate) fn live_variant_floors(&self)->(usize,usize,bool){
+        (self.cache_ca_min_live.get(),self.fuse_min_live.get(),self.fc_pdl_other_lives.get())}
     pub(crate) fn set_cache_ca_for_probe(&self,enabled:bool,stream:&Stream)->Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_MOE_CACHE_CA_SCREEN").as_deref()==Ok("1")
             &&self.cache_ca.is_some()&&self.input_address_enabled.get()&&self.live_bounds
@@ -781,12 +948,21 @@ impl Workspace {
     }
     /// Route scratch stays owned by this workspace and its stream. Ordinary
     /// callers still receive the fully reduced output; only LayerFfn may defer.
+    /// Whether a live-row launch of this workspace has the front-end node that can take the router's top-k
+    /// (moe::offer_route): the ordinary plans do; the one-row micro plan has no such node.
+    pub(crate) fn route_front_admits(&self,live:usize)->bool {
+        let has=|w:&Workspace|w.contract.nodes.iter().any(|n|n.kernel_id=="integration.tp_moe.dynamic");
+        self.contract.rows<=16 && self.contract.experts==384 && self.contract.topk==6 && has(self)
+            && live>=1 && live<=self.contract.rows
+            && !(live==1 && self.single_row_micro.is_some())
+            && !(live==3 && self.three_row_task_order.as_ref().is_some_and(|w|!has(w)))
+    }
     pub(crate) fn run_live_for_ffn(&self,expert:&Expert,input:&Buffer<bf16>,ids:&Buffer<i32>,
         routing_weights:&Buffer<f32>,live:usize,fuse_sum:bool,stream:&Stream)->Result<Option<(u64,usize)>> {
         let fuse=fuse_sum && matches!(self.contract.rows,6|16|32)
             // The short M3 model screen lost time despite the component
             // saving. Keep its existing shared-expert overlap schedule.
-            && (self.contract.rows!=6 || live==6)
+            && (self.contract.rows!=6 || live==6 || (live>=self.fuse_min_live.get() && live!=3))
             && !(live==1&&self.single_row_micro.is_some())
             && !(live==3&&self.three_row_task_order.is_some());
         let region=if fuse {Some((self.scratch.ptr()+Self::sum_input_offset(&self.contract)? as u64,
@@ -843,7 +1019,8 @@ impl Workspace {
             let p=self.late_fc_pdl.as_ref().context("late expert FC PDL plan absent")?;
             return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
         }
-        if self.fc_pdl_mode.get()==1 || (self.fc_pdl_mode.get()==3 && live==3) {
+        if self.fc_pdl_mode.get()==1 || (self.fc_pdl_mode.get()==3
+            && (live==3 || (self.fc_pdl_other_lives.get() && matches!(live,2|4|5)))) {
             let p=self.fc_pdl.as_ref().context("expert FC PDL plan absent")?;
             return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
         }
@@ -851,7 +1028,8 @@ impl Workspace {
             let p=self.scale_codes.as_ref().context("expert scale-code plan absent")?;
             return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
         }
-        if self.cache_ca_enabled.get() && self.input_address_enabled.get() && live==6 {
+        if self.cache_ca_enabled.get() && self.input_address_enabled.get()
+            && (live==6 || (live>=self.cache_ca_min_live.get() && live!=3)) {
             let p=self.cache_ca.as_ref().context("expert cache-ca plan absent")?;
             return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
         }
@@ -887,6 +1065,18 @@ impl Workspace {
         let bounded128=c.rows==128 && bounded_rows.is_some();
         let bounded512=c.rows==512 && bounded_rows.is_some();
         let bounded1024=c.rows==1024 && bounded_rows.is_some();
+        // A partial chunk on the 4,096/8,192-row profiles (ordinary or packed plan):
+        // the capacity scalars and scratch layout stay; only the token counts shrink.
+        let bounded_wide=crate::config::partial_wide_width(c.rows) && bounded_rows.is_some();
+        let live=if bounded_wide {
+            let n=bounded_rows.unwrap();
+            ensure!((1..c.rows).contains(&n) && c.nodes.len()==2 && c.nodes.iter().all(|node|match node.kernel_id.as_str() {
+                "integration.tp_moe.dynamic"=>node.scalars.get("num_tokens")==Some(&(c.rows as i32)),
+                "moe.w4a16.topk_sum"=>node.scalars.get("active_m")==Some(&(c.rows as i32)),
+                _=>false,
+            }),"wide live expert contract");
+            n
+        }else{live};
         if bounded128 {
             ensure!(bounded_rows==Some(live) && (17..128).contains(&live)
                 && c.kernel_library_sha256=="7c4cb9ca260c6bdc22cdde9d2690778d404249d0ad6bbb408c5cf407c94ce207"
@@ -978,7 +1168,7 @@ impl Workspace {
                 .i32_scalars
                 .iter()
                 .map(|name| {
-                    if self.live_bounds || bounded128 || bounded512 || bounded1024 {
+                    if self.live_bounds || bounded128 || bounded512 || bounded1024 || bounded_wide {
                         match (node.kernel_id.as_str(),name.as_str()) {
                             ("integration.tp_moe.dynamic","num_tokens")
                             | ("gemm.mxfp8_quant_cute","m")
@@ -991,6 +1181,51 @@ impl Workspace {
                     node.scalars[name]
                 })
                 .collect();
+            // The exported front-end's node of this launch is replaced after the capture (cuda::NodeSwap): decode
+            // owners only, where the front-end's protocol and not its arithmetic is the cost.
+            if node.kernel_id=="integration.tp_moe.dynamic" && c.rows<=16 && crate::cuda::capturing()
+                && let Some(func)=native_front() {
+                let at=|name:&str|->Result<u64> {
+                    let p=node.pointers.get(name).with_context(||format!("expert front-end operand {name}"))?;
+                    let (base,bytes)=roles.get(p.role.as_str()).context("unknown MoE runtime pointer role")?;
+                    ensure!(p.offset<*bytes,"MoE pointer offset outside operand");
+                    Ok(*base+p.offset as u64)
+                };
+                let scalar=|name:&str|->Result<i32> {
+                    let index=entry.i32_scalars.iter().position(|n|n==name)
+                        .with_context(||format!("expert front-end scalar {name}"))?;
+                    Ok(scalars[index])
+                };
+                let (rows,tiles,tasks,padded)=(scalar("num_tokens")?,scalar("max_phys_tiles")?,scalar("max_tasks")?,scalar("rows_padded")?);
+                ensure!(tiles>0 && tasks%tiles==0 && padded==tiles*16 && rows>=1 && rows as usize<=c.rows
+                    && c.rows*c.topk<=128 && c.experts<512 && c.hidden==5120 && input_bytes>=rows as usize*c.hidden*2
+                    && node.pointers.get("a_ptr").is_some_and(|p|p.role=="input"&&p.offset==0),
+                    "native expert front-end domain");
+                let mut pointers=vec![at("a_ptr")?,at("topk_ids_ptr")?,at("topk_weights_ptr")?,at("packed_a_storage_ptr")?,
+                    at("scale_storage_ptr")?,at("token_map_ptr")?,at("token_weights_ptr")?,at("task_expert_ptr")?,
+                    at("task_valid_rows_ptr")?,at("expert_tile_base")?];
+                let mut scalars=vec![rows,c.topk as i32,c.experts as i32,c.hidden as i32,tasks/tiles,16];
+                let mut func=func;
+                let mut grid=(rows as u32*160).div_ceil(512);
+                // A router that left its top-k to this node (ffn::Router::run_products): the first block routes.
+                if let Some(route)=ROUTE_OPERANDS.with(|r|r.take()) {
+                    ensure!(route.ids==pointers[1] && route.weights==pointers[2] && route.owner_rows==c.rows
+                        && c.experts==384 && c.topk==6 && rows as usize<=route.owner_rows && route.logits!=0
+                        && route.bias!=0 && route.bias_alt!=0 && route.tokens!=0 && route.live!=0,
+                        "fused routing domain");
+                    func=ROUTE_FRONT.with(Cell::get);
+                    pointers.extend([route.logits,route.bias,route.bias_alt,route.tokens,route.live,route.padding]);
+                    scalars.push(route.owner_rows as i32);
+                    grid+=1; // block 0 routes and plans only; the others quantize
+                    ROUTE_PLACED.with(|n|n.set(n.get()+1));
+                }
+                crate::cuda::graph_swap(crate::cuda::NodeSwap {
+                    name:"MoEDynamicKernel",
+                    markers:[at("a_ptr")?,at("topk_ids_ptr")?,at("packed_a_storage_ptr")?],
+                    func,grid,block:512,
+                    pointers,scalars,
+                })?;
+            }
             unsafe {
                 primitives
                     .launch(node.entry, &pointers, &scalars, stream)

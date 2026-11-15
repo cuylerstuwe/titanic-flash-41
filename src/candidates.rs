@@ -473,9 +473,23 @@ pub(crate) struct Consumer {
     module: Module,
     rows: usize,
     mask_stride: usize,
-    bounded_mask: bool,
+    bounded_mask: std::cell::Cell<bool>,
+}
+/// CANADA_SCRATCH_BOUNDED_CANDIDATE_MASK_DECODE=1 (default off): the six- and 16-row verify owners' candidate
+/// consumers (layers 24..36) use the bounded mask kernel too. The plain kernel launches one thread per score column
+/// of the full context capacity (6 x 1,048,576: 24,576 blocks that mostly return at once, ~38 us a layer at any
+/// context length); the bounded one walks only the live 8-key blocks and makes the same writes.
+pub(crate) fn bounded_mask_decode() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_BOUNDED_CANDIDATE_MASK_DECODE").as_deref() == Ok("1"))
 }
 impl Consumer {
+    /// Plan screen: the bounded mask kernel on or off for this consumer (decode owners at full capacity only).
+    pub(crate) fn set_bounded_for_probe(&self, on: bool) -> Result<()> {
+        ensure!(matches!(self.rows, 6 | 16) && self.mask_stride == 1048576usize.div_ceil(BLOCK), "bounded mask probe owner");
+        self.bounded_mask.set(on);
+        Ok(())
+    }
     pub(crate) fn new(cuda: &Cuda, core: &[u8], rows: usize, columns: usize) -> Result<Self> {
         ensure!(needed(columns) && columns <= crate::config::MODEL_CONTEXT, "candidate consumer geometry");
         let enabled=match std::env::var("CANADA_SCRATCH_BOUNDED_CANDIDATE_MASK") {
@@ -488,7 +502,8 @@ impl Consumer {
             module: cuda.module(core)?,
             rows,
             mask_stride: columns.div_ceil(BLOCK),
-            bounded_mask: enabled && rows==128 && columns==1048576,
+            bounded_mask: std::cell::Cell::new(enabled && columns==1048576
+                && (rows==128 || (matches!(rows, 6 | 16) && bounded_mask_decode()))),
         })
     }
     pub(crate) fn apply(
@@ -530,7 +545,7 @@ impl Consumer {
             (&mut row0 as *mut i32).cast(),
             (&mut count as *mut i32).cast(),
         ];
-        if self.bounded_mask {
+        if self.bounded_mask.get() {
             // s355: same writes with fewer idle CTAs at long serving capacity.
             // Consumer128 uses bounded16-row score chunks. Keep a control switch.
             unsafe {self.module.function("ca_apply_candidate_mask_bounded")?.launch(

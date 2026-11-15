@@ -106,6 +106,18 @@ pub(crate) fn early_layer_reservation_requested() -> Result<bool> {
         _ => anyhow::bail!("early layer weight reservation must be0or1"),
     }
 }
+/// Release each staged atlas file's page cache once its bytes are verified on the device (Nov 11, default off).
+/// A model load reads more file bytes than the host has free memory. Without this the kernel evicts the earlier
+/// files while later layers are being allocated, and the pages it frees, from the other half of physical memory,
+/// end up under those layers (GB10 reads that mix the two halves are up to 8 % slower).
+#[cfg_attr(not(target_os="linux"),allow(dead_code))]
+pub(crate) fn atlas_cache_release_requested() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_ATLAS_CACHE_RELEASE").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("0") => Ok(false),
+        Ok("1") => Ok(true),
+        _ => anyhow::bail!("atlas cache release must be0or1"),
+    }
+}
 pub(crate) fn compressed_target_weights_requested() -> Result<bool> {
     match std::env::var("CANADA_SCRATCH_COMPRESSED_TARGET_WEIGHTS").as_deref() {
         Err(std::env::VarError::NotPresent) | Ok("0") => Ok(false),
@@ -849,6 +861,12 @@ impl Weights {
             ordered_hash.unwrap_or_else(||format!("{:x}", hash.finalize())) == m.atlas_sha256,
             "staged atlas data hash mismatch"
         );
+        #[cfg(target_os="linux")]
+        if atlas_cache_release_requested()? {
+            use std::os::fd::AsRawFd;
+            // Advisory: every byte is verified and on the device; a refusal changes nothing.
+            let _=unsafe{libc::posix_fadvise(input.as_raw_fd(),0,0,libc::POSIX_FADV_DONTNEED)};
+        }
         let result = Self {
             atlas,
             views,

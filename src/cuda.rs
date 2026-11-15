@@ -32,6 +32,11 @@ impl std::fmt::Display for AllocationFloorError {
     }
 }
 impl std::error::Error for AllocationFloorError {}
+/// True for the allocator's own floor refusal (`Cuda::allocate` with the allocation-floor guard on): the one
+/// allocation error that leaves the device, the context and every existing buffer as they were.
+pub(crate) fn allocation_floor_refused(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AllocationFloorError>().is_some()
+}
 
 /// Only allocation capacity is retryable. In particular, an asynchronous
 /// execution error reported by cuMemAlloc must still retire the worker group.
@@ -120,6 +125,112 @@ const _: () = {
     assert!(std::mem::offset_of!(LaunchConfig, attrs) == 40);
     assert!(std::mem::offset_of!(LaunchConfig, count) == 48);
 };
+
+// CUDA's CUDA_KERNEL_NODE_PARAMS_v2 (cuda.h 13.0), for the graph-node grid rule below.
+#[repr(C)]
+struct KernelNodeParams {
+    func: Handle,
+    grid: [c_uint; 3],
+    block: [c_uint; 3],
+    shared: c_uint,
+    params: *mut *mut c_void,
+    extra: *mut *mut c_void,
+    kern: Handle,
+    ctx: Handle,
+}
+const _: () = {
+    assert!(std::mem::size_of::<KernelNodeParams>() == 72);
+    assert!(std::mem::offset_of!(KernelNodeParams, params) == 40);
+};
+/// Kernel nodes of the graphs captured inside a `graph_regrid_scope` whose function name contains `name` and whose
+/// grid is (1, 1, from) launch with (1, 1, to) blocks instead. For kernels that size their own cooperation from
+/// the launch grid (the routed experts' front-end reads its grid for its barriers) `to` is never above `from`,
+/// so every block stays resident. `grow` lifts that bound: only for kernels whose blocks stride one list of
+/// independent tasks by the launch grid and keep no state outside their own shared memory (the experts' two phase
+/// kernels: `task = block; while task < tasks { ..; task += grid }`), where any grid computes every task once.
+/// `carveout`: Some(percent) also sets the function's preferred shared-memory carve-out (100 lets as many blocks
+/// stay resident on an SM as its registers allow; -1 restores the driver's choice). The attribute belongs to the
+/// function, so a later capture must restore it where it should not persist.
+#[derive(Clone, Copy)]
+pub(crate) struct Regrid { pub name: &'static str, pub from: u32, pub to: u32, pub grow: bool, pub carveout: Option<i32> }
+thread_local! {
+    static REGRID: std::cell::Cell<[Option<Regrid>; 3]> = const { std::cell::Cell::new([None; 3]) };
+    static REGRIDDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+pub(crate) struct RegridScope(());
+impl Drop for RegridScope {
+    fn drop(&mut self) { REGRID.with(|r| r.set([None; 3])); }
+}
+/// Apply `rules` (one to three) to every graph this thread captures until the scope drops; `graph_regridded` then
+/// gives the number of kernel nodes they matched.
+pub(crate) fn graph_regrid_scope(rules: &[Regrid]) -> Result<RegridScope> {
+    ensure!((1..=3).contains(&rules.len()) && rules.iter().all(|rule| rule.to >= 1
+            && (rule.to <= rule.from || (rule.grow && rule.to <= 1024))
+            && rule.carveout.is_none_or(|c| c == -1 || (0..=100).contains(&c)))
+        && REGRID.with(|r| r.get().iter().all(Option::is_none)), "graph node grid rule");
+    let mut slots = [None; 3];
+    for (slot, rule) in slots.iter_mut().zip(rules) { *slot = Some(*rule); }
+    REGRIDDED.with(|n| n.set(0));
+    REGRID.with(|r| r.set(slots));
+    Ok(RegridScope(()))
+}
+pub(crate) fn graph_regridded() -> usize { REGRIDDED.with(|n| n.replace(0)) }
+/// A kernel node of the graph being captured that is replaced, before the graph is instantiated, by another kernel
+/// with its own arguments (`graph_swap`, called by the code that enqueues the node's launch). The node is found by
+/// its function name and by its own arguments: it must hold every pointer of `markers`, so a record can never
+/// land on another launch's node; records that match the same node must be identical. The replacement's module
+/// outlives every graph. Arguments: `pointers` first, then the 32-bit `scalars`.
+pub(crate) struct NodeSwap {
+    pub name: &'static str,
+    pub markers: [u64; 3],
+    pub func: usize,
+    pub grid: u32,
+    pub block: u32,
+    pub pointers: Vec<u64>,
+    pub scalars: Vec<i32>,
+}
+thread_local! {
+    static CAPTURE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SWAPS: std::cell::RefCell<Vec<NodeSwap>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SWAPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Whether this thread is inside exactly one `Stream::capture` body (the only place `graph_swap` is legal).
+pub(crate) fn capturing() -> bool { CAPTURE_DEPTH.with(|d| d.get() == 1) }
+pub(crate) fn graph_swap(swap: NodeSwap) -> Result<()> {
+    ensure!(capturing() && swap.func != 0 && swap.grid >= 1 && (32..=1024).contains(&swap.block) && swap.block % 32 == 0
+        && swap.markers.iter().all(|m| *m != 0), "graph node replacement outside a capture");
+    SWAPS.with(|s| s.borrow_mut().push(swap));
+    Ok(())
+}
+/// Kernel nodes replaced since the last call (screens).
+pub(crate) fn graph_swapped() -> usize { SWAPPED.with(|n| n.replace(0)) }
+/// Graph-node editing entry points, loaded on first use: ordinary startup does not depend on them.
+struct GraphEdit {
+    _library: Library,
+    node_type: unsafe extern "C" fn(Handle, *mut c_int) -> CuResult,
+    get: unsafe extern "C" fn(Handle, *mut KernelNodeParams) -> CuResult,
+    set: unsafe extern "C" fn(Handle, *const KernelNodeParams) -> CuResult,
+    name: unsafe extern "C" fn(*mut *const c_char, Handle) -> CuResult,
+    attribute: unsafe extern "C" fn(Handle, c_int, c_int) -> CuResult,
+    /// cuFuncGetParamInfo (CUDA 12.4): offset and size of one kernel parameter; an index past the end fails.
+    param_info: Option<unsafe extern "C" fn(Handle, usize, *mut usize, *mut usize) -> CuResult>,
+    /// cuGraphKernelNodeSetAttribute, for clearing a replaced node's cooperative-launch attribute.
+    node_attribute: Option<unsafe extern "C" fn(Handle, c_int, *const [u64; 8]) -> CuResult>,
+}
+fn graph_edit() -> Result<&'static GraphEdit> {
+    static EDIT: std::sync::OnceLock<Option<GraphEdit>> = std::sync::OnceLock::new();
+    EDIT.get_or_init(|| unsafe {
+        let lib = Library::new("libcuda.so.1").ok()?;
+        let node_type = *lib.get(b"cuGraphNodeGetType\0").ok()?;
+        let get = *lib.get(b"cuGraphKernelNodeGetParams_v2\0").ok()?;
+        let set = *lib.get(b"cuGraphKernelNodeSetParams_v2\0").ok()?;
+        let name = *lib.get(b"cuFuncGetName\0").ok()?;
+        let attribute = *lib.get(b"cuFuncSetAttribute\0").ok()?;
+        let param_info = lib.get(b"cuFuncGetParamInfo\0").ok().map(|f| *f);
+        let node_attribute = lib.get(b"cuGraphKernelNodeSetAttribute\0").ok().map(|f| *f);
+        Some(GraphEdit { _library: lib, node_type, get, set, name, attribute, param_info, node_attribute })
+    }).as_ref().context("the CUDA driver lacks the graph kernel-node entry points")
+}
 
 macro_rules! api {
     ($($field:ident : $ty:ty = $sym:literal;)+) => {
@@ -232,7 +343,9 @@ struct ContextOwner {
     auxiliary: RefCell<Option<(usize, Weak<Stream>)>>,
     coefficients: RefCell<Option<(usize, Weak<Stream>)>>,
     queries: RefCell<Option<(usize, Weak<Stream>)>>,
+    hints: RefCell<Option<(usize, Weak<Stream>)>>,
     row_arena: RefCell<Option<Rc<RowArena>>>,
+    chunk_scratch: RefCell<Option<(Rc<RowArena>, u32)>>,
     // A weak entry avoids a ContextOwner -> ModuleOwner -> ContextOwner cycle.
     // Only explicitly registered, immutable core code is eligible.
     shared_core: RefCell<Option<([u8;32],usize,Weak<ModuleOwner>)>>,
@@ -446,7 +559,9 @@ impl Cuda {
                 auxiliary: RefCell::new(None),
                 coefficients: RefCell::new(None),
                 queries: RefCell::new(None),
+                hints: RefCell::new(None),
                 row_arena: RefCell::new(None),
+                chunk_scratch: RefCell::new(None),
                 shared_core: RefCell::new(None),
                 allocation_floor_screen: std::env::var("CANADA_SCRATCH_ALLOCATION_FLOOR_SCREEN").as_deref()==Ok("1"),
                 allocation_sites: (std::env::var("CANADA_SCRATCH_ALLOCATION_SITES_SCREEN").as_deref()==Ok("1"))
@@ -533,6 +648,20 @@ impl Cuda {
         *self.owner.row_arena.borrow_mut() = None;
         result
     }
+    /// As with_row_arena, continuing after the arena's current extent instead of
+    /// restarting, so several builders of one profile get distinct storage. The
+    /// caller rewinds the arena once per profile (RowArena::rewind).
+    pub(crate) fn with_row_arena_append<R>(&self, arena: &Rc<RowArena>, build: impl FnOnce() -> Result<R>) -> Result<R> {
+        ensure!(
+            Rc::ptr_eq(&self.owner, &arena.storage.owner)
+                && self.owner.row_arena.borrow().is_none(),
+            "row arena context or nesting"
+        );
+        *self.owner.row_arena.borrow_mut() = Some(arena.clone());
+        let result = build();
+        *self.owner.row_arena.borrow_mut() = None;
+        result
+    }
     /// Row-proportional transient storage. Outside a row-arena scope this is an
     /// ordinary owned allocation, so existing profiles are unchanged.
     #[track_caller]
@@ -541,6 +670,36 @@ impl Cuda {
         let Some(arena) = arena else {
             return self.allocate(len);
         };
+        self.carve(arena, len)
+    }
+    /// Scratch that a prefill chunk rewrites in full before reading it and that nothing
+    /// reads once the chunk has finished. Inside a `with_chunk_scratch` scope it is carved
+    /// from that scope's arena, after the arena's current extent; anywhere else it is an
+    /// ordinary owned allocation. Only construction sites audited for that lifetime open
+    /// such a scope.
+    #[track_caller]
+    pub(crate) fn allocate_chunk_scratch<T: DeviceElement>(&self, kind: ChunkScratch, len: usize) -> Result<Buffer<T>> {
+        let scope = self.owner.chunk_scratch.borrow().clone();
+        match scope {
+            Some((arena, kinds)) if kinds & kind as u32 != 0 => self.carve(arena, len),
+            _ => self.allocate(len),
+        }
+    }
+    /// Lend `arena` to the chunk-scratch allocations of the given `kinds` (a mask of
+    /// ChunkScratch values) made by `build`. Independent of the row-arena scope, so a
+    /// builder may hold both.
+    pub(crate) fn with_chunk_scratch<R>(&self, arena: &Rc<RowArena>, kinds: u32, build: impl FnOnce() -> Result<R>) -> Result<R> {
+        ensure!(
+            Rc::ptr_eq(&self.owner, &arena.storage.owner)
+                && self.owner.chunk_scratch.borrow().is_none(),
+            "chunk scratch context or nesting"
+        );
+        *self.owner.chunk_scratch.borrow_mut() = Some((arena.clone(), kinds));
+        let result = build();
+        *self.owner.chunk_scratch.borrow_mut() = None;
+        result
+    }
+    fn carve<T: DeviceElement>(&self, arena: Rc<RowArena>, len: usize) -> Result<Buffer<T>> {
         ensure!(len > 0, "zero-size allocation");
         let bytes = len
             .checked_mul(size_of::<T>())
@@ -611,7 +770,7 @@ impl Cuda {
         let total:usize=grouped.values().map(|v|v.0).sum();
         let mut sorted=grouped.into_iter().collect::<Vec<_>>();sorted.sort_by_key(|(_,v)|std::cmp::Reverse(v.0));
         eprintln!("allocation_sites {}",serde_json::json!({"label":label,"ordinary_live_bytes_ge64KiB":total,
-            "top":sorted.into_iter().take(32).map(|(site,(bytes,count))|serde_json::json!({"site":site,"bytes":bytes,"count":count})).collect::<Vec<_>>(),
+            "top":sorted.into_iter().take(96).map(|(site,(bytes,count))|serde_json::json!({"site":site,"bytes":bytes,"count":count})).collect::<Vec<_>>(),
             "memory":self.admission_memory()?}));Ok(())
     }
     #[track_caller]
@@ -771,6 +930,12 @@ impl Cuda {
     pub(crate) fn coefficient_stream(&self, parent: &Stream) -> Result<Rc<Stream>> {
         self.cached_auxiliary(parent, &self.owner.coefficients)
     }
+    /// The FFN's L2 hint queue windows (the paced router/shared-expert window and the routed-expert window).
+    /// The auxiliary stream also carries the shared expert's branch, which a long hint there would hold back
+    /// into the experts' kernels; these hints run beside it instead.
+    pub(crate) fn hint_stream(&self, parent: &Stream) -> Result<Rc<Stream>> {
+        self.cached_auxiliary(parent, &self.owner.hints)
+    }
     /// Independent attention Q work; every layer joins before attention reads
     /// its output. Shared causal cache writes remain on the original parent.
     pub(crate) fn query_stream(&self, parent: &Stream) -> Result<Rc<Stream>> {
@@ -782,7 +947,7 @@ impl Cuda {
         cache: &RefCell<Option<(usize, Weak<Stream>)>>,
     ) -> Result<Rc<Stream>> {
         ensure!(self.owns_stream(parent), "auxiliary parent context");
-        for slot in [&self.owner.auxiliary, &self.owner.coefficients, &self.owner.queries] {
+        for slot in [&self.owner.auxiliary, &self.owner.coefficients, &self.owner.queries, &self.owner.hints] {
             if let Some((bound_parent, weak)) = slot.borrow().as_ref()
                 && weak.strong_count() > 0
             {
@@ -980,6 +1145,18 @@ impl MetadataStaging {
         owner.api.check(status, "coalesced metadata upload")
     }
 }
+/// The audited kinds of chunk scratch (Cuda::allocate_chunk_scratch), as mask bits.
+#[derive(Clone, Copy)]
+pub(crate) enum ChunkScratch {
+    EngramRows = 1,
+    MoeOutput = 2,
+    WoaGrouped = 4,
+    CompressorLatent = 8,
+    PairPool = 16,
+    QueryRows = 32,
+    TopkIndices = 64,
+    CandidateIds = 128,
+}
 /// Layer-parity transient storage for wide prefill profiles.
 pub struct RowArena {
     storage: Buffer<u8>,
@@ -992,6 +1169,10 @@ impl RowArena {
     }
     pub fn high_water(&self) -> usize {
         self.high_water.get()
+    }
+    /// Restart carving at the arena's beginning (once per profile's construction).
+    pub(crate) fn rewind(&self) {
+        self.next.set(0);
     }
 }
 impl Buffer<u8> {
@@ -1200,7 +1381,9 @@ impl Stream {
     /// https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__EVENT.html
     /// Stream/context/thread ownership and capture rejection match other fences.
     pub(crate) fn synchronize_polling(&self,microseconds:u64)->Result<()> {
-        ensure!([25,50].contains(&microseconds),"bounded completion polling interval");
+        // 1 = spin: the thread stays awake between queries (CANADA_SCRATCH_VERIFY_POLL_US=1). A 25 us sleep is
+        // ~80 us with the default timer slack, and a sleeping thread's core may drop into an idle state.
+        ensure!([1,25,50].contains(&microseconds),"bounded completion polling interval");
         self.owner.current()?;
         let mut capture=0;
         self.owner.api.check(unsafe{(self.owner.api.stream_capture_status)(self.raw,&mut capture)},
@@ -1218,8 +1401,100 @@ impl Stream {
             let code=unsafe{(self.owner.api.event_query)(fence)};
             if code==0{return Ok(())}
             if code!=600{return self.owner.api.check(code,"query completion fence")}
-            std::thread::sleep(std::time::Duration::from_micros(microseconds));
+            if microseconds==1 {std::hint::spin_loop();}
+            else {std::thread::sleep(std::time::Duration::from_micros(microseconds));}
         }
+    }
+    /// Apply grid rules to the captured graph's kernel nodes before it is instantiated; the nodes matched.
+    fn regrid(&self, graph: Handle, rules: &[Option<Regrid>; 3]) -> Result<usize> {
+        // CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT (cuda.h).
+        const CARVEOUT: c_int = 9;
+        let edit = graph_edit()?;
+        let api = &self.owner.api;
+        let mut count = 0usize;
+        api.check(unsafe { (api.graph_nodes)(graph, ptr::null_mut(), &mut count) }, "count graph nodes")?;
+        let mut nodes: Vec<Handle> = vec![ptr::null_mut(); count];
+        api.check(unsafe { (api.graph_nodes)(graph, nodes.as_mut_ptr(), &mut count) }, "list graph nodes")?;
+        let mut changed = 0;
+        for &node in &nodes[..count.min(nodes.len())] {
+            let mut kind: c_int = -1;
+            api.check(unsafe { (edit.node_type)(node, &mut kind) }, "graph node type")?;
+            if kind != 0 { continue; }   // CU_GRAPH_NODE_TYPE_KERNEL
+            let mut p = std::mem::MaybeUninit::<KernelNodeParams>::zeroed();
+            api.check(unsafe { (edit.get)(node, p.as_mut_ptr()) }, "kernel node parameters")?;
+            let mut p = unsafe { p.assume_init() };
+            if p.func.is_null() || !rules.iter().flatten().any(|rule| p.grid == [1, 1, rule.from]) { continue; }
+            let mut name: *const c_char = ptr::null();
+            api.check(unsafe { (edit.name)(&mut name, p.func) }, "kernel node function name")?;
+            if name.is_null() { continue; }
+            let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+            let Some(rule) = rules.iter().flatten().find(|rule| p.grid == [1, 1, rule.from] && name.contains(rule.name))
+                else { continue };
+            if let Some(percent) = rule.carveout {
+                api.check(unsafe { (edit.attribute)(p.func, CARVEOUT, percent) }, "set kernel shared-memory carve-out")?;
+            }
+            if rule.to != rule.from {
+                p.grid[2] = rule.to;
+                api.check(unsafe { (edit.set)(node, &p) }, "set kernel node grid")?;
+            }
+            changed += 1;
+        }
+        Ok(changed)
+    }
+    /// Replace the captured graph's kernel nodes named by `swaps` (see NodeSwap); the nodes replaced, which must be
+    /// one a record.
+    fn swap_nodes(&self, graph: Handle, swaps: &[NodeSwap]) -> Result<usize> {
+        // CU_LAUNCH_ATTRIBUTE_COOPERATIVE (cuda.h).
+        const COOPERATIVE: c_int = 2;
+        let edit = graph_edit()?;
+        let info = edit.param_info.context("the CUDA driver lacks cuFuncGetParamInfo")?;
+        let api = &self.owner.api;
+        let mut count = 0usize;
+        api.check(unsafe { (api.graph_nodes)(graph, ptr::null_mut(), &mut count) }, "count graph nodes")?;
+        let mut nodes: Vec<Handle> = vec![ptr::null_mut(); count];
+        api.check(unsafe { (api.graph_nodes)(graph, nodes.as_mut_ptr(), &mut count) }, "list graph nodes")?;
+        let mut changed = 0;
+        for &node in &nodes[..count.min(nodes.len())] {
+            let mut kind: c_int = -1;
+            api.check(unsafe { (edit.node_type)(node, &mut kind) }, "graph node type")?;
+            if kind != 0 { continue; }   // CU_GRAPH_NODE_TYPE_KERNEL
+            let mut p = std::mem::MaybeUninit::<KernelNodeParams>::zeroed();
+            api.check(unsafe { (edit.get)(node, p.as_mut_ptr()) }, "kernel node parameters")?;
+            let p = unsafe { p.assume_init() };
+            if p.func.is_null() || p.params.is_null() { continue; }
+            let mut name: *const c_char = ptr::null();
+            api.check(unsafe { (edit.name)(&mut name, p.func) }, "kernel node function name")?;
+            if name.is_null() { continue; }
+            let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+            if !swaps.iter().any(|swap| name.contains(swap.name)) { continue; }
+            // The node's own arguments, as 64-bit words (pointers are passed whole, alone or inside a tensor record).
+            let mut values = Vec::new();
+            for index in 0..1024usize {
+                let (mut offset, mut size) = (0usize, 0usize);
+                if unsafe { (info)(p.func, index, &mut offset, &mut size) } != 0 { break; }
+                let argument = unsafe { *p.params.add(index) };
+                if argument.is_null() { continue; }
+                for word in 0..size / 8 { values.push(unsafe { argument.cast::<u64>().add(word).read_unaligned() }); }
+            }
+            let mut matching = swaps.iter().filter(|swap| name.contains(swap.name)
+                && swap.markers.iter().all(|marker| values.contains(marker)));
+            // A launch of the same kernel that asked for no replacement keeps its node.
+            let Some(swap) = matching.next() else { continue };
+            ensure!(matching.all(|other| other.func == swap.func && other.grid == swap.grid && other.block == swap.block
+                && other.pointers == swap.pointers && other.scalars == swap.scalars), "ambiguous graph node replacement");
+            let (mut pointers, mut scalars) = (swap.pointers.clone(), swap.scalars.clone());
+            let mut arguments: Vec<*mut c_void> = pointers.iter_mut().map(|v| (v as *mut u64).cast())
+                .chain(scalars.iter_mut().map(|v| (v as *mut i32).cast())).collect();
+            let replacement = KernelNodeParams { func: swap.func as Handle, grid: [swap.grid, 1, 1], block: [swap.block, 1, 1],
+                shared: 0, params: arguments.as_mut_ptr(), extra: ptr::null_mut(), kern: ptr::null_mut(), ctx: p.ctx };
+            api.check(unsafe { (edit.set)(node, &replacement) }, "replace kernel node")?;
+            // The replaced kernel was launched cooperatively (all blocks resident); the replacement needs no such
+            // contract. Clearing is best effort: a few blocks are resident together either way.
+            if let Some(set) = edit.node_attribute { let _ = unsafe { set(node, COOPERATIVE, &[0u64; 8]) }; }
+            changed += 1;
+        }
+        ensure!(changed == swaps.len(), "graph node replacement: {changed} nodes for {} launches", swaps.len());
+        Ok(changed)
     }
     pub fn capture(&self, f: impl FnOnce() -> Result<()>) -> Result<Graph> {
         static DIAGNOSTIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1230,7 +1505,11 @@ impl Stream {
             unsafe { (self.owner.api.capture_begin)(self.raw, 0) },
             "begin graph capture",
         )?;
+        CAPTURE_DEPTH.with(|d| d.set(d.get() + 1));
         let body = f();
+        CAPTURE_DEPTH.with(|d| d.set(d.get() - 1));
+        // Replacement records belong to this capture alone, also when it fails.
+        let swaps = SWAPS.with(|s| std::mem::take(&mut *s.borrow_mut()));
         let mut graph = ptr::null_mut();
         let ended = self.owner.api.check(
             unsafe { (self.owner.api.capture_end)(self.raw, &mut graph) },
@@ -1268,6 +1547,15 @@ impl Stream {
                         }, "save diagnostic graph dependencies")?;
                     }
                 }
+            }
+            let rules = REGRID.with(|r| r.get());
+            if rules.iter().any(Option::is_some) {
+                let changed = self.regrid(graph, &rules)?;
+                REGRIDDED.with(|n| n.set(n.get() + changed));
+            }
+            if !swaps.is_empty() {
+                let changed = self.swap_nodes(graph, &swaps)?;
+                SWAPPED.with(|n| n.set(n.get() + changed));
             }
             self.owner.api.check(
             unsafe { (self.owner.api.graph_instantiate)(&mut exec, graph, 0) },
@@ -1342,6 +1630,8 @@ pub struct Function<'a> {
     raw: Handle,
 }
 impl Function<'_> {
+    /// The raw kernel handle, for graph node replacement (cuda::NodeSwap); valid while the module lives.
+    pub(crate) fn handle(&self) -> usize { self.raw as usize }
     /// Safety: the ordinary launch ABI/lifetime contract applies. The kernel
     /// additionally executes griddepcontrol.wait before dependent global reads;
     /// every predecessor's programmatic trigger is legal for that dependency.

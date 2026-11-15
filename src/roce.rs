@@ -681,6 +681,11 @@ impl Roce {
     /// Shape is part of NCCL capture identity, independently of pointer capacity.
     /// Target graph owners must select a capture with this accepted row count;
     /// a previously recorded matching variant can be reused.
+    /// Whether the enqueue policies are still those a five-row drafter pass selects (decode reduction, `rows` of
+    /// `rows`): nothing that enqueues collectives under another policy ran since (dspark draft pre-launch).
+    pub(crate) fn query_policy_current(&self, rows: usize) -> bool {
+        self.native_sum_selected.get() && self.prefill_rows.get() == ReductionRows::new(rows, rows).ok()
+    }
     pub(crate) fn select_prefill_rows(
         &self,
         live: usize,
@@ -782,6 +787,7 @@ impl Roce {
             }
             return result;
         }
+        crate::layer_clock::mark(stream, crate::layer_clock::Site::SumBefore)?;
         if let Some(rows)=self.native_sum_rows.get() {
             let count=rows.count(input.len())?;
             ensure!(std::mem::size_of::<T>()==2,"native prefix BF16 storage");
@@ -789,8 +795,9 @@ impl Roce {
             // pointers/counts, not the temporary Rust view objects.
             let input=unsafe{input.view(0,count)}?;
             let mut output=unsafe{output.view(0,count)}?;
-            unsafe {self.collect(&input,&mut output,stream,None)}
-        }else{unsafe { self.collect(input, output, stream, None) }}
+            unsafe {self.collect(&input,&mut output,stream,None)}?;
+        }else{unsafe { self.collect(input, output, stream, None) }?;}
+        crate::layer_clock::mark(stream, crate::layer_clock::Site::SumAfter)
     }
     /// Safety: all ranks agree on root, length and collective order and retain
     /// the span through stream completion. Used outside model graph captures.
@@ -867,7 +874,9 @@ impl Roce {
             if result.is_err() { self.poisoned.set(true); }
             return result;
         }
-        unsafe { self.collect_row_prefix(input,output,local_columns,stream,local_columns/8) }
+        crate::layer_clock::mark(stream, crate::layer_clock::Site::GatherBefore)?;
+        unsafe { self.collect_row_prefix(input,output,local_columns,stream,local_columns/8) }?;
+        crate::layer_clock::mark(stream, crate::layer_clock::Site::GatherAfter)
     }
     pub(crate) fn set_column_gather_rows_for_probe(&self,enabled:bool,stream:&Stream)->Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_PREFILL_COLUMN_GATHER_SCREEN").as_deref()==Ok("1")
@@ -955,6 +964,27 @@ impl Roce {
             self.cuda.zero_device(output.ptr(), output.bytes(), stream)?;
             self.gather_f32_at(&row, output, offset * 4, local_columns, stream)
         }
+    }
+    /// A row gather of exactly the rows given (it takes no live-row prefix of its own): `input` holds whole rows
+    /// of `local_columns` elements, `output` the same rows with the four ranks side by side.
+    pub(crate) unsafe fn gather_bf16_exact<T: DeviceElement>(&self, input: &Buffer<T>, output: &mut Buffer<T>,
+        local_columns: usize, stream: &Stream) -> Result<()> {
+        ensure!(std::mem::size_of::<T>() == 2 && local_columns > 0 && local_columns % 8 == 0
+            && input.len() % local_columns == 0 && input.len().checked_mul(4) == Some(output.len())
+            && self.gather.is_some(), "exact row gather shape");
+        crate::layer_clock::mark(stream, crate::layer_clock::Site::GatherBefore)?;
+        // CANADA_SCRATCH_QUARTER_GATHER_BLOCKS=<1|2|4|8|16> (screen): the grid of this wider gather (the statistics
+        // partials ride it). Every rank reads the same setting; the transport and its bytes are unchanged.
+        let previous = self.gather_grid_override.get();
+        if let Some(blocks) = crate::config::quarter_gather_blocks()? { self.gather_grid_override.set(Some(blocks)); }
+        let result = unsafe { self.collect(input, output, stream, Some(local_columns / 8)) };
+        self.gather_grid_override.set(previous);
+        result?;
+        crate::layer_clock::mark(stream, crate::layer_clock::Site::GatherAfter)
+    }
+    /// The rows a decode gather over `capacity` rows takes now (the live prefix when the row scope is set).
+    pub(crate) fn gather_live_rows(&self, capacity: usize) -> usize {
+        self.native_gather_rows.get().filter(|r| r.capacity == capacity).map_or(capacity, |r| r.live)
     }
     unsafe fn collect_row_prefix<T: DeviceElement>(&self,input:&Buffer<T>,output:&mut Buffer<T>,
         columns:usize,stream:&Stream,row_packs:usize)->Result<()> {

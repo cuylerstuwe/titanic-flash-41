@@ -107,6 +107,8 @@ pub struct Scratch {
     compact: Option<Compact>,
     compact_enabled: Cell<bool>,
     reference_enabled: Cell<bool>,
+    /// The compact 16-row partial product runs in ca_woa_mid_partial_w8 (same arithmetic; config::woa_native).
+    native_mid: Cell<bool>,
 }
 impl Scratch {
     pub fn new(cuda: &Cuda, core: &[u8], rows: usize) -> Result<Rc<RefCell<Self>>> {
@@ -126,11 +128,12 @@ impl Scratch {
             blas,
             rows,
             decoded: cuda.allocate(2048 * 4096)?,
-            grouped: cuda.allocate(rows * 2048)?,
+            grouped: cuda.allocate_chunk_scratch(crate::cuda::ChunkScratch::WoaGrouped, rows * 2048)?,
             stream: Cell::new(None),
             cache_enabled: Cell::new(true),
             compact:None,
             compact_enabled:Cell::new(false),
+            native_mid:Cell::new(false),
             reference_enabled:Cell::new(false),
         })))
     }
@@ -178,7 +181,17 @@ impl Grouped {
             }else{None};
             s.compact=Some(Compact{partial_op,reduce_op,partial,reference_op});
         }
+        if self.rows==16&&(crate::config::woa_native()||crate::config::woa_native_screen()) {
+            s.module.function("ca_woa_mid_partial_w8")?;
+            s.native_mid.set(crate::config::woa_native());
+        }
         s.compact_enabled.set(enabled);Ok(())
+    }
+    /// Plan screen: the native 16-row partial kernel on or off (config::woa_native_screen).
+    pub(crate) fn set_native_for_probe(&self,on:bool)->Result<()> {
+        let s=self.scratch.try_borrow()?;
+        ensure!(crate::config::woa_native_screen()&&self.rows==16&&s.compact.is_some(),"native medium WO-A screen");
+        s.native_mid.set(on);Ok(())
     }
     pub(crate) fn set_compact_mode_for_probe(&self,mode:u8)->Result<()> {
         let s=self.scratch.try_borrow()?;
@@ -254,6 +267,12 @@ impl Grouped {
         self.cached = Some(value);
         Ok(())
     }
+    /// The immutable canonical WO-A bytes (weights, scales) and their owner, for L2 hints: what the compact
+    /// 16/32-row kernels read. None while another path (decoded BF16 operands) is selected.
+    pub(crate) fn hint_regions(&self) -> Option<(Rc<Weights>, [(u64, usize); 2])> {
+        let compact = self.scratch.try_borrow().ok().is_some_and(|s| s.compact_enabled.get() && !s.reference_enabled.get());
+        compact.then(|| (self._weights.clone(), [(self.weight, 2048 * 4096), (self.scales, 8192)]))
+    }
     pub(crate) fn cached_allocation(&self) -> Option<(u64, usize)> {
         self.cached.as_ref().map(|v| (v.values.ptr(), v.values.bytes()))
     }
@@ -288,6 +307,17 @@ impl Grouped {
         }
         if s.compact_enabled.get() {
             let c=s.compact.as_ref().context("compact WO-A plan absent")?;
+            if s.native_mid.get()&&self.rows==16 {
+                let (mut x,mut w,mut sc,mut p,mut m)=(input.ptr(),self.weight,self.scales,c.partial.ptr(),16i32);
+                let mut args:[*mut std::ffi::c_void;5]=[(&mut x as *mut u64).cast(),(&mut w as *mut u64).cast(),
+                    (&mut sc as *mut u64).cast(),(&mut p as *mut u64).cast(),(&mut m as *mut i32).cast()];
+                // The exported kernel's grid: 16 column tiles of 64, 2 groups, 4 K splits; eight warps.
+                unsafe {
+                    s.module.function("ca_woa_mid_partial_w8")?.launch([16,2,4],[256,1,1],0,stream,&mut args)?;
+                    c.reduce_op.launch(self.rows as u32,&[c.partial.ptr(),self.output.ptr()],stream)?;
+                }
+                return Ok(());
+            }
             unsafe {
                 c.partial_op.launch(self.rows as u32,&[input.ptr(),self.weight,self.scales,c.partial.ptr()],stream)?;
                 c.reduce_op.launch(self.rows as u32,&[c.partial.ptr(),self.output.ptr()],stream)?;

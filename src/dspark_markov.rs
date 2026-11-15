@@ -48,6 +48,10 @@ pub(crate) struct Markov {
     conditional_bridge: Option<Rc<crate::markov_conditional::Bridge>>,
     gpu_prefix_stop: bool,
     prefix_stop_enabled: bool,
+    /// config::batched_proposal_launch: the prefix graph of this index is launched and not read yet.
+    launched_prefix: Option<usize>,
+    /// config::batched_proposal_launch: the rest graph of this index is launched and not read yet.
+    launched_rest: bool,
     produced: usize,
     draft_schedule: usize,
     proposal_temperature: f32,
@@ -407,6 +411,8 @@ impl Markov {
                 Err(std::env::VarError::NotPresent)=>false,
                 Err(e)=>return Err(e.into()),
             },
+            launched_prefix:None,
+            launched_rest:false,
             produced:0,
             proposal_temperature: 1.,
             draft_schedule: 0,
@@ -627,6 +633,16 @@ impl Markov {
         );
         Ok(&self.proposal_probabilities)
     }
+    /// Data collection (CANADA_SCRATCH_STEP_CONFIDENCE_LOG): the drafter's probability of each proposal it drew
+    /// (the hierarchical sampler's selected q; 0 for proposals not produced or when that sampler is not active).
+    /// Five small device reads; not on any serving path without the log.
+    pub(crate) fn selected_q_for_log(&self)->Result<[f64;5]>{
+        let mut q=[0f64;5];
+        if !(self.hierarchical_active&&self.ready&&!self.poisoned&&self.sampled){return Ok(q);}
+        let h=self.hierarchical.as_ref().unwrap();
+        for(i,slot)in q.iter_mut().enumerate().take(self.produced.min(5)){*slot=h.draws[i].selected_q().download()?[0];}
+        Ok(q)
+    }
     pub(crate) fn produced(&self)->Result<usize>{
         ensure!(self.ready&&!self.poisoned,"draft count unavailable");Ok(self.produced)
     }
@@ -695,6 +711,80 @@ impl Markov {
                 let ids=self.read_full_result()?;self.produced=5;Ok(ids)
             }
         })();
+        if result.is_err(){self.poisoned=true;self.invalidate_results();}else{self.ready=true;}
+        result
+    }
+    /// config::batched_proposal_launch: the first segment of `run_causal_three` without its wait, so several
+    /// conversations' drafters launch theirs back to back and share one. False when this drafter cannot take
+    /// that path now (no host-side prefix stop, or its prefix graphs are not captured yet): the caller then
+    /// runs `run_causal_three` as before.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_causal_three_prefix(&mut self,base:&Buffer<f32>,post_hc:&Buffer<bf16>,anchor:u32,
+        seed:u64,position:u64,comm:&Roce,stream:&Stream)->Result<bool>{
+        if !self.prefix_stop_enabled||self.gpu_prefix_stop{return Ok(false);}
+        self.guard(stream)?;
+        ensure!(base.len()==5*32320&&self.cuda.owns_buffer(base)
+            &&post_hc.len()==5*5120&&self.cuda.owns_buffer(post_hc)
+            &&anchor<VOCAB as u32&&position.checked_add(5).is_some()
+            &&comm.rank()==self.rank&&self.comm_instance.is_none_or(|i|i==comm.instance())
+            &&self.base_pointer.is_none_or(|p|p==base.ptr())
+            &&self.hidden_pointer.is_none_or(|p|p==post_hc.ptr())
+            &&self.launched_prefix.is_none()&&!self.launched_rest,"causal Markov launch input/identity");
+        let index=proposal_graph_index(true,self.direct_gather,self.temperature_index,
+            self.fused_head_active,self.confidence_fused_active,self.draft_schedule,self.correction_cache_active,self.scaled_head_active);
+        if self.prefix_graphs[index].is_none(){return Ok(false);}
+        self.invalidate_results();self.sampled=true;
+        let result=(||{
+            self.anchor.upload(&[anchor as i32])?;
+            self.upload_proposal_uniforms(seed,position)?;
+            stream.join_default()?;
+            self.flush_inputs(stream)?;
+            unsafe{self.prefix_graphs[index].as_ref().unwrap().0.launch(stream)}
+        })();
+        match result {
+            Ok(())=>{self.launched_prefix=Some(index);Ok(true)}
+            Err(e)=>{self.poisoned=true;self.invalidate_results();Err(e)}
+        }
+    }
+    /// After the stream's wait: reads the prefix as `run_causal_three` does. Some(ids): the prefix stop took it
+    /// (two proposals). None: the rest of the proposals is launched; `finish_causal_three_rest` reads it after
+    /// the next wait.
+    pub(crate) fn finish_causal_three_prefix(&mut self,threshold:f32,comm:&Roce,stream:&Stream)->Result<Option<[u32;5]>>{
+        let index=self.launched_prefix.take().ok_or_else(||anyhow::anyhow!("no launched Markov prefix"))?;
+        let result=(||{
+            self.guard(stream)?;
+            ensure!(threshold.is_finite()&&(0. ..=1.).contains(&threshold),"causal Markov threshold");
+            comm.health()?;
+            let words=self.readout.download()?;
+            ensure!(words[15]==0x4453504b&&words[5..15].iter().all(|&x|x==0)
+                &&words[..2].iter().all(|&id|id<VOCAB as u32),"causal Markov prefix ID/error");
+            let mut confidence=[0.;5];
+            for i in 0..3{
+                confidence[i]=f32::from_bits(words[27+i]);
+                ensure!(words[21+i]==words[27+i]&&confidence[i].is_finite()
+                    &&confidence[i]>=0.&&confidence[i]<=1.&&f32::from_bits(words[16+i]).is_finite(),
+                    "causal confidence disagrees with rank0/invalid");
+            }
+            if confidence[..3].iter().product::<f32>()<threshold{
+                self.last_confidence=Some((confidence,3));self.produced=2;
+                Ok(Some([words[0],words[1],0,0,0]))
+            }else{
+                unsafe{self.prefix_graphs[index].as_ref().unwrap().1.launch(stream)}?;
+                self.launched_rest=true;
+                Ok(None)
+            }
+        })();
+        match &result {
+            Err(_)=>{self.poisoned=true;self.launched_rest=false;self.invalidate_results();}
+            Ok(Some(_))=>self.ready=true,
+            Ok(None)=>{}
+        }
+        result
+    }
+    /// After the second wait: the five proposals of a drafter whose prefix continued.
+    pub(crate) fn finish_causal_three_rest(&mut self,comm:&Roce)->Result<[u32;5]>{
+        ensure!(std::mem::take(&mut self.launched_rest)&&!self.poisoned,"no launched Markov rest");
+        let result=(||{comm.health()?;let ids=self.read_full_result()?;self.produced=5;Ok(ids)})();
         if result.is_err(){self.poisoned=true;self.invalidate_results();}else{self.ready=true;}
         result
     }

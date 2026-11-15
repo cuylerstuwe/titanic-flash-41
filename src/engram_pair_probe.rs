@@ -110,8 +110,8 @@ pub fn run(backing:&Path,rank:usize)->Result<Value> {
         drop(first);drop(second);
         let first=File::open(temporary.join("first"))?;let second=File::open(temporary.join("second"))?;
         let mut reader=crate::engram_io::Reader::new()?;
-        ensure!(reader.read_pair(&first,&[0],&second,&[ROW_BYTES as u64]).is_err(),"short paired read accepted");
-        let bytes=reader.read_pair(&first,&[ROW_BYTES as u64],&second,&[0])?;
+        ensure!(reader.read_pair(&first,&[0],&second,&[ROW_BYTES as u64],false).is_err(),"short paired read accepted");
+        let bytes=reader.read_pair(&first,&[ROW_BYTES as u64],&second,&[0],false)?;
         ensure!(bytes[..ROW_BYTES].iter().all(|&b|b==0x3c) && bytes[ROW_BYTES..].iter().all(|&b|b==0xa5),"paired queue did not recover after short read");
         Ok(())
     })();

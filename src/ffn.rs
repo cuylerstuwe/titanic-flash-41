@@ -92,6 +92,9 @@ pub struct TokenRows {
     image_owner: Option<Rc<crate::prompt_media::Bindings>>,
     rows: usize,
     active_rows: usize,
+    /// Batched verification with padding routes: each row's source row (-1: its own routing).
+    padding_sources: Buffer<i32>,
+    padding_active: bool,
 }
 impl TokenRows {
     pub fn new(cuda: &Cuda, ids: &[i64], live: usize) -> Result<Self> {
@@ -103,8 +106,11 @@ impl TokenRows {
             image_owner: None,
             rows: ids.len(),
             active_rows: 0,
+            padding_sources: cuda.allocate(ids.len())?,
+            padding_active: false,
         };
         s.image_pointers.upload(&vec![0; ids.len()])?;
+        s.padding_sources.upload(&vec![-1; ids.len()])?;
         s.update(ids, live)?;
         Ok(s)
     }
@@ -119,6 +125,18 @@ impl TokenRows {
         self.live.upload(&[live as i32])?;
         self.clear_images()?;
         self.active_rows = live;
+        // Every step starts without padding routes; a batched step sets them after this update.
+        self.padding_active = false;
+        Ok(())
+    }
+    /// Batched verification: padding rows take their source rows' experts (zero weights) in every
+    /// layer's routing (ca_route_padding_rows). Valid until the next update.
+    pub(crate) fn set_padding_sources(&mut self, sources: &[i32]) -> Result<()> {
+        ensure!(sources.len() == self.rows && sources.iter().enumerate()
+            .all(|(r, &s)| s < 0 || ((s as usize) < self.active_rows && (s as usize) != r && sources[s as usize] < 0)),
+            "padding route sources must name live rows");
+        self.padding_sources.upload(sources)?;
+        self.padding_active = true;
         Ok(())
     }
     pub fn ids(&self) -> &Buffer<i64> {
@@ -159,6 +177,10 @@ pub struct Router {
     ids: Buffer<i32>,
     routing: Buffer<f32>,
     stream: Cell<usize>,
+    /// Verify owners: the kernel module for padding routes of batched steps.
+    padding_routes: Option<Module>,
+    /// route_census: this router's layer key and expert count.
+    census: (usize, usize),
 }
 enum Scores {
     Tiny { weight: u64, output: Buffer<f32> },
@@ -174,8 +196,10 @@ impl Router {
         root: &Path,
         vendor_blas: Option<Rc<Blas>>,
     ) -> Result<Self> {
+        // Target profiles, and the per-rank shard of a wide width (a flex width's shard is
+        // not itself a profile width). The vendor projection and routing kernel take any count.
         ensure!(
-            (1..=16).contains(&rows) || crate::config::target_rows(rows),
+            (1..=16).contains(&rows) || crate::config::target_rows(rows) || crate::config::wide_rows(rows * 4),
             "router row capacity"
         );
         let experts = id.experts();
@@ -282,9 +306,23 @@ impl Router {
             ids: cuda.allocate_rows(rows * topk)?,
             routing: cuda.allocate_rows(rows * topk)?,
             stream: Cell::new(0),
+            padding_routes: None,
+            census: (id.key(), experts),
         })
     }
+    /// Diagnostic (route_census): count this pass's routed slots (after the ids are final).
+    pub(crate) fn census(&self, tokens: &TokenRows, stream: &Stream) -> Result<()> {
+        if !crate::route_census::requested() { return Ok(()); }
+        crate::route_census::add(self.census.0, self.census.1, self.ids.ptr(), tokens.live.ptr(), self.rows,
+            self.ids.len() / self.rows, stream)
+    }
     pub fn run(&self, input: &Buffer<bf16>, tokens: &TokenRows, stream: &Stream) -> Result<()> {
+        self.run_routed(input, tokens, false, stream)
+    }
+    /// `fused`: the gate product only; the top-k (and padding routes) are left to the front-end node of the
+    /// experts' launch that follows (moe::offer_route; the caller checked moe::route_front_ready and the
+    /// workspace's route_front_admits, and calls moe::route_taken after that launch).
+    fn run_routed(&self, input: &Buffer<bf16>, tokens: &TokenRows, fused: bool, stream: &Stream) -> Result<()> {
         ensure!(
             input.len() == self.rows * 5120
                 && tokens.rows == self.rows
@@ -322,6 +360,18 @@ impl Router {
             },
             Scores::Vendor(p) => p.run(input, stream)?,
         }
+        crate::mhc::stats_point(crate::mhc::StatsPoint::AfterRouterProduct, stream)?;
+        if fused {
+            ensure!(matches!(self.scores, Scores::Tiny { .. }) && self.rows <= 16 && self.ids.len() == self.rows * 6
+                && (!tokens.padding_active || self.padding_routes.is_some()), "fused routing owner");
+            crate::moe::offer_route(crate::moe::RouteOperands {
+                logits: self.logits().ptr(), bias: self.bias, bias_alt: self.bias_vl, tokens: tokens.ids.ptr(),
+                live: tokens.live.ptr(), padding: if tokens.padding_active { tokens.padding_sources.ptr() } else { 0 },
+                ids: self.ids.ptr(), weights: self.routing.ptr(), owner_rows: self.rows,
+            })?;
+            crate::mhc::stats_point(crate::mhc::StatsPoint::AfterRouting, stream)?;
+            return Ok(());
+        }
         unsafe {
             self.route.launch(
                 self.rows as u32,
@@ -337,7 +387,24 @@ impl Router {
                 ],
                 stream,
             )
+        }?;
+        if tokens.padding_active {
+            let module = self.padding_routes.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("padding routes on an owner without the routing kernel"))?;
+            ensure!(tokens.rows == self.rows, "padding route rows");
+            let topk = self.ids.len() / self.rows;
+            let (mut ids, mut weights, mut source) = (self.ids.ptr(), self.routing.ptr(), tokens.padding_sources.ptr());
+            let (mut rows, mut k) = (self.rows as i32, topk as i32);
+            let mut args = [(&mut ids as *mut u64).cast::<std::ffi::c_void>(), (&mut weights as *mut u64).cast(),
+                (&mut source as *mut u64).cast(), (&mut rows as *mut i32).cast(), (&mut k as *mut i32).cast()];
+            unsafe {
+                module.function("ca_route_padding_rows")?.launch(
+                    [((self.rows * topk) as u32).div_ceil(128), 1, 1], [128, 1, 1], 0, stream, &mut args)
+            }?;
         }
+        self.census(tokens, stream)?;
+        crate::mhc::stats_point(crate::mhc::StatsPoint::AfterRouting, stream)?;
+        Ok(())
     }
     pub fn logits(&self) -> &Buffer<f32> {
         match &self.scores {
@@ -361,6 +428,8 @@ pub struct LayerFfn {
     shared_down: Linear,
     shared_quant: Option<Module>,
     fused_sum: Option<Module>,
+    /// config::experts_tail: the gate launched on the shared branch after its activation (module, shared bytes).
+    tail_gate: Option<(Module, u32)>,
     fused_sum_enabled: Cell<bool>,
     activation: Buffer<bf16>,
     output: Buffer<bf16>,
@@ -371,6 +440,17 @@ pub struct LayerFfn {
     row_transport: Option<RowTransport>,
     use_row_transport: bool,
     local_shared: Option<LocalShared>,
+    /// This FFN's windows of the layer's L2 hint queue, one per plan, and the selected plan (shared with the
+    /// layer's attention).
+    hint_queues: Vec<FfnHintQueue>,
+    hint_queue_selected: Rc<Cell<Option<usize>>>,
+}
+/// The FFN's part of a decode layer's L2 hint queue under one plan (config::FfnPlan).
+struct FfnHintQueue {
+    /// Router, shared up and shared down weights from the attention sum's start; replaces the FFN hint.
+    w4: Option<crate::l2_prefetch::Window>,
+    /// The routed experts' first FC1 tiles, from the end of routing.
+    routed: Option<crate::l2_prefetch::Window>,
 }
 /// Sequence-parallel row-local shared expert (CANADA_SCRATCH_PREFILL_LOCAL_SHARED=1):
 /// staged full w13 (rank-blocked [gate_r | up_r]) and full-K w2 on this rank's rows.
@@ -483,13 +563,13 @@ impl LayerFfn {
             if !concurrent {branch.input_ready.record(stream)?;}
             branch.input_ready.wait(&branch.stream)?;
             self.shared_up.run_quantized(q,sm,&branch.stream)?;
-            self.finish_shared(&branch.stream)?;
+            self.finish_shared(&branch.stream, None)?;
             branch.output_ready.record(&branch.stream)?;
             branch.output_ready.wait(stream)?;
         } else {
             workspace.run_packed(&self.expert,gathered,self.router.ids(),self.router.routing(),stream)?;
             self.shared_up.run_quantized(q,sm,stream)?;
-            self.finish_shared(stream)?;
+            self.finish_shared(stream, None)?;
         }
         self.add_shared(workspace,stream)
     }
@@ -537,7 +617,7 @@ impl LayerFfn {
             }),
             id,
         )?);
-        let router = Router::new(
+        let mut router = Router::new(
             cuda,
             &weights,
             id,
@@ -550,6 +630,11 @@ impl LayerFfn {
             }),
             vendor_blas,
         )?;
+        // Verify owners route the padding rows of batched steps (Target::execute_rows).
+        if !id.is_draft() && matches!(rows, 6 | 16 | 32) {
+            module.function("ca_route_padding_rows")?;
+            router.padding_routes = Some(module.clone());
+        }
         let up = Matrix::prepare_shared_named(cuda, module, stream, &weights, id)?;
         let down = Matrix::prepare(
             cuda,
@@ -617,6 +702,11 @@ impl LayerFfn {
                 vec![shared_up.immutable_matrix(), shared_down.immutable_matrix()],
                 Some((weights.clone(), &router_key)),
             )?.with_chunk(chunk)?)
+        } else if id.is_draft() && crate::config::draft_hints()?.is_some_and(|h| h.2) {
+            // config::draft_hints: the drafter's shared expert, beside its attention sum (the stage begins it).
+            Some(crate::l2_prefetch::Window::new(cuda, module, stream,
+                vec![shared_up.immutable_matrix(), shared_down.immutable_matrix()], None)?
+                .on_stream(cuda.hint_stream(stream)?)?)
         } else {
             None
         };
@@ -628,6 +718,14 @@ impl LayerFfn {
             &&(fused_sum_requested||std::env::var("CANADA_SCRATCH_FFN_SUM_SHARED_SCREEN").as_deref()==Ok("1")) {
             module.function("ca_ffn_sum_shared")?;Some(module.clone())
         }else{None};
+        let tail_gate = match crate::config::validate_experts_tail()? {
+            Some(bytes) if rows == 6 && !id.is_draft() => {
+                let gate = module.function("ca_tail_gate")?;
+                if bytes > 48 * 1024 { gate.opt_in_shared_memory(bytes)?; }
+                Some((module.clone(), bytes))
+            }
+            _ => None,
+        };
         Ok(Self {
             cuda: cuda.clone(),
             native,
@@ -637,24 +735,54 @@ impl LayerFfn {
             shared_down,
             shared_quant,
             fused_sum,
+            tail_gate,
             fused_sum_enabled:Cell::new(fused_sum_requested),
             activation: cuda.allocate_rows(rows * 576)?,
             output: cuda.allocate_rows(rows * 5120)?,
             rows,
             shared_branch,
             prefetch,
+            hint_queues: Vec::new(),
+            hint_queue_selected: Rc::new(Cell::new(None)),
             expert_prefetch: None,
             row_transport: None,
             use_row_transport: false,
             local_shared: None,
         })
     }
+    /// The drafter's FFN over `rows` (10 or 15) for a batched body pass (CANADA_SCRATCH_BATCHED_DRAFT_BODY):
+    /// the five-row owner's native primitives and immutable shared-expert matrices, the target's 16-row
+    /// shared projections run at `rows` (the same per-rank shapes), its own router and outputs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_draft_batch(cuda: &Cuda, weights: Rc<Weights>, layout: Prepared, kernels: &Path,
+        rows: usize, donor: &Self) -> Result<Self> {
+        let id = LayerId::from_key(layout.layer)?;
+        ensure!(crate::config::batched_draft_body() && id.is_draft() && [10, 15].contains(&rows) && donor.rows == 5
+            && layout.experts == id.experts() && donor.shared_quant.is_none() && donor.row_transport.is_none(),
+            "batched drafter FFN profile");
+        let native = donor.native.clone();
+        let router = Router::new(cuda, &weights, id, rows, native.clone(), &kernels.join("routing-dspark-v1"), None)?;
+        let shared_up = Linear::new_rc_at_rows(cuda, &kernels.join("fp8-shared-w13-r0-m16-v1"),
+            donor.shared_up.immutable_matrix(), rows)?;
+        let shared_down = Linear::new_rc_at_rows(cuda, &kernels.join("fp8-shared-w2-r0-m16-v1"),
+            donor.shared_down.immutable_matrix(), rows)?;
+        Ok(Self {
+            cuda: cuda.clone(), native, router, expert: Expert::new(weights, layout)?, shared_up, shared_down,
+            shared_quant: None, fused_sum: None, tail_gate: None, fused_sum_enabled: Cell::new(false),
+            activation: cuda.allocate_rows(rows * 576)?, output: cuda.allocate_rows(rows * 5120)?, rows,
+            shared_branch: None, prefetch: None, expert_prefetch: None, row_transport: None,
+            use_row_transport: false, local_shared: None,
+            hint_queues: Vec::new(), hint_queue_selected: Rc::new(Cell::new(None)),
+        })
+    }
     pub(crate) fn enable_row_transport(&mut self, kernels: &Path, vendor_blas: Option<Rc<Blas>>) -> Result<()> {
-        ensure!([8192,16384].contains(&self.rows) && self.row_transport.is_none() && self.shared_branch.is_none(),
+        ensure!(crate::config::packed_wide_width(self.rows) && self.row_transport.is_none() && self.shared_branch.is_none(),
             "packed MoE transport requires the wide sequential profile");
         self.shared_up.wide_shared_quantization_buffers()?;
         let fast = std::env::var("CANADA_SCRATCH_PREFILL_MOE_CODEC_FAST").as_deref() == Ok("1");
-        let root = kernels.join(if fast {"moe-input-codec-fast-v1".to_owned()} else {format!("moe-runtime-m{}-prequant-v1",self.rows)});
+        // A flex width uses the 8192-row bundle's codec; its functions take the row count.
+        let (root, _) = crate::config::building_wide_profile(self.rows, || crate::config::resolve_flex_bundle(&kernels.join(
+            if fast {"moe-input-codec-fast-v1".to_owned()} else {format!("moe-runtime-m{}-prequant-v1",self.rows)})))?;
         let path = root.join("libcanada_moe_input_codec.so");
         let raw = std::fs::read(&path)?;
         ensure!(format!("{:x}",Sha256::digest(&raw)) == if fast {
@@ -687,7 +815,7 @@ impl LayerFfn {
     }
     pub(crate) fn run_row_transport(&mut self, workspace: &Workspace, input: &Buffer<bf16>,
         tokens: &TokenRows, rank: usize, comm: &crate::roce::Roce, stream: &Stream) -> Result<()> {
-        ensure!(self.use_row_transport && [8192,16384].contains(&self.rows) && rank < 4 && tokens.rows == self.rows
+        ensure!(self.use_row_transport && crate::config::packed_wide_width(self.rows) && rank < 4 && tokens.rows == self.rows
             && input.len() == (self.rows/4)*5120 && self.cuda.owns_buffer(input)
             && self.cuda.owns_buffer(&tokens.ids) && self.cuda.owns_buffer(&tokens.live)
             && self.cuda.owns_stream(stream), "packed MoE transport input geometry/context");
@@ -701,6 +829,8 @@ impl LayerFfn {
             image_owner: tokens.image_owner.clone(),
             live: unsafe {t.live.view(0,1)}?, rows:(self.rows/4),
             active_rows:tokens.active_rows.saturating_sub(rank*(self.rows/4)).min(self.rows/4),
+            padding_sources: unsafe {tokens.padding_sources.view(rank*(self.rows/4),self.rows/4)}?,
+            padding_active: false,
         };
         ensure!(unsafe {(t.local_live)(tokens.live.ptr() as *const c_void,t.live.ptr() as *mut c_void,
             (self.rows/4) as i32,rank as i32,stream.raw())} == 0, "packed MoE local metadata launch");
@@ -734,10 +864,46 @@ impl LayerFfn {
         let gathered=unsafe{t.gathered.view(0,t.gathered.len())}?;
         self.run_packed_and_shared(workspace,&gathered,q,sm,stream)
     }
+    /// This FFN's L2 hint queue windows, one pair per plan (fields four and five of CANADA_SCRATCH_L2_QUEUE).
+    /// W4 is one queue of the router, shared up and shared down weights; the routed window follows routing.
+    pub(crate) fn build_hint_queues(&mut self, module: &Module, stream: &Stream, plans: &[crate::config::FfnPlan],
+        selected: Rc<Cell<Option<usize>>>) -> Result<()> {
+        ensure!(self.hint_queues.is_empty() && matches!(self.rows, 6 | 16) && !self.use_row_transport,
+            "FFN L2 hint queue profile");
+        let id = LayerId::from_key(self.expert.layout_layer())?;
+        let (weights, region) = self.expert.routed_hint_region()?;
+        let router_key = format!("{}.ffn.gate.weight", id.prefix());
+        let router = weights.view(&router_key)?;
+        ensure!(router.dtype == crate::checkpoint::Dtype::Bf16 && router.shape == [384, 5120]
+            && router.bytes == 384 * 5120 * 2, "FFN L2 hint queue router contract");
+        let matrices = vec![self.shared_up.immutable_matrix(), self.shared_down.immutable_matrix()];
+        let mut regions = vec![(weights.ptr(&router_key)?, router.bytes)];
+        for matrix in &matrices { regions.extend(matrix.immutable_regions()?); }
+        // Not the auxiliary stream: the shared expert's branch runs there and would wait behind these hints.
+        let side = self.cuda.hint_stream(stream)?;
+        for plan in plans {
+            let w4 = if plan.w4.bytes == 0 { None } else {
+                crate::l2_prefetch::Window::new_queue(&self.cuda, module, stream, matrices.clone(), weights.clone(),
+                    &regions, 0, plan.w4.bytes, plan.w4.pace)?.map(|w| w.with_warps(plan.w4.warps)?.with_wave(plan.w4.wave)?.on_stream(side.clone())).transpose()?
+            };
+            let routed = plan.routed.map(|r| crate::l2_prefetch::Window::new_routed(&self.cuda, module, stream,
+                weights.clone(), self.router.ids(), region, r)?.on_stream(side.clone())).transpose()?;
+            self.hint_queues.push(FfnHintQueue { w4, routed });
+        }
+        self.hint_queue_selected = selected;
+        Ok(())
+    }
+    fn selected_hint_queue(&self) -> Option<&FfnHintQueue> {
+        self.hint_queue_selected.get().and_then(|i| self.hint_queues.get(i))
+    }
     pub(crate) fn prefetch_begin(&self, stream: &Stream) -> Result<()> {
         // Queue the small expert hint first. Its early join must not wait for
         // the existing dense-weight hint's deliberately later consumer.
         if let Some(hint)=&self.expert_prefetch {hint.begin(stream)?;}
+        // A selected plan's W4 replaces the FFN hint.
+        if let Some(w4) = self.selected_hint_queue().and_then(|q| q.w4.as_ref()) {
+            return w4.begin(stream);
+        }
         if let Some(hint) = &self.prefetch {
             hint.begin(stream)?;
         }
@@ -774,8 +940,13 @@ impl LayerFfn {
             .set_budget_for_probe(budget,stream)
     }
     pub(crate) fn prefetch_join(&self, stream: &Stream) -> Result<()> {
+        if let Some(q) = self.selected_hint_queue() {
+            for w in [&q.w4, &q.routed].into_iter().flatten() {
+                if w.is_open() { w.join(stream)?; }
+            }
+        }
         if let Some(hint) = &self.prefetch {
-            hint.join(stream)?;
+            if hint.is_open() { hint.join(stream)?; }
         }
         Ok(())
     }
@@ -800,19 +971,30 @@ impl LayerFfn {
             self.cuda.owns_buffer(workspace.output()),
             "MoE workspace context mismatch"
         );
+        // The router's top-k inside the experts' front-end node (CANADA_SCRATCH_MOE_ROUTE_FRONT): captured decode
+        // graphs only, no routed hint window (it would read the ids before the front-end wrote them).
+        let fused = crate::moe::route_front_ready() && matches!(self.router.scores, Scores::Tiny { .. })
+            && workspace.route_front_admits(tokens.active_rows())
+            && self.selected_hint_queue().is_none_or(|q| q.routed.is_none());
         if self.local_shared_active() {
             // Routed experts only (no fused shared sum); the shared expert ran row-locally.
-            self.router.run(input, tokens, stream)?;
+            self.router.run_routed(input, tokens, fused, stream)?;
             self.join_local_shared(stream)?;
             workspace.run_live_for_ffn(&self.expert, input, self.router.ids(), self.router.routing(),
                 tokens.active_rows(), false, stream)?;
+            if fused { crate::moe::route_taken()?; self.router.census(tokens, stream)?; }
             return Ok(());
         }
         let concurrent=prefill_shared_concurrent(self.rows);
         if let Some(branch) = self.shared_branch.as_ref().filter(|_| concurrent) {
             branch.input_ready.record(stream)?;
         }
-        self.router.run(input, tokens, stream)?;
+        if !crate::knockout::has(crate::knockout::Site::Router) { self.router.run_routed(input, tokens, fused, stream)?; }
+        // The selected plan's routed window: the experts just chosen, hinted beside the route/pack kernel.
+        if let Some(routed) = self.selected_hint_queue().and_then(|q| q.routed.as_ref()) {
+            if routed.is_open() { routed.join(stream)?; }
+            routed.begin(stream)?;
+        }
         let deferred=workspace.run_live_for_ffn(
             &self.expert,
             input,
@@ -822,14 +1004,16 @@ impl LayerFfn {
             self.fused_sum.is_some()&&self.fused_sum_enabled.get(),
             stream,
         )?;
+        if fused { crate::moe::route_taken()?; self.router.census(tokens, stream)?; }
+        crate::mhc::routed_end_point(stream)?;
         if let Some(branch) = &self.shared_branch {
             if !concurrent {branch.input_ready.record(stream)?;}
             branch.input_ready.wait(&branch.stream)?;
-            self.run_shared_quantized_input(input,quantized,&branch.stream)?;
+            self.run_shared_quantized_input(input,quantized,&branch.stream,concurrent.then_some(stream))?;
             branch.output_ready.record(&branch.stream)?;
             branch.output_ready.wait(stream)?;
         } else {
-            self.run_shared_quantized_input(input,quantized,stream)?;
+            self.run_shared_quantized_input(input,quantized,stream,None)?;
         }
         if let Some((mut routes,live))=deferred {
             let module=self.fused_sum.as_ref().context("fused sum module absent")?;
@@ -848,7 +1032,7 @@ impl LayerFfn {
         self.fused_sum_enabled.set(enabled);Ok(())
     }
     fn run_shared_quantized_input(&self,input:&Buffer<bf16>,
-        quantized:Option<(&Buffer<u8>,&Buffer<u8>)>,stream:&Stream)->Result<()> {
+        quantized:Option<(&Buffer<u8>,&Buffer<u8>)>,stream:&Stream,tail:Option<&Stream>)->Result<()> {
         // The compact M16 shared projection retains its own quantizer's
         // minimum-amax semantics. Reuse the fused BF16 normalization here,
         // but do not substitute legacy MXFP8 operands for that quantizer.
@@ -857,7 +1041,7 @@ impl LayerFfn {
             ensure!(matches!(self.rows,6|16) && !self.shared_up.narrow_projection(),
                 "prequantized normalized shared input requires the checked legacy quantizer");
             self.shared_up.run_quantized(values,scales,stream)?;
-            self.finish_shared(stream)
+            self.finish_shared(stream,tail)
         } else {self.run_shared(input,stream)}
     }
     fn add_shared(&self, workspace: &Workspace, stream: &Stream) -> Result<()> {
@@ -881,9 +1065,10 @@ impl LayerFfn {
     }
     fn run_shared(&self, input: &Buffer<bf16>, stream: &Stream) -> Result<()> {
         self.shared_up.run(input, stream)?;
-        self.finish_shared(stream)
+        self.finish_shared(stream, None)
     }
-    fn finish_shared(&self, stream: &Stream) -> Result<()> {
+    /// `tail`: the stream the routed experts run on while this branch runs on `stream` (the experts' tail point).
+    fn finish_shared(&self, stream: &Stream, tail: Option<&Stream>) -> Result<()> {
         if self.rows==16 && self.shared_quant.is_some() { return self.finish_shared16(stream); }
         if let Some(module)=&self.shared_quant {
             let (values,rowscales,scales)=self.shared_down.shared_quantization_buffers()?;
@@ -896,6 +1081,9 @@ impl LayerFfn {
                 &mut [(&mut x as *mut u64).cast(),(&mut a as *mut u64).cast(),
                     (&mut q as *mut u64).cast(),(&mut sr as *mut u64).cast(),
                     (&mut sm as *mut u64).cast(),(&mut rows as *mut i32).cast()])?;}
+            if let (Some(parent), Some((gate, bytes))) = (tail, &self.tail_gate) {
+                crate::mhc::tail_point(gate, *bytes, parent, stream)?;
+            }
             return self.shared_down.run_quantized(values,scales,stream);
         }
         ensure!(
@@ -909,6 +1097,9 @@ impl LayerFfn {
             } == 0,
             "shared SwiGLU launch failed"
         );
+        if let (Some(parent), Some((gate, bytes))) = (tail, &self.tail_gate) {
+            crate::mhc::tail_point(gate, *bytes, parent, stream)?;
+        }
         self.shared_down.run(&self.activation, stream)?;
         Ok(())
     }
@@ -1041,7 +1232,7 @@ impl LayerFfn {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn enable_local_shared(&mut self, cuda: &Cuda, module: &Module, stream: &Stream,
         weights: &Rc<Weights>, kernels: &Path, layer: usize, rank: usize) -> Result<()> {
-        ensure!(crate::config::wide_rows(self.rows) && self.rows % 512 == 0 && rank < 4 && self.local_shared.is_none(),
+        ensure!(crate::config::wide_rows(self.rows) && self.rows % 128 == 0 && rank < 4 && self.local_shared.is_none(),
             "row-local shared expert geometry");
         let local = self.rows / 4;
         let p = format!("layers.{layer}.ffn.shared_experts");
@@ -1167,7 +1358,8 @@ impl LayerFfn {
         ensure!(t.pack_bf16.is_some()&&t.intermediates.is_none(),"pipeline requires fused dual-row input contract");
         let local=TokenRows{ids:unsafe{tokens.ids.view(rank*2048,2048)}?,live:unsafe{t.live.view(0,1)}?,
             image_pointers:unsafe{tokens.image_pointers.view(rank*2048,2048)}?,image_owner:tokens.image_owner.clone(),
-            rows:2048,active_rows:tokens.active_rows.saturating_sub(rank*2048).min(2048)};
+            rows:2048,active_rows:tokens.active_rows.saturating_sub(rank*2048).min(2048),
+            padding_sources:unsafe{tokens.padding_sources.view(rank*2048,2048)}?,padding_active:false};
         ensure!(unsafe{(t.local_live)(tokens.live.ptr()as *const c_void,t.live.ptr()as *mut c_void,
             2048,rank as i32,stream.raw())}==0,"pipeline local metadata launch");
         t.router.run(input,&local,stream)?;

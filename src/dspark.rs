@@ -27,6 +27,14 @@ use std::{path::Path, rc::Rc};
 
 #[path = "dspark_pair_query.rs"]
 mod pair_query;
+/// Head runs of batched body passes by form [whole, subset] since the last batched timing report (diagnostic).
+pub(crate) static BATCHED_HEAD_FORMS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+/// Pooled NVFP4 head passes of batched body passes (config::draft_head_pool) since the last report (diagnostic).
+pub(crate) static BATCHED_HEAD_POOLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[path = "dspark_batch_query.rs"]
+mod batch_query;
+pub(crate) use batch_query::BatchBodies;
 #[path="dspark_query_reuse_probe.rs"]
 mod query_reuse_probe;
 pub(crate) use query_reuse_probe::QueryOutputSnapshot;
@@ -39,6 +47,8 @@ struct Stage {
     attn_reduced: Buffer<bf16>,
     ffn_reduced: Buffer<bf16>,
     sink: Buffer<f32>,
+    /// config::draft_hints: the next stage's hint queue, whose first window this stage begins beside its FFN sum.
+    next_hint: Option<Rc<crate::layer_attention::HintQueue>>,
 }
 impl Stage {
     #[allow(clippy::too_many_arguments)]
@@ -100,6 +110,7 @@ impl Stage {
             attn_reduced: cuda.allocate(QUERY_ROWS * 5120)?,
             ffn_reduced: cuda.allocate(QUERY_ROWS * 5120)?,
             sink,
+            next_hint: None,
         })
     }
     #[allow(clippy::too_many_arguments)]
@@ -127,6 +138,8 @@ impl Stage {
             Some(comm),
             stream,
         )?;
+        // config::draft_hints: the shared expert's weights beside the attention sum (no-op without the hint).
+        self.ffn.prefetch_begin(stream)?;
         unsafe { comm.sum_bf16(self.attention.output(), &mut self.attn_reduced, stream) }?;
         self.attn_boundary
             .finish(&self.attn_reduced, residual, stream)?;
@@ -137,9 +150,28 @@ impl Stage {
         )?;
         self.ffn
             .run(workspace, self.ffn_boundary.input(), tokens, stream)?;
+        self.ffn.prefetch_join(stream)?;
+        // config::draft_hints: the next stage's first window beside this stage's FFN sum (that stage joins it).
+        if let Some(w) = self.next_hint.as_ref().and_then(|q| q.w1.as_ref()) { w.begin(stream)?; }
         unsafe { comm.sum_bf16(self.ffn.output(), &mut self.ffn_reduced, stream) }?;
         self.ffn_boundary
             .finish(&self.ffn_reduced, self.attn_boundary.output(), stream)
+    }
+    /// One phase of the attention sublayer on this owner's five rows of a batched pass's boundary input
+    /// (layer_attention::Layer::run_draft_phase); after phase 16, `attention_partial` is its WO-B partial.
+    #[allow(clippy::too_many_arguments)]
+    fn run_attention_phase(&mut self, phase: u8, input: &Buffer<bf16>, positions: &Positions, locations: &RowLocations,
+        cache: &mut PagedKv, candidates: &Candidates, stream: &Stream) -> Result<()> {
+        self.attention.run_draft_phase(phase, input, positions, locations, cache, candidates, &self.sink, stream)
+    }
+    fn attention_partial(&self) -> &Buffer<bf16> { self.attention.output() }
+    /// The attention sublayer alone, on this owner's five rows of a batched pass's boundary input
+    /// (dspark_batch_query); returns its WO-B partial.
+    #[allow(clippy::too_many_arguments)]
+    fn run_attention(&mut self, input: &Buffer<bf16>, positions: &Positions, locations: &RowLocations,
+        cache: &mut PagedKv, candidates: &Candidates, comm: &Roce, stream: &Stream) -> Result<&Buffer<bf16>> {
+        self.attention.run_distributed(input, positions, locations, cache, candidates, &self.sink, Some(comm), stream)?;
+        Ok(self.attention.output())
     }
     fn output(&self) -> &Buffer<bf16> {
         self.ffn_boundary.output()
@@ -152,7 +184,15 @@ impl Stage {
 pub struct QueryNetwork {
     // Drop the captured executable before any pointer storage.
     graph: Option<Graph>,
+    /// The captured graph of the other draft-head form (script subset / whole head), kept across switches.
+    graph_other: Option<Graph>,
+    /// The form `graph` was (or will be) captured with: the private head's script subset.
+    head_subset: bool,
+    /// Draft passes since the last report, by head form [whole, subset] (diagnostic).
+    head_passes: [u64; 2],
     pair_body_graph:Option<Graph>,
+    /// Batched body passes (dspark_batch_query), built at the first fork and shared with every fork.
+    shared_bodies: Rc<std::cell::OnceCell<std::cell::RefCell<BatchBodies>>>,
     pair_head:Option<crate::draft_head::Pair>,
     cuda: Cuda,
     module: Module,
@@ -190,6 +230,7 @@ impl QueryNetwork {
         stream:&Stream,kernels:&Path)->Result<Self> {
         self.guard(stream)?;
         ensure!(std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1")
+            ||crate::config::batched_rows_admitted()
             ||crate::config::resident_banks_requested(),
             "independent drafter requires finite pairing admission");
         let (io,frequencies)=target.draft_resources(core,stream,kernels)?;
@@ -206,6 +247,13 @@ impl QueryNetwork {
         ensure!(Rc::ptr_eq(&self.weights,&fork.weights)&&self.state.independent_from(&fork.state)?
             &&self.io.local_logits().ptr()!=fork.io.local_logits().ptr()
             &&self.normalized.ptr()!=fork.normalized.ptr(),"independent drafter aliased mutable storage");
+        if crate::config::batched_draft_body()&&crate::config::batched_rows_admitted() {
+            if self.shared_bodies.get().is_none() {
+                let bodies=BatchBodies::new(self,stream,kernels)?;
+                ensure!(self.shared_bodies.set(std::cell::RefCell::new(bodies)).is_ok(),"batched drafter bodies raced");
+            }
+            fork.shared_bodies=self.shared_bodies.clone();
+        }
         Ok(fork)
     }
     pub(crate) fn sampled_graphs_ready(&self) -> bool {
@@ -316,6 +364,13 @@ impl QueryNetwork {
                 stage,
             )?);
         }
+        if let Some((w1, w3, _)) = crate::config::draft_hints()? {
+            let mut queues = Vec::with_capacity(3);
+            for (k, stage) in stages.iter_mut().enumerate() {
+                queues.push(stage.attention.build_draft_hint_queue(&module, stream, w1, w3, 200, k > 0)?);
+            }
+            for k in 0..stages.len() - 1 { stages[k].next_hint = Some(queues[k + 1].clone()); }
+        }
         let v = weights.view("mtp.2.norm.weight")?;
         ensure!(
             v.dtype == Dtype::Bf16 && v.shape == [5120],
@@ -342,7 +397,15 @@ impl QueryNetwork {
                 }
             }
             if std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_NVFP4_SCREEN").as_deref()==Ok("1") {
-                head=head.with_nvfp4(&kernels.join("draft-head-nvfp4-marlin-m5-v1"),stream)?;
+                head=head.with_nvfp4(&kernels.join("draft-head-nvfp4-marlin-m5-v1"),stream,core,rank)?;
+            } else if crate::config::draft_head_nvfp4() {
+                // One copy a rank: the first drafter builds it, sharers take it in share_encoding_from.
+                static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !BUILT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    head=head.with_nvfp4(&kernels.join("draft-head-nvfp4-marlin-m5-v1"),stream,core,rank)?;
+                    head.activate_nvfp4()?;
+                    eprintln!("rank{rank} DSpark draft head: NVFP4 copy active for own draft passes (CANADA_SCRATCH_DRAFT_HEAD_NVFP4)");
+                }
             }
             Some(head)
         } else {
@@ -373,10 +436,17 @@ impl QueryNetwork {
         };
         let result = Self {
             graph: None,
+            graph_other: None,
+            head_subset: crate::config::draft_head_subset()? == 2,
+            head_passes: [0; 2],
             pair_body_graph:None,
+            shared_bodies: Rc::new(std::cell::OnceCell::new()),
             pair_head:if crate::config::paired_draft_head_requested(){
+                // Batched decode (serving or its screens) pools pairs of its conversations' heads
+                // (CANADA_SCRATCH_BATCHED_POOLED_HEAD=1); its drafters are independent forks.
                 ensure!(crate::config::paired_serving_requested()
-                    ||std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1"),
+                    ||std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref()==Ok("1")
+                    ||(crate::config::batched_pooled_head()&&crate::config::batched_rows_admitted()),
                     "paired draft head requires independent generation owners");
                 Some(crate::draft_head::Pair::new(cuda,&kernels.join("draft-head-pool-m10-v1"),stream)?)
             }else{None},
@@ -489,7 +559,7 @@ impl QueryNetwork {
         if self.io.draft_head_gemv_enabled() != active {
             stream.join_default()?;
             stream.synchronize()?;
-            self.graph = None;
+            self.graph = None; self.graph_other = None;
             self.io.set_draft_head_gemv_for_probe(active)?;
             self.ready = false;
             self.last_anchor = None;
@@ -502,7 +572,7 @@ impl QueryNetwork {
         ensure!(self.private_head_active,"private GEMV screen requires active private head");
         let head=self.private_head.as_ref().ok_or_else(||anyhow::anyhow!("private head absent"))?;
         if head.gemv_enabled()!=active {
-            stream.join_default()?;stream.synchronize()?;self.graph=None;
+            stream.join_default()?;stream.synchronize()?;self.graph=None;self.graph_other=None;
             head.set_gemv_for_probe(active)?;
             self.ready=false;self.last_anchor=None;self.markov.invalidate_results();
         }
@@ -513,7 +583,7 @@ impl QueryNetwork {
         ensure!(self.private_head_active,"private precision screen requires active private head");
         let head=self.private_head.as_ref().ok_or_else(||anyhow::anyhow!("private head absent"))?;
         if head.precision_kind()!=kind {
-            stream.join_default()?;stream.synchronize()?;self.graph=None;
+            stream.join_default()?;stream.synchronize()?;self.graph=None;self.graph_other=None;
             head.set_precision_for_probe(kind)?;
             self.ready=false;self.last_anchor=None;self.markov.invalidate_results();
         }
@@ -528,7 +598,7 @@ impl QueryNetwork {
             // changing the head; the probe warms its replacement before timing.
             stream.join_default()?;
             stream.synchronize()?;
-            self.graph = None;
+            self.graph = None; self.graph_other = None;
             self.private_head_active = active;
             self.ready = false;
             self.last_anchor = None;
@@ -536,6 +606,24 @@ impl QueryNetwork {
         }
         Ok(())
     }
+    /// The form of this drafter's next passes (CANADA_SCRATCH_DRAFT_HEAD_SUBSET): the private head's script
+    /// subset or the whole head. Each form has its own captured graph; switching swaps them (the other one is
+    /// captured on its first use) and discards the last pass's results. A no-op without a subset head.
+    pub(crate) fn select_head_subset(&mut self, subset: bool, stream: &Stream) -> Result<()> {
+        if self.head_subset == subset || !self.private_head_active
+            || !self.private_head.as_ref().is_some_and(|h| h.nvfp4_subset_available()) { return Ok(()); }
+        self.guard(stream)?;
+        stream.join_default()?;
+        stream.synchronize()?;
+        std::mem::swap(&mut self.graph, &mut self.graph_other);
+        self.head_subset = subset;
+        self.ready = false;
+        self.last_anchor = None;
+        self.markov.invalidate_results();
+        Ok(())
+    }
+    /// Draft passes by head form [whole, subset] since the last call.
+    pub(crate) fn take_head_passes(&mut self) -> [u64; 2] { std::mem::take(&mut self.head_passes) }
     pub(crate) fn warm_head_for_probe(&mut self, anchor:u32, comm:&Roce, stream:&Stream) -> Result<()> {
         ensure!(std::env::var("CANADA_SCRATCH_DRAFT_HEAD_SCREEN").as_deref()==Ok("1")
             || std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_NVFP4_SCREEN").as_deref()==Ok("1")
@@ -842,6 +930,10 @@ impl QueryNetwork {
     }
     /// sample_from_anchor=true: one observed anchor and four noise embeddings,
     /// with five bidirectional output rows. This does not sample proposals yet.
+    /// The last run (alone or paired) drafted from `anchor` and its outputs are ready.
+    pub(crate) fn ready_for(&self, anchor: u32) -> bool {
+        self.ready && !self.poisoned && self.last_anchor == Some(anchor)
+    }
     pub fn run(&mut self, anchor: u32, comm: &Roce, stream: &Stream) -> Result<()> {
         self.guard(stream)?;
         ensure!(
@@ -871,6 +963,7 @@ impl QueryNetwork {
                 self.comm_instance = Some(comm.instance());
             }
             unsafe { self.graph.as_ref().unwrap().launch(stream) }?;
+            self.head_passes[usize::from(self.head_subset)] += 1;
             self.state.publish_queries(stream)?;
             comm.health()?;
             Ok(())
@@ -886,8 +979,14 @@ impl QueryNetwork {
     }
     fn enqueue(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
         self.enqueue_body(comm,stream)?;
+        self.run_head(comm,stream)
+    }
+    /// This owner's vocabulary head over its normalized body output.
+    fn run_head(&mut self, comm: &Roce, stream: &Stream) -> Result<()> {
         if self.private_head_active {
             let head = self.private_head.as_ref().ok_or_else(||anyhow::anyhow!("private draft head absent"))?;
+            // The head copy is shared between drafters; the form is this drafter's and is chosen per pass.
+            head.set_nvfp4_subset_mode(self.head_subset)?;
             self.io.run_private_draft_head(head, &self.normalized, stream)?;
         } else {
             self.io.run_normalized_head(&self.normalized, stream)?;
@@ -1000,6 +1099,27 @@ impl QueryNetwork {
         let position=self.position()?.checked_add(1).ok_or_else(||anyhow::anyhow!("draft position overflow"))?;
         self.proposals(Some((seed,position)),Some(threshold),comm,stream)
     }
+    /// config::batched_proposal_launch: launch the first segment of this drafter's proposals without waiting
+    /// (Markov::launch_causal_three_prefix). False: not on that path now; propose as before.
+    pub(crate) fn launch_causal_three_prefix(&mut self,seed:u64,comm:&Roce,stream:&Stream)->Result<bool>{
+        self.guard(stream)?;
+        ensure!(self.ready&&self.comm_instance==Some(comm.instance())&&comm.rank()==self.rank,"DSpark proposal owner");
+        let anchor=self.last_anchor.ok_or_else(||anyhow::anyhow!("DSpark query anchor missing"))?;
+        let position=self.position()?.checked_add(1).ok_or_else(||anyhow::anyhow!("draft position overflow"))?;
+        let result=self.markov.launch_causal_three_prefix(self.io.local_logits(),&self.combined,anchor,seed,position,comm,stream);
+        if result.is_err(){self.poisoned=true;self.ready=false;self.state.invalidate();}
+        result
+    }
+    pub(crate) fn finish_causal_three_prefix(&mut self,threshold:f32,comm:&Roce,stream:&Stream)->Result<Option<[u32;5]>>{
+        let result=self.markov.finish_causal_three_prefix(threshold,comm,stream);
+        if result.is_err(){self.poisoned=true;self.ready=false;self.state.invalidate();}
+        result
+    }
+    pub(crate) fn finish_causal_three_rest(&mut self,comm:&Roce)->Result<[u32;5]>{
+        let result=self.markov.finish_causal_three_rest(comm);
+        if result.is_err(){self.poisoned=true;self.ready=false;self.state.invalidate();}
+        result
+    }
     pub(crate) fn set_prefix_stop_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()>{
         self.markov.set_prefix_stop_for_probe(enabled,stream)
     }
@@ -1016,6 +1136,10 @@ impl QueryNetwork {
         self.guard(stream)?;self.markov.cache_counters_for_probe(stream)
     }
     pub(crate) fn hierarchical_active(&self)->bool{self.markov.hierarchical_active()}
+    /// Diagnostic export only (crate::logit_export::head4_enabled): the drafter's active 4-bit vocabulary head.
+    pub(crate) fn nvfp4_head_for_export(&self)->Option<std::rc::Rc<crate::nvfp4_head::Head>> {
+        self.private_head.as_ref().and_then(|h|h.nvfp4_for_export())
+    }
     pub(crate) fn set_hierarchical_for_probe(&mut self,active:bool,stream:&Stream)->Result<()>{
         self.guard(stream)?;self.markov.set_hierarchical_for_probe(active,stream)
     }
@@ -1023,6 +1147,7 @@ impl QueryNetwork {
         self.markov.sharded_probabilities(requested)
     }
     pub(crate) fn produced_proposals(&self)->Result<usize>{self.markov.produced()}
+    pub(crate) fn selected_q_for_log(&self)->Result<[f64;5]>{self.markov.selected_q_for_log()}
     pub(crate) fn proposal_probabilities_prefix(&self,requested:usize)->Result<&Buffer<f64>>{
         self.markov.probabilities_prefix(requested)
     }
@@ -1136,12 +1261,27 @@ impl QueryNetwork {
         saved
     }
     pub(crate) fn state_image_bytes(&self)->Result<usize> {self.state.state_image_bytes()}
+    /// This fresh fork and `origin` restore each other's state images (dspark_kv::State::join_image_family).
+    pub(crate) fn join_image_family(&mut self, origin: &Self) -> Result<()> {
+        ensure!(!self.poisoned && !self.ready && self.graph.is_none() && self.pair_body_graph.is_none()
+            && self.comm_instance.is_none() && self.rank == origin.rank && Rc::ptr_eq(&self.weights, &origin.weights),
+            "an image family takes fresh forks of one drafter");
+        self.state.join_image_family(&origin.state)
+    }
     pub(crate) fn restore_state_image(&mut self, saved: &crate::dspark_kv::StateImage,
         comm: &Roce, stream: &Stream) -> Result<()> {
         self.guard(stream)?;
-        ensure!(comm.rank() == self.rank && self.comm_instance == Some(comm.instance()),
+        ensure!(comm.rank() == self.rank && self.comm_instance.is_none_or(|c|c==comm.instance()),
             "draft image restore changed communicator");
         comm.health()?;
+        // A restore can be a drafter's first use: batched serving's spare drafters take region 0 when its
+        // conversation moves to a serving region, and the next thing there may be a paused or cached
+        // conversation's image. The same initial-binding rule as run() and save_state_image(). (Until Nov 14
+        // 2026 a restore needed an earlier query or save on this drafter and stopped the engine otherwise.)
+        if self.comm_instance.is_none() {
+            ensure!(self.graph.is_none(), "captured draft graph lost its communicator");
+            self.comm_instance=Some(comm.instance());
+        }
         self.poisoned = true;
         self.ready = false;
         self.last_anchor = None;

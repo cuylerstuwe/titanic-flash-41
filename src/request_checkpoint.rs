@@ -49,9 +49,13 @@ pub(super) fn try_checkpoint_protected(w: &mut Worker, other_charge: usize,
     checkpoint(w, other_charge, other_count, Some(protected))
 }
 
+/// Room a pause asks for beyond the reserve and its own charge when it has to release completed cache against
+/// measured memory: the save's own cache-reserve check and ordinary host movement between the two readings.
+const PAUSE_SLACK_BYTES: usize = 64 * 1024 * 1024;
+
 fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
     protected: Option<u16>) -> Result<Option<(RequestCheckpoint, Value)>> {
-    w.state_pressure_trim=None;
+    w.state_pressure_trim=None;w.park_refusal=None;
     ensure!(w.current.is_some() && other_count<=1 && w.verify.profile_is_current()
         && w.verify.position() == w.history.frontier() as u64,
         "request checkpoint needs a committed active request and bounded peers");
@@ -81,7 +85,10 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
     // cache may lend it, but an unfinished owner is never an eviction target.
     // Exchanges between already prepared owners account their staging below.
     let working_room=if exchange && other_count==0 {256}else{16}*1024usize.pow(2);
-    let reserve = crate::memory::floor_bytes()+working_room;
+    // The image is allocated through the allocator's floor guard (floor plus its 512 MiB allowance when the guard
+    // is on). Reclaim completed cache up to that line: with the bare floor here a pause found "enough" memory,
+    // evicted nothing and then failed inside the allocation (Nov 14 2026, see state_image::Image::try_allocate).
+    let reserve = crate::memory::floor_bytes().max(w.cuda.allocation_reserve_bytes())+working_room;
     let mut host_allocator_trim = None;
     if exchange || crate::config::single_bank_requested() {
         // Optional completed checkpoints may borrow unused parking capacity.
@@ -89,7 +96,10 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
         // acceleration, whether parking uses copies or in-place exchange.
         // No live or suspended request state is an eviction target.
         if evictions.is_none(){evictions=cache_evictions(&entries,(usize::MAX,charge),budget,true,slots);}
-        if !w.control.all_admit(evictions.is_some())?{return Ok(None);}
+        if !w.control.all_admit(evictions.is_some())?{
+            w.park_refusal=Some(json!({"stage":"image budget or slots","charge_bytes":charge,"budget_bytes":budget,"entries":entries.len()}));
+            return Ok(None);
+        }
         let indices=evictions.as_mut().unwrap();
         let mut policy=vec![entries.len()as u8];policy.extend(indices.iter().map(|&i|i as u8));w.control.agree(&policy)?;
         let mut available=w.cuda.admission_memory()?.admitted_available;
@@ -103,7 +113,10 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
             }
             let candidate=(0..entries.len()).filter(|i|!indices.contains(i))
                 .min_by_key(|&i|usize::from(protected.unwrap_or(0)&(1<<i)!=0));
-            let Some(i)=candidate else{return Ok(None);};indices.push(i);
+            let Some(i)=candidate else{
+                w.park_refusal=Some(json!({"stage":"every cached entry planned","available_bytes":available,"required_bytes":reserve+charge,"entries":entries.len()}));
+                return Ok(None);
+            };indices.push(i);
         }
     } else if protected.is_some() {
         let reclaimable = evictions.as_ref().map_or(0, |indices| indices.iter().map(|&i| entries[i].1).sum());
@@ -111,6 +124,7 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
         // Agree before deleting anything. A rank-local refusal must not cause
         // the other devices to spend cache on a park that cannot take place.
         if !w.control.all_admit(evictions.is_some() && available.saturating_add(reclaimable) >= reserve+charge)? {
+            w.park_refusal=Some(json!({"stage":"two-owner plan","available_bytes":available,"required_bytes":reserve+charge,"entries":entries.len()}));
             return Ok(None);
         }
     }
@@ -121,7 +135,25 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
         indices.sort_unstable();evicted=indices.len();
         for i in indices.into_iter().rev(){w.cached_sessions.remove(i);}
     }
-    if !w.control.all_admit(within_budget && w.cuda.admission_memory()?.admitted_available >= reserve+charge)? {
+    // The plan counts every evicted entry's whole charge. Cached images that share ancestor pages with an entry
+    // that stays give back less than that, and the save below must still leave the cache reserve, so the plan can
+    // come up short while gigabytes of completed cache remain: the release stress panel's pause at the allocator's
+    // line was refused with ~4 GiB of completed cache resident (Nov 14 2026, s1580), and a refused pause is not
+    // retried for the rest of the request. Completed cache never outranks an unfinished owner: keep releasing
+    // it, oldest first, against the MEASURED memory (every rank releases the same entries).
+    let needed=reserve+charge+PAUSE_SLACK_BYTES;
+    let mut measured_evictions=0;
+    if within_budget && (exchange || crate::config::single_bank_requested())
+        && !w.control.all_admit(w.cuda.admission_memory()?.admitted_available >= needed)?
+        && !w.cached_sessions.is_empty() {
+        let event=reclaim_optional_cache(&w.cuda,&mut w.control,&mut w.cached_sessions,false,needed)?;
+        measured_evictions=event["evicted"].as_array().map_or(0,Vec::len);
+        evicted+=measured_evictions;
+    }
+    let available=w.cuda.admission_memory()?.admitted_available;
+    if !w.control.all_admit(within_budget && available >= reserve+charge)? {
+        w.park_refusal=Some(json!({"stage":"after releasing completed cache","available_bytes":available,"required_bytes":reserve+charge,
+            "planned_evictions":evicted-measured_evictions,"measured_evictions":measured_evictions,"entries_left":w.cached_sessions.len()}));
         return Ok(None);
     }
     w.stream.synchronize()?;
@@ -133,6 +165,8 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
         if w.control.all_admit(local.is_some()&&w.cuda.admission_memory()?.admitted_available>=reserve)?{local}else{None}
     }else{w.try_save_session_image(w.history.pending().unwrap(),device)?};
     let Some(image)=image else {
+        w.park_refusal=Some(json!({"stage":"image save","available_bytes":w.cuda.admission_memory()?.admitted_available,
+            "required_bytes":reserve+charge,"measured_evictions":measured_evictions,"entries_left":w.cached_sessions.len()}));
         return Ok(None);
     };
     w.stream.synchronize()?;
@@ -143,6 +177,7 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
         "emitted":saved.emitted,"limit":saved.limit,"charge_bytes":charge,
         "held_bytes":other_charge+charge,"evicted_cache_entries":evicted,
         "protected_entries_reclaimed_for_admitted_owner":evicted_protected,
+        "evicted_against_measured_memory":measured_evictions,
         "host_allocator_trim":host_allocator_trim,
         "prefill_working_allowance_bytes":working_room,
         "cached_bytes":w.cached_sessions.iter().map(|c|c.charge).sum::<usize>(),
@@ -239,8 +274,40 @@ pub(super) fn suspend(w: &mut Worker) -> Result<Value> {
     Ok(json!({"request_id":id,"frontier":w.history.frontier(),"client_finish_emitted":false}))
 }
 
+/// A resumed request's image is about to replace region 0's state. The conversation loaded there keeps what a
+/// newcomer's prompt keeps for the conversation it displaces (Worker::reuse_cached_session) and what a region
+/// conversation moving back keeps for the one it finds (Worker::save_peer): its newest bank-retained checkpoints
+/// as standalone images (the bank's lineage ends with the restore, and its next turn starts from them), and, if
+/// it finished there, its complete image under the cache's ordinary admission. `loaded_is_parked`: region 0 holds
+/// the suspended state of a paused request, whose complete state is its image already; its checkpoints are kept
+/// all the same (they are separate cache entries, and they end with the lineage even when it is the request
+/// being resumed).
+/// Until Nov 14 2026 a restore kept nothing. With requests taking turns through paused images, every
+/// conversation but the last one to finish began its next turn without its prompt's checkpoint (release regions
+/// panel on s1583: of three conversations taking turns, two reused 0 % of their prompts on the follow-up).
+pub(super) fn keep_displaced(w: &mut Worker, loaded_is_parked: bool) -> Result<Value> {
+    if w.session.is_none() || w.session_cache_budget == 0 || w.history.committed().is_empty()
+        || !w.verify.profile_is_current() || w.verify.position() != w.history.frontier() as u64 {
+        return Ok(Value::Null);
+    }
+    let prefix = w.history.committed().to_vec();
+    let mut kept = json!({"saved":false,"loaded_is_parked":loaded_is_parked});
+    if !loaded_is_parked {
+        if let Some(pending) = w.history.pending() {
+            let media = w.history.media().through(prefix.len());
+            kept = w.retain_cached_prefix_reserved(&prefix, pending, media, 0, 0, w.displaced_snapshot)?;
+        }
+    }
+    let checkpoints = w.materialize_displaced_checkpoint(&[], &prefix, None)?;
+    if !checkpoints.is_null() { kept["kept_images"] = checkpoints; }
+    Ok(kept)
+}
+
 pub(super) fn restore(w: &mut Worker, saved: &RequestCheckpoint) -> Result<Value> {
     ensure!(w.current.is_none(),"probe restore would replace an active request");
+    // Batched serving (Worker::region0_admits): the scheduler resumes such a conversation only with the regions empty.
+    ensure!(w.region0_admits(saved.history.frontier().saturating_add(saved.limit.saturating_sub(saved.emitted)))?,
+        "a paused conversation that reaches past one serving region needs every region empty");
     let reserve=crate::memory::floor_bytes()+16*1024usize.pow(2);
     let mut admitted=w.control.all_admit(w.cuda.admission_memory()?.admitted_available>=reserve)?;
     if !admitted {

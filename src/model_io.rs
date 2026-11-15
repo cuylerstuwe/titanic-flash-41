@@ -53,6 +53,8 @@ pub struct ModelIo {
     sparse_publish_active: bool,
     logits: Buffer<f32>,
     stream: Cell<usize>,
+    /// crate::head4_rescore (six-row verify owner; default absent).
+    head4: Option<Rc<crate::head4_rescore::Rescore>>,
 }
 /// Only immutable head weights/encoding are shared. Pack/scatter storage is
 /// private to the pair executor and outlives every graph using its addresses.
@@ -249,7 +251,37 @@ impl ModelIo {
             sparse_publish_active:false,
             logits: cuda.allocate(head_rows * 129280)?,
             stream: Cell::new(0),
+            head4: None,
         })
+    }
+    /// crate::head4_rescore: this (six-row verify) owner's head through the drafter's 4-bit copy with exact
+    /// rescoring. `on` false installs it for the plan screen's A/B.
+    pub(crate) fn install_head4(&mut self, head: Rc<crate::nvfp4_head::Head>, cap: usize, window: f32, on: bool) -> Result<()> {
+        ensure!(self.rows == crate::head4_rescore::ROWS && !self.input_only && self.head4.is_none(), "4-bit head rescoring owner");
+        let view = self.weights.view("head.weight")?;
+        ensure!(view.dtype == crate::checkpoint::Dtype::Bf16 && view.shape == [32320, 5120], "canonical head slice shape/dtype");
+        self.head4 = Some(Rc::new(crate::head4_rescore::Rescore::new(&self.cuda, &self.module, head,
+            self.weights.ptr("head.weight")?, cap, window, on)?));
+        Ok(())
+    }
+    pub(crate) fn head4_on(&self) -> bool { self.head4.as_ref().is_some_and(|h| h.on()) }
+    pub(crate) fn set_head4(&self, on: bool) -> Result<()> {
+        self.head4.as_ref().context("4-bit head rescoring is not installed")?.set(on);
+        Ok(())
+    }
+    pub(crate) fn head4_counts(&self, live: usize) -> Result<Vec<i32>> {
+        self.head4.as_ref().context("4-bit head rescoring is not installed")?.last_counts(live)
+    }
+    pub(crate) fn head4_settings(&self) -> Option<(usize, f32)> { self.head4.as_ref().map(|h| h.settings()) }
+    /// Diagnostic export: the installed scheme's logits of the current head input (see head4_rescore::Rescore::export).
+    pub(crate) fn head4_export(&self, live: usize, stream: &Stream) -> Result<Option<(Vec<u8>, Vec<i32>)>> {
+        match &self.head4 { Some(h) => Ok(Some(h.export(&self.normalized, live, stream)?)), None => Ok(None) }
+    }
+    /// The final boundary, then the head by crate::head4_rescore over the first `live` rows.
+    pub(crate) fn run_head4(&mut self, residual: &Buffer<bf16>, pre: &Buffer<f32>, live: usize, stream: &Stream) -> Result<()> {
+        self.prepare_head(residual, pre, stream)?;
+        let head4 = self.head4.clone().context("4-bit head rescoring is not installed")?;
+        head4.run(&self.normalized, self.head.output(), live, stream)
     }
     pub(crate) fn head_gemv_enabled(&self) -> bool {
         self.head.uses_head_gemv() && self.last_head.uses_head_gemv()
@@ -492,6 +524,16 @@ impl ModelIo {
             "private head is bound to a different DSpark atlas/profile"
         );
         draft.run(normalized, self.head.output(), stream)
+    }
+    /// Where `run_private_draft_head` publishes: the FP32 logits of this drafter's five rows (a pooled pass of
+    /// several drafters writes each one's here).
+    pub(crate) fn private_draft_head_output(&self, draft: &crate::draft_head::DraftHead, stream: &Stream) -> Result<&Buffer<f32>> {
+        self.bind(stream)?;
+        ensure!(
+            self.rows == 5 && !self.input_only && draft.shares_source(&self.weights),
+            "private head is bound to a different DSpark atlas/profile"
+        );
+        Ok(self.head.output())
     }
     /// Prefill needs only the last live next-token distribution. Row pruning
     /// avoids unused vocabulary projections while retaining FP32 head output.

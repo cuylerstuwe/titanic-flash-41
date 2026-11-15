@@ -63,7 +63,8 @@ impl Rows {
         Ok(Self {
             cuda: cuda.clone(),
             inputs,
-            local: cuda.allocate(rows * 6144)?,
+            // Written by the dequantization and read by the collective that follows it.
+            local: cuda.allocate_chunk_scratch(crate::cuda::ChunkScratch::EngramRows, rows * 6144)?,
             rows,
             interval: store.interval(),
             prepared: false,
@@ -255,6 +256,8 @@ impl Layer {
         }
         self.projection_ahead_enabled=enabled;self.projection_ahead_selected=false;Ok(())
     }
+    /// The projection's immutable weights (hint region of config::l2_queue_engram_lead).
+    pub(crate) fn projection_matrix(&self)->Rc<crate::blockscaled::Matrix> {self.projection.immutable_matrix()}
     pub(crate) fn select_projection_ahead(&mut self,selected:bool)->Result<()> {
         ensure!(!self.projection_queued&&(!selected||(self.projection_ahead_enabled&&self.projection_ahead.is_some())),
             "Engram projection selection before its producer");

@@ -1,0 +1,174 @@
+{
+  "all_live_exact": true,
+  "cases": [
+    {
+      "live_rows": 1,
+      "routing": "shared",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "fd99dd928b0fc504af5939599520993adce023568dacf53045ad8dfdce893751"
+    },
+    {
+      "live_rows": 1,
+      "routing": "overlap",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "5367bc83caf213764248527290ba5dfd562081ff37201c37f0f9094cd6faefbb"
+    },
+    {
+      "live_rows": 1,
+      "routing": "disjoint",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "95a132a0d8692807155cd6002173a6e5422f0bd77cc9e73253d8d32e9fdc9146"
+    },
+    {
+      "live_rows": 2,
+      "routing": "shared",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "3e31b2ec8d92b77a7750b412aca82807de94591a179a40da405f39cbe518518b"
+    },
+    {
+      "live_rows": 2,
+      "routing": "overlap",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "19781d778dc2fa68e50ea2737ba04dfe4f72f38691768579eb14beee77b28fa9"
+    },
+    {
+      "live_rows": 2,
+      "routing": "disjoint",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "db2225102c95dae393256a6e2666dd38d1379083b013a483f548cf5d298609d0"
+    },
+    {
+      "live_rows": 3,
+      "routing": "shared",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "643428a481c289b18e8ab991047fd01dbb0034ca7cd16983463b32a4a0214621"
+    },
+    {
+      "live_rows": 3,
+      "routing": "overlap",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "5d6c1041dae7b8b569eae3fb7ca7384ca9bccac0ff716abea9a1452263f30731"
+    },
+    {
+      "live_rows": 3,
+      "routing": "disjoint",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "53be96de97e19a98d8da2b1f516de96b2d05eec32e859a88db70942c57756cc3"
+    },
+    {
+      "live_rows": 4,
+      "routing": "shared",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "64ffae30319dd58e36365b5f80d2edec3ca142fb89c54ccb1036d7b24e5db62a"
+    },
+    {
+      "live_rows": 4,
+      "routing": "overlap",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "77f932b43e9a5a82b6d00774779d1aa51e1f5dcc6074739efcdbfa7a058e32cc"
+    },
+    {
+      "live_rows": 4,
+      "routing": "disjoint",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "7283772d1bb92a1514bdcb872495a96a5aefe56fc6f01bd7e9d8d80f77fb3f1d"
+    },
+    {
+      "live_rows": 5,
+      "routing": "shared",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "35f13dfc7377720a988b58ed3596de49142b4154330b730e174a1b18264c0b2b"
+    },
+    {
+      "live_rows": 5,
+      "routing": "overlap",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "bd4d70eb4a86d47242a5bd9f3fbe47af1d40f2fc08c5176ca0d98932fd1ab7e4"
+    },
+    {
+      "live_rows": 5,
+      "routing": "disjoint",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "df7615f4e776a7befe64acdffa16cb264a80d8e565ccd1dbfba279f5e2e33cd3"
+    },
+    {
+      "live_rows": 6,
+      "routing": "shared",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "e2b12d0870594e99f618659723f46a7b5f40c8214d2cef3ea9d10594462a5e95"
+    },
+    {
+      "live_rows": 6,
+      "routing": "overlap",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "dea12800f21221fcddf3d0fa5fb18aa1d0f968b1deba6f9f45f436248d79a72e"
+    },
+    {
+      "live_rows": 6,
+      "routing": "disjoint",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "e67b30806c566bc16d87e9af747c4823a4103c8c032532077b0a8177523ae5c8"
+    },
+    {
+      "live_rows": 0,
+      "routing": "masked",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "live_rows": 6,
+      "routing": "zero",
+      "exact": true,
+      "padding_independent": true,
+      "graph_repeats": 3,
+      "sha256": "0693f6bfa2117a9b14f9ceca13d3a5611de5dca226bf999f20a7f615fbd08dff"
+    }
+  ],
+  "nodes": [
+    "integration.tp_moe.dynamic",
+    "moe.w4a16.topk_sum"
+  ],
+  "canonical_layer": 0,
+  "tensor_parallel_rank": 0,
+  "scratch_bytes": 4118728,
+  "control_library_sha256": "c76ab738eccf40f86106ad2651f883a5e79e66492be61fe09a68a21bf54cc761",
+  "runtime_python_required": false
+}

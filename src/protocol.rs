@@ -337,9 +337,13 @@ impl Frontend {
             tokenizer.get_vocab_size(true) == 129280,
             "canonical tokenizer vocabulary size"
         );
+        // Level 2 of the shared-prefix checkpoints finds a prompt's system part by this token.
+        ensure!(crate::config::shared_prefix_checkpoint()? < 2
+            || tokenizer.token_to_id("<｜User｜>") == Some(crate::config::USER_TURN_TOKEN),
+            "user turn token id differs from the pinned tokenizer's");
         Ok(Self {
             prompt_tokenizer: PromptTokenizer::new(&tokenizer),
-            region_cache: crate::prompt_regions::RegionCache::new(32 * 1024 * 1024),
+            region_cache: crate::prompt_regions::RegionCache::with_prefix_reuse(32 * 1024 * 1024, crate::config::prompt_prefix_reuse()),
             use_region_cache: match std::env::var("CANADA_SCRATCH_PROMPT_REGION_CACHE") {
                 Ok(value) => { ensure!(value == "0" || value == "1", "invalid prompt-region cache policy"); value == "1" },
                 Err(std::env::VarError::NotPresent) => true,

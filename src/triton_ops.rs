@@ -118,6 +118,15 @@ impl Operator {
     /// sizes, dtypes, alignment and lifetimes obey the source operator contract.
     /// Module/buffers remain alive until every queued/captured launch completes.
     pub unsafe fn launch(&self, rows: u32, values: &[u64], stream: &Stream) -> Result<()> {
+        unsafe { self.launch_slices(rows, None, values, stream) }
+    }
+    /// `launch` with only the first `y` blocks of the grid's second dimension (a kernel whose slices are that
+    /// dimension, e.g. the mixing-statistics partial kernel on a part of its columns).
+    pub(crate) unsafe fn launch_y(&self, rows: u32, y: u32, values: &[u64], stream: &Stream) -> Result<()> {
+        ensure!(y > 0 && y <= self.entry.grid.y, "AOT slice count");
+        unsafe { self.launch_slices(rows, Some(y), values, stream) }
+    }
+    unsafe fn launch_slices(&self, rows: u32, y: Option<u32>, values: &[u64], stream: &Stream) -> Result<()> {
         ensure!(
             rows > 0 && rows <= 65536 && values.len() == self.entry.arguments.len(),
             "AOT row/argument contract"
@@ -137,7 +146,7 @@ impl Operator {
         let grid = [
             (rows * self.entry.grid.x_mul).div_ceil(self.entry.grid.rows_div)
                 + self.entry.grid.x_add,
-            self.entry.grid.y,
+            y.unwrap_or(self.entry.grid.y),
             self.entry.grid.z,
         ];
         let function = self.module.function(&self.entry.symbol)?;

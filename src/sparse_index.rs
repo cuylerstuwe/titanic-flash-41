@@ -27,10 +27,20 @@ pub(crate) struct Sparse6 {
     packed_gather: Option<Module>,
     keys: Rc<KeyMatrix>,
     dense: Dense,
-    ranges: Ranges,
+    ranges: Rc<Ranges>,
     counts: Buffer<i32>,
-    ids: Buffer<i32>,
-    error: Buffer<u32>,
+    ids: Rc<Buffer<i32>>,
+    error: Rc<Buffer<u32>>,
+    /// config::sparse_union_share: the candidate union and its gathered keys depend only on source 20's
+    /// publication, the rows' lengths and source 20's key cache, which the four consuming layers of a pass
+    /// share. The first layer (the owner) computes them; a follower reuses them (same buffers) after checking
+    /// that the owner ran on the same inputs since the follower's last run.
+    union: Rc<UnionPass>,
+    /// Linked to an owner's buffers (share_union_from); `follows` then says whether this layer skips its own
+    /// union and gather (a plan screen's control arm recomputes them into the shared buffers, as before).
+    linked: bool,
+    follows: std::cell::Cell<bool>,
+    seen: std::cell::Cell<u64>,
     output: Buffer<f32>,
     columns: usize,
     blocks: usize,
@@ -39,6 +49,9 @@ pub(crate) struct Sparse6 {
     fused_remap_sort: bool,
 }
 struct CompactSelection { windows:Windows, selection:Selection }
+/// The owner's last enqueue: its (cache, slots, lengths, mask) addresses and a count of its runs.
+#[derive(Default)]
+struct UnionPass { inputs: std::cell::Cell<[u64; 4]>, token: std::cell::Cell<u64> }
 
 impl Sparse6 {
     pub(crate) fn selector_taps(&self)->Result<(usize,Vec<(&'static str,u64,usize)>)> {
@@ -86,10 +99,14 @@ impl Sparse6 {
             module: cuda.module(core)?,
             packed_gather: None,
             dense: Dense::new(cuda, native, queries, keys.clone(), capacity, compact_bytes)?,
-            ranges: Ranges::new(cuda, capacity, capacity, &[0; 6], &[0; 6])?,
+            ranges: Rc::new(Ranges::new(cuda, capacity, capacity, &[0; 6], &[0; 6])?),
             counts: cuda.allocate(blocks.div_ceil(256) + 1)?,
-            ids: cuda.allocate(capacity / BLOCK)?,
-            error: cuda.allocate(1)?,
+            ids: Rc::new(cuda.allocate(capacity / BLOCK)?),
+            error: Rc::new(cuda.allocate(1)?),
+            union: Rc::new(UnionPass::default()),
+            linked: false,
+            follows: std::cell::Cell::new(false),
+            seen: std::cell::Cell::new(0),
             output: cuda.allocate(6 * stride)?,
             keys,
             columns,
@@ -127,6 +144,32 @@ impl Sparse6 {
         Ok(())
     }
     pub(crate) fn packed_gather_enabled(&self)->bool {self.packed_gather.is_some()}
+    /// Before any execution: reuse `owner`'s union and gathered keys from now on (see `union`). Both scorers
+    /// must have the same geometry and gather kernel; the owner must itself compute its union.
+    pub(crate) fn share_union_from(&mut self, owner: &Self, follow: bool) -> Result<()> {
+        ensure!(!self.linked && !owner.linked && self.columns == owner.columns && self.blocks == owner.blocks
+            && self.keys.rows() == owner.keys.rows() && self.ids.len() == owner.ids.len()
+            && self.packed_gather.is_some() == owner.packed_gather.is_some()
+            && self.cuda.owns_buffer(&owner.keys.payload) && !Rc::ptr_eq(&self.keys, &owner.keys),
+            "shared candidate union geometry/owner");
+        self.dense.rebind_keys(owner.keys.clone())?;
+        self.keys = owner.keys.clone();
+        self.ranges = owner.ranges.clone();
+        self.ids = owner.ids.clone();
+        self.error = owner.error.clone();
+        self.union = owner.union.clone();
+        self.linked = true;
+        self.follows.set(follow);
+        Ok(())
+    }
+    pub(crate) fn follows_union(&self) -> bool { self.linked && self.follows.get() }
+    pub(crate) fn union_linked(&self) -> bool { self.linked }
+    /// Plan screen: a linked layer reuses the owner's union (true) or recomputes it (false). Graphs are recaptured by the caller.
+    pub(crate) fn set_union_follow_for_probe(&self, on: bool) -> Result<()> {
+        ensure!(self.linked, "candidate union follower switch on an unlinked scorer");
+        self.follows.set(on);
+        Ok(())
+    }
 
     // Isolated qualification path. Serving constructors do not enable this.
     pub(crate) fn enable_compact_selection(&mut self,native:Rc<topk::Native>)->Result<()> {
@@ -225,6 +268,14 @@ impl Sparse6 {
             "candidate-only raw cache/context"
         );
         self.keys.bind(stream)?;
+        let inputs = [cache.ptr(), slots.ptr(), windows.lengths().ptr(), mask.ptr()];
+        if self.follows.get() {
+            // The owner's kernels of this pass precede these on the same ordered stream.
+            ensure!(self.union.inputs.get() == inputs && self.union.token.get() != self.seen.get() && self.keys.ready.get(),
+                "shared candidate union: its owner has not run on these inputs since this layer's last run");
+            self.seen.set(self.union.token.get());
+            return self.score_union(windows, mask, stream);
+        }
         unsafe {
             self.cuda
                 .zero_device(self.error.ptr(), self.error.bytes(), stream)
@@ -249,7 +300,7 @@ impl Sparse6 {
             &mut args![mask_ptr, lengths, counts, blocks, columns, error],
             stream,
         )?;
-        let mut ends = self.ranges.key_ends_mut().ptr();
+        let mut ends = self.ranges.key_ends().ptr();
         self.launch(
             "ca_sparse6_union_offsets",
             1,
@@ -293,6 +344,15 @@ impl Sparse6 {
             stream,
         )?;
         self.keys.ready.set(true);
+        self.union.inputs.set(inputs);
+        self.union.token.set(self.union.token.get() + 1);
+        self.score_union(windows, mask, stream)
+    }
+    /// Scores of the pass's union keys for this layer's queries, masked per row (after the union and the gather).
+    fn score_union(&mut self, windows: &Windows, mask: &Buffer<u8>, stream: &Stream) -> Result<()> {
+        let (mut mask_ptr, mut lengths, mut ids) = (mask.ptr(), windows.lengths().ptr(), self.ids.ptr());
+        let (mut blocks, mut columns) = (self.blocks as i32, self.columns as i32);
+        let mut ends = self.ranges.key_ends().ptr();
         let (mut output, mut count) = (self.output.ptr(), self.output.len() as i32);
         if self.compact_selection.is_none() {
             self.launch("ca_sparse6_fill_scores",192,256,&mut args![output,count],stream)?;

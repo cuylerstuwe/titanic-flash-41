@@ -33,6 +33,11 @@ impl View<'_> {
         Ok(None)
     }
     fn ordinary(&mut self,comm:&Roce,stream:&Stream,control:&mut ControlChannel)->Result<Step> {
+        if crate::config::draft_head_subset()?==1 {
+            // Guarded draft-head subset: this conversation's own step, decided from its context before the step.
+            let pending=self.history.pending().context("paired anchor missing")?;
+            self.session.set_head_subset_ok(crate::config::draft_head_subset_guard(self.history.committed(),pending));
+        }
         self.session.step_with_profile_barrier(self.verify,self.history.pending().context("paired anchor missing")?,
             self.step_limit()?.min(6),comm,stream,&mut||control.agree(b"warm-verify-profile-rendezvous"))
     }

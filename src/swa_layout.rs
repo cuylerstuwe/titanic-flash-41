@@ -30,6 +30,9 @@ impl Layout {
             _ => crate::config::MAX_WIDE_ROWS,
         }
     }
+    /// Ring size, None for the absolute layout. A batched session's window
+    /// region spans OFFSET + this many slots.
+    pub(crate) fn ring(self) -> Option<usize> { self.ring_slots() }
     fn ring_slots(self) -> Option<usize> {
         match self {
             Self::Absolute => None,

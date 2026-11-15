@@ -5,7 +5,7 @@
 //! Background prefill can yield at encoder chunks under an explicit policy;
 //! router holds drain all ranks and retain active state in place until needed.
 use super::*;
-use super::request_checkpoint::{try_checkpoint,try_checkpoint_protected,suspend,restore,try_exchange,exchange_enabled};
+use super::request_checkpoint::{try_checkpoint,try_checkpoint_protected,suspend,restore,keep_displaced,try_exchange,exchange_enabled};
 use crate::{http_server::{Job,Queue},protocol::BackendEvent};
 use deepseek_recipe::stream::InferenceFinishReason;
 use std::collections::VecDeque;
@@ -25,6 +25,8 @@ mod parked_request;
 use parked_request::{ParkedRequest,Storage};
 #[path = "idle_anchor_policy.rs"]
 pub(super) mod idle_anchor_policy;
+#[path = "batched_admission.rs"]
+mod batched_admission;
 use idle_anchor_policy::Policy as IdlePolicy;
 enum Scheduled {
     Native(Command),
@@ -39,6 +41,15 @@ enum Scheduled {
     Hold,
     OutputWait,
     IdleAnchor,
+    /// Batched decode (batched_serving.rs): move the decoding region-0 conversation into region n.
+    Detach(u8),
+    /// One batched decode step over the region conversations; true includes region 0's. The mask's
+    /// bit r leaves region r's conversation out of this step (its reader is behind).
+    Batched(bool,u8),
+    /// End a region conversation (reason: 0 stop, 1 length, 2 cancelled or drop a finished one).
+    PeerFinish(u64,u8),
+    /// Region 0 takes back the finished region conversation as its resident one.
+    SavePeer(u64),
 }
 impl Scheduled {
     fn follows_progress(&self,paused_ids:&[u64],remaining:usize)->bool {
@@ -49,6 +60,8 @@ impl Scheduled {
             Self::Discard(id)=>paused_ids.contains(id),
             Self::Exchange(id)=>paused_ids.contains(id)&&remaining>0,
             Self::PairStep(id)=>paused_ids.len()==1&&paused_ids.contains(id)&&remaining>=6,
+            // Batched decode moves, steps and ends already admitted conversations only.
+            Self::Detach(_)|Self::Batched(..)|Self::PeerFinish(..)|Self::SavePeer(_)=>true,
             _=>false,
         }
     }
@@ -66,6 +79,13 @@ impl Scheduled {
             Self::Hold=>Ok(vec![15]),
             Self::OutputWait=>Ok(vec![16]),
             Self::IdleAnchor=>Ok(vec![19]),
+            Self::Detach(region)=>{ensure!(*region>0,"region 0 is not a detach target");Ok(vec![20,*region])},
+            Self::Batched(region0,skip)=>{ensure!(skip&1==0,"region 0 is excluded by the flag");Ok(vec![21,u8::from(*region0),*skip])},
+            Self::PeerFinish(id,reason)=>{
+                ensure!(*id>0&&*reason<=2,"invalid region conversation finish");
+                let mut bytes=vec![22,*reason];bytes.extend(id.to_le_bytes());Ok(bytes)
+            },
+            Self::SavePeer(id)=>{ensure!(*id>0,"invalid region conversation identity");let mut bytes=vec![23];bytes.extend(id.to_le_bytes());Ok(bytes)},
             Self::Park(None)=>Ok(vec![7]),
             Self::Park(Some(mask))=>{let mut bytes=vec![7];bytes.extend(mask.to_le_bytes());Ok(bytes)},
             Self::Exchange(id)=>{ensure!(*id>0,"invalid exchange request identity");let mut bytes=vec![17];bytes.extend(id.to_le_bytes());Ok(bytes)},
@@ -86,6 +106,16 @@ impl Scheduled {
             [15]=>Ok(Self::Hold),
             [16]=>Ok(Self::OutputWait),
             [19]=>Ok(Self::IdleAnchor),
+            [20,region] if (1..=3).contains(region)=>Ok(Self::Detach(*region)),
+            [21,region0,skip] if *region0<=1&&*skip&0xf1==0=>Ok(Self::Batched(*region0==1,*skip)),
+            [22,reason,..] if bytes.len()==10&&*reason<=2=>{
+                let id=u64::from_le_bytes(bytes[2..].try_into().unwrap());
+                ensure!(id>0,"invalid region conversation identity");Ok(Self::PeerFinish(id,*reason))
+            },
+            [23,..] if bytes.len()==9=>{
+                let id=u64::from_le_bytes(bytes[1..].try_into().unwrap());
+                ensure!(id>0,"invalid region conversation identity");Ok(Self::SavePeer(id))
+            },
             [17,..]if bytes.len()==9=>{
                 let id=u64::from_le_bytes(bytes[1..].try_into().unwrap());ensure!(id>0,"invalid exchange request identity");Ok(Self::Exchange(id))
             },
@@ -184,6 +214,7 @@ fn execute(w:&mut Worker,images:&mut Vec<ParkedRequest>,command:Scheduled,
                 "evicted_cache_entries":evicted,"protected_cache_mask":protected,
                 "protected_entries_reclaimed_for_admitted_owner":protected_reclaimed,
                 "host_allocator_trim":w.state_pressure_trim.take(),
+                "refusal":w.park_refusal.take(),
                 "prefill_working_allowance_bytes":prefill_working_allowance,
                 "protected_cache_entries":protected.map_or(0,u16::count_ones),
                 "seconds":began.elapsed().as_secs_f64()}))}
@@ -191,6 +222,9 @@ fn execute(w:&mut Worker,images:&mut Vec<ParkedRequest>,command:Scheduled,
         Scheduled::Resume(id)|Scheduled::Discard(id)=>{
             let index=images.iter().position(|p|p.id==id)
                 .ok_or_else(||anyhow::anyhow!("unknown suspended request"))?;
+            // Region 0 holds either the suspended state of a paused request (this one or another) or a
+            // conversation that finished there (request_checkpoint::keep_displaced).
+            let loaded_is_parked=images.iter().any(|p|p.matches_history(&w.history));
             let saved=images.remove(index);
             if matches!(saved.storage,Storage::Resident(_)) {
                 if matches!(command,Scheduled::Resume(_)){parked_request::resume(w,&saved)}
@@ -198,11 +232,18 @@ fn execute(w:&mut Worker,images:&mut Vec<ParkedRequest>,command:Scheduled,
             }else{
                 let Storage::Image(saved)=saved.storage else{unreachable!()};
                 if matches!(command,Scheduled::Resume(_)) {
+                    let displaced=keep_displaced(w,loaded_is_parked)?;
                     let mut event=restore(w,&saved)?;
-                    event["type"]=json!("resume");Ok(event)
+                    event["type"]=json!("resume");
+                    if !displaced.is_null() {event["displaced"]=displaced;}
+                    Ok(event)
                 }else{w.agree(&[])?;Ok(json!({"type":"discard","request_id":id}))}
             }
         }
+        Scheduled::Detach(region)=>w.detach_active(region as usize),
+        Scheduled::Batched(region0,skip)=>w.batched_decode_step(region0,skip),
+        Scheduled::PeerFinish(id,reason)=>w.finish_peer(id,match reason {0=>Finish::Stop,1=>Finish::Length,_=>Finish::Cancelled}),
+        Scheduled::SavePeer(id)=>w.save_peer(id),
         Scheduled::PairStep(id)=>{
             ensure!(images.len()==1&&images[0].id==id&&!images[0].is_image(),
                 "paired step requires exactly one physical peer");
@@ -230,6 +271,7 @@ fn execute(w:&mut Worker,images:&mut Vec<ParkedRequest>,command:Scheduled,
     event["shared_image_count"]=json!(w.suspended_image_count+w.cached_sessions.len());
     event["parked_resident_owners"]=json!(images.iter().filter(|p|!p.is_image()).count());
     event["shared_image_budget_bytes"]=json!(w.shared_image_budget);
+    event["drafter_images_relocated"]=json!(crate::dspark_kv::relocated_restores());
     Ok(event)
 }
 
@@ -324,7 +366,7 @@ fn choose(w:&mut Worker,queue:&Queue,active:&mut Option<Job>,ready:&mut VecDeque
             if let Some(job)=queue.try_foreground()? {ready.push_front((None,job));}
         }
         if ready.is_empty() {
-            if let Some(job)=queue.next(Duration::from_millis(500))? {ready.push_back((None,job));}
+            if let Some(job)=queue.next(w.idle_wait())? {ready.push_back((None,job));}
         }else if !queue.router_hold() && !ready.iter().any(|(_,job)|!job.background)
             && ready.iter().all(|(_,job)|job.output_backpressured()) {
             if let Some(job)=queue.try_next()? {ready.push_back((None,job));}
@@ -384,7 +426,9 @@ pub(super) fn validate_startup()->Result<()> {
 }
 
 pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_log::EventLog)->Result<()> {
-    let two_stream=two_stream_enabled()?;
+    // Batched decode replaces the two-owner admission with one owner per serving region.
+    let batched=super::batched_serving::enabled()?;
+    let two_stream=two_stream_enabled()?&&!batched;
     ensure!(!exchange_enabled()?||two_stream,"HTTP state exchange requires two-owner admission");
     if two_stream {if let Some(queue)=queue {queue.enable_two_stream_admission();}}
     if exchange_enabled()? {if let Some(queue)=queue {queue.reserve_waiting_image_capacity(w.shared_image_budget)?;}}
@@ -392,12 +436,16 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
     let mut images=Vec::new();
     let mut protection=Protection::default();
     let mut turns=Turns::new(w.peer_prefill_slice)?;
-    ensure!(!turns.enabled||(two_stream&&w.peer_prefill_enabled),"work-aware scheduling needs two owners and resumable peer prefill");
+    // Batched decode schedules its own prefill slices (batched_admission) and uses no two-owner turns.
+    ensure!(!turns.enabled||batched||(two_stream&&w.peer_prefill_enabled),"work-aware scheduling needs two owners and resumable peer prefill");
     if let Some(queue)=queue {queue.set_decode_prefill_slice(turns.decode_prefill_slice);}
+    if batched {if let Some(queue)=queue {queue.set_decode_prefill_slice(Some(batched_admission::prefill_slice()?));}}
     w.control.agree(&[0x62,u8::from(turns.enabled)])?;
     let mut active:Option<Job>=None;
     // None is a newly admitted HTTP job; Some(id) owns a saved unfinished one.
     let mut ready:VecDeque<(Option<u64>,Job)>=VecDeque::new();
+    // Batched decode: HTTP owners of the conversations decoding in serving regions 1...
+    let mut region_jobs:Vec<(u64,Job)>=Vec::new();
     let mut next_id=1u64;let mut quantum_start=0;let mut prefill_turn_done=false;let mut refused=false;
     let mut authorized_next=None;
     let mut priority=PrioritySnapshot::default();
@@ -408,7 +456,8 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
         loop {
             let began=Instant::now();
             let bytes=if authorized_next.is_some(){None}else if let Some(queue)=queue {
-                Some(select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns,&mut idle_policy)?.encode()?)
+                Some(if batched {batched_admission::choose(w,queue,&mut active,&mut ready,&region_jobs,&mut next_id,&mut prefill_turn_done,quantum_start,refused,&images)?}
+                    else {select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns,&mut idle_policy)?}.encode()?)
             }else{None};
             let wire=if let Some(next)=authorized_next.take(){next}else{w.control.command(bytes.as_deref())?};
             let command=Scheduled::decode(&wire)?;
@@ -446,7 +495,8 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                 // an already paused request, or exchange two existing owners.
                 // It cannot admit a new prompt or a standalone restoration.
                 let agreement_began=Instant::now();
-                let next=queue.map(|queue|select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns,&mut idle_policy)
+                let next=queue.map(|queue|if batched {batched_admission::choose(w,queue,&mut active,&mut ready,&region_jobs,&mut next_id,&mut prefill_turn_done,quantum_start,refused,&images)}
+                    else {select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns,&mut idle_policy)}
                     .and_then(|command|command.encode())).transpose()?;
                 let tokens:Vec<u32>=serde_json::from_value(event["output_ids"].clone())?;
                 let wire=w.control.agree_and_next(&w.agreement_state(&tokens),next.as_deref())?;
@@ -469,7 +519,43 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                     peer_event["request_mode"]=json!(if job.background{"background"}else{"foreground"});
                 }
             }
-            if let Some(job)=active.as_ref().filter(|_|!discarded) {
+            // Batched decode: route region conversations' events to their HTTP owners (rank 0 only;
+            // the other ranks execute the same commands but own no HTTP jobs).
+            if queue.is_some() { match event["type"].as_str() {
+                Some("detach")=>{
+                    let id=event["request_id"].as_u64().context("detached request identity")?;
+                    let job=active.take().context("detached HTTP owner lost")?;
+                    event["http_request_id"]=json!(job.id);
+                    region_jobs.push((id,job));
+                }
+                Some("batched_tokens")=>{
+                    let region0=event["region0"]==true;
+                    if let Some(conversations)=event["conversations"].as_array_mut() {
+                        for (k,c) in conversations.iter_mut().enumerate() {
+                            let id=c["request_id"].as_u64().context("batched request identity")?;
+                            let job=if region0&&k==0 {active.as_ref().context("region-0 HTTP owner lost")?}
+                                else {&region_jobs.iter().find(|(r,_)|*r==id).context("region HTTP owner lost")?.1};
+                            job.emit(BackendEvent::Tokens(serde_json::from_value(c["output_ids"].clone())?));
+                            c["http_request_id"]=json!(job.id);
+                        }
+                    }
+                }
+                Some("finish") if event["peer"]==true=>{
+                    let id=event["request_id"].as_u64().context("finished region request identity")?;
+                    let index=region_jobs.iter().position(|(r,_)|*r==id).context("finished region HTTP owner lost")?;
+                    let (_,job)=region_jobs.remove(index);
+                    job.emit(match event["reason"].as_str(){
+                        Some("stop")=>BackendEvent::Finish(InferenceFinishReason::Stop),
+                        Some("length")=>BackendEvent::Finish(InferenceFinishReason::Length),
+                        Some("cancelled")=>BackendEvent::Failed("request cancelled before completion".into()),
+                        _=>anyhow::bail!("unknown region completion"),
+                    });
+                    event["http_request_id"]=json!(job.id);
+                }
+                _=>{}
+            } }
+            let region_event=matches!(event["type"].as_str(),Some("detach"|"batched_tokens"|"peer_saved"|"peer_dropped"))||event["peer"]==true;
+            if let Some(job)=active.as_ref().filter(|_|!discarded&&!region_event) {
                 if !input_refused && (started || event["resumed_prefill"]==true) {
                     job.record_prefill_timing(&event);
                 }
@@ -480,15 +566,17 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                             event["cached_tokens"].as_u64().unwrap_or(0))as usize);
                     // Capture this request's media receipt before another
                     // request can replace the worker's active receipt.
-                    job.emit(BackendEvent::Ready{fingerprint:w.identity.clone(),
-                        cached_tokens:event["cached_tokens"].as_u64().unwrap()as usize});
+                    if event["early_first_token"]!=true {job.emit(BackendEvent::Ready{fingerprint:w.identity.clone(),
+                        cached_tokens:event["cached_tokens"].as_u64().unwrap()as usize});}
                     event["queue_and_prefill_seconds"]=json!(job.enqueued.elapsed().as_secs_f64());
                 }
                 if input_refused {
                     job.emit(BackendEvent::Failed(event["message"].as_str()
                         .ok_or_else(||anyhow::anyhow!("input refusal message missing"))?.into()));
                 }else if event["type"]=="tokens" {
-                    job.emit(BackendEvent::Tokens(serde_json::from_value(event["output_ids"].clone())?));
+                    if event["early_first_token"]!=true {
+                        job.emit(BackendEvent::Tokens(serde_json::from_value(event["output_ids"].clone())?));
+                    }
                 }else if finished {
                     idle_policy.finished(matches!(event["reason"].as_str(),Some("stop"|"length")),job.background);
                     if two_stream && !job.background && matches!(event["reason"].as_str(),Some("stop"|"length")) {
@@ -512,7 +600,7 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                     }
                 }else{
                     refused=true;
-                    if !two_stream&&active.as_ref().is_some_and(|job|job.background) {
+                    if !two_stream&&!batched&&active.as_ref().is_some_and(|job|job.background) {
                         // Serial fallback is fine for equal peers. It is not a
                         // successful priority handoff: reject new foreground
                         // work rather than cancel/replay the background owner.
@@ -535,6 +623,10 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                     event["two_stream_admission"]=json!(true);
                     event["execution_owners"]=json!(usize::from(active.is_some())+ready.len());
                 }
+                if batched {
+                    event["batched_decode"]=json!(true);
+                    event["execution_owners"]=json!(usize::from(active.is_some())+ready.len()+region_jobs.len());
+                }
                 event["progress_next"]=json!(w.progress_next);
                 event["control_and_execution_seconds"]=json!(began.elapsed().as_secs_f64());
                 events.record(&event)?;
@@ -551,6 +643,7 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
     if result.is_err() {events.worker_failed(w.current);}
     if let Some(job)=active {job.emit(BackendEvent::Failed("native worker group failed".into()));}
     for (_,job)in ready {job.emit(BackendEvent::Failed("native worker group failed".into()));}
+    for (_,job)in region_jobs {job.emit(BackendEvent::Failed("native worker group failed".into()));}
     if let Some(queue)=queue {queue.fail();}
     result
 }
@@ -558,6 +651,20 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn batched_decode_commands_roundtrip_and_reject_invalid_frames() {
+        for command in [Scheduled::Detach(1),Scheduled::Detach(3),Scheduled::Batched(false,0),Scheduled::Batched(true,0b1010),
+            Scheduled::PeerFinish(1,0),Scheduled::PeerFinish(u64::MAX,2),Scheduled::SavePeer(5)] {
+            let wire=command.encode().unwrap();
+            assert_eq!(Scheduled::decode(&wire).unwrap().encode().unwrap(),wire);
+            assert!(command.follows_progress(&[],6));
+        }
+        assert!(Scheduled::Detach(0).encode().is_err());
+        assert!(Scheduled::PeerFinish(0,0).encode().is_err()&&Scheduled::PeerFinish(1,3).encode().is_err());
+        for invalid in [vec![20,0],vec![20,4],vec![21,2,0],vec![21,1,1],vec![21,1],vec![22,3,1,0,0,0,0,0,0,0],vec![22,0,0,0,0,0,0,0,0,0],vec![22,0,1]] {
+            assert!(Scheduled::decode(&invalid).is_err(),"{invalid:?}");
+        }
+    }
     #[test]
     fn scheduler_commands_preserve_ids_and_reject_truncation() {
         for hold in [false,true] {

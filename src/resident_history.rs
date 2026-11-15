@@ -22,6 +22,11 @@ pub(crate) struct Plan {
     /// retaining its exact input. Only an optional displaced-output copy may
     /// be skipped; this does not authorize any different GPU prefix reuse.
     pub replaces_completed_output: bool,
+    /// The next chat turn of the same conversation: the prompt keeps every token of the completed request's
+    /// input but its final generation prefix (at most two tokens, e.g. `<think>`), so the completed output is
+    /// replaced (CANADA_SCRATCH_SKIP_REPLACED_TURN). Same meaning: only the optional displaced-output copy
+    /// may be skipped.
+    pub replaces_completed_turn: bool,
     pub prompt: Vec<u32>,
     pub media: MediaIdentity,
 }
@@ -58,6 +63,8 @@ pub(crate) struct ResidentHistory {
     pending: Option<u32>,
     phase: Phase,
     completed_prompt_tokens: Option<usize>,
+    /// The finished request's input length, whatever ended it (turn detection only).
+    finished_prompt_tokens: Option<usize>,
 }
 
 impl ResidentHistory {
@@ -77,6 +84,7 @@ impl ResidentHistory {
             pending: None,
             phase: Phase::Idle,
             completed_prompt_tokens: None,
+            finished_prompt_tokens: None,
         })
     }
     pub fn prepare(&mut self, id: u64, prompt: Vec<u32>, limit: usize, seed: u64) -> Result<Plan> {
@@ -107,6 +115,10 @@ impl ResidentHistory {
         let replaces_completed_output = !reuse && self.completed_prompt_tokens.is_some_and(|n|
             n < previous && prompt.starts_with(&self.committed[..n])
             && media.matches_prefix(&self.media,n));
+        // At least 128 shared tokens: an unrelated short prompt never counts as the next turn.
+        let replaces_completed_turn = !reuse && self.finished_prompt_tokens.is_some_and(|n|
+            n >= 130 && n < previous && prompt.len() >= n && prompt.starts_with(&self.committed[..n - 2])
+            && media.matches_prefix(&self.media,n - 2));
         // The final emitted anchor was never in KV. The incoming prompt may
         // include it or replace it; only committed IDs govern reusable state.
         let plan = Plan {
@@ -116,6 +128,7 @@ impl ResidentHistory {
             previous,
             reuse,
             replaces_completed_output,
+            replaces_completed_turn,
             prompt,
             media,
         };
@@ -127,6 +140,7 @@ impl ResidentHistory {
         };
         self.last_id = id;
         self.completed_prompt_tokens = None;
+        self.finished_prompt_tokens = None;
         Ok(plan)
     }
     /// Record a committed partial prompt without emitting its temporary anchor.
@@ -261,10 +275,10 @@ impl ResidentHistory {
             },
             "backend completion reason contradicts committed state"
         );
-        self.completed_prompt_tokens = if reason == Finish::Stop {
-            Some(self.committed.len().checked_sub(emitted - 1)
-                .ok_or_else(||anyhow::anyhow!("completed request input extent"))?)
-        } else { None };
+        let input = self.committed.len().checked_sub(emitted - 1)
+            .ok_or_else(||anyhow::anyhow!("completed request input extent"))?;
+        self.completed_prompt_tokens = (reason == Finish::Stop).then_some(input);
+        self.finished_prompt_tokens = Some(input);
         self.phase = Phase::Idle;
         Ok(())
     }
@@ -350,6 +364,26 @@ mod tests {
             assert!(!finished(reason).prepare(2,vec![2,3,10,55,7],3,8).unwrap().replaces_completed_output);
         }
         assert!(!finished(Finish::Stop).prepare(2,vec![2,4,10,55],3,8).unwrap().replaces_completed_output);
+    }
+    #[test]
+    fn next_turn_hint_needs_the_previous_input_but_its_generation_prefix() {
+        let previous:Vec<u32>=(0..200u32).map(|i|10+i).collect();
+        let finished=|reason| {
+            let mut h=ResidentHistory::new(1024,1).unwrap();
+            h.prepare(1,previous.clone(),3,7).unwrap();h.prefilled(200,500).unwrap();
+            h.committed_step(&[500,501],if reason==Finish::Stop{1}else{502},202).unwrap();
+            h.finish(reason).unwrap();h
+        };
+        let mut next=previous[..199].to_vec();next.extend([7,8,9]);
+        for reason in [Finish::Stop,Finish::Length] {
+            let p=finished(reason).prepare(2,next.clone(),3,8).unwrap();
+            assert!(!p.reuse&&p.replaces_completed_turn);
+        }
+        let mut other=previous[..150].to_vec();other.extend([7,8,9]);
+        assert!(!finished(Finish::Stop).prepare(2,other,3,8).unwrap().replaces_completed_turn);
+        let mut cont=previous.clone();cont.extend([500,501,1,7]);
+        let p=finished(Finish::Stop).prepare(2,cont,3,8).unwrap();
+        assert!(p.reuse&&!p.replaces_completed_turn);
     }
     #[test]
     fn completed_output_hint_respects_media_identity_and_request_ownership() {

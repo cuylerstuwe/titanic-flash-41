@@ -19,6 +19,8 @@ pub struct RowLocations {
     frequency_rows: usize,
 }
 impl RowLocations {
+    /// The device slots of the step's rows (row 0 first), for the KV window hint.
+    pub(crate) fn locations_ptr(&self) -> u64 { self.locations.ptr() }
     /// Publish metadata in the same stream as its consumers, so a following
     /// chunk cannot overwrite an earlier store's positions or ring locations.
     #[allow(clippy::too_many_arguments)]
