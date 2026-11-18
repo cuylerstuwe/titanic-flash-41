@@ -16,7 +16,10 @@ struct ImageBuffer {
 }
 impl ImageBuffer {
     fn allocate(cuda: &Cuda, bytes: usize) -> Result<Self> {
-        let (_charge, buffer) = crate::memory::allocate_image_storage(bytes, || cuda.allocate(bytes))?;
+        let (_charge, buffer) = crate::memory::allocate_image_storage(bytes, || match cuda.allocate_pooled(bytes)? {
+            Some(pooled) => Ok(pooled),
+            None => cuda.allocate(bytes),
+        })?;
         Ok(Self { _charge, buffer })
     }
 }
@@ -224,7 +227,10 @@ impl Image {
         // a 974K-token conversation with 8.99 GiB available on the vision rank (0.84 GiB image). A refusal by
         // the guard itself (memory moved between this reading and the allocation) is the same refusal.
         let reserve = crate::memory::floor_bytes().max(cuda.allocation_reserve_bytes());
-        if cuda.admission_memory()?.admitted_available < reserve + total { return Ok(None); }
+        // A snapshot the startup pool will hold (CANADA_SCRATCH_IMAGE_POOL_MIB) takes no host memory: host memory must
+        // still keep its reserve, but not the snapshot's own bytes.
+        let host_bytes = if cuda.image_pool_fits(total) { 0 } else { total };
+        if cuda.admission_memory()?.admitted_available < reserve + host_bytes { return Ok(None); }
         let storage = match ImageBuffer::allocate(cuda, total) {
             Ok(storage) => storage,
             Err(error) if crate::cuda::allocation_floor_refused(&error) => return Ok(None),

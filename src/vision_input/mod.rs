@@ -159,6 +159,15 @@ pub fn prepare_rgb(rgb: &[u8], width: usize, height: usize) -> Result<(Plan, Vec
     Ok((plan, bits))
 }
 
+/// Upper bound on what decoding one image allocates besides its 8-bit RGB result: the decoder's output buffer
+/// (at most 8 bytes a pixel, 16-bit RGBA), libjpeg-turbo's coefficient planes for progressive JPEG (6 bytes a pixel)
+/// or a PNG's RGBA-to-RGB conversion, and fixed decoder state. Nov 17: the reservation used to charge the decoder's
+/// fixed 512 MiB cap for every image (a 1280x720 screenshot reserved ~515 MB to use a few MB), which refused screenshots
+/// half a GiB early whenever memory was near the floor. The cap stays 512 MiB, so the largest images are unchanged.
+pub fn decode_alloc_bound(width: usize, height: usize) -> usize {
+    width.saturating_mul(height).saturating_mul(12).saturating_add(32 << 20).min(512 << 20)
+}
+
 pub fn decode_rgb(encoded: &[u8]) -> Result<(usize, usize, Vec<u8>)> {
     ensure!(
         !encoded.is_empty() && encoded.len() <= MAX_ENCODED_BYTES,
@@ -229,8 +238,14 @@ pub fn decode_rgb(encoded: &[u8]) -> Result<(usize, usize, Vec<u8>)> {
         ),
         "{INVALID_IMAGE}"
     );
+    // The header gives the bound before any pixel is allocated; the decoder then cannot exceed what was reserved.
+    let (header_w, header_h) = image::ImageReader::new(Cursor::new(encoded))
+        .with_guessed_format()
+        .map_err(|_| anyhow::anyhow!(INVALID_IMAGE))?
+        .into_dimensions()
+        .map_err(|_| anyhow::anyhow!(INVALID_IMAGE))?;
     let mut limits = image::Limits::default();
-    limits.max_alloc = Some(512 << 20);
+    limits.max_alloc = Some(decode_alloc_bound(header_w as usize, header_h as usize) as u64);
     limits.max_image_width = Some(MAX_INPUT_PIXELS as u32);
     limits.max_image_height = Some(MAX_INPUT_PIXELS as u32);
     reader.limits(limits);
@@ -273,6 +288,21 @@ pub fn prepare(encoded: &[u8], detail: Detail) -> Result<Prepared> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decode_bound_is_sized_by_the_header_and_capped() {
+        assert_eq!(super::decode_alloc_bound(1280, 720), 1280 * 720 * 12 + (32 << 20));
+        assert_eq!(super::decode_alloc_bound(9459, 9459), 512 << 20);
+        assert_eq!(super::decode_alloc_bound(usize::MAX, 2), 512 << 20);
+        // A 16-bit RGBA PNG (8 bytes a pixel decoded, then converted to RGB) decodes inside its bound.
+        let (w, h) = (1500u32, 1000u32);
+        let img = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_fn(w, h, |x, y| {
+            image::Rgba([(x * 40) as u16, (y * 60) as u16, ((x + y) * 20) as u16, 65535])
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba16(img).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let (dw, dh, rgb) = super::decode_rgb(&png.into_inner()).unwrap();
+        assert_eq!((dw, dh, rgb.len()), (1500, 1000, 1500 * 1000 * 3));
+    }
     use super::*;
     #[test]
     fn dimensions_and_image_identity_are_bounded() {

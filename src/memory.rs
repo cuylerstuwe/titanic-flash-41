@@ -28,21 +28,83 @@ pub(crate) fn parse_floor_override(value: Option<&str>) -> Result<usize> {
     Ok(mib << 20)
 }
 
+/// The serving floor with the snapshot chunk pool (Nov 17), in MiB: 2048..=8192, accepted only when
+/// CANADA_SCRATCH_IMAGE_POOL_MIB is set. The pool holds every snapshot from startup, so serving no longer makes the
+/// large runtime GPU allocations that fragmented aged memory; that is what lets the floor sit below 8 GiB. Without
+/// the pool the 8 GiB default stands. The test override above takes precedence when both are set.
+pub(crate) const SERVING_FLOOR_ENV: &str = "CANADA_SCRATCH_MEMORY_FLOOR_MIB";
+const MAX_SERVING_FLOOR_MIB: usize = 8192;
+
+/// The floor the two settings select (`test`: the test override, `serving`: the pool's serving floor).
+pub(crate) fn parse_floor(test: Option<&str>, serving: Option<&str>, pool: bool) -> Result<usize> {
+    if test.is_some() { return parse_floor_override(test); }
+    let Some(value) = serving else { return Ok(DEFAULT_FLOOR) };
+    ensure!(pool, "{SERVING_FLOOR_ENV} needs the snapshot pool (CANADA_SCRATCH_IMAGE_POOL_MIB)");
+    let mib: usize = value
+        .trim()
+        .parse()
+        .with_context(|| format!("{SERVING_FLOOR_ENV} must be a whole number of MiB"))?;
+    ensure!(
+        (MIN_FLOOR_MIB..=MAX_SERVING_FLOOR_MIB).contains(&mib),
+        "{SERVING_FLOOR_ENV} must be {MIN_FLOOR_MIB}..={MAX_SERVING_FLOOR_MIB} MiB"
+    );
+    Ok(mib << 20)
+}
+
 fn floor_setting() -> &'static std::result::Result<usize, String> {
     static FLOOR: std::sync::OnceLock<std::result::Result<usize, String>> = std::sync::OnceLock::new();
     FLOOR.get_or_init(|| {
-        let value = std::env::var(FLOOR_OVERRIDE_ENV).ok();
-        parse_floor_override(value.as_deref()).map_err(|error| format!("{error:#}"))
+        let test = std::env::var(FLOOR_OVERRIDE_ENV).ok();
+        let serving = std::env::var(SERVING_FLOOR_ENV).ok();
+        let pool = std::env::var_os("CANADA_SCRATCH_IMAGE_POOL_MIB").is_some();
+        parse_floor(test.as_deref(), serving.as_deref(), pool).map_err(|error| format!("{error:#}"))
     })
 }
 
-/// Startup check: refuses an invalid override, and reports a valid one.
+/// Startup check: refuses an invalid setting, and reports a valid one.
 pub(crate) fn validate_floor() -> Result<usize> {
     let floor = floor_setting().clone().map_err(anyhow::Error::msg)?;
     if floor != DEFAULT_FLOOR {
-        eprintln!("memory floor override: {} MiB (test only)", floor >> 20);
+        let kind = if std::env::var_os(FLOOR_OVERRIDE_ENV).is_some() {"test override"} else {"with the snapshot pool"};
+        eprintln!("memory floor: {} MiB ({kind})", floor >> 20);
     }
     Ok(floor)
+}
+
+/// Nov 17 (CANADA_SCRATCH_RELEASE_LOAD_FILE_CACHE=1): after the startup warm-up, advise the kernel to drop the page cache
+/// of every file under `root` (the kernel bundles' buffers and libraries are read once at load; their clean pages then sit
+/// in the page cache as inactive memory, ~2.7 GiB on the head). Advisory: a page still mapped (a loaded library) stays,
+/// and a file read again later is read from disk once. Returns (files, bytes the cache held before, bytes after).
+#[cfg(target_os = "linux")]
+pub(crate) fn release_file_cache(root: &Path) -> Result<(usize, usize, usize)> {
+    use std::os::fd::AsRawFd;
+    let resident = |file: &std::fs::File, size: usize| -> usize {
+        if size == 0 { return 0; }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0) };
+        if ptr == libc::MAP_FAILED { return 0; }
+        let mut vec = vec![0u8; size.div_ceil(page)];
+        let ok = unsafe { libc::mincore(ptr, size, vec.as_mut_ptr()) } == 0;
+        unsafe { libc::munmap(ptr, size); }
+        if ok { vec.iter().filter(|b| **b & 1 != 0).count() * page } else { 0 }
+    };
+    let (mut files, mut before, mut after) = (0usize, 0usize, 0usize);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() { stack.push(entry.path()); continue; }
+            if !kind.is_file() { continue; }
+            let Ok(file) = std::fs::File::open(entry.path()) else { continue };
+            let size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+            before += resident(&file, size);
+            let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            after += resident(&file, size);
+            files += 1;
+        }
+    }
+    Ok((files, before, after))
 }
 
 /// The physical memory floor every admission keeps free: 8 GiB unless the test-only override
@@ -262,10 +324,25 @@ mod tests {
         for bad in ["2047", "65537", "0", "-1", "4.5", "", "4GiB"] {
             assert!(parse_floor_override(Some(bad)).is_err(), "{bad:?} must be refused");
         }
-        // Production never sets the override, so every admission check keeps exactly 8 GiB.
-        if std::env::var_os(FLOOR_OVERRIDE_ENV).is_none() {
+        // Without either setting, every admission check keeps exactly 8 GiB.
+        if std::env::var_os(FLOOR_OVERRIDE_ENV).is_none() && std::env::var_os(SERVING_FLOOR_ENV).is_none() {
             assert_eq!(floor_bytes(), 8usize << 30);
         }
+    }
+    #[test]
+    fn serving_floor_needs_the_pool_and_stays_at_or_below_eight_gib() {
+        assert_eq!(parse_floor(None, None, false).unwrap(), 8usize << 30);
+        assert_eq!(parse_floor(None, None, true).unwrap(), 8usize << 30);
+        assert_eq!(parse_floor(None, Some("3072"), true).unwrap(), 3usize << 30);
+        assert_eq!(parse_floor(None, Some(" 4096 "), true).unwrap(), 4usize << 30);
+        assert!(parse_floor(None, Some("3072"), false).is_err(), "no pool, no lower floor");
+        for bad in ["2047", "8193", "0", "4.5", "", "3GiB"] {
+            assert!(parse_floor(None, Some(bad), true).is_err(), "{bad:?} must be refused");
+        }
+        // the test override wins and keeps its own range
+        assert_eq!(parse_floor(Some("2048"), Some("4096"), true).unwrap(), 2usize << 30);
+        assert_eq!(parse_floor(Some("16384"), None, false).unwrap(), 16usize << 30);
+        assert!(parse_floor(Some("bad"), Some("4096"), true).is_err());
     }
     #[test]
     fn percpu_diagnostic_counts_zones_without_changing_admission() {

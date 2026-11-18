@@ -45,7 +45,7 @@ fn workspace_bytes(width: usize, height: usize, p: &vision_input::Plan) -> usize
         output * (4 * input.div_ceil(output).max(1) + 3) * 12 + output * 16
     };
     let rgb = width * height * 3;
-    let decode = (512usize << 20) + rgb;
+    let decode = vision_input::decode_alloc_bound(width, height) + rgb;
     let resize = rgb
         + height * p.resize_width * 3
         + p.resize_width * p.resize_height * 3
@@ -823,7 +823,9 @@ mod tests {
     fn insufficient_memory_rejects_before_decoding_and_releases_only_warm_inputs() {
         let mut cache = ImageInputCache::for_test();
         let live = cache.prepare(&png(10), Detail::Auto).unwrap();
-        cache.available_memory = || Ok((8usize << 30) + (256 << 20));
+        // Nov 17: the decoder allowance is sized from the header (vision_input::decode_alloc_bound, at least 32 MiB),
+        // no longer a fixed 512 MiB; 16 MiB above the floor is too little for any image.
+        cache.available_memory = || Ok((8usize << 30) + (16 << 20));
         let error = cache.prepare(&png(20), Detail::Auto).err().unwrap();
         assert!(error.to_string().contains("UMA reserve"));
         assert!(error.downcast_ref::<crate::memory::InputCapacityError>().is_some());
@@ -836,6 +838,9 @@ mod tests {
         // allowance refused this valid input despite preserving the 8GiB floor.
         cache.available_memory = || Ok((8usize << 30) + (768 << 20));
         assert!(cache.prepare(&png(20), Detail::Auto).is_ok());
+        // ...and so does 256 MiB, which the fixed 512 MiB decoder allowance used to refuse.
+        cache.available_memory = || Ok((8usize << 30) + (256 << 20));
+        assert!(cache.prepare(&png(21), Detail::Auto).is_ok());
     }
     #[test]
     #[ignore = "requires CANADA_TEST_IMAGE_CASES pointing to the qualified public input panel"]

@@ -609,6 +609,68 @@ fn displaced_reclaim()->Result<bool> {
         Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
     }
 }
+/// CANADA_SCRATCH_CACHE_COST_ORDER=1 (default off; Nov 17, the owner's queue item "eviction order"): before a cache save
+/// plans its evictions, entries are reordered so the planners (which take the oldest unprotected entry first) lose the
+/// cheapest entry first: the one whose loss costs the fewest tokens to prefill again. An entry's cost is the distance
+/// from the longest other cached entry it extends (its next-best restore point; its whole length when it extends none).
+/// A conversation's dense checkpoints and replaced follow-ups are cheap; another conversation's only snapshot costs its
+/// whole length. Entries unused for STALE_AFTER saves lose that protection. Found on Nov 17: in production's own release
+/// stress panel, sixteen image requests of one ~50K-token conversation pushed an idle 974K-token conversation's snapshots
+/// out (re-prefilled in ~116 s) to keep sixteen checkpoints a few hundred tokens apart.
+fn cache_cost_order()->Result<bool> {
+    match std::env::var("CANADA_SCRATCH_CACHE_COST_ORDER") {
+        Ok(v)=>{ensure!(v=="0"||v=="1","cache cost order must be0or1");Ok(v=="1")},
+        Err(std::env::VarError::NotPresent)=>Ok(false),Err(e)=>Err(e.into()),
+    }
+}
+/// Room for the cache entries: (bytes, slots). Entries are charged to the cache budget (`session`) and, with parked
+/// request images (`suspended_*`), to the shared inactive budget (`shared`). `extra_*` is a restored parent held
+/// outside the vector that goes back into it, so it is charged to both. Nov 17 (P3 stress panel, s1590): its bytes
+/// were taken from the shared budget only; with the cache budget below the shared one (6 GiB against 7 GiB) the
+/// displaced conversation's save filled the parent's room and the parent's return stopped the worker group.
+fn cache_capacity_of(session:usize,shared:usize,suspended_bytes:usize,suspended_count:usize,limit:usize,
+    extra_bytes:usize,extra_count:usize)->(usize,usize) {
+    (session.min(shared.saturating_sub(suspended_bytes)).saturating_sub(extra_bytes),
+        limit.saturating_sub(suspended_count.saturating_add(extra_count)))
+}
+
+/// Saves after which an entry no longer protects itself by cost (it is then the cheapest).
+const STALE_AFTER:usize=32;
+/// The order (indices, the first one evicted first) for prefixes given oldest first, chosen one entry at a time against
+/// the entries still left:
+/// 0. stale entries (STALE_AFTER positions from the newest) first;
+/// 1. then a rung with exactly one direct extension among the others (a conversation's older turn under its newer
+///    one): only an edit inside the gap would restore it; a continuation restores the newer entry;
+/// 2. then everything else: a conversation's newest entry, and a branch point (two or more direct extensions, e.g. a
+///    prompt with two regenerations, which serves the next regeneration).
+/// The class comes from all entries (a branch point stays one after a sibling goes). Within a class the cheapest loss
+/// goes first: the tokens between the entry and the longest entry left that it extends (its whole length when none);
+/// oldest first among equal costs. Choosing again after each pick lets an entry whose lower rungs are gone count its
+/// whole length.
+/// Nov 17 (C13 bar, residency 4 x 980K): the first version ranked every entry by that cost alone, so a conversation's
+/// newest turn (a few dozen tokens past its previous one) went first and the next turn restored an older rung
+/// (~100 tokens more to prefill, +0.1 s at ~1M tokens).
+fn eviction_cost_order(prefixes:&[&[u32]])->Vec<usize> {
+    let n=prefixes.len();
+    // ext[a][b]: entry a strictly extends entry b (b is a proper prefix of a).
+    let ext=(0..n).map(|a|(0..n).map(|b|a!=b&&prefixes[b].len()<prefixes[a].len()&&prefixes[a].starts_with(prefixes[b]))
+        .collect::<Vec<_>>()).collect::<Vec<_>>();
+    // direct extensions of i: entries that extend i with no entry between them
+    let rung=(0..n).map(|i|(0..n).filter(|&j|ext[j][i]&&!(0..n).any(|k|ext[j][k]&&ext[k][i])).count()==1).collect::<Vec<_>>();
+    let mut left=(0..n).collect::<Vec<_>>();
+    let mut order=Vec::with_capacity(n);
+    while !left.is_empty() {
+        let key=|i:usize|->(u8,usize,usize) {
+            if n-1-i>=STALE_AFTER {return (0,0,i);}
+            let covered=left.iter().filter(|&&j|ext[i][j]).map(|&j|prefixes[j].len()).max().unwrap_or(0);
+            (if rung[i] {1} else {2},prefixes[i].len()-covered,i)
+        };
+        let at=(0..left.len()).min_by_key(|&p|key(left[p])).expect("entries left");
+        order.push(left.remove(at));
+    }
+    order
+}
+
 fn checkpoint_ladder()->Result<bool> {
     match std::env::var("CANADA_SCRATCH_CHECKPOINT_LADDER") {
         Ok(v)=>{ensure!(v=="0"||v=="1","checkpoint ladder must be0or1");Ok(v=="1")},
@@ -832,12 +894,31 @@ fn encoder_checkpoint_evictions_ladder(entries:&[(usize,usize)], optional:&[bool
 /// floor. One physical owner saves several GiB of permanently allocated state, and with the V4.1 cache formats a
 /// ~1M-token image is ~0.94 GB per rank, so one bank allows 8 GiB: four 1M conversations resident with room to
 /// park an overlapping request. Two physical banks keep 2 GiB.
-fn shared_image_limit(single_bank:bool)->usize {
-    (if single_bank {8} else {2})*1024usize.pow(3)
+/// With the snapshot chunk pool (CANADA_SCRATCH_IMAGE_POOL_MIB) one bank's limit is the pool's size when that is
+/// larger: pooled snapshots take no runtime allocation, and the pool holds their device bytes (a charge is never
+/// below its device bytes, so a budget within the pool keeps every cached and parked snapshot inside it).
+fn shared_image_limit(single_bank:bool,pool_mib:Option<usize>)->usize {
+    if single_bank {cache_budget_ceiling(pool_mib)} else {2*1024usize.pow(3)}
 }
 
-fn validate_shared_image_budget(budget:usize,single_bank:bool,exchange:bool)->Result<()> {
-    ensure!((64*1024usize.pow(2)..=shared_image_limit(single_bank)).contains(&budget),
+/// The ceiling of the cache budget (CANADA_SCRATCH_SESSION_CACHE_BYTES): 8 GiB, or the snapshot pool's size when it
+/// is larger (see shared_image_limit). Every save is still admitted against measured memory above the floor.
+fn cache_budget_ceiling(pool_mib:Option<usize>)->usize {
+    (8*1024usize.pow(3)).max(pool_mib.unwrap_or(0)<<20)
+}
+
+/// CANADA_SCRATCH_IMAGE_POOL_MIB: the snapshot chunk pool's size in MiB (256..65536; unset: no pool).
+fn image_pool_mib()->Result<Option<usize>> {
+    match std::env::var("CANADA_SCRATCH_IMAGE_POOL_MIB") {
+        Ok(v)=>{let mib:usize=v.parse().context("CANADA_SCRATCH_IMAGE_POOL_MIB must be a whole number of MiB")?;
+            ensure!((256..=65536).contains(&mib),"image pool size outside 256..65536 MiB");Ok(Some(mib))},
+        Err(std::env::VarError::NotPresent)=>Ok(None),
+        Err(error)=>Err(error.into()),
+    }
+}
+
+fn validate_shared_image_budget(budget:usize,single_bank:bool,exchange:bool,pool_mib:Option<usize>)->Result<()> {
+    ensure!((64*1024usize.pow(2)..=shared_image_limit(single_bank,pool_mib)).contains(&budget),
         "shared inactive image budget exceeds the selected owner layout");
     // State exchange lends the budget's unallocated growth to waiting inputs, a reservation sized for at
     // most 2 GiB (HttpQueue::reserve_waiting_image_capacity). Refuse at startup rather than at readiness.
@@ -873,10 +954,15 @@ struct CacheSaveAdmission {
 /// Reclaim only completed, optional conversation snapshots. The caller owns
 /// the live session and paused-request images separately. Headroom may differ
 /// by rank (only rank zero runs vision); all ranks still evict the same entry.
+/// `for_image`: the room is for a snapshot (with the startup pool, evicted snapshots free pool chunks, so count them).
+/// Room for anything else is host memory, which evicting pooled snapshots does not give back: with a pool, nothing is
+/// evicted for it (Nov 17).
 fn reclaim_optional_cache(cuda:&Cuda,control:&mut ControlChannel,
-    cached:&mut Vec<CachedSession>,long_first:bool,headroom:usize)->Result<Value> {
+    cached:&mut Vec<CachedSession>,long_first:bool,headroom:usize,for_image:bool)->Result<Value> {
     let began=Instant::now();
     cuda.synchronize_all()?;
+    let room=|| if for_image {cuda.image_admission_memory()} else {cuda.admission_memory()};
+    let pointless=!for_image&&cuda.image_pool_total_bytes().is_some();
     let mut proof=b"optional-cache-reclaim-v1".to_vec();
     proof.extend_from_slice(&(cached.len() as u64).to_le_bytes());
     for entry in cached.iter() {
@@ -886,20 +972,20 @@ fn reclaim_optional_cache(cuda:&Cuda,control:&mut ControlChannel,
         proof.push(u8::from(entry.opportunistic_logits()));
     }
     control.agree(&proof)?;
-    let before=cuda.admission_memory()?;
+    let before=room()?;
     let mut admitted=control.all_admit(before.admitted_available > headroom)?;
     let mut evicted=Vec::new();
-    while !admitted && !cached.is_empty() {
+    while !admitted && !cached.is_empty() && !pointless {
         let index=cached.iter().enumerate().min_by_key(|(i,c)|
             (!c.opportunistic_logits(),if long_first {c.prefix.len()}else{0},*i)).unwrap().0;
         let entry=cached.remove(index);
         evicted.push(json!({"prefix_tokens":entry.prefix.len(),"charge_bytes":entry.charge}));
         drop(entry);
-        admitted=control.all_admit(cuda.admission_memory()?.admitted_available > headroom)?;
+        admitted=control.all_admit(room()?.admitted_available > headroom)?;
     }
-    Ok(json!({"headroom_bytes":headroom,"admitted":admitted,"evicted":evicted,
+    Ok(json!({"headroom_bytes":headroom,"admitted":admitted,"evicted":evicted,"for_image":for_image,
         "remaining_cache_entries":cached.len(),"memory_before":before,
-        "memory_after":cuda.admission_memory()?,"seconds":began.elapsed().as_secs_f64()}))
+        "memory_after":room()?,"seconds":began.elapsed().as_secs_f64()}))
 }
 
 struct Worker {
@@ -988,6 +1074,7 @@ struct Worker {
     begin_record: Option<(f64, Value, usize, bool)>,
     displaced_checkpoint_enabled: bool,
     displaced_reclaim: bool,
+    cache_cost_order: bool,
     media: Option<crate::worker_media::Media>,
     active_media: Option<std::rc::Rc<crate::prompt_media::Bindings>>,
     media_receipt: Value,
@@ -1041,7 +1128,7 @@ impl Worker {
             let long_first=self.session_cache_long_first;
             let (bindings,receipt)=self.media.as_mut().ok_or_else(||anyhow::anyhow!("vision is not configured"))?
                 .prepare(plan.media.clone(),images,frontier,&mut self.control,&self.comm,&self.stream,
-                    &mut |control,headroom|reclaim_optional_cache(cuda,control,cached,long_first,headroom))?;
+                    &mut |control,headroom|reclaim_optional_cache(cuda,control,cached,long_first,headroom,false))?;
             self.install_media(Some(bindings))?;
             self.media_receipt=receipt;
         }
@@ -1249,17 +1336,19 @@ impl Worker {
         };
         let session_cache_slots=configured_session_cache_slots()?;
         // Every save is still admitted against real available memory above the floor; this is only the ceiling.
-        // After the FP4 cache a 1M conversation's image is about 1 GB, so 8 GiB holds four with their ladders.
-        ensure!(session_cache_budget<=8*1024usize.pow(3)
+        // After the FP4 cache a 1M conversation's image is about 1 GB, so 8 GiB holds four with their ladders;
+        // with the snapshot pool the ceiling is the pool's size when larger (cache_budget_ceiling).
+        let pool_mib=image_pool_mib()?;
+        ensure!(session_cache_budget<=cache_budget_ceiling(pool_mib)
             && (session_cache_budget==0 || std::env::var("CANADA_SCRATCH_COMPACT_STATE_IMAGE").as_deref()==Ok("1")),
-            "session cache requires compact images and at most 8 GiB additional state");
+            "session cache requires compact images and at most 8 GiB (or the snapshot pool's size) of additional state");
         let shared_image_budget=match std::env::var("CANADA_SCRATCH_SHARED_IMAGE_BYTES") {
             Err(std::env::VarError::NotPresent)=>2*1024usize.pow(3),
             Ok(value)=>value.parse::<usize>()?,
             Err(error)=>return Err(error.into()),
         };
         validate_shared_image_budget(shared_image_budget,crate::config::single_bank_requested(),
-            request_checkpoint::exchange_enabled()?)?;
+            request_checkpoint::exchange_enabled()?,pool_mib)?;
         let session_cache_long_first=match std::env::var("CANADA_SCRATCH_SESSION_CACHE_POLICY") {
             Err(std::env::VarError::NotPresent)=>true,
             Ok(value)if value=="fifo"=>false,
@@ -1661,6 +1750,7 @@ impl Worker {
         control.agree(&[u8::from(crate::config::encoder_checkpoint_inline_requested()?)])?;
         control.agree(&[u8::from(displaced_checkpoint()?)])?;
         control.agree(&[0x7d,u8::from(displaced_reclaim()?)])?;
+        control.agree(&[0x7b,u8::from(cache_cost_order()?)])?;
         // Nov 12 cache policies: every rank must run the same ones (they decide positions, saves and copies).
         control.agree(&[0x7c,crate::config::shared_prefix_checkpoint()?,u8::from(crate::config::encoder_extra_near_end()?),
             u8::from(crate::config::batched_detach_keeps_images()?)])?;
@@ -1875,6 +1965,7 @@ impl Worker {
             begin_record: None,
             displaced_checkpoint_enabled: displaced_checkpoint()?,
             displaced_reclaim: displaced_reclaim()?,
+            cache_cost_order: cache_cost_order()?,
             media,
             active_media: None,
             media_receipt: Value::Null,
@@ -1964,6 +2055,16 @@ impl Worker {
     /// With the checkpoint ladder, mark this owner's cached prefixes that the
     /// incoming checkpoint extends (same tokens and media up to their length).
     /// Every rank holds the same entries, so all ranks choose the same victims.
+    /// See cache_cost_order(). Every rank holds the same entries, so the order is the same everywhere; nothing else holds
+    /// an index into the cache across this call. `_incoming` is kept for the call sites (the order does not depend on it).
+    fn order_cache_by_lineage(&mut self,_incoming:&[u32]) {
+        if !self.cache_cost_order||self.cached_sessions.len()<2 {return;}
+        let order=eviction_cost_order(&self.cached_sessions.iter().map(|c|c.prefix.as_slice()).collect::<Vec<_>>());
+        if order.iter().enumerate().all(|(k,&i)|k==i) {return;}
+        let mut slots=std::mem::take(&mut self.cached_sessions).into_iter().map(Some).collect::<Vec<_>>();
+        self.cached_sessions=order.into_iter().map(|i|slots[i].take().unwrap()).collect();
+    }
+
     fn ladder_ancestors(&self,prefix:&[u32],media:&crate::prompt_media::Identity)->Option<Vec<bool>> {
         self.checkpoint_ladder.then(||self.cached_sessions.iter().map(|c|c.owner==self.bank_id
             &&c.prefix.len()<prefix.len()&&prefix.starts_with(&c.prefix)
@@ -1974,10 +2075,11 @@ impl Worker {
         self.retain_cached_prefix_reserved(prefix,pending,media.through(prefix.len()),0,0,false)
     }
 
+    /// See cache_capacity_of(). `extra_bytes`/`extra_count`: a restored parent held outside the vector that goes
+    /// back into it (return_encoder_parent).
     fn cache_capacity(&self,extra_bytes:usize,extra_count:usize)->(usize,usize) {
-        (self.session_cache_budget.min(self.shared_image_budget
-            .saturating_sub(self.suspended_image_bytes.saturating_add(extra_bytes))),
-            self.image_entry_limit().saturating_sub(self.suspended_image_count.saturating_add(extra_count)))
+        cache_capacity_of(self.session_cache_budget,self.shared_image_budget,self.suspended_image_bytes,
+            self.suspended_image_count,self.image_entry_limit(),extra_bytes,extra_count)
     }
 
     // The configured cache slots remain available while at most two request images
@@ -2022,7 +2124,7 @@ impl Worker {
         let budget_evictions=removed.len();
         let mut reusable=Vec::new();
         if self.cache_pressure_reclaim {
-            let available=self.cuda.admission_memory()?.admitted_available;
+            let available=self.cuda.image_admission_memory()?.admitted_available;
             // Ordinary saves need exactly the existing memory query and one
             // all-rank vote. Enter the fuller eviction agreement only when a
             // rank actually needs reclamation or a logical-budget eviction.
@@ -2072,11 +2174,11 @@ impl Worker {
         // resident. Crediting its bytes here could crowd a lazy graph capture
         // during the prefix. If any rank cannot keep that headroom, drop it
         // everywhere and retry the unchanged ordinary post-eviction admission.
-        let mut available=self.cuda.admission_memory()?.admitted_available;
+        let mut available=self.cuda.image_admission_memory()?.admitted_available;
         let mut local_fits=available>=required;
         let mut admitted=self.control.all_admit(eligible&&local_fits)?;
         if !admitted&&recycled.is_some() {
-            recycled=None;available=self.cuda.admission_memory()?.admitted_available;
+            recycled=None;available=self.cuda.image_admission_memory()?.admitted_available;
             local_fits=available>=required;admitted=self.control.all_admit(eligible&&local_fits)?;
         }
         Ok(CacheSaveAdmission{admitted,available,local_fits,evicted,
@@ -2129,7 +2231,7 @@ impl Worker {
             if let Some(media)=&mut self.media {media.release_warm();}
         }
         let mut event=reclaim_optional_cache(&self.cuda,&mut self.control,&mut self.cached_sessions,
-            self.session_cache_long_first,headroom)?;
+            self.session_cache_long_first,headroom,false)?;
         self.agree(&[])?;
         event["type"]=json!("input_reclaim");event["request_id"]=json!(self.current);
         event["frontier"]=json!(self.history.frontier());event["suspended_image_bytes"]=json!(self.suspended_image_bytes);
@@ -2289,6 +2391,7 @@ impl Worker {
         let charge=device_bytes.checked_add(host_bytes).and_then(|n|n.checked_add(prefix.len()*4+media.metadata_bytes()))
             .and_then(|n|n.checked_add(self.complete_cache_ancestor_bytes()))
             .ok_or_else(||anyhow::anyhow!("cached session byte overflow"))?;
+        self.order_cache_by_lineage(prefix);
         let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
         let (budget,slots)=self.cache_capacity(extra_bytes,extra_count);
         let optional=self.optional_entries(prefix.len());
@@ -2346,6 +2449,7 @@ impl Worker {
             .and_then(|n|n.checked_add(self.complete_cache_ancestor_bytes()))
             .and_then(|n|n.checked_add(crate::sampling::VOCAB*4))
             .ok_or_else(||anyhow::anyhow!("prompt logit cache size overflow"))?;
+        self.order_cache_by_lineage(&plan.prompt);
         let (budget,slots)=self.cache_capacity(0,0);
         let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
         let speculative=self.cached_sessions.iter().map(|c|c.speculative).collect::<Vec<_>>();
@@ -2358,7 +2462,7 @@ impl Worker {
         let eligible=evictions.is_some();
         let reserve=self.cache_reserve()?;
         let admitted=self.control.all_admit(eligible
-            && self.cuda.admission_memory()?.admitted_available>=reserve+charge)?;
+            && self.cuda.image_admission_memory()?.admitted_available>=reserve+charge)?;
         // Admission is conservative while all old allocations still exist.
         // A refused allocation leaves their cache ownership untouched.
         let mut evicted=0;
@@ -2597,6 +2701,7 @@ impl Worker {
                         retained_image=self.return_encoder_parent(Some(candidate))?;
                     }else{
                         let cached=candidate;
+                        self.order_cache_by_lineage(&cached.prefix);
                         let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
                         let (budget,slots)=self.cache_capacity(0,0);
                         let ancestors=self.ladder_ancestors(&cached.prefix,&cached.media);
@@ -2942,6 +3047,7 @@ impl Worker {
         // Retain the shared parent even when this checkpoint advances into a
         // branch-specific suffix. Both images must fit the existing budget;
         // do not credit the parent's bytes before a successor actually exists.
+        self.order_cache_by_lineage(prefix);
         let (budget,slots)=self.cache_capacity(0,0);
         let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
         let optional=self.optional_entries(checkpoint);
@@ -2998,6 +3104,7 @@ impl Worker {
                 let duplicate2=self.cached_sessions.iter().chain(wanted.iter()).any(|c|
                     (c.owner==self.bank_id||self.can_import_cached_encoder(c))
                     &&c.prefix==prefix2&&c.media.matches_prefix(&media2,prefix2.len()));
+                self.order_cache_by_lineage(prefix2);
                 let (budget,slots)=self.cache_capacity(0,0);
                 let reserved=wanted.as_ref().map_or(0,|c|c.charge).saturating_add(charge);
                 let held=usize::from(wanted.is_some())+1;
@@ -3252,9 +3359,23 @@ impl Worker {
                 self.peer_bank.as_ref().unwrap().encoder_import_source(&parent)?;
             }
             let (budget,slots)=self.cache_capacity(0,0);
-            ensure!(self.cached_sessions.len()<slots
-                &&self.cached_sessions.iter().map(|c|c.charge).sum::<usize>()+parent.charge<=budget,
-                "encoder parent reservation lost");
+            let charged=self.cached_sessions.iter().map(|c|c.charge).sum::<usize>();
+            if self.cached_sessions.len()>=slots||charged.saturating_add(parent.charge)>budget {
+                // Every save made while the parent is held reserves its slot and bytes, so this is an accounting
+                // gap. The worker keeps serving: the cache's own policy makes room (every rank holds the same
+                // entries and plans the same victims; nothing is allocated) and the parent is dropped only when
+                // that fails. Logged, so the bar sees it.
+                self.order_cache_by_lineage(&parent.prefix);
+                let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
+                let plan=cache_evictions(&entries,(parent.prefix.len(),parent.charge),budget,
+                    self.session_cache_long_first,slots);
+                eprintln!("encoder parent reservation gap: {}",json!({"parent_tokens":parent.prefix.len(),
+                    "parent_charge":parent.charge,"entries":entries.len(),"charged":charged,"budget":budget,"slots":slots,
+                    "evicted":plan.as_ref().map(Vec::len),"parent_dropped":plan.is_none()}));
+                let Some(mut victims)=plan else {return Ok(false);};
+                victims.sort_unstable();
+                for i in victims.into_iter().rev(){self.cached_sessions.remove(i);}
+            }
             self.cached_sessions.push(parent);
             Ok(true)
         }else{Ok(false)}
@@ -5155,6 +5276,24 @@ pub fn run_http(path: &Path) -> Result<()> {
     #[cfg(not(feature = "serving"))]
     let wide_startup_warmup:Option<Value> = None;
     worker.cuda.report_allocation_sites("startup warmup complete")?;
+    // Nov 17: the snapshot chunk pool (cuda::ChunkPool), created after every startup allocation so it takes memory last;
+    // every rank must agree on its size (snapshots are planned identically everywhere).
+    let image_pool_mib = image_pool_mib()?;
+    worker.control.agree(&[0x7a].iter().copied().chain((image_pool_mib.unwrap_or(0) as u64).to_le_bytes()).collect::<Vec<u8>>())?;
+    // Before the pool takes its memory: give back the page cache of the kernel bundles read at load (see
+    // memory::release_file_cache). Rank-local and advisory; every rank reports what it released.
+    #[cfg(target_os = "linux")]
+    if std::env::var("CANADA_SCRATCH_RELEASE_LOAD_FILE_CACHE").as_deref() == Ok("1") {
+        let before = worker.cuda.admission_memory()?;
+        let (files, cached, left) = crate::memory::release_file_cache(&p.kernels)?;
+        eprintln!("load file cache released {}", json!({"rank":p.rank,"files":files,"cached_bytes":cached,"left_bytes":left,
+            "memory_before":before,"memory_after":worker.cuda.admission_memory()?}));
+    }
+    let image_pool = match image_pool_mib {
+        Some(mib) => { let report = worker.cuda.create_image_pool(mib << 20)?; eprintln!("image pool {report}"); Some(report) },
+        None => None,
+    };
+    crate::cuda::SERVING_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
     worker.progress_next = progress_next;
     let mut ready = json!({"type":"ready","rank":p.rank,"identity":worker.identity,
         "session_cache_budget_bytes":worker.session_cache_budget,"prompt_checkpoint":worker.prompt_checkpoint,
@@ -5223,6 +5362,7 @@ pub fn run_http(path: &Path) -> Result<()> {
     ready["idle_anchor_rolling"]=json!(worker.idle_anchor_rolling);
     ready["encoder_image_recycle"]=json!(worker.encoder_image_recycle);
     ready["session_cache_slots"]=json!(worker.session_cache_slots);
+    ready["image_pool"]=json!(image_pool);
     if let Ok(f)=crate::attention::kv_format() {
         ready["kv_format"]=json!({"window":f.window.name(),"compressed":f.compressed.name()});
     }
@@ -5545,15 +5685,24 @@ mod tests {
     #[test]
     fn shared_image_budget_follows_the_owner_layout_and_exchange() {
         let gib=1024usize.pow(3);
-        assert_eq!(shared_image_limit(true),8*gib);
-        assert_eq!(shared_image_limit(false),2*gib);
-        for ok in [64*1024usize.pow(2),4*gib,7*gib,8*gib] {assert!(validate_shared_image_budget(ok,true,false).is_ok(),"{ok}");}
-        assert!(validate_shared_image_budget(8*gib+1,true,false).is_err());
-        assert!(validate_shared_image_budget(32*1024usize.pow(2),true,false).is_err());
-        assert!(validate_shared_image_budget(2*gib,false,false).is_ok());
-        assert!(validate_shared_image_budget(3*gib,false,false).is_err(),"two banks keep 2 GiB");
-        assert!(validate_shared_image_budget(2*gib,true,true).is_ok());
-        assert!(validate_shared_image_budget(4*gib,true,true).is_err(),"exchange lends at most 2 GiB to waiting inputs");
+        assert_eq!(shared_image_limit(true,None),8*gib);
+        assert_eq!(shared_image_limit(false,None),2*gib);
+        for ok in [64*1024usize.pow(2),4*gib,7*gib,8*gib] {assert!(validate_shared_image_budget(ok,true,false,None).is_ok(),"{ok}");}
+        assert!(validate_shared_image_budget(8*gib+1,true,false,None).is_err());
+        assert!(validate_shared_image_budget(32*1024usize.pow(2),true,false,None).is_err());
+        assert!(validate_shared_image_budget(2*gib,false,false,None).is_ok());
+        assert!(validate_shared_image_budget(3*gib,false,false,None).is_err(),"two banks keep 2 GiB");
+        assert!(validate_shared_image_budget(2*gib,true,true,None).is_ok());
+        assert!(validate_shared_image_budget(4*gib,true,true,None).is_err(),"exchange lends at most 2 GiB to waiting inputs");
+        // the snapshot pool raises one bank's ceiling to its own size, never lowers it, and leaves two banks alone
+        assert_eq!(shared_image_limit(true,Some(12*1024)),12*gib);
+        assert_eq!(shared_image_limit(true,Some(4*1024)),8*gib);
+        assert_eq!(shared_image_limit(false,Some(12*1024)),2*gib);
+        assert!(validate_shared_image_budget(11*gib,true,false,Some(12*1024)).is_ok());
+        assert!(validate_shared_image_budget(12*gib+1,true,false,Some(12*1024)).is_err());
+        assert!(validate_shared_image_budget(4*gib,true,true,Some(12*1024)).is_err(),"exchange still lends at most 2 GiB");
+        assert_eq!(cache_budget_ceiling(None),8*gib);
+        assert_eq!(cache_budget_ceiling(Some(10*1024)),10*gib);
     }
     #[test]
     fn request_incident_redaction_keeps_cache_counts_without_output_tokens() {
@@ -5781,6 +5930,77 @@ mod tests {
             4,true,&[0,1,2]),None);
     }
     use super::*;
+    #[test]
+    fn cost_order_loses_dense_checkpoints_before_a_long_conversation() {
+        // oldest first: a long conversation L (shared 45K base, then grown) with two rungs, then an image conversation F
+        // over the same base with four checkpoints ~1K apart
+        let base=vec![7u32;45_000];
+        let mut l1=base.clone();l1.extend(vec![1u32;600_000]);let mut l2=l1.clone();l2.extend(vec![1u32;300_000]);
+        let mut f=Vec::new();let mut cur=base.clone();
+        for k in 0..4 {cur.extend(vec![2u32+k;1_000]);f.push(cur.clone());}
+        let prefixes=[l1.as_slice(),l2.as_slice(),f[0].as_slice(),f[1].as_slice(),f[2].as_slice(),f[3].as_slice()];
+        let order=super::eviction_cost_order(&prefixes);
+        // F's older checkpoints (rungs: 1K over their predecessor, then F's first 46K) go first, then L's older rung,
+        // then the newest entries by cost: F's newest, and L2 (the long conversation's newest) last.
+        assert_eq!(order,vec![3,4,2,0,5,1]);
+        // replaced follow-ups of A (siblings over A's cached prompt) go before D's only entry
+        let a=vec![3u32;15_000];let mut a1=a.clone();a1.extend(vec![4u32;300]);let mut a2=a.clone();a2.extend(vec![5u32;300]);
+        let d=vec![9u32;15_000];
+        let p=[d.as_slice(),a.as_slice(),a1.as_slice(),a2.as_slice()];
+        let o=super::eviction_cost_order(&p);
+        assert_eq!(&o[..2],&[2,3]);
+        // then D's only entry and A's prompt cost the same (their whole length): the older goes first
+        assert!(!o[..2].contains(&0));
+        // a stale entry costs nothing
+        let many=(0..40).map(|k|vec![k as u32+100;10]).collect::<Vec<_>>();
+        let refs=many.iter().map(|v|v.as_slice()).collect::<Vec<_>>();
+        assert_eq!(super::eviction_cost_order(&refs)[0],0);
+    }
+
+    #[test]
+    fn held_parent_is_charged_to_the_cache_budget_too() {
+        const G:usize=1<<30;
+        // production's budgets: cache 6 GiB, shared 7 GiB, 16 slots; nothing parked
+        assert_eq!(super::cache_capacity_of(6*G,7*G,0,0,16,0,0),(6*G,16));
+        // a held ~0.9 GiB parent: the room is 6 GiB minus the parent, not min(6, 7 - 0.9) = 6 GiB
+        assert_eq!(super::cache_capacity_of(6*G,7*G,0,0,16,G-G/10,1),(6*G-(G-G/10),15));
+        // a parked image takes from the shared budget; the parent from what is left
+        assert_eq!(super::cache_capacity_of(6*G,7*G,2*G,1,17,G/2,1),(5*G-G/2,15));
+        // saturating: nothing is left rather than wrapping
+        assert_eq!(super::cache_capacity_of(G,7*G,0,0,1,2*G,2),(0,0));
+        // the P3 case: 14 entries (5.24 GiB) with the parent among them; the parent is checked out and the displaced
+        // conversation's ~1 GB image is saved before the parent goes back
+        let parent=950_000_000usize;
+        let mut entries=vec![(974_000usize,parent)];
+        for k in 0..13 {entries.push((50_000+k*1000,(5_625_025_028-parent)/13));}
+        let held=entries.remove(0);
+        let displaced=(974_587usize,1_010_000_000usize);
+        let (budget,slots)=super::cache_capacity_of(6*G,7*G,0,0,16,held.1,1);
+        let optional=vec![false;entries.len()];let ancestors=vec![false;entries.len()];
+        let plan=super::completed_cache_evictions(&entries,&optional,&ancestors,displaced,budget,true,slots).unwrap();
+        let kept=(0..entries.len()).filter(|i|!plan.contains(i)).map(|i|entries[i].1).sum::<usize>();
+        let count=entries.len()-plan.len()+1;
+        // the parent still fits when it returns: one slot and its bytes are left
+        assert!(count<16&&kept+displaced.1+held.1<=6*G,"{kept} {count}");
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn cost_order_keeps_each_conversations_newest_turn_before_older_rungs() {
+        // C13 bar, residency 4 x 980K: four long conversations, each with its turn-0 and turn-1 images (turn 1 extends
+        // turn 0 by a few dozen tokens), oldest first. The older rungs go first, every conversation's newest turn stays.
+        let mut prefixes=Vec::new();
+        for c in 0..4u32 {let base=vec![c+1;90_000];let mut t1=base.clone();t1.extend(vec![77u32;45]);prefixes.push(base);prefixes.push(t1);}
+        let refs=prefixes.iter().map(|v|v.as_slice()).collect::<Vec<_>>();
+        let order=super::eviction_cost_order(&refs);
+        assert_eq!(&order[..4],&[0,2,4,6],"turn-0 rungs first");
+        assert!(order[4..].iter().all(|i|i%2==1));
+        // a branch point keeps its class after one of its two regenerations goes
+        let a=vec![3u32;15_000];let mut a1=a.clone();a1.extend(vec![4u32;300]);let mut a2=a.clone();a2.extend(vec![5u32;300]);
+        let d=vec![9u32;15_000];
+        let o=super::eviction_cost_order(&[d.as_slice(),a.as_slice(),a1.as_slice(),a2.as_slice()]);
+        assert_eq!(o,vec![2,3,0,1]);
+    }
     #[test]
     fn physical_pressure_prefers_optional_then_longest_superseded_snapshot() {
         let entries=[(8000,30),(200000,70),(210000,80),(100,10)];

@@ -1,5 +1,80 @@
 # Validation status
 
+## November 17 memory release (s1595)
+
+s1595 keeps every setting of s1586 and changes four, all about memory: the snapshot chunk pool, a lower admission
+floor that the pool makes safe, and cache budgets that fill the pool. It also fixes one accounting bug. Eviction stays least recently used. No kernel, numeric code, weight,
+clock policy or router change.
+
+**Why.** On memory that days of serving had fragmented, the engine's large allocations while serving made the GPU
+driver fall back from large pages, and the kernel then reclaimed and compacted memory, which also swaps idle pages
+out. Almost all of those allocations were conversation snapshots (cached conversations and paused requests): in the
+stress panel, about a hundred of up to 857 MiB, 18 GiB allocated and freed in nine minutes. Every admission also kept
+8 GiB of available memory free, part of which is page cache rather than free memory.
+
+**The change.**
+- **Snapshot chunk pool** (`CANADA_SCRATCH_IMAGE_POOL_MIB=8192`): after the startup warm-up, every device creates a
+  fixed pool of 16 MiB physical chunks (about 0.2 s for 8 GiB). A snapshot maps the chunks it needs into one
+  contiguous range and returns them when it is dropped, so serving makes no large allocation. Snapshots under 8 MiB
+  keep ordinary allocations. Measured on memory that had served for hours without being sorted, the stress panel
+  then behaved like freshly sorted memory: no direct reclaim, compaction or swap on any device.
+- **Admission floor 4 GiB** (`CANADA_SCRATCH_MEMORY_FLOOR_MIB=4096`, accepted only with the pool; 8 GiB without it).
+- **Cache budgets** 6 -> 6.75 GiB (cache) and 7 -> 7.75 GiB (shared inactive images), inside the pool.
+- **Fix.** While a restore has a cached snapshot checked out, the snapshot's room is now reserved against the cache
+  budget as well as the shared one. Before, a save made in the meantime could take that room and the engine stopped
+  ("encoder parent reservation lost"); production never reached it, a stress test with a candidate eviction order
+  did. If a gap remains, the engine now makes room by its cache policy instead of stopping.
+
+**Left out after the comparison.** A fifth setting, the release of the page cache the engine reads at load
+(`CANADA_SCRATCH_RELEASE_LOAD_FILE_CACHE`), passed the bar but not the comparison: with it, the first conversation
+after a load ran up to a third slower for about a minute (prefill and decode) in two of three runs; without it,
+and with production's settings, in none. It stays in the runtime, off, and the bar was run again without it.
+
+**Qualification of s1595, all release settings on.** The same seven panels as s1586, each started on sorted memory,
+plus a new rule for every panel: no page swapped out on any device (the kernel's swap, reclaim and compaction
+counters were read before and after each panel on all four devices; apart from the load's own page-ins, every
+difference was zero).
+- **Timing contract.** It passed: the header on streamed and plain responses; of six conversations for four owners,
+  two waited; three conversations without `max_tokens` paused nine times and all three reported waiting again
+  after running.
+- **Routed panel.** It passed: nine routed requests, every response 200; the follow-up through the incremental
+  context transport reused 3,540 prompt tokens.
+- **Several-conversations panel.** It passed: 17 synthetic conversations (the longest 296,940 prompt tokens), every
+  answer naming its own planted code words; all three follow-ups after turn-taking reused their whole prompt.
+- **Stress panel.** It passed: 70 requests reaching 974,076 prompt tokens. Lowest available memory was 6.26 GiB
+  (against the new admission line of 4.5 GiB). The hottest device read 91.6°C, with about 22 s at or above 90°C.
+  There were no `allocation_failure` lines and no driver large-page retries.
+- **Near-1M cancellation check** and **serving gate.** Both passed; the tool turns had the expected tool-call
+  behavior, and cancel/resume worked.
+- **Residency.** Four conversations of about 980K tokens took turns for three rounds: all eight return turns were
+  served from the cache, with a median time to first token of 0.38 s. Lowest available memory was 6.52 GiB.
+- **Reference quality** is carried over from s1585: no numeric code changed.
+- **Other checks.** The native Arm64 build passed 264 CPU tests, and ten installation interruption and rollback
+  fixtures passed.
+
+**Against production (s1586) on one boot.** Every load on sorted memory, production's arms first: the live tool loop
+at 16K and 200K (first tokens of cached appends: 0.170 against 0.170 s at +27 tokens on 16K, 0.166 against 0.163 s on
+200K), appended file excerpts of 450-7,400 tokens on two 16K conversations (mean first token 0.531 against 0.520 s;
+the first conversation after the load, a median 1.04 times production's on its first five turns), one to four streams
+at the harness's token limit (86.8 / 92.6 / 94.8 / 88.5 against 86.1 / 92.4 / 94.8 / 88.4 tokens/s), three
+conversations taking turns and then their follow-ups at once (both passed; every follow-up reused its whole prompt;
+first tokens 0.84 against 0.85 s), and decode bare and after a 128K document (five seeds: prose 72.0 against 72.0
+tokens/s, code 93.4 against 93.4, prose at 128K 71.6 against 70.9, code at 128K 94.6 against 94.7). No cell was slower
+beyond its noise allowance.
+
+**Installation and activation.** s1595 was installed in one journaled transaction that falls back to s1586; only the
+runtime's paths, the four settings and the runtime's hash pins change in the deployment. It was activated on fresh
+boots with one production model load per device.
+- A head-local smoke test passed text, prompt reuse (15,641 of 15,641 prompt tokens), continuation, image input and
+  text after an image, and found the execution-timing header and the running and waiting comments on the live service.
+- **Through the router.** Six requests went through the router in use: a conversation turn (3,662 tokens, first token
+  0.59 s), its follow-up (3,661 of 3,728 prompt tokens reused, first token 0.15 s), an image, a plain response and two
+  conversations at once. All were served, and every line the router logged afterwards had status 200.
+- Runtime hashes, clocks, APST guards and health checks passed. A baseline of every device's swap, reclaim and
+  compaction counters was taken after the load, to be checked after days of serving.
+
+See the [sanitized qualification record](../validation/memory-pool-2026-11-17.json).
+
 ## November 15 routed-serving fix (s1586)
 
 s1586 is s1585 with one change in the engine's HTTP layer. Every setting is unchanged.

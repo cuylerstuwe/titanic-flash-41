@@ -1,0 +1,635 @@
+{
+  "release": "s1595",
+  "date": "2026-11-17",
+  "base": "s1586",
+  "failed_start_fallback": "s1586",
+  "change": {
+    "snapshot_pool": "conversation snapshots (cache entries, paused requests) map 16 MiB chunks of a pool created once after warm-up (8 GiB a device) instead of allocating while serving. Snapshots were ~99 % of the large allocations made while serving; on memory fragmented by days of use those made the driver fall back from large pages and the kernel reclaim and compact. With the pool, memory that had served for hours behaved like freshly sorted memory under the stress panel.",
+    "memory_floor": "the admission floor drops from 8 GiB to 4 GiB of available memory (allowed only with the pool)",
+    "cache_budgets": "cache 6 GiB -> 6.75 GiB, shared inactive images 7 GiB -> 7.75 GiB (within the pool)",
+    "fix": "a restore that checks a cached snapshot out now reserves its room against the cache budget as well as the shared one; before, a save made while the snapshot was out could take its room and the engine stopped (never seen in production; reached in a stress test once a candidate eviction order kept long conversations cached). A remaining gap is handled by the cache policy instead of stopping."
+  },
+  "unchanged": [
+    "weights",
+    "kernels and numeric code",
+    "every other setting of s1586",
+    "2350 MHz clock policy",
+    "the response timing contract",
+    "portable profile"
+  ],
+  "memory": {
+    "rule": "no page swapped out on any device during any panel",
+    "no_swap_per_panel": {
+      "q-timing": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-router": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-regions": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-cancel": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-cand": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-stress": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "resid1m": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ]
+    },
+    "passed": true
+  },
+  "timing_contract_panel": {
+    "passed": true,
+    "streamed_header": "v1",
+    "plain_header": "v1",
+    "six_conversations_waited": 2,
+    "turn_taking_pauses": 9,
+    "streams_reporting_a_wait_after_running": 3,
+    "min_available_gib": [
+      6.444,
+      7.221,
+      8.551,
+      8.851
+    ]
+  },
+  "routed_panel": {
+    "passed": true,
+    "routed_requests": 9,
+    "statuses": [
+      200
+    ],
+    "context_outcomes": [
+      "seeded",
+      "incremental",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded"
+    ],
+    "follow_up_cached_tokens": 3540,
+    "min_available_gib": [
+      6.655,
+      7.127,
+      8.854,
+      8.942
+    ]
+  },
+  "several_conversations_panel": {
+    "passed": true,
+    "conversations_checked": 17,
+    "drafter_images_restored_into_another_drafter": 1,
+    "longest_prompt_tokens": 296940,
+    "follow_up_reuse_of_first_prompt": {
+      "30": 1.0,
+      "31": 1.0,
+      "32": 1.0
+    },
+    "min_available_gib": [
+      6.287,
+      7.089,
+      8.904,
+      9.111
+    ]
+  },
+  "stress_panel": {
+    "passed": true,
+    "requests": 70,
+    "max_prompt_tokens": 974076,
+    "max_temperature_c": [
+      91.6,
+      90.7,
+      90.7,
+      89.7
+    ],
+    "approx_seconds_at_or_above_90c": {
+      "0": 4.0,
+      "1": 22.0,
+      "2": 20.0,
+      "3": 0.0
+    },
+    "min_available_gib": [
+      6.264,
+      7.005,
+      8.729,
+      8.862
+    ],
+    "kernel_driver_large_page_retry_lines": 0,
+    "engine_allocation_failures": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 0
+    }
+  },
+  "serving_gate": {
+    "passed": true,
+    "requests": 15,
+    "min_available_gib": [
+      5.85,
+      6.716,
+      8.335,
+      8.548
+    ],
+    "criterion": "functional (tool-call behavior, cache reuse, cancel/resume)"
+  },
+  "cancellation_check": {
+    "passed": true,
+    "min_available_gib": [
+      6.296,
+      7.221,
+      8.965,
+      9.414
+    ]
+  },
+  "residency_check": {
+    "flags": "candidate c17: 16 slots, pool-backed budgets, floor 4096 MiB",
+    "sizes_k": [
+      980,
+      980,
+      980,
+      980
+    ],
+    "rounds": 3,
+    "return_turns": 8,
+    "return_cached_fraction": 1.0,
+    "return_seconds_median": 0.383,
+    "min_available_gib": [
+      6.52,
+      7.69,
+      9.14,
+      9.29
+    ]
+  },
+  "reference_quality": {
+    "carried_over_from": "s1585",
+    "why": "no numeric code changed: where snapshots are stored, budget accounting and admission thresholds; every restore path ran through the pool in the gate, cancel and regions panels",
+    "positions": 2499,
+    "kl": 0.009325392849739931,
+    "kl_ci95": [
+      0.00814229524266305,
+      0.010598958210404472
+    ],
+    "yardstick": 0.009537610223259073,
+    "kl_minus_yardstick_ci95": [
+      -0.0009862300175128823,
+      0.00036526078701479433
+    ],
+    "top1_agree": 0.9595838335334134,
+    "yardstick_top1_agree": 0.9591836734693877,
+    "clear_flips": 0
+  },
+  "against_production_s1586": {
+    "cells": {
+      "toolloop": {
+        "16k/+27": {
+          "candidate_first_token_s": 0.17025778349488974,
+          "production_first_token_s": 0.169893354002852,
+          "n": [
+            4,
+            4
+          ]
+        },
+        "16k/+75": {
+          "candidate_first_token_s": 0.21123815601458773,
+          "production_first_token_s": 0.20563251699786633,
+          "n": [
+            3,
+            3
+          ]
+        },
+        "16k/+254": {
+          "candidate_first_token_s": 0.2580610449949745,
+          "production_first_token_s": 0.25472938298480585,
+          "n": [
+            3,
+            3
+          ]
+        },
+        "200k/+27": {
+          "candidate_first_token_s": 0.1661231664911611,
+          "production_first_token_s": 0.1632666285004234,
+          "n": [
+            4,
+            4
+          ]
+        },
+        "200k/+75": {
+          "candidate_first_token_s": 0.227249502990162,
+          "production_first_token_s": 0.2198757320002187,
+          "n": [
+            3,
+            3
+          ]
+        },
+        "200k/+254": {
+          "candidate_first_token_s": 0.273207543999888,
+          "production_first_token_s": 0.2721401559829246,
+          "n": [
+            3,
+            3
+          ]
+        }
+      },
+      "appended_excerpts": {
+        "450": {
+          "candidate_first_token_s": 0.2583,
+          "production_first_token_s": 0.2541
+        },
+        "600": {
+          "candidate_first_token_s": 0.2698,
+          "production_first_token_s": 0.27115
+        },
+        "760": {
+          "candidate_first_token_s": 0.29835,
+          "production_first_token_s": 0.28600000000000003
+        },
+        "900": {
+          "candidate_first_token_s": 0.3033,
+          "production_first_token_s": 0.28769999999999996
+        },
+        "1100": {
+          "candidate_first_token_s": 0.33594999999999997,
+          "production_first_token_s": 0.32435
+        },
+        "1250": {
+          "candidate_first_token_s": 0.34650000000000003,
+          "production_first_token_s": 0.3429
+        },
+        "1400": {
+          "candidate_first_token_s": 0.35735,
+          "production_first_token_s": 0.3469
+        },
+        "1700": {
+          "candidate_first_token_s": 0.403,
+          "production_first_token_s": 0.40249999999999997
+        },
+        "2000": {
+          "candidate_first_token_s": 0.42164999999999997,
+          "production_first_token_s": 0.4266
+        },
+        "2250": {
+          "candidate_first_token_s": 0.4435,
+          "production_first_token_s": 0.43855
+        },
+        "2500": {
+          "candidate_first_token_s": 0.45909999999999995,
+          "production_first_token_s": 0.4565
+        },
+        "2750": {
+          "candidate_first_token_s": 0.46704999999999997,
+          "production_first_token_s": 0.4699
+        },
+        "3000": {
+          "candidate_first_token_s": 0.51925,
+          "production_first_token_s": 0.5167999999999999
+        },
+        "3250": {
+          "candidate_first_token_s": 0.56485,
+          "production_first_token_s": 0.5635
+        },
+        "3500": {
+          "candidate_first_token_s": 0.64615,
+          "production_first_token_s": 0.62975
+        },
+        "3800": {
+          "candidate_first_token_s": 0.68265,
+          "production_first_token_s": 0.6436999999999999
+        },
+        "4500": {
+          "candidate_first_token_s": 0.8109,
+          "production_first_token_s": 0.75975
+        },
+        "5000": {
+          "candidate_first_token_s": 0.9073,
+          "production_first_token_s": 0.8643
+        },
+        "6400": {
+          "candidate_first_token_s": 1.0141,
+          "production_first_token_s": 1.0101
+        },
+        "7400": {
+          "candidate_first_token_s": 1.11015,
+          "production_first_token_s": 1.1074000000000002
+        },
+        "mean": {
+          "candidate_first_token_s": 0.53096,
+          "production_first_token_s": 0.5201225,
+          "sizes": 20
+        }
+      },
+      "first_conversation_after_load": {
+        "ratios": [
+          1.008,
+          0.981,
+          1.066,
+          1.074,
+          1.044
+        ],
+        "median": 1.0435984034387473
+      },
+      "streams_harness_limit": {
+        "1": {
+          "candidate_aggregate_tok_s": 86.8,
+          "production_aggregate_tok_s": 86.13
+        },
+        "2": {
+          "candidate_aggregate_tok_s": 92.56,
+          "production_aggregate_tok_s": 92.43
+        },
+        "3": {
+          "candidate_aggregate_tok_s": 94.83,
+          "production_aggregate_tok_s": 94.78
+        },
+        "4": {
+          "candidate_aggregate_tok_s": 88.54,
+          "production_aggregate_tok_s": 88.44
+        }
+      },
+      "takes_turns": {
+        "candidate_passed": true,
+        "production_passed": true,
+        "candidate_follow_up_reuse": {
+          "30": 1.0,
+          "31": 1.0,
+          "32": 1.0
+        },
+        "production_follow_up_reuse": {
+          "30": 1.0,
+          "31": 1.0,
+          "32": 1.0
+        },
+        "candidate_mean_first_token_s": 0.8435,
+        "production_mean_first_token_s": 0.854
+      },
+      "decode": {
+        "agentic": {
+          "candidate_tok_s": 91.98836162328776,
+          "production_tok_s": 92.16919466973259,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "code": {
+          "candidate_tok_s": 93.36677463907694,
+          "production_tok_s": 93.44859420849043,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "code-at-128k": {
+          "candidate_tok_s": 94.59955169743942,
+          "production_tok_s": 94.65685735804792,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "json": {
+          "candidate_tok_s": 98.86407496556686,
+          "production_tok_s": 100.43123753667906,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose": {
+          "candidate_tok_s": 72.00347511952982,
+          "production_tok_s": 71.96346319479696,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose-at-128k": {
+          "candidate_tok_s": 71.55347138529477,
+          "production_tok_s": 70.93422365809005,
+          "n": [
+            5,
+            5
+          ]
+        }
+      }
+    },
+    "slower_beyond_noise": []
+  },
+  "install_recovery_fixtures": {
+    "passed": true,
+    "cases": 10
+  },
+  "cpu_tests": {
+    "passed": true,
+    "tests_passed": 264,
+    "failed": 0,
+    "ignored": 29
+  },
+  "activation": {
+    "date": "2026-11-17",
+    "installed": "one journaled transaction falling back to s1586; only runtime paths, the four settings and the runtime's hash pins changed",
+    "fresh_boots": "all four devices rebooted once; production started with one model load per device",
+    "daily_verification": {
+      "passed": true,
+      "runtime": "s1595",
+      "single_load_on_every_device": true,
+      "clock_cap_mhz": 2350
+    },
+    "head_local_smoke": {
+      "passed": true,
+      "execution_timing_header": "v1",
+      "running_and_waiting_comments": true,
+      "checks": [
+        "text",
+        "prompt reuse (15,641 of 15,641 prompt tokens)",
+        "continuation",
+        "image input",
+        "text after an image"
+      ]
+    },
+    "routed_smoke": {
+      "passed": true,
+      "requests": [
+        "conversation turn (3,662 tokens, first token 0.59 s)",
+        "its follow-up through the incremental context transport (3,661 of 3,728 prompt tokens reused, first token 0.15 s)",
+        "an image",
+        "a plain response",
+        "two conversations at once"
+      ]
+    },
+    "router_log_after_activation": {
+      "lines_checked": 120,
+      "all_status_200": true
+    },
+    "memory_audit": "baseline of every device's swap, reclaim and compaction counters taken after the load; checked again after days of serving before any lower floor"
+  }
+}

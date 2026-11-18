@@ -102,7 +102,7 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
         }
         let indices=evictions.as_mut().unwrap();
         let mut policy=vec![entries.len()as u8];policy.extend(indices.iter().map(|&i|i as u8));w.control.agree(&policy)?;
-        let mut available=w.cuda.admission_memory()?.admitted_available;
+        let mut available=w.cuda.image_admission_memory()?.admitted_available;
         loop {
             let reclaimed=indices.iter().map(|&i|entries[i].1).sum::<usize>();
             if w.control.all_admit(available.saturating_add(reclaimed)>=reserve+charge)?{break;}
@@ -120,7 +120,7 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
         }
     } else if protected.is_some() {
         let reclaimable = evictions.as_ref().map_or(0, |indices| indices.iter().map(|&i| entries[i].1).sum());
-        let available = w.cuda.admission_memory()?.admitted_available;
+        let available = w.cuda.image_admission_memory()?.admitted_available;
         // Agree before deleting anything. A rank-local refusal must not cause
         // the other devices to spend cache on a park that cannot take place.
         if !w.control.all_admit(evictions.is_some() && available.saturating_add(reclaimable) >= reserve+charge)? {
@@ -144,13 +144,13 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
     let needed=reserve+charge+PAUSE_SLACK_BYTES;
     let mut measured_evictions=0;
     if within_budget && (exchange || crate::config::single_bank_requested())
-        && !w.control.all_admit(w.cuda.admission_memory()?.admitted_available >= needed)?
+        && !w.control.all_admit(w.cuda.image_admission_memory()?.admitted_available >= needed)?
         && !w.cached_sessions.is_empty() {
-        let event=reclaim_optional_cache(&w.cuda,&mut w.control,&mut w.cached_sessions,false,needed)?;
+        let event=reclaim_optional_cache(&w.cuda,&mut w.control,&mut w.cached_sessions,false,needed,true)?;
         measured_evictions=event["evicted"].as_array().map_or(0,Vec::len);
         evicted+=measured_evictions;
     }
-    let available=w.cuda.admission_memory()?.admitted_available;
+    let available=w.cuda.image_admission_memory()?.admitted_available;
     if !w.control.all_admit(within_budget && available >= reserve+charge)? {
         w.park_refusal=Some(json!({"stage":"after releasing completed cache","available_bytes":available,"required_bytes":reserve+charge,
             "planned_evictions":evicted-measured_evictions,"measured_evictions":measured_evictions,"entries_left":w.cached_sessions.len()}));
@@ -206,7 +206,7 @@ pub(super) fn try_exchange(w:&mut Worker,saved:&mut RequestCheckpoint)->Result<O
     let evictions=cache_evictions(&entries,(usize::MAX,peak_charge),w.shared_image_budget,true,5);
     let reserve=crate::memory::floor_bytes()+16*1024usize.pow(2);
     if !w.control.all_admit(evictions.is_some())?{return Ok(None);}
-    let mut evictions=evictions.unwrap();let mut available=w.cuda.admission_memory()?.admitted_available;
+    let mut evictions=evictions.unwrap();let mut available=w.cuda.image_admission_memory()?.admitted_available;
     let mut host_allocator_trim=None;
     let mut policy=vec![entries.len()as u8];policy.extend(evictions.iter().map(|&i|i as u8));
     w.control.agree(&policy)?;
@@ -226,7 +226,7 @@ pub(super) fn try_exchange(w:&mut Worker,saved:&mut RequestCheckpoint)->Result<O
     evictions.sort_unstable();
     let evicted=evictions.len();
     for i in evictions.into_iter().rev(){w.cached_sessions.remove(i);}
-    if !w.control.all_admit(w.cuda.admission_memory()?.admitted_available>=reserve+extra)?{return Ok(None);}
+    if !w.control.all_admit(w.cuda.image_admission_memory()?.admitted_available>=reserve+extra)?{return Ok(None);}
     w.cuda.synchronize_all()?;let began=Instant::now();
     let prepared=w.session.as_mut().unwrap().prepare_exchange(&w.verify,&saved.image,w.shared_image_budget,&w.comm,&w.stream)?;
     if !w.control.all_admit(prepared.is_some()&&w.cuda.admission_memory()?.admitted_available>=reserve)?{return Ok(None);}
@@ -259,7 +259,8 @@ fn trim_for_state(w:&mut Worker,required_available:usize)->Result<usize> {
     let after=w.cuda.admission_memory()?;
     w.state_pressure_trim=Some(json!({"returned_pages":released,"seconds":seconds,
         "required_available":required_available,"memory_before":before,"memory_after":after}));
-    Ok(after.admitted_available)
+    // The callers compare this with a snapshot's bytes: count free pool chunks too (no pool: the same value).
+    Ok(w.cuda.image_admission_memory()?.admitted_available)
 }
 
 pub(super) fn suspend(w: &mut Worker) -> Result<Value> {

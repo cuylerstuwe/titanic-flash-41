@@ -69,6 +69,22 @@ mod input_allocation_tests {
     }
 }
 
+/// Nov 17 floor work: set once the worker has finished its startup warm-up. With the allocation-site screen on
+/// (CANADA_SCRATCH_ALLOCATION_SITES_SCREEN=1), every device allocation or free of 16 MiB or more after that point is
+/// logged as a `runtime_allocation` line (site, bytes, host available memory), the inventory of what a serving engine
+/// allocates while it runs. Diagnostic only; nothing changes without the screen.
+pub(crate) static SERVING_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn trace_runtime_allocation(kind: &str, site: &std::panic::Location<'_>, bytes: usize) {
+    if bytes < (16 << 20) || !SERVING_STARTED.load(std::sync::atomic::Ordering::Relaxed) { return; }
+    let available = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines()
+        .find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()));
+    let free = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| m.lines()
+        .find(|l| l.starts_with("MemFree:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()));
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    eprintln!("runtime_allocation {}", serde_json::json!({"t": t, "kind": kind, "site": format!("{}:{}", site.file(), site.line()),
+        "bytes": bytes, "available_kib": available, "free_kib": free}));
+}
+
 // CUDA 13.0 public VMM ABI. Used only for opt-in, individually owned,
 // losslessly compressible weight storage. The finite external-pool experiment
 // can import allocations from its direct parent in the same memory cgroup.
@@ -352,6 +368,7 @@ struct ContextOwner {
     allocation_floor_screen: bool,
     allocation_floor_pending: std::cell::Cell<usize>,
     allocation_sites: Option<RefCell<std::collections::BTreeMap<u64,(&'static std::panic::Location<'static>,usize)>>>,
+    image_pool: RefCell<Option<Rc<ChunkPool>>>,
 }
 impl ContextOwner {
     fn current(&self) -> Result<()> {
@@ -363,9 +380,50 @@ impl ContextOwner {
 }
 impl Drop for ContextOwner {
     fn drop(&mut self) {
+        // Every pooled image holds this owner, so all chunks are back in the pool by now.
+        if let Some(pool) = self.image_pool.borrow_mut().take() && self.current().is_ok() {
+            for handle in pool.free.borrow_mut().drain(..) { unsafe { (self.api.mem_release)(handle); } }
+        }
         unsafe {
             (self.api.primary_release)(self.device);
         }
+    }
+}
+
+/// Nov 17 (the owner: "preallocate as much RAM up-front as we reasonably and justifiably expect to need, and then just hold
+/// onto this RAM and reuse it"): conversation snapshots (cache entries, paused requests) take their memory from physical
+/// chunks created once at startup, while memory is unfragmented, instead of from fresh driver allocations into memory that
+/// days of serving have fragmented (on aged memory those large allocations made the driver fall back from large pages and
+/// the kernel reclaim and compact, while sorted memory under the same load did neither). Each snapshot maps the chunks it
+/// takes into one contiguous address range (CUDA VMM); dropping it unmaps them and returns them. Any free chunk serves any
+/// snapshot, so the pool cannot fragment. CANADA_SCRATCH_IMAGE_POOL_MIB sets the size (unset: no pool).
+pub(crate) struct ChunkPool {
+    chunk: usize,
+    count: usize,
+    free: RefCell<Vec<u64>>,
+}
+/// Snapshots smaller than this keep ordinary allocations (small blocks are never scarce; a chunk would waste most of itself).
+pub(crate) const POOLED_IMAGE_MIN: usize = 8 << 20;
+struct PooledAllocation {
+    owner: Rc<ContextOwner>,
+    pool: Rc<ChunkPool>,
+    ptr: u64,
+    span: usize,
+    handles: Vec<u64>,
+    mapped: usize,
+}
+impl Drop for PooledAllocation {
+    fn drop(&mut self) {
+        if self.owner.current().is_ok() {
+            let api = &self.owner.api;
+            unsafe {
+                // Like any VMM unmap, this does not join GPU users of the range; drain first.
+                if self.mapped > 0 { (api.context_sync)(); }
+                for i in 0..self.mapped { (api.mem_unmap)(self.ptr + (i * self.pool.chunk) as u64, self.pool.chunk); }
+                if self.ptr != 0 { (api.address_free)(self.ptr, self.span); }
+            }
+        }
+        self.pool.free.borrow_mut().extend(self.handles.drain(..));
     }
 }
 
@@ -567,6 +625,7 @@ impl Cuda {
                 allocation_sites: (std::env::var("CANADA_SCRATCH_ALLOCATION_SITES_SCREEN").as_deref()==Ok("1"))
                     .then(||RefCell::new(std::collections::BTreeMap::new())),
                 allocation_floor_pending: std::cell::Cell::new(0),
+                image_pool: RefCell::new(None),
             }),
             mapped_metadata_bytes: None,
             staged_metadata: None,
@@ -805,6 +864,7 @@ impl Cuda {
         result?;
         if bytes>=65536&&let Some(sites)=&self.owner.allocation_sites {
             sites.borrow_mut().insert(ptr,(std::panic::Location::caller(),bytes));
+            trace_runtime_allocation("alloc", std::panic::Location::caller(), bytes);
         }
         Ok(Buffer {
             owner: self.owner.clone(),
@@ -822,6 +882,80 @@ impl Cuda {
             .and_then(|n| n.checked_add(self.allocation_reserve_bytes()))
             .context("input allocation size overflow")?;
         self.allocate(len).map_err(|e| input_allocation_error(e, required))
+    }
+    /// Create the snapshot chunk pool (see ChunkPool). Called once, after the startup warm-up.
+    pub(crate) fn create_image_pool(&self, bytes: usize) -> Result<serde_json::Value> {
+        ensure!(self.owner.image_pool.borrow().is_none(), "image pool already exists");
+        self.owner.current()?;
+        let api = &self.owner.api;
+        let prop = MemAllocationProp {kind:1,location:MemLocation {kind:1,id:self.owner.device},..MemAllocationProp::default()};
+        let mut granularity = 0usize;
+        api.check(unsafe{(api.mem_granularity)(&mut granularity,&prop,0)},"query image pool granularity")?;
+        ensure!(granularity.is_power_of_two(),"invalid VMM granularity");
+        let chunk = (16usize << 20).max(granularity).div_ceil(granularity) * granularity;
+        let count = bytes / chunk;
+        ensure!(count > 0, "image pool smaller than one chunk");
+        let began = std::time::Instant::now();
+        let before = self.admission_memory()?;
+        let mut handles = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut handle = 0u64;
+            let created = api.check(unsafe{(api.mem_create)(&mut handle,chunk,&prop,0)},"create image pool chunk");
+            if let Err(error) = created {
+                for h in handles { unsafe { (api.mem_release)(h); } }
+                return Err(error);
+            }
+            handles.push(handle);
+        }
+        *self.owner.image_pool.borrow_mut() = Some(Rc::new(ChunkPool {chunk,count,free:RefCell::new(handles)}));
+        Ok(serde_json::json!({"chunks":count,"chunk_bytes":chunk,"bytes":count*chunk,"granularity":granularity,
+            "seconds":began.elapsed().as_secs_f64(),"memory_before":before,"memory_after":self.admission_memory()?}))
+    }
+    pub(crate) fn image_pool_free_bytes(&self) -> Option<usize> {
+        self.owner.image_pool.borrow().as_ref().map(|p| p.free.borrow().len() * p.chunk)
+    }
+    pub(crate) fn image_pool_total_bytes(&self) -> Option<usize> {
+        self.owner.image_pool.borrow().as_ref().map(|p| p.count * p.chunk)
+    }
+    /// Whether a snapshot of `bytes` would come from the pool right now.
+    pub(crate) fn image_pool_fits(&self, bytes: usize) -> bool {
+        bytes >= POOLED_IMAGE_MIN && self.owner.image_pool.borrow().as_ref()
+            .is_some_and(|p| p.free.borrow().len() >= bytes.div_ceil(p.chunk))
+    }
+    /// A snapshot from the pool, or None (no pool, too small, or not enough free chunks: the caller allocates normally).
+    pub(crate) fn allocate_pooled(&self, bytes: usize) -> Result<Option<Buffer<u8>>> {
+        if bytes < POOLED_IMAGE_MIN { return Ok(None); }
+        let Some(pool) = self.owner.image_pool.borrow().clone() else { return Ok(None) };
+        let k = bytes.div_ceil(pool.chunk);
+        let handles = {
+            let mut free = pool.free.borrow_mut();
+            if free.len() < k { return Ok(None); }
+            let n = free.len();
+            free.split_off(n - k)
+        };
+        let span = k * pool.chunk;
+        // Owned from here on: an error below unmaps what was mapped and returns every chunk.
+        let mut a = PooledAllocation {owner:self.owner.clone(),pool:pool.clone(),ptr:0,span,handles,mapped:0};
+        self.owner.current()?;
+        let api = &self.owner.api;
+        api.check(unsafe{(api.address_reserve)(&mut a.ptr,span,pool.chunk,0,0)},"reserve pooled image addresses")?;
+        for i in 0..k {
+            api.check(unsafe{(api.mem_map)(a.ptr+(i*pool.chunk) as u64,pool.chunk,0,a.handles[i],0)},"map pooled image chunk")?;
+            a.mapped += 1;
+        }
+        let access = MemAccessDesc {location:MemLocation {kind:1,id:self.owner.device},flags:3};
+        api.check(unsafe{(api.mem_access)(a.ptr,span,&access,1)},"set pooled image access")?;
+        let ptr = a.ptr;
+        Ok(Some(Buffer {owner:self.owner.clone(),ptr,len:bytes,storage:Storage::Pooled(a),_element:PhantomData}))
+    }
+    /// Admission for conversation snapshots only: with the pool, its free chunks are where a snapshot goes, so they count
+    /// as room. Every other allocation still answers to host memory through admission_memory().
+    pub(crate) fn image_admission_memory(&self) -> Result<crate::memory::Available> {
+        let mut memory = self.admission_memory()?;
+        if let Some(free) = self.image_pool_free_bytes() {
+            memory.admitted_available = memory.admitted_available.saturating_add(free);
+        }
+        Ok(memory)
     }
     fn compressible_properties(&self) -> Result<MemAllocationProp> {
         self.owner.current()?;
@@ -1092,6 +1226,8 @@ pub struct Buffer<T: DeviceElement> {
 enum Storage {
     Owned,
     Vmm(#[allow(dead_code)] VmmAllocation),
+    // A conversation snapshot mapped from the startup chunk pool; dropping returns the chunks.
+    Pooled(#[allow(dead_code)] PooledAllocation),
     // Created only by the scoped integer-metadata allocator above.
     MappedMetadata(MappedHost),
     StagedMetadata { arena: Rc<MetadataStaging>, offset: usize },
@@ -1297,7 +1433,9 @@ impl<T: DeviceElement> Drop for Buffer<T> {
         if !matches!(self.storage, Storage::Owned) {
             return;
         }
-        if let Some(sites)=&self.owner.allocation_sites {sites.borrow_mut().remove(&self.ptr);}
+        if let Some(sites)=&self.owner.allocation_sites {
+            if let Some((site,bytes))=sites.borrow_mut().remove(&self.ptr) {trace_runtime_allocation("free",site,bytes);}
+        }
         let _ = self.owner.current();
         unsafe {
             (self.owner.api.free)(self.ptr);

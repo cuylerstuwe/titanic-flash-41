@@ -205,6 +205,35 @@ available on every rank.
 All memory-floor checks now use one function, with the same 8 GiB default.
 `CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB` overrides the floor and is for tests only.
 
+## November 17 memory release settings
+
+Native production (s1595) keeps every November 15 setting and changes four, all about memory. They are runtime
+settings read at startup; the portable profile is unchanged.
+
+- `CANADA_SCRATCH_IMAGE_POOL_MIB=8192`: the snapshot chunk pool. After the startup warm-up every device creates a fixed
+  pool of 16 MiB physical chunks (about 0.2 s for 8 GiB). A conversation snapshot (a cached conversation or a paused
+  request) maps the chunks it needs into one contiguous range and returns them when it is dropped. Snapshots were
+  almost all of the large allocations made while serving (in the stress panel, about a hundred of up to 857 MiB,
+  18 GiB allocated and freed in nine minutes). On memory that days of use have fragmented, those allocations made the
+  driver fall back from large pages and the kernel reclaim and compact; with the pool, serving makes no large
+  allocation and such memory behaves like freshly sorted memory. Snapshots under 8 MiB keep ordinary allocations.
+- `CANADA_SCRATCH_MEMORY_FLOOR_MIB=4096`: the admission floor, 4 GiB of available memory instead of the 8 GiB default.
+  Accepted only together with the pool (2048-8192 MiB); without the pool the 8 GiB default stands. The test override
+  `CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB` still takes precedence.
+- `CANADA_SCRATCH_SESSION_CACHE_BYTES` 6 GiB -> 6.75 GiB and `CANADA_SCRATCH_SHARED_IMAGE_BYTES` 7 GiB -> 7.75 GiB, so
+  the cache uses the pool (with the pool, both may be set up to the pool's size).
+
+The runtime also has `CANADA_SCRATCH_RELEASE_LOAD_FILE_CACHE` (after the warm-up, ask the kernel to drop the page
+cache of the kernel bundle tree, about 2 GB a device); it is off: in the comparison against production, the first
+conversation after a load ran up to a third slower for about a minute in two of three runs with it, and in none
+without it.
+
+Eviction stays least recently used. The runtime also has `CANADA_SCRATCH_CACHE_COST_ORDER` (eviction by how much
+prefill an entry's loss would cost); it is off, because the qualification found cases where it evicts the entry the
+next request needs. The runtime fixes one accounting bug: while a restore has a cached snapshot checked out, the
+snapshot's room is now reserved against the cache budget as well as the shared one (before, a save made meanwhile
+could take it and the engine stopped).
+
 ## November 15 release settings
 
 Native production (s1586; the settings are s1585's) runs the s1399 profile with five settings changed and 58 added, and twelve encoder
