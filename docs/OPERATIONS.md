@@ -205,6 +205,29 @@ available on every rank.
 All memory-floor checks now use one function, with the same 8 GiB default.
 `CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB` overrides the floor and is for tests only.
 
+## November 18 cache release settings
+
+Native production (s1599) keeps every November 17 setting and adds two, both about which conversation snapshot a turn
+saves or keeps. They are runtime settings read at startup; the portable profile is unchanged.
+
+- `CANADA_SCRATCH_NEAR_END_AFTER_RESTORE=1`: a turn whose prefix is restored from a snapshot inside the cache lookup
+  saves its next checkpoint one token before its prompt end (`CANADA_SCRATCH_ENCODER_NEAR_END`), captured inside the
+  same prefill pass. Before, such a turn saved the last 128-aligned position instead; when that position fell in the
+  first 128 tokens of the appended text it could not be captured inside the pass, and the prefill ran as two passes
+  (150-175 ms more; appends of 129-383 tokens). The capture plan is the one a turn restored from an encoder snapshot
+  already ran.
+- `CANADA_SCRATCH_REDUNDANT_PROMPT_IMAGE=1`: a long turn of a conversation with images keeps three nearly equal
+  snapshots: one token before its prompt end, the prompt end with its first-token logits, and the completed turn. A
+  follow-up that re-renders the previous answer can only restore the first; an exact retry of the same prompt restores
+  the second; a client that sends the answer back verbatim restores the third. When sixteen entries fill the cache,
+  the eviction rule protects the two longest entries longer than the incoming one, which were the last two, and the
+  first was evicted. With this setting a prompt-end snapshot whose near-end snapshot is cached is optional and yields
+  first. An exact retry then restores the near-end snapshot plus one short pass (about 0.1 s) instead of nothing.
+
+The runtime also has `CANADA_SCRATCH_CACHE_TRACE` (off; logs every eviction decision and every restore lookup with
+prefix lengths and byte counts only, for diagnosis), `CANADA_SCRATCH_CACHE_LADDER_CAP` (off) and
+`CANADA_SCRATCH_IMAGE_SOURCE_STORE_MIB` (off).
+
 ## November 17 memory release settings
 
 Native production (s1595) keeps every November 15 setting and changes four, all about memory. They are runtime

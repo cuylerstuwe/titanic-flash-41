@@ -1,5 +1,81 @@
 # Validation status
 
+## November 18 cache release (s1599)
+
+s1599 keeps every setting of s1595 and adds two, both about which conversation snapshot a turn saves or keeps. No
+kernel, numeric code, weight, clock policy or router change.
+
+**Why.**
+- *A second prefill pass.* A turn whose prefix is restored from a snapshot inside the cache lookup saved its next
+  checkpoint at the last 128-aligned position. When that position fell in the first 128 tokens of the appended text,
+  the checkpoint could not be captured inside the pass, and the prefill ran as two passes: appends of 257 and 268
+  tokens took 383 and 391 ms where 360 tokens took 241 ms. Appends of 129-383 tokens are where it can happen; in a
+  night of real traffic it hit under 1 % of requests.
+- *The wrong snapshots kept.* A long turn of a conversation with images keeps three nearly equal snapshots: one token
+  before its prompt end, the prompt end with its first-token logits, and the completed turn. When another
+  conversation filled the cache's sixteen entries, the rule that protects the two longest entries kept the last two,
+  and evicted the first, which is the only one a follow-up that re-renders the previous answer can restore. In the
+  stress panel, an idle 974,076-token conversation was then read again from scratch (116 s).
+
+**The change.**
+- `CANADA_SCRATCH_NEAR_END_AFTER_RESTORE=1`: such a turn saves its next checkpoint one token before its prompt end,
+  captured inside the same pass, as a turn restored from an encoder snapshot already did.
+- `CANADA_SCRATCH_REDUNDANT_PROMPT_IMAGE=1`: a prompt-end snapshot whose near-end snapshot is cached yields first. An
+  exact retry of the same prompt then restores the near-end snapshot plus one short pass (about 0.1 s).
+
+**Measured before the bar.** On the turn bench of November 17 the two split appends took 228 and 235 ms (one pass,
+-155 ms each); every other request was within noise, and decode after the new checkpoints ran at the same rate as
+without the setting. On the three cache cases every eviction change must pass: the stress panel's idle conversation
+reused 974,059 of 974,076 tokens (first token 0.22 s; the panel's uncached tokens fell from 2.01M to 1.02M and its
+summed first-token time from 254 s to 136 s); four ~980K conversations taking turns still re-read only 19-20 tokens a
+return turn; follow-ups after turn-taking still reused their whole prompt.
+
+**Qualification of s1599, both settings on.** The same seven panels as s1595, each started on sorted memory, with the
+rule that no page may be swapped out on any device (swap, reclaim and compaction counters read before and after each
+panel on all four devices: every difference was zero), and the three cache cases on the bar's own panels.
+- **Timing contract.** It passed: the header on streamed and plain responses; of six conversations for four owners,
+  two waited; three conversations without `max_tokens` paused nine times and all three reported waiting again
+  after running.
+- **Routed panel.** It passed: nine routed requests, every response 200; the follow-up through the incremental
+  context transport reused 3,540 prompt tokens.
+- **Several-conversations panel.** It passed: 17 synthetic conversations (the longest 296,940 prompt tokens), every
+  answer naming its own planted code words; all three follow-ups after turn-taking reused their whole prompt.
+- **Stress panel.** It passed: 70 requests reaching 974,076 prompt tokens; the idle 974,076-token conversation's
+  follow-up was served from the cache (first token 0.20 s; under s1595's rules it was read again, about 116 s). Lowest
+  available memory 6.39 GiB (admission line 4.5 GiB); the hottest device read 88.7°C, never 90°C; no
+  `allocation_failure` lines and no driver large-page retries.
+- **Near-1M cancellation check** and **serving gate.** Both passed; the tool turns had the expected tool-call
+  behavior, and cancel/resume worked.
+- **Residency.** Four conversations of about 980K tokens took turns for three rounds: all eight return turns were
+  served from the cache (at most 20 tokens read again), with a median time to first token of 0.37 s.
+- **Reference quality** is carried over from s1585: no numeric code changed (which snapshot is evicted, and where a
+  restored turn saves its checkpoint; the capture plan is the one the restore path from an encoder snapshot already ran).
+- **Other checks.** The native Arm64 build passed 269 CPU tests, and ten installation interruption and rollback
+  fixtures passed.
+
+**Against production (s1595) on one boot.** Every load on sorted memory, production's arms first: the live tool loop
+at 16K and 200K (first tokens of cached appends within 1.2 % at every point: 0.168 against 0.168 s at +27 tokens on 16K,
+0.271 against 0.271 s at +254 tokens on 200K), appended file excerpts of 450-7,400 tokens on two 16K conversations
+(mean first token 0.522 against 0.522 s; the first conversation after the load 0.99 of production's on its first five
+turns), one to four streams at the harness's token limit (86.6 / 92.7 / 95.2 / 89.0 against 86.5 / 92.9 / 95.2 / 89.1
+tokens/s), three conversations taking turns and then their follow-ups at once (both passed; every follow-up reused its
+whole prompt; first tokens 0.85 against 0.88 s), and decode bare and after a 128K document (five seeds: prose 72.1
+against 71.8 tokens/s, code 93.4 against 93.6, prose at 128K 71.1 against 71.8, code at 128K 95.7 against 94.7). No
+cell was slower beyond its noise allowance.
+
+**Installation and activation.** s1599 was installed in one journaled transaction that falls back to s1595; only the
+runtime's paths, the two settings and the runtime's hash pins change in the deployment. It was activated on fresh
+boots with one production model load per device.
+- A head-local smoke test passed text, prompt reuse (15,651 of 15,651 prompt tokens), continuation, image input and
+  text after an image, and found the execution-timing header and the running and waiting comments on the live service.
+- **Through the router.** Six requests went through the router in use: a conversation turn (3,662 tokens), its
+  follow-up (3,661 of 3,728 prompt tokens reused), an image, a plain response and two conversations at once. All were
+  served, and every line the router logged afterwards had status 200.
+- A baseline of every device's swap, reclaim and compaction counters was taken after the load (free 6.3-6.9 GiB,
+  available 9.1-9.5 GiB, no swap), to be checked after days of serving.
+
+See the [sanitized qualification record](../validation/cache-release-2026-11-18.json).
+
 ## November 17 memory release (s1595)
 
 s1595 keeps every setting of s1586 and changes four, all about memory: the snapshot chunk pool, a lower admission

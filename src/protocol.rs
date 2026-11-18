@@ -44,7 +44,11 @@ pub struct Frontend {
 /// deserialized from an ordinary HTTP request.
 pub struct ImageReference {
     pub source: String,
-    pub input: Arc<crate::worker_media::PatchInput>,
+    /// The processed patches while they are live; otherwise `stored` holds the image's encoded bytes
+    /// (CANADA_SCRATCH_IMAGE_SOURCE_STORE_MIB) and the planner defers its pixels like a full-source image.
+    pub input: Option<Arc<crate::worker_media::PatchInput>>,
+    pub stored: Option<Arc<crate::image_input_cache::StoredSource>>,
+    pub identity: [u8; 32],
     pub detail: deepseek_recipe_core::multimodal::ImageDetail,
     pub encoded_bytes: usize,
 }
@@ -341,6 +345,9 @@ impl Frontend {
         ensure!(crate::config::shared_prefix_checkpoint()? < 2
             || tokenizer.token_to_id("<｜User｜>") == Some(crate::config::USER_TURN_TOKEN),
             "user turn token id differs from the pinned tokenizer's");
+        // An invalid source-store setting is refused here (the cache itself falls back to off).
+        #[cfg(feature = "vision-protocol")]
+        crate::image_input_cache::source_store_budget()?;
         Ok(Self {
             prompt_tokenizer: PromptTokenizer::new(&tokenizer),
             region_cache: crate::prompt_regions::RegionCache::with_prefix_reuse(32 * 1024 * 1024, crate::config::prompt_prefix_reuse()),
@@ -372,7 +379,8 @@ impl Frontend {
     #[cfg(feature = "vision-protocol")]
     pub(crate) fn pin_context_images(&self, keys: &[[u8;32]]) -> Result<Vec<ImageReference>> {
         if keys.is_empty() { return Ok(Vec::new()); }
-        self.image_cache.as_ref().ok_or(ContextImageMiss)?.pin_references(keys)
+        // A reference whose patches were evicted resolves from the source store only where pixels may be deferred.
+        self.image_cache.as_ref().ok_or(ContextImageMiss)?.pin_references(keys, self.defer_image_pixels)
     }
     #[cfg(all(test, feature = "vision-protocol"))]
     pub(crate) fn enable_test_images(&mut self) {self.image_cache=Some(Arc::new(crate::image_input_cache::ImageInputCache::for_test()));}
@@ -458,10 +466,14 @@ impl Frontend {
             #[cfg(feature = "vision-protocol")]
             {
                 let cache = self.image_cache.as_ref().ok_or_else(|| anyhow::anyhow!("native vision is not enabled"))?;
-                // Compact-context references retain their existing pinning and
-                // miss behavior. Only immutable full-source requests may defer.
+                // Full-source requests defer the pixels of memoized images; compact-context requests defer those of
+                // references resolved from the source store (Nov 17; live references keep their patches).
                 if self.defer_image_pixels && _references.is_none() {
                     let planned = cache.plan_cancellable(tokens, &rendered.image_sources, context_capacity, cancelled)?;
+                    deferred_image_inputs = planned.deferred;
+                    (planned.tokens, planned.images, planned.inputs, planned.aliases)
+                } else if let Some(references) = _references.filter(|r| self.defer_image_pixels && r.iter().any(|r| r.input.is_none())) {
+                    let planned = cache.plan_referenced(tokens, &rendered.image_sources, context_capacity, cancelled, references)?;
                     deferred_image_inputs = planned.deferred;
                     (planned.tokens, planned.images, planned.inputs, planned.aliases)
                 } else {
@@ -1121,7 +1133,7 @@ mod tests {
         let referenced=f.prepare_chat_referenced(&body,4096,&[],&||false).unwrap();
         assert_eq!(referenced.tokens,tokens);assert_eq!(referenced.image_inputs[0].patches,pixels);
         assert!(referenced.deferred_image_inputs.is_empty());assert_eq!(referenced.image_aliases.len(),1);
-        assert_eq!(f.pin_context_images(&[identity]).unwrap()[0].input.patches,pixels);
+        assert_eq!(f.pin_context_images(&[identity]).unwrap()[0].input.as_ref().unwrap().patches,pixels);
     }
     #[test]
     #[ignore = "requires CANADA_TEST_TOKENIZER pointing to the pinned public1017 tokenizer"]

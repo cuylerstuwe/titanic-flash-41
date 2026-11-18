@@ -1,0 +1,641 @@
+{
+  "release": "s1599",
+  "date": "2026-11-18",
+  "base": "s1595",
+  "failed_start_fallback": "s1595",
+  "change": {
+    "near_end_after_restore": "a turn whose prefix is restored from a snapshot inside the cache lookup now saves its next checkpoint one token before its prompt end, captured inside the same prefill pass. Before, such a turn saved the last 128-aligned position instead; when that position fell in the first 128 tokens of the appended text, the prefill ran as two passes (+150-175 ms; appends of 129-383 tokens, under 1 % of real requests). Same capture plan as the restore path that already used it.",
+    "redundant_prompt_image": "each long turn of a conversation with images kept three nearly equal snapshots (one token before the prompt end, the prompt end with its logits, the completed turn). The rule that protects the two longest snapshots kept the last two, and the first one, which is the one a follow-up that re-renders the previous answer restores, was evicted when another conversation filled the sixteen slots. A prompt-end snapshot whose near-end snapshot is cached now yields first; an exact retry of the same prompt restores the near-end one plus one short pass instead."
+  },
+  "unchanged": [
+    "weights",
+    "kernels and numeric code",
+    "every other setting of s1595 (snapshot pool, 4 GiB floor, cache budgets)",
+    "2350 MHz clock policy",
+    "the response timing contract",
+    "portable profile"
+  ],
+  "eviction_acceptance": {
+    "stress_idle_974k_conversation_cached_fraction": 1.0,
+    "stress_idle_974k_conversation_first_token_s": 0.19685968900012085,
+    "residency_worst_return_uncached_tokens": 20,
+    "regions_phase_d_follow_up_reuse": {
+      "30": 1.0,
+      "31": 1.0,
+      "32": 1.0
+    },
+    "accepted": true
+  },
+  "memory": {
+    "rule": "no page swapped out on any device during any panel",
+    "no_swap_per_panel": {
+      "q-timing": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-router": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-regions": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-cancel": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-cand": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-stress": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "resid1m": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ]
+    },
+    "passed": true
+  },
+  "timing_contract_panel": {
+    "passed": true,
+    "streamed_header": "v1",
+    "plain_header": "v1",
+    "six_conversations_waited": 2,
+    "turn_taking_pauses": 9,
+    "streams_reporting_a_wait_after_running": 3,
+    "min_available_gib": [
+      6.959,
+      8.839,
+      8.875,
+      7.307
+    ]
+  },
+  "routed_panel": {
+    "passed": true,
+    "routed_requests": 9,
+    "statuses": [
+      200
+    ],
+    "context_outcomes": [
+      "seeded",
+      "incremental",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded"
+    ],
+    "follow_up_cached_tokens": 3540,
+    "min_available_gib": [
+      6.805,
+      9.179,
+      8.833,
+      7.651
+    ]
+  },
+  "several_conversations_panel": {
+    "passed": true,
+    "conversations_checked": 17,
+    "drafter_images_restored_into_another_drafter": 1,
+    "longest_prompt_tokens": 296940,
+    "follow_up_reuse_of_first_prompt": {
+      "30": 1.0,
+      "31": 1.0,
+      "32": 1.0
+    },
+    "min_available_gib": [
+      6.796,
+      8.713,
+      8.582,
+      7.083
+    ]
+  },
+  "stress_panel": {
+    "passed": true,
+    "requests": 70,
+    "max_prompt_tokens": 974076,
+    "max_temperature_c": [
+      87.7,
+      87.7,
+      87.9,
+      88.7
+    ],
+    "approx_seconds_at_or_above_90c": {
+      "0": 0.0,
+      "1": 0.0,
+      "2": 0.0,
+      "3": 0.0
+    },
+    "min_available_gib": [
+      6.39,
+      8.999,
+      8.739,
+      7.12
+    ],
+    "kernel_driver_large_page_retry_lines": 0,
+    "engine_allocation_failures": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 0
+    }
+  },
+  "serving_gate": {
+    "passed": true,
+    "requests": 15,
+    "min_available_gib": [
+      6.557,
+      8.541,
+      8.88,
+      7.051
+    ],
+    "criterion": "functional (tool-call behavior, cache reuse, cancel/resume)"
+  },
+  "cancellation_check": {
+    "passed": true,
+    "min_available_gib": [
+      6.669,
+      9.238,
+      9.564,
+      7.306
+    ]
+  },
+  "residency_check": {
+    "flags": "candidate c18: 16 slots, pool-backed budgets, floor 4096 MiB",
+    "sizes_k": [
+      980,
+      980,
+      980,
+      980
+    ],
+    "rounds": 3,
+    "return_turns": 8,
+    "return_cached_fraction": 1.0,
+    "return_seconds_median": 0.371,
+    "min_available_gib": [
+      6.76,
+      9.4,
+      9.65,
+      7.69
+    ]
+  },
+  "reference_quality": {
+    "carried_over_from": "s1585",
+    "why": "no numeric code changed: which snapshot is evicted, and where a restored turn saves its checkpoint (the capture plan is the one the restore path from an encoder snapshot already ran)",
+    "positions": 2499,
+    "kl": 0.009325392849739931,
+    "kl_ci95": [
+      0.00814229524266305,
+      0.010598958210404472
+    ],
+    "yardstick": 0.009537610223259073,
+    "kl_minus_yardstick_ci95": [
+      -0.0009862300175128823,
+      0.00036526078701479433
+    ],
+    "top1_agree": 0.9595838335334134,
+    "yardstick_top1_agree": 0.9591836734693877,
+    "clear_flips": 0
+  },
+  "against_production_s1595": {
+    "cells": {
+      "toolloop": {
+        "16k/+27": {
+          "candidate_first_token_s": 0.16832894099934492,
+          "production_first_token_s": 0.16812395700253546,
+          "n": [
+            4,
+            4
+          ]
+        },
+        "16k/+75": {
+          "candidate_first_token_s": 0.20797785300237592,
+          "production_first_token_s": 0.20678216799569782,
+          "n": [
+            3,
+            3
+          ]
+        },
+        "16k/+254": {
+          "candidate_first_token_s": 0.2558712190002552,
+          "production_first_token_s": 0.2528165359981358,
+          "n": [
+            3,
+            3
+          ]
+        },
+        "200k/+27": {
+          "candidate_first_token_s": 0.16251231099886354,
+          "production_first_token_s": 0.16372643500289996,
+          "n": [
+            4,
+            4
+          ]
+        },
+        "200k/+75": {
+          "candidate_first_token_s": 0.2235693460024777,
+          "production_first_token_s": 0.22193645800143713,
+          "n": [
+            3,
+            3
+          ]
+        },
+        "200k/+254": {
+          "candidate_first_token_s": 0.27138666300015757,
+          "production_first_token_s": 0.27123232099984307,
+          "n": [
+            3,
+            3
+          ]
+        }
+      },
+      "appended_excerpts": {
+        "450": {
+          "candidate_first_token_s": 0.2562,
+          "production_first_token_s": 0.25895
+        },
+        "600": {
+          "candidate_first_token_s": 0.26905,
+          "production_first_token_s": 0.27165
+        },
+        "760": {
+          "candidate_first_token_s": 0.28659999999999997,
+          "production_first_token_s": 0.2883
+        },
+        "900": {
+          "candidate_first_token_s": 0.2903,
+          "production_first_token_s": 0.29400000000000004
+        },
+        "1100": {
+          "candidate_first_token_s": 0.3262,
+          "production_first_token_s": 0.33075
+        },
+        "1250": {
+          "candidate_first_token_s": 0.34075,
+          "production_first_token_s": 0.3396
+        },
+        "1400": {
+          "candidate_first_token_s": 0.3472,
+          "production_first_token_s": 0.3469
+        },
+        "1700": {
+          "candidate_first_token_s": 0.4017,
+          "production_first_token_s": 0.40625
+        },
+        "2000": {
+          "candidate_first_token_s": 0.42945,
+          "production_first_token_s": 0.4236
+        },
+        "2250": {
+          "candidate_first_token_s": 0.4436,
+          "production_first_token_s": 0.447
+        },
+        "2500": {
+          "candidate_first_token_s": 0.4546,
+          "production_first_token_s": 0.4567
+        },
+        "2750": {
+          "candidate_first_token_s": 0.46814999999999996,
+          "production_first_token_s": 0.4713
+        },
+        "3000": {
+          "candidate_first_token_s": 0.51875,
+          "production_first_token_s": 0.51835
+        },
+        "3250": {
+          "candidate_first_token_s": 0.5679000000000001,
+          "production_first_token_s": 0.5666
+        },
+        "3500": {
+          "candidate_first_token_s": 0.6348,
+          "production_first_token_s": 0.63105
+        },
+        "3800": {
+          "candidate_first_token_s": 0.6468,
+          "production_first_token_s": 0.64705
+        },
+        "4500": {
+          "candidate_first_token_s": 0.7624,
+          "production_first_token_s": 0.7618
+        },
+        "5000": {
+          "candidate_first_token_s": 0.8645,
+          "production_first_token_s": 0.8635999999999999
+        },
+        "6400": {
+          "candidate_first_token_s": 1.0126,
+          "production_first_token_s": 1.0098500000000001
+        },
+        "7400": {
+          "candidate_first_token_s": 1.11035,
+          "production_first_token_s": 1.1164999999999998
+        },
+        "mean": {
+          "candidate_first_token_s": 0.521595,
+          "production_first_token_s": 0.52249,
+          "sizes": 20
+        },
+        "arms": "p8t / c8t"
+      },
+      "first_conversation_after_load": {
+        "ratios": [
+          0.996,
+          0.989,
+          0.988,
+          0.981,
+          0.995
+        ],
+        "median": 0.9892711801701815
+      },
+      "streams_harness_limit": {
+        "1": {
+          "candidate_aggregate_tok_s": 86.58,
+          "production_aggregate_tok_s": 86.47
+        },
+        "2": {
+          "candidate_aggregate_tok_s": 92.72,
+          "production_aggregate_tok_s": 92.94
+        },
+        "3": {
+          "candidate_aggregate_tok_s": 95.2,
+          "production_aggregate_tok_s": 95.17
+        },
+        "4": {
+          "candidate_aggregate_tok_s": 88.96,
+          "production_aggregate_tok_s": 89.11
+        }
+      },
+      "takes_turns": {
+        "candidate_passed": true,
+        "production_passed": true,
+        "candidate_follow_up_reuse": {
+          "30": 1.0,
+          "31": 1.0,
+          "32": 1.0
+        },
+        "production_follow_up_reuse": {
+          "30": 1.0,
+          "31": 1.0,
+          "32": 1.0
+        },
+        "candidate_mean_first_token_s": 0.847,
+        "production_mean_first_token_s": 0.8776666666666667
+      },
+      "decode": {
+        "agentic": {
+          "candidate_tok_s": 92.29518100407876,
+          "production_tok_s": 92.27301992334013,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "code": {
+          "candidate_tok_s": 93.38040964252617,
+          "production_tok_s": 93.59488479236924,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "code-at-128k": {
+          "candidate_tok_s": 95.68722797696505,
+          "production_tok_s": 94.74952164699386,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "json": {
+          "candidate_tok_s": 100.74761317431117,
+          "production_tok_s": 100.38608895770557,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose": {
+          "candidate_tok_s": 72.07743118008824,
+          "production_tok_s": 71.84923110875908,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose-at-128k": {
+          "candidate_tok_s": 71.10596778886834,
+          "production_tok_s": 71.75903536045935,
+          "n": [
+            5,
+            5
+          ]
+        }
+      }
+    },
+    "slower_beyond_noise": []
+  },
+  "install_recovery_fixtures": {
+    "passed": true,
+    "cases": 10
+  },
+  "cpu_tests": {
+    "passed": true,
+    "tests_passed": 269,
+    "failed": 0,
+    "ignored": 29
+  },
+  "activation": {
+    "activated": "2026-11-18, fresh boots of all four devices, one production model load per device",
+    "install": "one journaled transaction; a failed start would fall back to s1595",
+    "head_local_smoke": {
+      "passed": true,
+      "timing_header": "v1",
+      "running_and_waiting_comments": true,
+      "text": true,
+      "prompt_reuse_tokens": "15651 of 15651",
+      "continuation": true,
+      "image": true
+    },
+    "through_the_router": {
+      "passed": true,
+      "requests": 6,
+      "follow_up_reused_tokens": "3661 of 3728",
+      "every_router_line_after_activation_status_200": "12 of 12"
+    },
+    "memory_baseline_after_load": {
+      "free_gib": [
+        6.32,
+        6.73,
+        6.86,
+        6.89
+      ],
+      "available_gib": [
+        9.09,
+        9.42,
+        9.48,
+        9.54
+      ],
+      "swap_used_gib": 0.0
+    }
+  }
+}

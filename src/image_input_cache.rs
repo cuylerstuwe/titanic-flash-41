@@ -18,6 +18,25 @@ use std::{
 
 const WARM_BYTES: usize = 256 << 20;
 const LIVE_BYTES: usize = 2 << 30;
+/// CANADA_SCRATCH_IMAGE_SOURCE_STORE_MIB (Nov 17; 0..=4096, default 0 = off): keep the encoded bytes of prepared
+/// images (a screenshot is ~0.1-0.5 MB encoded against ~5 MB of patches), so a context reference whose patches
+/// were evicted still resolves: deferred, its pixels are made again only if the worker's cached prefix does not
+/// cover it. Without it such a reference is a context miss (the router then resends full bodies for 25 minutes).
+pub(crate) fn source_store_budget() -> Result<usize> {
+    match std::env::var("CANADA_SCRATCH_IMAGE_SOURCE_STORE_MIB") {
+        Ok(v) => { let mib: usize = v.parse().map_err(|_| anyhow::anyhow!("image source store must be a whole number of MiB"))?;
+                   ensure!(mib <= 4096, "image source store at most 4096 MiB"); Ok(mib << 20) },
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+/// Encoded bytes of a prepared image, by identity (see source_store_budget).
+pub(crate) struct StoredSource {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) detail: Detail,
+    pub(crate) canonical: ImageDetail,
+    pub(crate) geometry: Geometry,
+}
 // Metadata only: no encoded strings or extra strong image owners. Mutable HTTP
 // URLs are deliberately excluded; only an exact data URL and detail can hit.
 const SOURCE_ENTRIES: usize = 1024;
@@ -67,8 +86,32 @@ struct State {
     misses: u64,
     source_hits: u64,
     metadata_deferrals: u64,
+    stored: HashMap<[u8; 32], Arc<StoredSource>>,
+    stored_oldest: VecDeque<[u8; 32]>,
+    stored_bytes: usize,
+    stored_references: u64,
 }
 impl State {
+    /// Keep (or refresh) an image's encoded bytes under the store's byte budget, oldest out first.
+    fn store_source(&mut self, budget: usize, identity: [u8; 32], make: impl FnOnce() -> StoredSource) {
+        if budget == 0 { return; }
+        if self.stored.contains_key(&identity) { self.touch_stored(&identity); return; }
+        let source = make();
+        if source.bytes.len() > budget { return; }
+        while self.stored_bytes + source.bytes.len() > budget {
+            let Some(old) = self.stored_oldest.pop_front() else { break };
+            if let Some(gone) = self.stored.remove(&old) { self.stored_bytes -= gone.bytes.len(); }
+        }
+        self.stored_bytes += source.bytes.len();
+        self.stored_oldest.push_back(identity);
+        self.stored.insert(identity, Arc::new(source));
+    }
+    fn touch_stored(&mut self, identity: &[u8; 32]) {
+        if self.stored.contains_key(identity) {
+            self.stored_oldest.retain(|k| k != identity);
+            self.stored_oldest.push_back(*identity);
+        }
+    }
     fn remember_source(&mut self, key: [u8; 32], input: &PatchInput, encoded_bytes: usize) {
         if self.sources.contains_key(&key) { return; }
         while self.sources.len() >= SOURCE_ENTRIES {
@@ -110,6 +153,8 @@ pub struct ImageInputCache {
     http: ureq::Agent,
     available_memory: fn() -> Result<usize>,
     reserve_workspace: fn(usize) -> Result<Option<crate::memory::HostWorkspaceReservation>>,
+    /// See source_store_budget (0 = off). Startup refuses an invalid setting (protocol.rs).
+    store_budget: usize,
 }
 pub struct Expanded {
     pub tokens: Vec<u32>,
@@ -130,9 +175,12 @@ pub struct Planned {
 pub struct DeferredInput {
     identity: [u8; 32],
     geometry: Geometry,
-    source: ImageSource,
+    source: DeferredSource,
     cache: Arc<ImageInputCache>,
 }
+/// Where a deferred image's pixels come from if the worker needs them: the request's own immutable data URL, or the
+/// source store's copy of a referenced image's encoded bytes (both checked against the identity on use).
+enum DeferredSource { Request(ImageSource), Stored(Arc<StoredSource>) }
 impl DeferredInput {
     pub fn identity(&self) -> [u8; 32] { self.identity }
     pub fn geometry(&self) -> Geometry { self.geometry }
@@ -140,10 +188,15 @@ impl DeferredInput {
         ensure!(!cancelled(), "request cancelled during image processing");
         // No mutable URL can enter this path. The owned source is the exact
         // immutable input from which this process previously learned metadata.
-        ensure!(matches!(self.source, ImageSource::DataUrl { .. }), "deferred source is mutable");
-        let (bytes, detail) = self.cache.resolve(&self.source)?;
-        ensure!(!cancelled(), "request cancelled during image processing");
-        let input = self.cache.prepare(&bytes, detail)?;
+        let input = match &self.source {
+            DeferredSource::Request(source) => {
+                ensure!(matches!(source, ImageSource::DataUrl { .. }), "deferred source is mutable");
+                let (bytes, detail) = self.cache.resolve(source)?;
+                ensure!(!cancelled(), "request cancelled during image processing");
+                self.cache.prepare(&bytes, detail)?
+            }
+            DeferredSource::Stored(stored) => self.cache.prepare(&stored.bytes, stored.detail)?,
+        };
         ensure!(input.identity == self.identity && input.geometry == self.geometry,
             "deferred image identity or geometry differs");
         ensure!(!cancelled(), "request cancelled during image processing");
@@ -156,6 +209,7 @@ impl ImageInputCache {
             state: Mutex::new(State::default()),
             available_memory: available_host_memory,
             reserve_workspace: |bytes|crate::memory::reserve_host_workspace(bytes).map(Some),
+            store_budget: source_store_budget().unwrap_or(0),
             http: ureq::Agent::config_builder()
                 .timeout_global(Some(Duration::from_secs(20)))
                 .max_redirects(5)
@@ -282,6 +336,7 @@ impl ImageInputCache {
         if let Some(input) = state.live.get(&identity).and_then(Weak::upgrade) {
             state.hits += 1;
             state.retain(input.clone());
+            state.touch_stored(&identity);
             return Ok(input);
         }
         state.live.retain(|_, p| p.strong_count() > 0);
@@ -343,19 +398,32 @@ impl ImageInputCache {
             Detail::Auto=>ImageDetail::Auto,Detail::Original=>ImageDetail::Original};
         state.source_info.insert(identity,(canonical_detail,bytes.len()));
         state.retain(input.clone());
+        let geometry = input.geometry;
+        state.store_source(self.store_budget, identity, || StoredSource {
+            bytes: bytes.to_vec(), detail, canonical: canonical_detail, geometry });
         Ok(input)
     }
-    pub(crate) fn pin_references(&self, keys: &[[u8;32]]) -> Result<Vec<crate::protocol::ImageReference>> {
+    /// `allow_stored`: a reference whose patches are no longer live may resolve from the source store (the
+    /// caller then plans with deferred pixels, protocol.rs); otherwise it is a context miss as before.
+    pub(crate) fn pin_references(&self, keys: &[[u8;32]], allow_stored: bool) -> Result<Vec<crate::protocol::ImageReference>> {
         let mut state=self.state.lock().map_err(|_|anyhow::anyhow!("image input cache poisoned"))?;
         let mut result=Vec::new();
         for key in keys {
-            if result.iter().any(|r:&crate::protocol::ImageReference|r.input.identity==*key){continue;}
-            let input=state.live.get(key).and_then(Weak::upgrade).ok_or(crate::protocol::ContextImageMiss)?;
-            let (detail,encoded_bytes)=*state.source_info.get(key).ok_or(crate::protocol::ContextImageMiss)?;
-            state.retain(input.clone());
-            let identity=key.iter().map(|b|format!("{b:02x}")).collect::<String>();
-            result.push(crate::protocol::ImageReference{source:format!("http://titanic-context.invalid/{identity}"),
-                input,detail,encoded_bytes});
+            if result.iter().any(|r:&crate::protocol::ImageReference|r.identity==*key){continue;}
+            let hex=key.iter().map(|b|format!("{b:02x}")).collect::<String>();
+            let source=format!("http://titanic-context.invalid/{hex}");
+            let live=state.live.get(key).and_then(Weak::upgrade);
+            if let (Some(input),Some(&(detail,encoded_bytes)))=(live,state.source_info.get(key)) {
+                state.retain(input.clone());
+                state.touch_stored(key);
+                result.push(crate::protocol::ImageReference{source,input:Some(input),stored:None,identity:*key,detail,encoded_bytes});
+                continue;
+            }
+            let stored=state.stored.get(key).filter(|_|allow_stored).cloned().ok_or(crate::protocol::ContextImageMiss)?;
+            state.touch_stored(key);
+            state.stored_references+=1;
+            result.push(crate::protocol::ImageReference{source,input:None,identity:*key,detail:stored.canonical,
+                encoded_bytes:stored.bytes.len(),stored:Some(stored)});
         }
         Ok(result)
     }
@@ -395,6 +463,12 @@ impl ImageInputCache {
     pub fn plan_cancellable(self: &Arc<Self>, tokens: Vec<u32>, sources: &[ImageSource],
         capacity: usize, cancelled: &dyn Fn() -> bool) -> Result<Planned> {
         self.expand_plan(tokens, sources, capacity, cancelled, None, Some(self))
+    }
+    /// Deferred planning for a compact-context request (Nov 17): live references keep their patches, stored ones
+    /// (patches evicted, encoded bytes in the source store) defer their pixels to the worker.
+    pub(crate) fn plan_referenced(self: &Arc<Self>, tokens: Vec<u32>, sources: &[ImageSource], capacity: usize,
+        cancelled: &dyn Fn() -> bool, references: &[crate::protocol::ImageReference]) -> Result<Planned> {
+        self.expand_plan(tokens, sources, capacity, cancelled, Some(references), Some(self))
     }
     fn expand_plan(&self, tokens: Vec<u32>, sources: &[ImageSource], capacity: usize,
         cancelled: &dyn Fn() -> bool, references: Option<&[crate::protocol::ImageReference]>,
@@ -444,8 +518,9 @@ impl ImageInputCache {
                         ensure!(output.len().checked_add(count).is_some_and(|n| n <= capacity), "image prompt exceeds context capacity");
                         images.push(Descriptor { start: output.len(), geometry: memo.geometry, input: memo.identity });
                         output.extend(std::iter::repeat_n(IMAGE_TOKEN, count));
+                        self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?.touch_stored(&memo.identity);
                         deferred.push(DeferredInput { identity: memo.identity, geometry: memo.geometry,
-                            source: source.clone(), cache: cache.clone() });
+                            source: DeferredSource::Request(source.clone()), cache: cache.clone() });
                         continue;
                     }
                 }
@@ -458,10 +533,39 @@ impl ImageInputCache {
                         .ok_or_else(|| anyhow::anyhow!("context_image_miss"))?;
                     ensure!(reference.detail == source.detail()
                         && (1..=MAX_ENCODED_BYTES).contains(&reference.encoded_bytes), "invalid cached image reference");
-                    let identity = reference.input.identity.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                    let identity = reference.identity.iter().map(|b|format!("{b:02x}")).collect::<String>();
                     ensure!(url == &format!("http://titanic-context.invalid/{identity}"), "cached image hash differs");
-                    reference.input.validate()?;
-                    (reference.input.clone(), reference.encoded_bytes)
+                    match (&reference.input, &reference.stored) {
+                        (Some(input), _) => {
+                            ensure!(input.identity == reference.identity, "cached image hash differs");
+                            input.validate()?;
+                            (input.clone(), reference.encoded_bytes)
+                        }
+                        // Patches evicted, encoded bytes kept: plan it like a deferred full-source image (the
+                        // worker makes its pixels only if its cached prefix does not cover it) or, on the eager
+                        // path, prepare it now from the stored bytes.
+                        (None, Some(stored)) => {
+                            ensure!(stored.bytes.len() == reference.encoded_bytes && stored.canonical == reference.detail,
+                                "stored image reference differs");
+                            if let Some(cache) = deferred_cache {
+                                encoded_bytes = encoded_bytes.checked_add(stored.bytes.len())
+                                    .ok_or_else(|| anyhow::anyhow!("request encoded image byte capacity exceeded"))?;
+                                ensure!(encoded_bytes <= 128 << 20, "request encoded image byte capacity exceeded");
+                                let count = stored.geometry.validate()?.tokens();
+                                ensure!(output.len().checked_add(count).is_some_and(|n| n <= capacity), "image prompt exceeds context capacity");
+                                images.push(Descriptor { start: output.len(), geometry: stored.geometry, input: reference.identity });
+                                output.extend(std::iter::repeat_n(IMAGE_TOKEN, count));
+                                deferred.push(DeferredInput { identity: reference.identity, geometry: stored.geometry,
+                                    source: DeferredSource::Stored(stored.clone()), cache: cache.clone() });
+                                continue;
+                            }
+                            let input = self.prepare_with_optional_pins(&stored.bytes, stored.detail, &mut pins)?;
+                            ensure!(input.identity == reference.identity && input.geometry == stored.geometry,
+                                "stored image identity or geometry differs");
+                            (input, reference.encoded_bytes)
+                        }
+                        (None, None) => anyhow::bail!("context_image_miss"),
+                    }
                 } else {
                     let cached = source_key.as_ref().map(|key| self.source_hit(key, (128usize << 20) - encoded_bytes)).transpose()?.flatten();
                     if let Some(input) = cached { input } else {
@@ -533,7 +637,8 @@ impl ImageInputCache {
             serde_json::json!({"hits":state.hits,"misses":state.misses,"warm_bytes":state.retained,
             "live_bytes":state.live_bytes(),"warm_budget_bytes":WARM_BYTES,"live_budget_bytes":LIVE_BYTES,
             "source_hits":state.source_hits,"source_entries":state.sources.len(),"source_entry_limit":SOURCE_ENTRIES,
-            "metadata_deferrals":state.metadata_deferrals}),
+            "metadata_deferrals":state.metadata_deferrals,"stored_sources":state.stored.len(),"stored_bytes":state.stored_bytes,
+            "store_budget_bytes":self.store_budget,"stored_references":state.stored_references}),
         )
     }
 }
@@ -665,6 +770,61 @@ mod tests {
         assert!(weak.upgrade().is_none());
         assert_eq!(cache.metadata().unwrap()["live_bytes"], 0);
         assert_eq!(cache.metadata().unwrap()["misses"], 1);
+    }
+    #[test]
+    fn stored_reference_resolves_after_patch_eviction_and_defers_pixels() {
+        let mut cache = ImageInputCache::for_test();
+        cache.store_budget = 64 << 20;
+        let cache = Arc::new(cache);
+        let bytes = png(61);
+        let first = cache.expand(vec![IMAGE_TOKEN], &[data_source(&bytes, ImageDetail::Auto, "")], 4096).unwrap();
+        let (identity, geometry, patches) = (first.inputs[0].identity, first.inputs[0].geometry, first.inputs[0].patches.clone());
+        drop(first); cache.forget_for_test();
+        assert!(cache.state.lock().unwrap().live.get(&identity).and_then(Weak::upgrade).is_none(), "patches evicted");
+        // Where pixels may not be deferred, an evicted reference is still a context miss.
+        assert!(cache.pin_references(&[identity], false).err().unwrap().downcast_ref::<crate::protocol::ContextImageMiss>().is_some());
+        let refs = cache.pin_references(&[identity], true).unwrap();
+        assert!(refs[0].input.is_none() && refs[0].stored.is_some() && refs[0].identity == identity);
+        assert_eq!(refs[0].encoded_bytes, bytes.len());
+        let url = ImageSource::Url { url: refs[0].source.clone(), detail: ImageDetail::Auto, path: String::new() };
+        let planned = cache.plan_referenced(vec![IMAGE_TOKEN], std::slice::from_ref(&url), 4096, &|| false, &refs).unwrap();
+        assert!(planned.inputs.is_empty() && planned.deferred.len() == 1);
+        assert_eq!(planned.images[0].input, identity);
+        assert_eq!(planned.tokens.len(), geometry.tokens());
+        assert_eq!(cache.metadata().unwrap()["misses"], 1, "planning made no pixels");
+        let made = planned.deferred[0].materialize(&|| false).unwrap();
+        assert_eq!((made.identity, made.geometry), (identity, geometry));
+        assert_eq!(made.patches, patches, "pixels made again from the stored bytes are the same");
+        assert_eq!(cache.metadata().unwrap()["stored_references"], 1);
+        // The eager path prepares the stored bytes at once.
+        drop(made); drop(planned); cache.forget_for_test();
+        let refs = cache.pin_references(&[identity], true).unwrap();
+        let eager = cache.expand_referenced(vec![IMAGE_TOKEN], std::slice::from_ref(&url), 4096, &|| false, &refs).unwrap();
+        assert_eq!(eager.inputs[0].identity, identity);
+        assert_eq!(eager.inputs[0].patches, patches);
+        // A live reference keeps its patches (no deferral).
+        let refs = cache.pin_references(&[identity], true).unwrap();
+        assert!(refs[0].input.is_some() && refs[0].stored.is_none());
+    }
+    #[test]
+    fn source_store_is_off_by_default_and_bounded_oldest_out() {
+        let cache = ImageInputCache::for_test();
+        let a = cache.expand(vec![IMAGE_TOKEN], &[data_source(&png(62), ImageDetail::Auto, "")], 4096).unwrap();
+        let id = a.inputs[0].identity; drop(a); cache.forget_for_test();
+        if cache.store_budget == 0 {
+            assert_eq!(cache.metadata().unwrap()["stored_sources"], 0);
+            assert!(cache.pin_references(&[id], true).is_err(), "no store: a miss as before");
+        }
+        let mut cache = ImageInputCache::for_test();
+        let sizes = [png(63).len(), png(64).len(), png(65).len()];
+        cache.store_budget = sizes[1] + sizes[2];
+        let ids = (63u8..66).map(|c| cache.expand(vec![IMAGE_TOKEN], &[data_source(&png(c), ImageDetail::Auto, "")], 4096)
+            .unwrap().inputs[0].identity).collect::<Vec<_>>();
+        let state = cache.state.lock().unwrap();
+        assert_eq!(state.stored.len(), 2);
+        assert!(!state.stored.contains_key(&ids[0]) && state.stored.contains_key(&ids[1]) && state.stored.contains_key(&ids[2]));
+        assert!(state.stored_bytes <= cache.store_budget && state.stored_bytes == sizes[1] + sizes[2]);
+        assert_eq!(state.stored_oldest.len(), 2);
     }
     #[test]
     fn exact_source_reuse_preserves_identity_detail_aliases_and_admission() {

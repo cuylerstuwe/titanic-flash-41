@@ -490,6 +490,33 @@ impl CachedSession {
 /// (every rank agrees); the planners below read it.
 static SHORT_RESERVE:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
 fn short_reserve()->usize {SHORT_RESERVE.load(std::sync::atomic::Ordering::Relaxed)}
+/// CANADA_SCRATCH_CACHE_LADDER_CAP=K (Nov 17; 0 = off, default; at most 16): a conversation whose earlier checkpoints
+/// already hold K or more cache entries pays for a new checkpoint with one of its own (`ladder_victim`: never its two
+/// latest rungs) instead of another conversation's least recently used entry. Otherwise eviction is unchanged (least
+/// recently used). Found Nov 17: sixteen image requests of one ~50K conversation pushed an idle 974K conversation out
+/// of the cache (re-read 115 s) by filling all sixteen slots with its own checkpoints. Cost-based orders that fixed
+/// that broke rotating long conversations or thinking-stripped follow-ups (see eviction_cost_order).
+static LADDER_CAP:std::sync::atomic::AtomicUsize=std::sync::atomic::AtomicUsize::new(0);
+fn ladder_cap()->usize {LADDER_CAP.load(std::sync::atomic::Ordering::Relaxed)}
+fn parse_ladder_cap(value:Option<&str>)->Result<usize> {
+    let Some(value)=value else {return Ok(0)};
+    let cap:usize=value.parse()?;
+    ensure!(cap==0||(2..=16).contains(&cap),"cache ladder cap must be 0 or 2..=16");
+    Ok(cap)
+}
+/// CANADA_SCRATCH_CACHE_TRACE=1 (Nov 17; diagnostic, default off): one `cache trace {json}` line on stderr for every
+/// cache eviction decision: the path (a save's budget plan and memory-pressure victims, the restored-image
+/// retention pass), the incoming entry, every victim's prefix length and charge, the entries held, and for a save the
+/// memory available against the memory required. Read-only: it changes no decision. Found Nov 17: the stress panel's
+/// idle 974K conversation is lost although the slot planner protects it, so the losing path must be seen.
+static CACHE_TRACE:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+fn parse_cache_trace(value:Option<&str>)->Result<bool> {
+    match value {None=>Ok(false),Some("0")=>Ok(false),Some("1")=>Ok(true),
+        Some(_)=>anyhow::bail!("CANADA_SCRATCH_CACHE_TRACE must be 0 or 1")}
+}
+fn cache_trace(event:impl FnOnce()->Value) {
+    if CACHE_TRACE.load(std::sync::atomic::Ordering::Relaxed) {eprintln!("cache trace {}",event());}
+}
 fn parse_short_reserve(value:Option<&str>,slots:usize)->Result<usize> {
     let Some(value)=value else {return Ok(0)};
     let reserve:usize=value.parse()?;
@@ -699,14 +726,15 @@ fn cache_evictions(entries:&[(usize,usize)], incoming:(usize,usize), budget:usiz
 /// evicted are unchanged; `None` is exactly the ordinary policy.
 fn cache_evictions_ladder(entries:&[(usize,usize)], ancestors:Option<&[bool]>, incoming:(usize,usize),
     budget:usize,long_first:bool,slots:usize)->Option<Vec<usize>> {
-    cache_evictions_ladder_reserved(entries,ancestors,incoming,budget,long_first,slots,short_reserve())
+    cache_evictions_ladder_reserved(entries,ancestors,incoming,budget,long_first,slots,short_reserve(),ladder_cap())
 }
 /// As cache_evictions_ladder with `reserve` slots kept for checkpoints under 8,192 tokens (0: no shares). The
 /// entry the ordinary policy starts from (the oldest unprotected one) is then chosen by kind: an image of 8,192
 /// tokens or more skips the newest `reserve` short entries; a shorter image takes the oldest short entry once
 /// short entries hold `reserve` slots or more, and otherwise the oldest entry of either kind.
+#[allow(clippy::too_many_arguments)]
 fn cache_evictions_ladder_reserved(entries:&[(usize,usize)], ancestors:Option<&[bool]>, incoming:(usize,usize),
-    budget:usize,long_first:bool,slots:usize,reserve:usize)->Option<Vec<usize>> {
+    budget:usize,long_first:bool,slots:usize,reserve:usize,cap:usize)->Option<Vec<usize>> {
     if incoming.1>budget || slots==0 || ancestors.is_some_and(|a|a.len()!=entries.len()) {return None;}
     let mut protected=if long_first {
         (0..entries.len()).filter(|&i|entries[i].0>incoming.0).collect::<Vec<_>>()
@@ -724,6 +752,9 @@ fn cache_evictions_ladder_reserved(entries:&[(usize,usize)], ancestors:Option<&[
             else{*retained.iter().find(|&&i|!protected.contains(&i))?}
         };
         let victim=match ancestors {
+            // See ladder_cap: a conversation holding K or more of its own rungs pays with one of them.
+            Some(a) if cap>0&&retained.iter().filter(|&&i|a[i]).count()>=cap=>
+                ladder_victim(entries,a,&retained,&protected).unwrap_or(oldest),
             Some(a) if a[oldest]=>ladder_victim(entries,a,&retained,&protected).unwrap_or(oldest),
             _=>oldest,
         };
@@ -823,6 +854,11 @@ fn system_prefix_checkpoint(system:usize,otherwise:usize,prompt:usize,minimum:us
     if at>=otherwise||at<minimum||prompt<at+128 {return None;}
     let (gain,cost)=(at,otherwise-at);
     (gain>=1024&&cost<=1024&&gain>=8*cost).then_some(at)
+}
+/// Whether `near` is a near-end checkpoint of the prompt `prompt` (CANADA_SCRATCH_REDUNDANT_PROMPT_IMAGE): a proper,
+/// non-empty prefix of it fewer than 128 tokens shorter, which a repeated prompt restores with one short suffix.
+fn near_end_of(prompt:&[u32],near:&[u32])->bool {
+    !near.is_empty()&&near.len()<prompt.len()&&prompt.len()-near.len()<128&&prompt.starts_with(near)
 }
 /// Length of the common prefix of two token sequences. Whole blocks first: prompts reach a million tokens and a
 /// cache holds sixteen of them.
@@ -1029,6 +1065,8 @@ struct Worker {
     prompt_checkpoint_tail: usize,
     prompt_cache_logits: bool,
     retain_restored_checkpoint: bool,
+    // CANADA_SCRATCH_REDUNDANT_PROMPT_IMAGE (see config::redundant_prompt_image).
+    redundant_prompt_image: bool,
     prepared_session: Option<PreparedSession>,
     session_prepare_seconds: f64,
     nccl_init_seconds: f64,
@@ -1738,6 +1776,12 @@ impl Worker {
         let reserve=parse_short_reserve(std::env::var("CANADA_SCRATCH_SESSION_CACHE_SHORT_RESERVE").ok().as_deref(),session_cache_slots)?;
         control.agree(&[&[0x7e][..],&(reserve as u64).to_le_bytes()].concat())?;
         SHORT_RESERVE.store(reserve,std::sync::atomic::Ordering::Relaxed);
+        let cap=parse_ladder_cap(std::env::var("CANADA_SCRATCH_CACHE_LADDER_CAP").ok().as_deref())?;
+        control.agree(&[&[0x7f][..],&(cap as u64).to_le_bytes()].concat())?;
+        LADDER_CAP.store(cap,std::sync::atomic::Ordering::Relaxed);
+        // Diagnostic only (no decision depends on it), so each rank reads it alone: no agreement needed.
+        CACHE_TRACE.store(parse_cache_trace(std::env::var("CANADA_SCRATCH_CACHE_TRACE").ok().as_deref())?,
+            std::sync::atomic::Ordering::Relaxed);
         control.agree(&(shared_image_budget as u64).to_le_bytes())?;
         control.agree(&[u8::from(parking_extra_slots)])?;
         control.agree(&[u8::from(session_cache_long_first)])?;
@@ -1754,6 +1798,10 @@ impl Worker {
         // Nov 12 cache policies: every rank must run the same ones (they decide positions, saves and copies).
         control.agree(&[0x7c,crate::config::shared_prefix_checkpoint()?,u8::from(crate::config::encoder_extra_near_end()?),
             u8::from(crate::config::batched_detach_keeps_images()?)])?;
+        // Nov 18: the near-end image after a restore made inside the lookup changes the chunk plan on every rank.
+        control.agree(&[0x6e,u8::from(crate::config::near_end_after_restore()?)])?;
+        // Nov 18: redundant prompt-end images yield first; it changes eviction victims on every rank.
+        control.agree(&[0x6f,u8::from(crate::config::redundant_prompt_image()?)])?;
         // Host waits (Nov 12): the control socket's spin budget and the worker thread's timer slack
         // (CANADA_SCRATCH_TIMER_SLACK_NS, 1000-50000; default: the system's 50 us): a 25 us completion poll
         // sleeps ~80 us with the default slack.
@@ -1925,6 +1973,7 @@ impl Worker {
             prompt_checkpoint_tail,
             prompt_cache_logits,
             retain_restored_checkpoint,
+            redundant_prompt_image: crate::config::redundant_prompt_image()?,
             prepared_session: Some(prepared_session),
             session_prepare_seconds,
             nccl_init_seconds,
@@ -2046,8 +2095,18 @@ impl Worker {
         let reserve=short_reserve();
         let short=|c:&CachedSession|c.prefix.len()<8192&&!c.opportunistic_logits();
         let mut spare=self.cached_sessions.iter().filter(|c|short(c)).count().saturating_sub(reserve);
-        self.cached_sessions.iter().map(|c|c.opportunistic_logits()||(incoming>=8192&&short(c)&&{
+        let redundant=self.redundant_prompt_images();
+        self.cached_sessions.iter().zip(redundant).map(|(c,r)|r||c.opportunistic_logits()||(incoming>=8192&&short(c)&&{
             let take=reserve==0||spare>0;spare=spare.saturating_sub(1);take})).collect()
+    }
+
+    /// CANADA_SCRATCH_REDUNDANT_PROMPT_IMAGE (config::redundant_prompt_image): the prompt-end images with exact logits
+    /// whose near-end checkpoint is cached as well (same owner, a proper prefix 1-127 tokens shorter, same media
+    /// through it). Every rank holds the same entries, so every rank marks the same ones.
+    fn redundant_prompt_images(&self)->Vec<bool> {
+        self.cached_sessions.iter().enumerate().map(|(i,c)|self.redundant_prompt_image&&c.prompt_logits.is_some()
+            &&self.cached_sessions.iter().enumerate().any(|(j,e)|j!=i&&e.owner==c.owner
+                &&near_end_of(&c.prefix,&e.prefix)&&c.media.matches_prefix(&e.media,e.prefix.len()))).collect()
     }
 
     /// Retain only a committed target/drafter/history image. Prompt checkpoints
@@ -2123,8 +2182,10 @@ impl Worker {
             "cache admission would evict a protected parent");
         let budget_evictions=removed.len();
         let mut reusable=Vec::new();
+        let mut traced_available=None;
         if self.cache_pressure_reclaim {
             let available=self.cuda.image_admission_memory()?.admitted_available;
+            traced_available=Some(available);
             // Ordinary saves need exactly the existing memory query and one
             // all-rank vote. Enter the fuller eviction agreement only when a
             // rank actually needs reclamation or a logical-budget eviction.
@@ -2155,6 +2216,14 @@ impl Worker {
                 removed.push(next);
             }
             if !removed.is_empty(){self.stream.synchronize()?;}
+        }
+        if !removed.is_empty() {
+            let held=|i:usize|{let c=&self.cached_sessions[i];json!([c.prefix.len(),c.charge])};
+            cache_trace(||json!({"path":"save","incoming_tokens":prefix.len(),"required":required,
+                "available":traced_available,"slots":slots,"protected":protected,
+                "budget_victims":removed[..budget_evictions].iter().map(|&i|held(i)).collect::<Vec<_>>(),
+                "pressure_victims":removed[budget_evictions..].iter().map(|&i|held(i)).collect::<Vec<_>>(),
+                "entries":(0..self.cached_sessions.len()).map(held).collect::<Vec<_>>()}));
         }
         removed.sort_unstable();
         let evicted=removed.len();
@@ -2355,6 +2424,11 @@ impl Worker {
                 removed.push(next);
             }
             removed.sort_unstable();
+            if !removed.is_empty() {
+                cache_trace(||json!({"path":"displaced_reclaim","incoming_tokens":tokens,"available":available,
+                    "victims":removed.iter().map(|&i|json!([entries[i].0,entries[i].1])).collect::<Vec<_>>(),
+                    "entries":entries.iter().map(|e|json!([e.0,e.1])).collect::<Vec<_>>()}));
+            }
             self.stream.synchronize()?;
             for &i in removed.iter().rev() {self.cached_sessions.remove(i);}
             index-=removed.iter().filter(|&&r|r<index).count();
@@ -2452,7 +2526,10 @@ impl Worker {
         self.order_cache_by_lineage(&plan.prompt);
         let (budget,slots)=self.cache_capacity(0,0);
         let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
-        let speculative=self.cached_sessions.iter().map(|c|c.speculative).collect::<Vec<_>>();
+        // Speculative entries yield first; with CANADA_SCRATCH_REDUNDANT_PROMPT_IMAGE so do prompt-end images whose
+        // near-end checkpoint is cached (redundant_prompt_images; all false without the flag).
+        let speculative=self.cached_sessions.iter().zip(self.redundant_prompt_images())
+            .map(|(c,r)|c.speculative||r).collect::<Vec<_>>();
         let evictions=if speculative.iter().any(|&v|v) {
             cache_evictions_with_optional(&entries,&speculative,(plan.prompt.len(),charge),budget,
                 self.session_cache_long_first,slots).filter(|removed|
@@ -2468,6 +2545,12 @@ impl Worker {
         let mut evicted=0;
         let ready=if admitted {
             let mut indices=evictions.unwrap();indices.sort_unstable();evicted=indices.len();
+            if !indices.is_empty() {
+                cache_trace(||json!({"path":"prompt_logits_save","incoming_tokens":plan.prompt.len(),"incoming_charge":charge,
+                    "budget":budget,"slots":slots,
+                    "victims":indices.iter().map(|&i|json!([entries[i].0,entries[i].1])).collect::<Vec<_>>(),
+                    "entries":entries.iter().map(|e|json!([e.0,e.1])).collect::<Vec<_>>()}));
+            }
             for i in indices.into_iter().rev(){self.cached_sessions.remove(i);}
             Some((self.large.snapshot_prompt_logits(&self.stream)?,device,charge))
         }else{None};
@@ -2500,6 +2583,11 @@ impl Worker {
                 && (c.prefix.len()<plan.prompt.len() || (self.prompt_cache_logits && allow_exact_logits
                     && c.prefix.len()==plan.prompt.len() && c.prompt_logits.is_some())))
             .max_by_key(|(_,c)|c.prefix.len()).map(|(i,_)|i);
+        // Which entry a request checks out (it is held outside the vector until it returns or is dropped), and what
+        // else the cache holds at that moment.
+        cache_trace(||json!({"path":"restore_lookup","prompt_tokens":plan.prompt.len(),
+            "hit":hit.map(|i|json!([self.cached_sessions[i].prefix.len(),self.cached_sessions[i].charge])),
+            "entries":self.cached_sessions.iter().map(|c|json!([c.prefix.len(),c.charge])).collect::<Vec<_>>()}));
         let wanted=hit.map(|i|{let mut cached=self.cached_sessions.remove(i);cached.speculative=false;cached});
         let current_prefix=self.history.committed().to_vec();
         // A displaced unfinished request already owns an immutable image.
@@ -2558,8 +2646,13 @@ impl Worker {
                 history.as_ref().map_or(0,crate::history_lookup::HistoryLookup::workspace_bytes),_=>0};
             let mut admitted=self.control.all_admit(self.cuda.admission_memory()?.admitted_available>=reserve+extra_history)?;
             if !admitted {
+                let dropped=self.cached_sessions.iter().map(|c|json!([c.prefix.len(),c.charge])).collect::<Vec<_>>();
+                let available=self.cuda.admission_memory()?.admitted_available;
+                cache_trace(||json!({"path":"restore_admission_clear","restoring_tokens":cached.prefix.len(),
+                    "required":reserve+extra_history,"available":available,"dropped":dropped}));
                 self.cached_sessions.clear();
                 admitted=self.control.all_admit(self.cuda.admission_memory()?.admitted_available>=reserve+extra_history)?;
+                cache_trace(||json!({"path":"restore_admission_retry","restoring_tokens":cached.prefix.len(),"admitted":admitted}));
             }
             if admitted {
                 let prior=if imported {let CachedState::Encoder{image,..}=&cached.image else{unreachable!()};
@@ -2672,6 +2765,12 @@ impl Worker {
                         if admitted {
                             let mut indices=evictions.unwrap();indices.sort_unstable();
                             upgrade_evicted_sessions=indices.len();
+                            if !indices.is_empty() {
+                                cache_trace(||json!({"path":"restored_image_upgrade","incoming_tokens":candidate.prefix.len(),
+                                    "incoming_charge":charge,"budget":budget,"slots":slots,
+                                    "victims":indices.iter().map(|&i|json!([entries[i].0,entries[i].1])).collect::<Vec<_>>(),
+                                    "entries":entries.iter().map(|e|json!([e.0,e.1])).collect::<Vec<_>>()}));
+                            }
                             for i in indices.into_iter().rev(){self.cached_sessions.remove(i);}
                             self.stream.synchronize()?;
                             let image=self.try_save_cached_session_image(pending,device)?;
@@ -2708,6 +2807,12 @@ impl Worker {
                         if let Some(mut evictions)=cache_evictions_ladder(&entries,ancestors.as_deref(),
                             (cached.prefix.len(),cached.charge),budget,self.session_cache_long_first,slots) {
                             evictions.sort_unstable();retention_evictions=evictions.len();
+                            if !evictions.is_empty() {
+                                cache_trace(||json!({"path":"restored_image_retention","incoming_tokens":cached.prefix.len(),
+                                    "incoming_charge":cached.charge,"budget":budget,"slots":slots,
+                                    "victims":evictions.iter().map(|&i|json!([entries[i].0,entries[i].1])).collect::<Vec<_>>(),
+                                    "entries":entries.iter().map(|e|json!([e.0,e.1])).collect::<Vec<_>>()}));
+                            }
                             for i in evictions.into_iter().rev(){self.cached_sessions.remove(i);}
                             self.cached_sessions.push(cached);
                             retained_image=true;
@@ -2965,7 +3070,11 @@ impl Worker {
         // A turn continuing a restored image saves its next image near its prompt end when that image is
         // captured inline (CANADA_SCRATCH_ENCODER_NEAR_END); otherwise the aligned position as before.
         let near=crate::config::encoder_near_end_checkpoint()?;
-        let near_end=if near>0&&wanted.is_some()&&!live_frontier&&!short_suffix
+        // CANADA_SCRATCH_NEAR_END_AFTER_RESTORE: a prefix restored inside the lookup (a complete image, or an encoder
+        // image reconstructed there) is a continuing turn as well; it arrives without `wanted`.
+        let restored_here=wanted.is_none()&&plan.reuse&&previous>0&&retained["hit"]==true
+            &&retained["restored_tokens"].as_u64()==Some(previous as u64)&&crate::config::near_end_after_restore()?;
+        let near_end=if near>0&&(wanted.is_some()||restored_here)&&!live_frontier&&!short_suffix
             &&plan.prompt.len()>=previous+128+near {
             let at=plan.prompt.len()-near;
             self.large.near_end_checkpoint_admitted(&self.wides,at-previous,near)?.then_some(at)
@@ -5565,6 +5674,20 @@ pub fn run_http(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn near_end_of_a_prompt() {
+        use super::near_end_of;
+        // Nov 18 traced stress panel: the prompt-end image 974,060 and its near-end checkpoint 974,059 (K=1).
+        let prompt=(0..974_060u32).map(|i|i%129_000).collect::<Vec<_>>();
+        assert!(near_end_of(&prompt,&prompt[..974_059]));
+        assert!(near_end_of(&prompt,&prompt[..974_060-127]));
+        assert!(!near_end_of(&prompt,&prompt[..974_060-128]),"128 rows or more: not one short suffix");
+        assert!(!near_end_of(&prompt,&prompt),"the same prompt is not its own near-end image");
+        assert!(!near_end_of(&prompt,&[]));
+        assert!(!near_end_of(&prompt[..974_059],&prompt),"longer is never near-end");
+        let mut other=prompt[..974_059].to_vec();other[10]+=1;
+        assert!(!near_end_of(&prompt,&other),"another conversation of nearly the same length");
+    }
+    #[test]
     fn shared_prefix_checkpoint_position() {
         use super::{common_prefix,shared_prefix_checkpoint as at};
         // s1509 shp1: a 14,731-token prompt whose first 14,250 tokens open another conversation. Cold: the
@@ -5615,7 +5738,10 @@ mod tests {
     }
     #[test]
     fn short_and_long_checkpoints_keep_their_shares() {
-        use super::{cache_evictions_ladder_reserved as plan,parse_short_reserve};
+        use super::parse_short_reserve;
+        // the ladder cap off (0): these cases are about the short-checkpoint shares only
+        let plan=|e:&[(usize,usize)],a:Option<&[bool]>,i:(usize,usize),b:usize,l:bool,s:usize,r:usize|
+            super::cache_evictions_ladder_reserved(e,a,i,b,l,s,r,0);
         let (long,short)=((15_000usize,40usize),(2_500usize,30usize));
         let full=vec![long;8];
         // No reserve: the ordinary policy (oldest first) whatever the kinds.
@@ -6000,6 +6126,33 @@ mod tests {
         let d=vec![9u32;15_000];
         let o=super::eviction_cost_order(&[d.as_slice(),a.as_slice(),a1.as_slice(),a2.as_slice()]);
         assert_eq!(o,vec![2,3,0,1]);
+    }
+    #[test]
+    fn ladder_cap_makes_a_busy_conversation_pay_with_its_own_rungs() {
+        // Oldest first: an idle long conversation's three rungs, then thirteen checkpoints of another conversation
+        // (~1K apart); sixteen slots; the incoming fourteenth checkpoint needs one slot.
+        let mut entries=vec![(350_000usize,10usize),(650_000,10),(974_000,10)];
+        for k in 0..13 {entries.push((50_000+k*1_000,1));}
+        let mut ancestors=vec![false;3];ancestors.extend(vec![true;13]);
+        let incoming=(63_000,1);
+        // Without the cap (least recently used): the idle conversation's oldest rung goes.
+        assert_eq!(super::cache_evictions_ladder_reserved(&entries,Some(&ancestors),incoming,1_000,true,16,0,0),Some(vec![0]));
+        // With the cap: one of the busy conversation's own rungs, never its two latest.
+        let with_cap=super::cache_evictions_ladder_reserved(&entries,Some(&ancestors),incoming,1_000,true,16,0,4).unwrap();
+        assert_eq!(with_cap.len(),1);
+        assert!(with_cap[0]>=3&&with_cap[0]<14,"{with_cap:?}");
+        // Below the cap nothing changes: three rungs of the incoming conversation, the oldest entry goes.
+        let few=vec![(350_000usize,10usize),(650_000,10),(974_000,10),(50_000,1),(51_000,1),(52_000,1)];
+        let a=vec![false,false,false,true,true,true];
+        assert_eq!(super::cache_evictions_ladder_reserved(&few,Some(&a),(53_000,1),1_000,true,6,0,4),Some(vec![0]));
+        assert!(super::parse_ladder_cap(None).unwrap()==0&&super::parse_ladder_cap(Some("4")).unwrap()==4);
+        assert!(super::parse_ladder_cap(Some("1")).is_err()&&super::parse_ladder_cap(Some("17")).is_err());
+    }
+    #[test]
+    fn cache_trace_is_off_by_default_and_parses_strictly() {
+        assert!(!super::parse_cache_trace(None).unwrap()&&!super::parse_cache_trace(Some("0")).unwrap());
+        assert!(super::parse_cache_trace(Some("1")).unwrap());
+        assert!(super::parse_cache_trace(Some("yes")).is_err()&&super::parse_cache_trace(Some("")).is_err());
     }
     #[test]
     fn physical_pressure_prefers_optional_then_longest_superseded_snapshot() {

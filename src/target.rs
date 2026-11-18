@@ -3108,7 +3108,8 @@ impl Target {
         // captured inline in the last encoder chunk, which then completes the request (checked below).
         let near_end=suffix.len()<128&&!short_restore;
         ensure!(encoder_checkpoint_enabled()&&!suffix.is_empty()&&previous+prefix.len()>=128
-            && (!near_end||(crate::config::encoder_near_end_checkpoint()?>0&&restore.is_some()))
+            && (!near_end||(crate::config::encoder_near_end_checkpoint()?>0
+                && (restore.is_some()||crate::config::near_end_after_restore()?)))
             && prefix.len()+suffix.len()<=self.context.saturating_sub(previous)
             && prefix.iter().chain(suffix).all(|&id|id<129280),
             "encoder checkpoint requires a complete replacement suffix");

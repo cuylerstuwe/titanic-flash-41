@@ -571,6 +571,33 @@ pub(crate) fn encoder_checkpoint_inline_requested() -> anyhow::Result<bool> {
 /// last encoder chunk, instead of at the aligned position 128 or more rows before the end. A chat turn's next
 /// prompt shares every token but the final generation prefix (`<think>`), so with K = 1 the next turn
 /// re-prefills only its own new rows. Cold prompts keep the aligned image (task-suffix reuse).
+/// Near-end checkpoints after a restore made inside the cache lookup (CANADA_SCRATCH_NEAR_END_AFTER_RESTORE=1; default
+/// off; needs CANADA_SCRATCH_ENCODER_NEAR_END=K). A turn whose prefix was restored from a complete image (or an encoder
+/// image reconstructed there) reaches the checkpoint choice without the borrowed encoder image the near-end rule looked
+/// for, so it saved the aligned image instead; when that position lay fewer than 128 rows into the append, the image
+/// could not be captured inline and the prefill ran as two passes (+150-175 ms; Nov 17 rap1: 257 and 268 uncached
+/// tokens). With the switch such a turn is a continuing turn too: the near-end image when the inline plan admits it.
+pub(crate) fn near_end_after_restore() -> anyhow::Result<bool> {
+    match std::env::var("CANADA_SCRATCH_NEAR_END_AFTER_RESTORE") {
+        Ok(v) => { anyhow::ensure!(v == "0" || v == "1", "invalid near-end-after-restore policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+/// Redundant prompt-end images yield first (CANADA_SCRATCH_REDUNDANT_PROMPT_IMAGE=1; default off). A prompt-end image
+/// with exact logits whose own near-end checkpoint (the same prompt less 1-127 tokens, same owner and media) is also
+/// cached is evicted before conversation images: the near-end image serves the same prompt again through a short
+/// suffix, and it is the only one a follow-up that re-renders the previous answer can restore. Found Nov 18 (traced
+/// stress panel, s1598): a burst of one image conversation's saves filled the sixteen slots; the length rule
+/// protected an idle 974K conversation's completed turn (974,075) and prompt-end image (974,060) and the prompt-logits
+/// save evicted its near-end checkpoint (974,059), the one its next turn needed (116 s re-read).
+pub(crate) fn redundant_prompt_image() -> anyhow::Result<bool> {
+    match std::env::var("CANADA_SCRATCH_REDUNDANT_PROMPT_IMAGE") {
+        Ok(v) => { anyhow::ensure!(v == "0" || v == "1", "invalid redundant prompt image policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
 pub(crate) fn encoder_near_end_checkpoint() -> anyhow::Result<usize> {
     match std::env::var("CANADA_SCRATCH_ENCODER_NEAR_END") {
         Ok(v) => { let k: usize = v.parse()?; anyhow::ensure!(k <= 64, "encoder near-end checkpoint offset"); Ok(k) }
