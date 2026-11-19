@@ -1,0 +1,653 @@
+{
+  "release": "s1621",
+  "date": "2026-11-19",
+  "base": "s1599",
+  "failed_start_fallback": "s1599",
+  "change": {
+    "disk_tier": "CANADA_SCRATCH_DISK_TIER=1. In idle time the coldest conversation snapshots get byte-exact copies on local NVMe (direct I/O, SHA-256 per 4 MiB chunk, written in 32 MiB slices). A snapshot with a copy is parked (its memory returns to the snapshot pool) instead of dropped when the cache evicts it; a later turn reloads it, checking every digest, when the read beats prefilling the tokens it saves (read rate 2,200 MB/s plus 30 ms, measured). A reload takes room only under the cache's own slot and byte limits. Files live in one directory per device, capped at 64 GiB, and are removed when the engine starts.",
+    "full_serving_regions": "CANADA_SCRATCH_FULL_REGIONS=1, CANADA_SCRATCH_ELASTIC_REGIONS=1, CANADA_SCRATCH_REGION_LOOKAHEAD=16384. Up to four conversations decode together in regions sized for the full context. Region memory is mapped on demand from a reserved address range and given back when conversations leave; regions 1 to the highest occupied one stay mapped, because the index scorer reads key ranges that can span a gap region (an earlier build that unmapped gap regions faulted there)."
+  },
+  "unchanged": [
+    "weights",
+    "kernels and numeric code",
+    "every other setting of s1599 (snapshot pool 8 GiB, 4 GiB floor, cache budgets, prefill widths)",
+    "2350 MHz clock policy",
+    "the response timing contract",
+    "portable profile"
+  ],
+  "disk_tier_tests": {
+    "exactness": "the same restore point with and without the tier gives identical text: 8 of 8 requests in each of three arms; retries served entirely from reloaded snapshots reproduced their original text",
+    "return_to_evicted_conversation_first_token_s": {
+      "with_tier": [
+        0.13,
+        0.14
+      ],
+      "without_tier_cold_prefill": [
+        4.7,
+        12.9
+      ]
+    },
+    "exact_retry_first_token_ms": {
+      "with_tier": [
+        109,
+        131
+      ],
+      "without_tier": [
+        134,
+        151
+      ]
+    },
+    "reload_ms_for_45_to_134_mb_snapshots": [
+      35,
+      82
+    ],
+    "reload_phases_ms": {
+      "read": [
+        17,
+        67
+      ],
+      "digest": [
+        3,
+        6
+      ],
+      "allocate": 2,
+      "upload": [
+        1,
+        2.5
+      ],
+      "agreement_across_devices": [
+        25,
+        30
+      ]
+    },
+    "copies_failed": 0
+  },
+  "full_regions_tests": {
+    "regions_panel_with_trace": "passed, 17 conversations, detaches, saves, a drop, a park and a resume, 0 faults",
+    "context_256k_streams_1_to_4_decode_tok_s": [
+      84.4,
+      99.2,
+      103.5,
+      73.5
+    ],
+    "note": "four streams at 256K are slower than three: the index scorer bounds a block of query rows by the union of their key ranges, so a block spanning regions reads the gap between them. Open item."
+  },
+  "eviction_acceptance": {
+    "stress_idle_974k_conversation_cached_fraction": 1.0,
+    "stress_idle_974k_conversation_first_token_s": 0.211,
+    "residency_worst_return_uncached_tokens": 20,
+    "regions_phase_d_follow_up_reuse": {
+      "30": 1.0,
+      "31": 1.0,
+      "32": 1.0
+    },
+    "accepted": true
+  },
+  "memory": {
+    "rule": "no page swapped out on any device during any panel",
+    "no_swap_per_panel": {
+      "q-timing": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-router": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-regions": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-cancel": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-cand": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "q-stress": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ],
+      "resid1m": [
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        },
+        {
+          "swapped_out_pages": 0,
+          "direct_reclaim_stalls": 0,
+          "compaction_stalls": 0,
+          "refaults": 0
+        }
+      ]
+    },
+    "passed": true
+  },
+  "timing_contract_panel": {
+    "passed": true,
+    "streamed_header": "v1",
+    "plain_header": "v1",
+    "six_conversations_waited": 2,
+    "turn_taking_pauses": 0,
+    "streams_reporting_a_wait_after_running": 3,
+    "min_available_gib": [
+      8.403,
+      7.277,
+      9.029,
+      8.863
+    ]
+  },
+  "routed_panel": {
+    "passed": true,
+    "routed_requests": 9,
+    "statuses": [
+      200
+    ],
+    "context_outcomes": [
+      "seeded",
+      "incremental",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded",
+      "seeded"
+    ],
+    "follow_up_cached_tokens": 3540,
+    "min_available_gib": [
+      8.75,
+      6.812,
+      8.585,
+      8.678
+    ]
+  },
+  "several_conversations_panel": {
+    "passed": true,
+    "conversations_checked": 17,
+    "drafter_images_restored_into_another_drafter": 1,
+    "longest_prompt_tokens": 296940,
+    "follow_up_reuse_of_first_prompt": {
+      "30": 1.0,
+      "31": 1.0,
+      "32": 1.0
+    },
+    "min_available_gib": [
+      8.397,
+      6.873,
+      8.648,
+      8.509
+    ]
+  },
+  "stress_panel": {
+    "passed": true,
+    "requests": 70,
+    "max_prompt_tokens": 974076,
+    "max_temperature_c": [
+      82.7,
+      79.7,
+      78.9,
+      82.9
+    ],
+    "approx_seconds_at_or_above_90c": {
+      "0": 0.0,
+      "1": 0.0,
+      "2": 0.0,
+      "3": 0.0
+    },
+    "min_available_gib": [
+      7.635,
+      6.629,
+      8.181,
+      8.106
+    ],
+    "kernel_driver_large_page_retry_lines": 0,
+    "engine_allocation_failures": {
+      "0": 0,
+      "1": 0,
+      "2": 0,
+      "3": 0
+    }
+  },
+  "serving_gate": {
+    "passed": true,
+    "requests": 15,
+    "min_available_gib": [
+      7.746,
+      6.646,
+      8.297,
+      8.226
+    ],
+    "criterion": "functional (tool-call behavior, cache reuse, cancel/resume)"
+  },
+  "cancellation_check": {
+    "passed": true,
+    "min_available_gib": [
+      8.171,
+      6.976,
+      8.663,
+      8.759
+    ]
+  },
+  "residency_check": {
+    "sizes_k": [
+      980,
+      980,
+      980,
+      980
+    ],
+    "rounds": 3,
+    "return_turns": 8,
+    "return_cached_fraction": 1.0,
+    "return_seconds_median": 0.355,
+    "min_available_gib": [
+      7.95,
+      7.34,
+      9.03,
+      9.4
+    ]
+  },
+  "reference_quality": {
+    "carried_over_from": "s1585",
+    "why": "no numeric code changed: the disk tier copies snapshots bit for bit (verified by digest, and the same restore point gives identical text with and without it); regions change where state lives, not the arithmetic",
+    "positions": 2499,
+    "kl": 0.009325392849739931,
+    "kl_ci95": [
+      0.00814229524266305,
+      0.010598958210404472
+    ],
+    "yardstick": 0.009537610223259073,
+    "kl_minus_yardstick_ci95": [
+      -0.0009862300175128823,
+      0.00036526078701479433
+    ],
+    "top1_agree": 0.9595838335334134,
+    "yardstick_top1_agree": 0.9591836734693877,
+    "clear_flips": 0
+  },
+  "against_production_s1599": {
+    "same_boot_cells": {
+      "tool_loop_first_token_s": {
+        "16k/+27": {
+          "candidate_first_token_s": 0.1698993839963805,
+          "production_first_token_s": 0.16896012450160924,
+          "n": [
+            4,
+            4
+          ]
+        },
+        "16k/+75": {
+          "candidate_first_token_s": 0.20871951799927047,
+          "production_first_token_s": 0.20825566099665593,
+          "n": [
+            3,
+            3
+          ]
+        },
+        "16k/+254": {
+          "candidate_first_token_s": 0.25415744299971266,
+          "production_first_token_s": 0.2555088450026233,
+          "n": [
+            3,
+            3
+          ]
+        },
+        "200k/+27": {
+          "candidate_first_token_s": 0.16365247499925317,
+          "production_first_token_s": 0.16152758950192947,
+          "n": [
+            4,
+            4
+          ]
+        },
+        "200k/+75": {
+          "candidate_first_token_s": 0.22620914300205186,
+          "production_first_token_s": 0.22152915599872358,
+          "n": [
+            3,
+            3
+          ]
+        },
+        "200k/+254": {
+          "candidate_first_token_s": 0.2753018899966264,
+          "production_first_token_s": 0.27842051399784395,
+          "n": [
+            3,
+            3
+          ]
+        }
+      },
+      "appended_excerpts_450_to_7400_tokens_mean_first_token_s": {
+        "s1621": 0.5215,
+        "s1599": 0.524
+      },
+      "first_cold_prefill_after_load_16k_tok_s": {
+        "s1621": 5504,
+        "s1599": 7404,
+        "note": "outside the bar; open"
+      },
+      "first_conversation_after_load_median_ratio": 0.993,
+      "streams_16k_aggregate_decode_tok_s": {
+        "1": {
+          "candidate_aggregate_tok_s": 85.41,
+          "production_aggregate_tok_s": 86.97
+        },
+        "2": {
+          "candidate_aggregate_tok_s": 104.66,
+          "production_aggregate_tok_s": 92.74
+        },
+        "3": {
+          "candidate_aggregate_tok_s": 106.63,
+          "production_aggregate_tok_s": 95.03
+        },
+        "4": {
+          "candidate_aggregate_tok_s": 136.33,
+          "production_aggregate_tok_s": 88.83
+        }
+      },
+      "takes_turns_mean_first_token_s": {
+        "s1621": 0.586,
+        "s1599": 0.889
+      },
+      "decode_tok_s_5_reps": {
+        "agentic": {
+          "candidate_tok_s": 92.06179207202058,
+          "production_tok_s": 92.19303257261501,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "code": {
+          "candidate_tok_s": 93.16982092114672,
+          "production_tok_s": 93.16773596128121,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "code-at-128k": {
+          "candidate_tok_s": 93.14014716921615,
+          "production_tok_s": 93.7478481791743,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "json": {
+          "candidate_tok_s": 100.28118830955188,
+          "production_tok_s": 100.35423110742654,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose": {
+          "candidate_tok_s": 71.94860632433719,
+          "production_tok_s": 71.91719855094753,
+          "n": [
+            5,
+            5
+          ]
+        },
+        "prose-at-128k": {
+          "candidate_tok_s": 68.96620981123911,
+          "production_tok_s": 71.87722496810011,
+          "n": [
+            5,
+            5
+          ]
+        }
+      }
+    },
+    "flagged_at_5_reps": [
+      {
+        "cell": "decode prose-at-128k",
+        "candidate": 68.97,
+        "production": 71.88
+      }
+    ],
+    "decode_recheck_20_reps_each_alternating": {
+      "agentic": {
+        "mean_ratio": 1.0008,
+        "median_ratio": 0.9977,
+        "relative_sd": [
+          0.0586,
+          0.0563
+        ]
+      },
+      "code": {
+        "mean_ratio": 0.9996,
+        "median_ratio": 0.9988,
+        "relative_sd": [
+          0.0369,
+          0.0364
+        ]
+      },
+      "code-at-128k": {
+        "mean_ratio": 1.0034,
+        "median_ratio": 1.0021,
+        "relative_sd": [
+          0.0274,
+          0.0286
+        ]
+      },
+      "json": {
+        "mean_ratio": 0.9992,
+        "median_ratio": 0.9957,
+        "relative_sd": [
+          0.0488,
+          0.0451
+        ]
+      },
+      "prose": {
+        "mean_ratio": 0.9931,
+        "median_ratio": 0.9964,
+        "relative_sd": [
+          0.0369,
+          0.0389
+        ]
+      },
+      "prose-at-128k": {
+        "mean_ratio": 0.9811,
+        "median_ratio": 0.9885,
+        "relative_sd": [
+          0.0573,
+          0.0572
+        ]
+      }
+    },
+    "verdict": "the flagged cell is within 3 % at 20 reps (mean 0.981, median 0.989, about one standard error); every other cell is equal or faster"
+  },
+  "install_recovery_fixtures": {
+    "passed": true,
+    "cases": 10
+  },
+  "cpu_tests": {
+    "passed": true,
+    "tests_passed": 276,
+    "failed": 0,
+    "ignored": 29
+  },
+  "activation": {
+    "activated": "2026-11-19, fresh boots of all four devices, one production model load per device",
+    "install": "one journaled transaction; a failed start would fall back to s1599",
+    "head_local_smoke": {
+      "passed": true,
+      "timing_header": "v1",
+      "text": true,
+      "prompt_reuse_tokens": "15651 of 15651",
+      "continuation": true,
+      "image": true
+    },
+    "through_the_router": {
+      "passed": true,
+      "requests": 6,
+      "follow_up_reused_tokens": "3661 of 3728",
+      "every_router_line_after_activation_status_200": "6 of 6"
+    },
+    "memory_baseline_after_load": {
+      "free_gib": [
+        7.1,
+        7.4,
+        7.4,
+        7.5
+      ],
+      "available_gib": [
+        9.1,
+        9.3,
+        9.2,
+        9.3
+      ],
+      "swap_used_gib": 0.0
+    }
+  }
+}

@@ -162,7 +162,7 @@ impl Image {
             }else{
                 let index=self.small.descriptors.iter().position(|r|r==d).ok_or_else(||anyhow::anyhow!("exchange digest region absent"))?;
                 let offset=self.small.offsets[index];
-                for pos in (0..d.bytes).step_by(16<<20){hash.update(self.small.storage.download_part(offset+pos,(d.bytes-pos).min(16<<20))?);}
+                for pos in (0..d.bytes).step_by(16<<20){hash.update(self.small.storage().download_part(offset+pos,(d.bytes-pos).min(16<<20))?);}
             }
         }Ok(format!("{:x}",hash.finalize()))
     }

@@ -53,12 +53,20 @@ impl KeySplit {
             Err(error)=>return Err(error.into()),
         };
         if partitions == 0 && !prefill {return Ok(None);}
-        let root=root.parent().ok_or_else(||anyhow::anyhow!("MQA bundle parent"))?.join("mqa-keysplit-s366");
+        // mqa-v2 (full serving regions: up to 4,198,400 key rows) pairs with mqa-keysplit-v2: the same device code and
+        // adapted source, only the adapters' key-row limit raised.
+        let wide = root.file_name().is_some_and(|n| n == "mqa-v2");
+        let (sibling, adapter) = if wide {
+            ("mqa-keysplit-v2", "4d5d8538d27bd5f9d422a91d822abd7d0378904d92d3069bd4921fee6a869506")
+        } else {
+            ("mqa-keysplit-s366", "09e911e7f4eac60e242e7a36314c6607e919d136f500848aad97721dac063d32")
+        };
+        let root=root.parent().ok_or_else(||anyhow::anyhow!("MQA bundle parent"))?.join(sibling);
         let contract:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
         ensure!(contract["source_commit"]=="14073b4e1e706506e193231209738c848d092a1f"
             && contract["original_sha256"]=="796ee2737d26864cbdf9ba0f9358a7e094e856d8912f8efbf97b6092b4eb5184"
             && contract["adapted_source_sha256"]=="ea77d550ad839ea58a16624ca1db78d844fd5a2640bf0e079e8bd7284ee0c32f"
-            && contract["adapter_sha256"]=="09e911e7f4eac60e242e7a36314c6607e919d136f500848aad97721dac063d32"
+            && contract["adapter_sha256"]==adapter
             && contract["variants"]==serde_json::json!([1,4,6,8,12,16,24]), "MQA split scheduler contract");
         for (name,field) in [("mqa_keysplit.cuh","adapted_source_sha256"),
             ("mqa_keysplit.cu","adapter_sha256"),("libcanada_mqa_keysplit.so","library_sha256")] {
@@ -169,22 +177,66 @@ pub struct KeyMatrix {
     pub(crate) scales: Buffer<i32>,
     stream: Cell<usize>,
     pub(crate) ready: Cell<bool>,
+    /// Full serving regions: rows = regions x region_rows; region k's keys are rows [k x region_rows, (k + 1) x
+    /// region_rows). One region otherwise (region_rows == rows).
+    region_rows: usize,
 }
 impl KeyMatrix {
     pub fn new(cuda: &Cuda, rows: usize) -> Result<Self> {
         ensure!((1..=1048576).contains(&rows), "MQA key rows");
+        Self::new_regions(cuda, rows, 1, false)
+    }
+    /// Full serving regions (config::full_regions): one matrix over `regions` conversations of `region_rows` keys each,
+    /// addressed as the compressed caches are (region k at k x region_rows). With `elastic`, only region 0's rows are
+    /// backed now and region k's are mapped from the image pool while a conversation occupies it (map_region /
+    /// unmap_region); a step never touches the rows of an empty region. Scales stay resident (4 bytes a row).
+    pub(crate) fn new_regions(cuda: &Cuda, region_rows: usize, regions: usize, elastic: bool) -> Result<Self> {
+        let rows = region_rows.checked_mul(regions).ok_or_else(|| anyhow::anyhow!("MQA region key rows overflow"))?;
+        ensure!((1..=4).contains(&regions) && (1..=1048576).contains(&region_rows)
+            && (regions == 1 || rows <= crate::config::index_key_capacity_limit()?), "MQA region key rows");
         let mut scales = cuda.allocate::<i32>(rows.div_ceil(4) * 4)?;
         scales.zero()?;
+        let payload = if elastic && regions > 1 {
+            cuda.allocate_elastic(rows * 64, region_rows * 64, &format!("mqa-region rows {region_rows} x {regions}"))?
+        } else {
+            cuda.allocate(rows * 64)?
+        };
         Ok(Self {
             rows,
-            payload: cuda.allocate(rows * 64)?,
+            payload,
             scales,
             stream: Cell::new(0),
             ready: Cell::new(false),
+            region_rows,
         })
     }
     pub fn rows(&self) -> usize {
         self.rows
+    }
+    pub(crate) fn regions(&self) -> usize {
+        self.rows / self.region_rows
+    }
+    /// Byte span of region k's rows in an elastic region matrix.
+    fn region_span(&self, k: usize) -> Result<(usize, usize)> {
+        ensure!(k >= 1 && k < self.regions() && self.payload.is_elastic(), "elastic key matrix region");
+        Ok((k * self.region_rows * 64, self.region_rows * 64))
+    }
+    /// Elastic region matrices: image-pool chunks mapping region k would take now (0 for any other matrix).
+    pub(crate) fn region_missing_chunks(&self, k: usize) -> Result<usize> {
+        if self.regions() == 1 || !self.payload.is_elastic() { return Ok(0); }
+        let (offset, len) = self.region_span(k)?;
+        self.payload.elastic_missing(offset, len)
+    }
+    /// Map region k's rows from the image pool (new chunks are zeroed); Ok(false), mapping nothing, without room.
+    pub(crate) fn map_region(&self, k: usize) -> Result<bool> {
+        if self.regions() == 1 || !self.payload.is_elastic() { return Ok(true); }
+        let (offset, len) = self.region_span(k)?;
+        self.payload.elastic_map(offset, len)
+    }
+    pub(crate) fn unmap_region(&self, k: usize) -> Result<()> {
+        if self.regions() == 1 || !self.payload.is_elastic() { return Ok(()); }
+        let (offset, len) = self.region_span(k)?;
+        self.payload.elastic_unmap(offset, len)
     }
     pub(crate) fn bind(&self, stream: &Stream) -> Result<()> {
         let p = stream.raw() as usize;
@@ -235,7 +287,8 @@ impl Ranges {
         ensure!(
             (1..=crate::config::MAX_WIDE_ROWS).contains(&starts.len())
                 && lengths.len() == starts.len()
-                && (1..=1048576).contains(&keys)
+                && keys >= 1
+                && (keys <= 1048576 || keys <= crate::config::index_key_capacity_limit()?)
                 && columns > 0
                 && columns <= keys,
             "MQA range dimensions"

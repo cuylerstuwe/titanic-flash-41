@@ -1,5 +1,94 @@
 # Validation status
 
+## November 19 disk-tier and regions release (s1621)
+
+s1621 keeps every setting of s1599 and adds four: a disk tier for conversation snapshots, and full serving regions with
+elastic mapping and a 16K admission lookahead, so that several long conversations decode together. No numeric code,
+weight, clock policy or router change; the serving kernels are the same, with new address layouts.
+
+**Why.**
+- *Evicted conversations were read again from scratch.* The cache keeps sixteen snapshots in an 8 GiB pool a device.
+  Switching between several long conversations evicts snapshots, and a return to an evicted conversation prefilled its
+  whole prompt again: 4.7-12.9 s for the 16K-128K-token conversations of the disk-tier test.
+- *Several conversations could not decode together.* Batched decode split one model context into four regions, so a
+  conversation longer than a quarter of it decoded alone while the others waited; and admission counted a request's
+  whole `max_tokens`, so a request with a large one (clients often send 262,144) never joined a region.
+
+**The change.**
+- `CANADA_SCRATCH_DISK_TIER=1`: in idle time the coldest snapshots get byte-exact copies on local NVMe (SHA-256 per
+  4 MiB chunk, written in 32 MiB slices); a snapshot with a copy is parked, its memory freed, instead of dropped; a
+  later turn reloads it, checking every digest, when the read beats prefilling the tokens it saves.
+- `CANADA_SCRATCH_FULL_REGIONS=1` and `CANADA_SCRATCH_ELASTIC_REGIONS=1`: every region holds a whole conversation, and
+  regions 1-3 are mapped from the snapshot pool only while conversations occupy them.
+- `CANADA_SCRATCH_REGION_LOOKAHEAD=16384`: admission counts the positions a conversation can reach in the next 16,384
+  tokens; one that reaches its region's end sits out and continues alone, never truncated.
+
+**Tests before the bar.**
+- *Disk tier.* Three arms over the same six conversations of 16K-128K tokens for three rounds: tier off, tier on with
+  reloads forced, tier at its defaults. Every request that restored the same prefix in two arms gave identical text
+  (8 of 8 in each pair), and retries served entirely from reloaded snapshots reproduced their original text. Returning
+  to a conversation whose snapshots the cache had evicted took 0.13-0.14 s to the first token with the tier, against
+  4.7-12.9 s without; exact retries took 109-131 ms against 134-151 ms. Reloads of 45-134 MB snapshots took 35-82 ms:
+  the read at about 2.2 GB/s, digests 3-6 ms, and 25-30 ms for the four devices to agree. No copy failed.
+- *Full regions.* The first build faulted after a region below the highest occupied one had been given back. A trace
+  of every map and unmap located the read in the index scorer, which bounds a block of query rows by the union of their
+  key ranges; regions up to the highest occupied one now stay mapped, and the several-conversations panel with the
+  trace on passed with no fault. At 256K, one to four conversations decoded 84.4 / 99.2 / 103.5 / 73.5 tokens/s
+  together. Four are slower than three because a block of rows spanning regions also scores the keys between them;
+  that is open.
+
+**Qualification of s1621, all four settings on.** The same seven panels as s1599, each started on sorted memory, with
+the rule that no page may be swapped out on any device (every swap, reclaim and compaction difference was zero), and
+the three cache cases on the bar's own panels.
+- **Timing contract.** It passed: the header on streamed and plain responses; of six conversations for four owners,
+  two waited; the three conversations without `max_tokens` needed no turn-taking pause (s1599: nine) and all three
+  reported a wait after running.
+- **Routed panel.** It passed: nine routed requests, every response 200; the follow-up through the incremental
+  context transport reused 3,540 prompt tokens.
+- **Several-conversations panel.** It passed: 17 synthetic conversations (the longest 296,940 prompt tokens), every
+  answer naming its own planted code words; all three follow-ups after turn-taking reused their whole prompt.
+- **Stress panel.** It passed: 70 requests reaching 974,076 prompt tokens; the idle 974,076-token conversation's
+  follow-up was served from the cache (first token 0.21 s). Lowest available memory 6.63 GiB; the hottest device read
+  82.9°C; no `allocation_failure` lines and no driver large-page retries.
+- **Near-1M cancellation check** and **serving gate.** Both passed.
+- **Residency.** Four conversations of about 980K tokens took turns for three rounds: all eight return turns were
+  served from the cache (at most 20 tokens read again), with a median time to first token of 0.36 s.
+- **Reference quality** is carried over from s1585: no numeric code changed. The disk tier copies snapshots bit for bit,
+  checked by digest, and the same restore point gives identical text with and without it; regions change where state
+  lives, not the arithmetic.
+- **Other checks.** The native Arm64 build passed 276 CPU tests, and ten installation interruption and rollback
+  fixtures passed.
+
+**Against production (s1599) on one boot.** Every load on sorted memory and cooled to the idle temperature, with each
+device's memory, temperature and process conditions recorded before and after every cell, production's arms first.
+- The live tool loop at 16K and 200K: first tokens of cached appends 0.989-1.021 of production's (0.170 against
+  0.169 s at +27 tokens on 16K, 0.275 against 0.278 s at +254 tokens on 200K).
+- Appended file excerpts of 450-7,400 tokens on two 16K conversations: mean first token 0.522 against 0.524 s; the
+  first conversation after the load 0.99 of production's.
+- One to four 16K streams at the harness's token limit: 85.4 / 104.7 / 106.6 / **136.3** against 87.0 / 92.7 / 95.0 /
+  88.8 tokens/s.
+- Three conversations taking turns and then their follow-ups at once: both passed, every follow-up reused its whole
+  prompt; mean first token **0.59 against 0.89 s**.
+- Decode bare and after a 128K document, five seeds: prose 71.9 against 71.9 tokens/s, code 93.2 against 93.2, agentic
+  92.1 against 92.2, JSON 100.3 against 100.4, code at 128K 93.1 against 93.7, and prose at 128K 69.0 against 71.9,
+  the one cell flagged. Rechecked with twenty runs an arm, alternating the two runtimes on one boot: prose at 128K
+  0.981 of production's (median 0.989; the runs vary 5.7 % apart, so this is about one standard error), every other
+  case 0.993-1.003. Within the 3 % allowance.
+- Outside the bar's cells: the first cold prefill after the load (one 16K stream) ran at 5,504 tokens/s against 7,404.
+  The startup warm-up of the region graphs is the suspect; it is open.
+
+**Installation and activation.** s1621 was installed in one journaled transaction that falls back to s1599; only the
+runtime's paths, the four settings and the runtime's hash pins change in the deployment. It was activated on fresh
+boots with one production model load per device.
+- A head-local smoke test passed text, prompt reuse (15,651 of 15,651 prompt tokens), continuation, image input and
+  text after an image, with the execution-timing header on the live service.
+- **Through the router.** Six requests went through the router in use: a conversation turn, its follow-up (3,661 of
+  3,728 prompt tokens reused), an image, a plain response and two conversations at once. All were served, and every
+  line the router logged afterwards had status 200.
+- A baseline after the load: free 7.1-7.5 GiB, available 9.1-9.3 GiB, no swap.
+
+See the [sanitized qualification record](../validation/disk-tier-regions-release-2026-11-19.json).
+
 ## November 18 cache release (s1599)
 
 s1599 keeps every setting of s1595 and adds two, both about which conversation snapshot a turn saves or keeps. No

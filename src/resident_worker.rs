@@ -473,8 +473,54 @@ struct CachedSession {
     // An image at the end of what several conversations begin with (CANADA_SCRATCH_SHARED_PREFIX_CHECKPOINT).
     // Other conversations restore it, so it is kept as a standalone image when an unrelated prompt takes the bank.
     shared:bool,
+    // Reuse census (Nov 18 2026, for a disk tier's sizing; read only by CANADA_SCRATCH_CACHE_TRACE): what saved the
+    // entry, when, and when a request last checked it out.
+    kind:&'static str,
+    born:Instant,
+    used:Instant,
 }
 impl CachedSession {
+    /// [prefix tokens, charge, kind, seconds since saved, seconds since last checked out, disk state] for the cache trace.
+    fn trace(&self)->Value {
+        let disk=if !self.resident_now(){"parked"}else if self.disk_clean(){"clean"}else{"ram"};
+        json!([self.prefix.len(),self.charge,self.kind,self.born.elapsed().as_secs(),self.used.elapsed().as_secs(),disk])
+    }
+    /// Disk tier (config::disk_tier): every copied image of the entry.
+    fn images(&self)->Vec<&crate::state_image::Image> {
+        match &self.image {CachedState::Complete{image,..}=>image.session.images(),CachedState::Encoder{image,..}=>image.images()}
+    }
+    fn images_mut(&mut self)->Vec<&mut crate::state_image::Image> {
+        match &mut self.image {CachedState::Complete{image,..}=>image.session.images_mut(),CachedState::Encoder{image,..}=>image.images_mut()}
+    }
+    /// Self-contained snapshots only: every storage a copied image (no exchange storage) and no bank-retained tail (its
+    /// omitted prefix lives in the live bank, so its validity depends on state outside the image).
+    fn parkable(&self)->bool {
+        match &self.image {
+            CachedState::Complete{image,..}=>image.session.images().len()==2,
+            CachedState::Encoder{image,..}=>!image.bank_retained()&&image.images().len()==1,
+        }
+    }
+    fn disk_clean(&self)->bool {let v=self.images();!v.is_empty()&&v.iter().all(|i|i.has_disk_copy())}
+    fn resident_now(&self)->bool {self.images().iter().all(|i|i.resident())}
+    fn disk_bytes(&self)->usize {self.images().iter().map(|i|i.disk_bytes()).sum()}
+    fn logical_bytes(&self)->usize {self.images().iter().map(|i|i.bytes()).sum()}
+    fn park_device(&mut self)->Result<()> {for image in self.images_mut(){image.drop_device()?;} Ok(())}
+    /// Ok(false): no memory for every image now (this rank's partial reload is undone).
+    /// Ok(None): no memory for every image now (this rank's partial reload is undone). Otherwise the seconds spent
+    /// allocating, reading, checking digests and uploading, summed over the images.
+    fn reload_device(&mut self)->Result<Option<[f64;4]>> {
+        let mut sum=[0.0f64;4];
+        let mut ok=true;
+        for image in self.images_mut(){
+            match image.reload()? {
+                Some((alloc,t))=>{sum[0]+=alloc;sum[1]+=t.read;sum[2]+=t.digest;sum[3]+=t.upload;}
+                None=>{ok=false;break;}
+            }
+        }
+        if !ok { for image in self.images_mut(){ if image.resident()&&image.has_disk_copy(){image.drop_device()?;} } return Ok(None); }
+        Ok(Some(sum))
+    }
+    fn drop_disk_copies(&mut self) {for image in self.images_mut(){ if image.resident(){let _=image.drop_disk_copy();} }}
     fn opportunistic_logits(&self)->bool {
         self.speculative || (self.prompt_logits.is_some() && self.media.placements().is_empty())
     }
@@ -963,6 +1009,204 @@ fn validate_shared_image_budget(budget:usize,single_bank:bool,exchange:bool,pool
     Ok(())
 }
 
+/// Disk tier: the copy in progress (one slice an idle command): the entry by birth and prefix length, the image being
+/// written, the write class, when the entry's copy began, and the open write.
+struct DiskPending {
+    born: Instant,
+    tokens: usize,
+    image: usize,
+    class: u8,
+    began: Instant,
+    write: Option<crate::disk_tier::PendingWrite>,
+}
+
+impl Worker {
+    /// Disk tier (config::disk_tier): evict cache entry `i`, parking it (RAM freed, kept on disk) when it has a disk copy,
+    /// else dropping it as before. Every rank holds the same entries and copies, so every rank does the same.
+    pub(crate) fn evict_cached(&mut self, i: usize) {
+        let mut entry = self.cached_sessions.remove(i);
+        if self.disk_tier.is_some() && entry.parkable() && entry.disk_clean() && entry.resident_now()
+            && entry.park_device().is_ok() {
+            self.push_parked(entry);
+        }
+    }
+    fn evict_all_cached(&mut self) {
+        while !self.cached_sessions.is_empty() { self.evict_cached(0); }
+    }
+    /// Add a parked entry (newest last) and keep the parked list within its count and the disk cap.
+    fn push_parked(&mut self, entry: CachedSession) {
+        self.parked_sessions.push(entry);
+        let Some((max, cap)) = self.disk_tier.as_ref().map(|t| (t.max_parked, t.cap_bytes)) else { return };
+        while !self.parked_sessions.is_empty()
+            && (self.parked_sessions.len() > max || self.disk_tier_bytes() as u64 > cap) {
+            self.parked_sessions.remove(0);
+        }
+    }
+    /// Disk bytes the tier holds: copies of resident entries and parked entries.
+    fn disk_tier_bytes(&self) -> usize {
+        self.cached_sessions.iter().chain(&self.parked_sessions).map(|c| c.disk_bytes()).sum()
+    }
+    /// Reload parked entry `j` on every rank; on success it is the newest cache entry. A rank without room makes every
+    /// rank undo and evict the oldest resident entry (which parks if it has a copy) before the next try; a read or digest
+    /// failure anywhere drops the entry everywhere (the request then prefills).
+    fn reload_parked(&mut self, j: usize) -> Result<bool> {
+        let began = Instant::now();
+        let mut entry = self.parked_sessions.remove(j);
+        let (tokens, bytes) = (entry.prefix.len(), entry.logical_bytes());
+        let mut evicted = 0usize;
+        // Room under the cache's own slot and byte limits first, chosen by the planner a new snapshot uses (victims park
+        // when they have a copy). Without room the entry stays parked and the request prefills as it would have.
+        let (budget, slots) = self.cache_capacity(0, 0);
+        let entries = self.cached_sessions.iter().map(|c| (c.prefix.len(), c.charge)).collect::<Vec<_>>();
+        let victims = cache_evictions(&entries, (tokens, entry.charge), budget, self.session_cache_long_first, slots);
+        if !self.control.all_admit(victims.is_some())? {
+            self.push_parked(entry);
+            eprintln!("disk tier {}", json!({"event":"reload_over_budget","tokens":tokens,"bytes":bytes}));
+            return Ok(false);
+        }
+        let mut victims = victims.unwrap_or_default();
+        victims.sort_unstable();
+        let planned = began.elapsed().as_secs_f64();
+        for i in victims.into_iter().rev() { self.evict_cached(i); evicted += 1; }
+        let evicting = began.elapsed().as_secs_f64() - planned;
+        let mut phases = [0.0f64; 4];
+        loop {
+            let local = match entry.reload_device() {
+                Ok(timing) => Some(timing),
+                Err(error) => { eprintln!("disk tier reload failed: {error:#}"); None }
+            };
+            if !self.control.all_admit(local.is_some())? {
+                eprintln!("disk tier {}", json!({"event":"reload_dropped","tokens":tokens,"bytes":bytes}));
+                return Ok(false);
+            }
+            let room = local.flatten();
+            if let Some(t) = room { for k in 0..4 { phases[k] += t[k]; } }
+            if self.control.all_admit(room.is_some())? { break; }
+            if entry.resident_now() { entry.park_device()?; }
+            if self.cached_sessions.is_empty() {
+                self.push_parked(entry);
+                eprintln!("disk tier {}", json!({"event":"reload_no_room","tokens":tokens,"bytes":bytes}));
+                return Ok(false);
+            }
+            self.evict_cached(0);
+            evicted += 1;
+        }
+        entry.used = Instant::now();
+        self.cached_sessions.push(entry);
+        eprintln!("disk tier {}", json!({"event":"reload","tokens":tokens,"bytes":bytes,"evicted":evicted,
+            "seconds":began.elapsed().as_secs_f64(),"parked_left":self.parked_sessions.len(),
+            "plan_s":planned,"evict_s":evicting,"alloc_s":phases[0],"read_s":phases[1],"digest_s":phases[2],"upload_s":phases[3]}));
+        Ok(true)
+    }
+    /// Write-behind candidate: prompt-end images with logits first, then completed turns of other conversations, then
+    /// the rest except the two newest entries (the next turn usually supersedes them: writing them would only wear the
+    /// SSD); oldest first within a class. Uses only state every rank shares.
+    fn disk_tier_pick(&self) -> Option<(u8, usize)> {
+        let live = self.history.committed();
+        let n = self.cached_sessions.len();
+        self.cached_sessions.iter().enumerate().filter(|(_, c)| c.parkable() && c.resident_now()
+            && !c.disk_clean() && !c.speculative)
+            .map(|(i, c)| (if c.kind == "prompt_end_logits" {0u8}
+                else if matches!(c.image, CachedState::Complete{..}) && !live.starts_with(&c.prefix) {1} else {2}, i))
+            .filter(|&(class, i)| class < 2 || n - 1 - i >= 2).min()
+    }
+    /// How long the leader waits for a request before its next idle command, given its usual wait: while copies wait to be
+    /// written and the cluster is quiet, idle commands follow each other closely (each writes one slice).
+    pub(crate) fn tier_idle_wait(&self, usual: Duration) -> Duration {
+        match &self.disk_tier {
+            Some(t) if self.disk_tier_busy && self.disk_tier_backoff == 0
+                && self.last_active.elapsed() >= Duration::from_secs(t.idle_secs) => usual.min(Duration::from_millis(20)),
+            _ => usual,
+        }
+    }
+    /// One idle-time step (config::disk_tier), run by every rank in lockstep: at most one slice
+    /// (disk_tier::SLICE) of the copy in progress, then policy parking. Whatever can differ between ranks (quiet time,
+    /// free space, budgets, write success) goes through an all-rank vote; the choices use only state every rank shares
+    /// (entry kinds, the cache's oldest-first order, entry identity by birth and length).
+    fn disk_tier_idle_step(&mut self) -> Result<Option<Value>> {
+        let Some(tier) = self.disk_tier.clone() else { return Ok(None) };
+        if !self.control.all_admit(self.last_active.elapsed() >= Duration::from_secs(tier.idle_secs))? { return Ok(None); }
+        let mut event = None;
+        // The copy in progress belongs to an entry that is still cached and resident; otherwise it is abandoned (the
+        // partial file goes with it). The cache is the same on every rank, so is this.
+        let at = self.disk_pending.as_ref().and_then(|p| self.cached_sessions.iter()
+            .position(|c| c.born == p.born && c.prefix.len() == p.tokens && c.resident_now()));
+        if at.is_none() { self.disk_pending = None; }
+        if self.disk_pending.is_none() && let Some((class, i)) = self.disk_tier_pick() {
+            let bytes = self.cached_sessions[i].logical_bytes() as u64;
+            while self.disk_tier_bytes() as u64 + bytes > tier.cap_bytes && !self.parked_sessions.is_empty() {
+                self.parked_sessions.remove(0);
+            }
+            let days = (self.disk_tier_started.elapsed().as_secs_f64() / 86400.0).max(1.0);
+            let budget = (crate::disk_tier::written_bytes() + bytes) as f64 <= tier.write_bytes_per_day as f64 * days;
+            let space = crate::disk_tier::free_bytes(&tier.dir).is_ok_and(|f| f >= tier.free_floor_bytes + bytes);
+            let cap = self.disk_tier_bytes() as u64 + bytes <= tier.cap_bytes;
+            if self.control.all_admit(budget && space && cap)? {
+                let c = &self.cached_sessions[i];
+                self.disk_pending = Some(DiskPending { born: c.born, tokens: c.prefix.len(), image: usize::MAX, class,
+                    began: Instant::now(), write: None });
+            } else {
+                self.disk_tier_backoff = 20;
+            }
+        }
+        if let Some(mut p) = self.disk_pending.take() {
+            let i = self.cached_sessions.iter().position(|c| c.born == p.born && c.prefix.len() == p.tokens)
+                .context("disk tier pending entry")?;
+            // Start the entry's next image without a copy when none is in progress.
+            let mut failed = None;
+            if p.write.is_none() {
+                let c = &self.cached_sessions[i];
+                if let Some(k) = c.images().iter().position(|im| !im.has_disk_copy()) {
+                    let began = c.images()[k].disk_write_begin(&crate::disk_tier::path_for(&tier.dir, c.kind));
+                    match began { Ok(w) => { p.image = k; p.write = Some(w); } Err(e) => failed = Some(e) }
+                }
+            }
+            if self.control.all_admit(failed.is_none())? {
+                if let Some(mut w) = p.write.take() {
+                    let stepped = self.cached_sessions[i].images()[p.image].disk_write_step(&mut w);
+                    let finished = match stepped {
+                        Ok(()) if w.done() => self.cached_sessions[i].images_mut()[p.image].disk_write_finish(w).map(|()| true),
+                        Ok(()) => { p.write = Some(w); Ok(false) }
+                        Err(e) => Err(e),
+                    };
+                    match finished { Err(e) => failed = Some(e), Ok(_) => {} }
+                }
+            }
+            if let Some(error) = &failed { eprintln!("disk tier write failed: {error:#}"); }
+            if !self.control.all_admit(failed.is_none())? {
+                drop(p);
+                self.cached_sessions[i].drop_disk_copies();
+                self.disk_tier_backoff = 20;
+                event = Some(json!({"event":"copy_failed","tokens":self.cached_sessions[i].prefix.len()}));
+            } else if p.write.is_none() && self.cached_sessions[i].disk_clean() {
+                let c = &self.cached_sessions[i];
+                event = Some(json!({"event":"copy","kind":c.kind,"class":p.class,"tokens":c.prefix.len(),
+                    "bytes":c.logical_bytes(),"seconds":p.began.elapsed().as_secs_f64(),"disk_bytes":self.disk_tier_bytes(),
+                    "written_total":crate::disk_tier::written_bytes()}));
+            } else {
+                self.disk_pending = Some(p);
+            }
+        }
+        // Policy parking: prompt-end images once they have a copy; completed turns of other conversations once
+        // `park_after` newer entries exist.
+        let keep = tier.park_after_requests as usize;
+        let n = self.cached_sessions.len();
+        let live = self.history.committed().to_vec();
+        let park = self.cached_sessions.iter().enumerate().filter(|(i, c)| c.parkable() && c.disk_clean()
+            && c.resident_now() && (c.kind == "prompt_end_logits"
+                || (matches!(c.image, CachedState::Complete{..}) && !live.starts_with(&c.prefix) && n - 1 - i >= keep)))
+            .map(|(i, _)| i).collect::<Vec<_>>();
+        if !park.is_empty() {
+            let freed = park.iter().map(|&i| self.cached_sessions[i].logical_bytes()).sum::<usize>();
+            for &i in park.iter().rev() { self.evict_cached(i); }
+            let parked = json!({"event":"park","entries":park.len(),"bytes_freed":freed,"parked":self.parked_sessions.len()});
+            event = Some(match event { Some(e) => json!([e, parked]), None => parked });
+        }
+        self.disk_tier_busy = self.disk_pending.is_some() || self.disk_tier_pick().is_some();
+        Ok(event)
+    }
+}
+
 /// Only completed cache entries participate. Borrowed parents and unfinished
 /// request images are absent. Prefer obsolete copies of this conversation;
 /// preserve the ordinary long-parent protection for unrelated short requests.
@@ -1035,8 +1279,21 @@ struct Worker {
     /// fresh drafters for the next region-0 conversation. Dropped with the other drafters.
     peers: Vec<batched_serving::Peer>,
     spare_sessions: Vec<GreedySession>,
+    /// Elastic regions: a conversation whose move into a serving region found no room in the image pool even after
+    /// evicting images; it takes turns until a region frees up or another conversation is current.
+    elastic_declined: Option<u64>,
     batched_timing: batched_serving::Timing,
     cached_sessions: Vec<CachedSession>,
+    /// Disk tier (config::disk_tier): snapshots parked on disk (RAM freed), oldest first. Every rank holds the same list.
+    parked_sessions: Vec<CachedSession>,
+    disk_tier: Option<crate::config::DiskTierConfig>,
+    disk_tier_started: Instant,
+    disk_tier_backoff: u32,
+    disk_pending: Option<DiskPending>,
+    /// Elastic serving regions: bit k set while region k's spans are mapped (batched_serving::map_region / release_regions).
+    elastic_mapped: u8,
+    /// Copies wait to be written (the leader shortens its idle wait: tier_idle_wait).
+    disk_tier_busy: bool,
     draft_tails: std::collections::VecDeque<DraftTail>,
     #[cfg(feature = "storage-fault-injection")]
     cache_save_fault: cache_admission_fault::Fault,
@@ -1751,6 +2008,7 @@ impl Worker {
         )?)?;
         let nccl_init_seconds = nccl_started.elapsed().as_secs_f64();
         comm.attach_precise_prefill(&core_bytes,p.wide_widths.iter().copied().max().unwrap_or(4096).max(4096))?;
+        comm.attach_oneshot_twin(&core_bytes, false)?;
         if std::env::var("CANADA_SCRATCH_ENGRAM_NCCL_GATHER").as_deref() == Ok("1") {
             comm.attach_prefill_column_gather(&core_bytes, p.wide_widths.iter().copied().max().unwrap_or(4096).max(4096))?;
         }
@@ -1944,8 +2202,16 @@ impl Worker {
             session: None,
             peers: Vec::new(),
             spare_sessions: Vec::new(),
+            elastic_declined: None,
             batched_timing: Default::default(),
             cached_sessions:Vec::new(),
+            parked_sessions:Vec::new(),
+            disk_tier:None,
+            disk_tier_started:Instant::now(),
+            disk_tier_backoff:0,
+            disk_pending:None,
+            elastic_mapped:0,
+            disk_tier_busy:false,
             draft_tails: Default::default(),
             #[cfg(feature = "storage-fault-injection")]
             cache_save_fault: cache_admission_fault::Fault::default(),
@@ -2034,10 +2300,10 @@ impl Worker {
     /// How long the leader waits for a request before its next idle command (config::idle_heartbeat shortens it
     /// while the last request is recent).
     pub(crate) fn idle_wait(&self) -> Duration {
-        match self.heartbeat {
+        self.tier_idle_wait(match self.heartbeat {
             Some((period, _, window, _)) if self.last_active.elapsed() < Duration::from_secs(window) => Duration::from_millis(period),
             _ => Duration::from_millis(500),
-        }
+        })
     }
     fn agreement_state(&self, tokens: &[u32]) -> Vec<u8> {
         let mut state = Vec::with_capacity(56);
@@ -2218,7 +2484,7 @@ impl Worker {
             if !removed.is_empty(){self.stream.synchronize()?;}
         }
         if !removed.is_empty() {
-            let held=|i:usize|{let c=&self.cached_sessions[i];json!([c.prefix.len(),c.charge])};
+            let held=|i:usize|self.cached_sessions[i].trace();
             cache_trace(||json!({"path":"save","incoming_tokens":prefix.len(),"required":required,
                 "available":traced_available,"slots":slots,"protected":protected,
                 "budget_victims":removed[..budget_evictions].iter().map(|&i|held(i)).collect::<Vec<_>>(),
@@ -2426,11 +2692,11 @@ impl Worker {
             removed.sort_unstable();
             if !removed.is_empty() {
                 cache_trace(||json!({"path":"displaced_reclaim","incoming_tokens":tokens,"available":available,
-                    "victims":removed.iter().map(|&i|json!([entries[i].0,entries[i].1])).collect::<Vec<_>>(),
-                    "entries":entries.iter().map(|e|json!([e.0,e.1])).collect::<Vec<_>>()}));
+                    "victims":removed.iter().map(|&i|self.cached_sessions[i].trace()).collect::<Vec<_>>(),
+                    "entries":self.cached_sessions.iter().map(|c|c.trace()).collect::<Vec<_>>()}));
             }
             self.stream.synchronize()?;
-            for &i in removed.iter().rev() {self.cached_sessions.remove(i);}
+            for &i in removed.iter().rev() {self.evict_cached(i);}
             index-=removed.iter().filter(|&&r|r<index).count();
             // The estimate never authorizes the allocation: recheck actual memory after the release.
             let available=self.cuda.admission_memory()?.admitted_available;
@@ -2487,7 +2753,7 @@ impl Worker {
             let began=Instant::now();
             if let Some(image)=self.try_save_cached_session_image(pending,device_bytes)? {
                 ensure!(image.device_bytes()==device_bytes,"cached image estimate differs from allocation");
-                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,image:CachedState::Complete{image,pending},charge,prompt_logits:None,speculative:false,shared:false});
+                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,image:CachedState::Complete{image,pending},charge,prompt_logits:None,kind:"completed",born:Instant::now(),used:Instant::now(),speculative:false,shared:false});
                 saved=true;
             }
             saved_seconds=began.elapsed().as_secs_f64();
@@ -2548,10 +2814,10 @@ impl Worker {
             if !indices.is_empty() {
                 cache_trace(||json!({"path":"prompt_logits_save","incoming_tokens":plan.prompt.len(),"incoming_charge":charge,
                     "budget":budget,"slots":slots,
-                    "victims":indices.iter().map(|&i|json!([entries[i].0,entries[i].1])).collect::<Vec<_>>(),
-                    "entries":entries.iter().map(|e|json!([e.0,e.1])).collect::<Vec<_>>()}));
+                    "victims":indices.iter().map(|&i|self.cached_sessions[i].trace()).collect::<Vec<_>>(),
+                    "entries":self.cached_sessions.iter().map(|c|c.trace()).collect::<Vec<_>>()}));
             }
-            for i in indices.into_iter().rev(){self.cached_sessions.remove(i);}
+            for i in indices.into_iter().rev(){self.evict_cached(i);}
             Some((self.large.snapshot_prompt_logits(&self.stream)?,device,charge))
         }else{None};
         Ok((ready,json!({"enabled":true,"saved":false,"admitted":admitted,
@@ -2576,6 +2842,26 @@ impl Worker {
         ensure!(if self.session.is_some(){self.verify.profile_is_current() && self.verify.position()==plan.previous as u64}
             else{plan.previous==0&&self.large.position()==0&&self.large.profile_is_current()},
             "cache lookup requires the current accepted owner");
+        // Disk tier: a parked entry that beats every resident one is reloaded (all ranks) and becomes the newest entry.
+        if self.disk_tier.is_some() && !self.parked_sessions.is_empty() {
+            let usable=|c:&CachedSession| c.owner==self.bank_id
+                && (allow_encoder||matches!(&c.image,CachedState::Complete{..})) && plan.prompt.starts_with(&c.prefix)
+                && plan.media.matches_prefix(&c.media,c.prefix.len())
+                && (c.prefix.len()<plan.prompt.len() || (self.prompt_cache_logits && allow_exact_logits
+                    && c.prefix.len()==plan.prompt.len() && c.prompt_logits.is_some()));
+            let resident_best=self.cached_sessions.iter().filter(|c|usable(c)).map(|c|c.prefix.len()).max();
+            let parked_best=self.parked_sessions.iter().enumerate().filter(|(_,c)|usable(c))
+                .max_by_key(|(_,c)|c.prefix.len()).map(|(j,c)|(j,c.prefix.len()));
+            if let Some((j,len))=parked_best && resident_best.is_none_or(|r|len>r) {
+                // Only when the read beats prefilling the rows it saves (disk_tier::reload_pays); every rank agrees.
+                let gain=len-resident_best.unwrap_or(0);
+                let bytes=self.parked_sessions[j].logical_bytes();
+                let (rate,fixed)=self.disk_tier.as_ref().map_or((1.0,0.0),|t|(t.read_bytes_per_s,t.read_fixed_s));
+                let pays=crate::disk_tier::reload_pays(bytes,gain,len==plan.prompt.len(),rate,fixed,crate::config::encoder_chunk_costs());
+                if self.control.all_admit(pays)? {self.reload_parked(j)?;}
+                else {eprintln!("disk tier {}",json!({"event":"reload_skipped","tokens":len,"gain":gain,"bytes":bytes}));}
+            }
+        }
         let hit=self.cached_sessions.iter().enumerate()
             .filter(|(_,c)|(c.owner==self.bank_id||(imports&&self.can_import_cached_encoder(c)))
                 && (allow_encoder||matches!(&c.image,CachedState::Complete{..})) && plan.prompt.starts_with(&c.prefix)
@@ -2586,9 +2872,10 @@ impl Worker {
         // Which entry a request checks out (it is held outside the vector until it returns or is dropped), and what
         // else the cache holds at that moment.
         cache_trace(||json!({"path":"restore_lookup","prompt_tokens":plan.prompt.len(),
-            "hit":hit.map(|i|json!([self.cached_sessions[i].prefix.len(),self.cached_sessions[i].charge])),
-            "entries":self.cached_sessions.iter().map(|c|json!([c.prefix.len(),c.charge])).collect::<Vec<_>>()}));
-        let wanted=hit.map(|i|{let mut cached=self.cached_sessions.remove(i);cached.speculative=false;cached});
+            "hit":hit.map(|i|self.cached_sessions[i].trace()),
+            "entries":self.cached_sessions.iter().map(|c|c.trace()).collect::<Vec<_>>(),
+            "parked":self.parked_sessions.iter().map(|c|c.trace()).collect::<Vec<_>>()}));
+        let wanted=hit.map(|i|{let mut cached=self.cached_sessions.remove(i);cached.speculative=false;cached.used=Instant::now();cached});
         let current_prefix=self.history.committed().to_vec();
         // A displaced unfinished request already owns an immutable image.
         // Do not copy that same loaded prefix into the optional cache too.
@@ -2650,7 +2937,7 @@ impl Worker {
                 let available=self.cuda.admission_memory()?.admitted_available;
                 cache_trace(||json!({"path":"restore_admission_clear","restoring_tokens":cached.prefix.len(),
                     "required":reserve+extra_history,"available":available,"dropped":dropped}));
-                self.cached_sessions.clear();
+                self.evict_all_cached();
                 admitted=self.control.all_admit(self.cuda.admission_memory()?.admitted_available>=reserve+extra_history)?;
                 cache_trace(||json!({"path":"restore_admission_retry","restoring_tokens":cached.prefix.len(),"admitted":admitted}));
             }
@@ -2771,7 +3058,7 @@ impl Worker {
                                     "victims":indices.iter().map(|&i|json!([entries[i].0,entries[i].1])).collect::<Vec<_>>(),
                                     "entries":entries.iter().map(|e|json!([e.0,e.1])).collect::<Vec<_>>()}));
                             }
-                            for i in indices.into_iter().rev(){self.cached_sessions.remove(i);}
+                            for i in indices.into_iter().rev(){self.evict_cached(i);}
                             self.stream.synchronize()?;
                             let image=self.try_save_cached_session_image(pending,device)?;
                             // Test builds can decline one rank's vote after the
@@ -2813,7 +3100,7 @@ impl Worker {
                                     "victims":evictions.iter().map(|&i|json!([entries[i].0,entries[i].1])).collect::<Vec<_>>(),
                                     "entries":entries.iter().map(|e|json!([e.0,e.1])).collect::<Vec<_>>()}));
                             }
-                            for i in evictions.into_iter().rev(){self.cached_sessions.remove(i);}
+                            for i in evictions.into_iter().rev(){self.evict_cached(i);}
                             self.cached_sessions.push(cached);
                             retained_image=true;
                         }
@@ -3386,6 +3673,7 @@ impl Worker {
         if let Some(image)=image {
             ensure!(image.bytes()==device_bytes&&image.position()==checkpoint,"encoder cache saved extent");
             self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,charge,prompt_logits:None,speculative:false,shared:shared_image,
+                kind:if shared_image {"shared_prefix"} else {"prompt_checkpoint"},born:Instant::now(),used:Instant::now(),
                 image:CachedState::Encoder{image,history:checkpoint_history.unwrap(),
                     policy:self.session.as_ref().unwrap().proposal_policy_image()?}});
         }
@@ -3395,6 +3683,7 @@ impl Worker {
             ensure!(image.bytes()==device2&&image.position()==at,"extra encoder cache saved extent");
             self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt[..at].to_vec(),media:media2,
                 charge:charge2,prompt_logits:None,speculative:false,shared:false,
+                kind:"near_end",born:Instant::now(),used:Instant::now(),
                 image:CachedState::Encoder{image,history,policy:self.session.as_ref().unwrap().proposal_policy_image()?}});
         }
         if retained.get("extra_near_end").is_some() {retained["extra_near_end"]["saved"]=json!(extra_saved);}
@@ -3424,6 +3713,7 @@ impl Worker {
             if let Some(image)=self.try_save_cached_session_image(anchor,device)? {
                 ensure!(image.device_bytes()==device,"encoder final prompt image estimate differs");
                 self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt.clone(),media:plan.media.clone(),charge,prompt_logits:Some(logits),speculative:false,shared:false,
+                    kind:"prompt_end_logits",born:Instant::now(),used:Instant::now(),
                     image:CachedState::Complete{image,pending:anchor}});
                 prompt_logit_cache["saved"]=json!(true);
             }else{prompt_logit_cache["late_memory_refused"]=json!(true);}
@@ -3483,7 +3773,7 @@ impl Worker {
                     "evicted":plan.as_ref().map(Vec::len),"parent_dropped":plan.is_none()}));
                 let Some(mut victims)=plan else {return Ok(false);};
                 victims.sort_unstable();
-                for i in victims.into_iter().rev(){self.cached_sessions.remove(i);}
+                for i in victims.into_iter().rev(){self.evict_cached(i);}
             }
             self.cached_sessions.push(parent);
             Ok(true)
@@ -3545,7 +3835,7 @@ impl Worker {
                     "cannot replace an active resident request"
                 );
                 // Batched serving (Worker::region0_admits): the scheduler keeps such a request waiting.
-                ensure!(self.region0_admits(tokens.len().saturating_add(limit))?,
+                ensure!(self.region0_admits(crate::config::region_reach(tokens.len(), limit)?)?,
                     "a conversation that reaches past one serving region needs every region empty");
                 if let Some(dir)=crate::logit_export::dir() {
                     crate::logit_export::prompt(&dir,self.comm.rank(),id,&tokens)?;
@@ -3715,7 +4005,8 @@ impl Worker {
                     if let Some(image)=self.try_save_cached_session_image(anchor,device)? {
                         ensure!(image.device_bytes()==device,"exact prompt image estimate disagrees");
                         self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt.clone(),media:plan.media.clone(),
-                            image:CachedState::Complete{image,pending:anchor},charge,prompt_logits:Some(logits),speculative:false,shared:false});
+                            image:CachedState::Complete{image,pending:anchor},charge,prompt_logits:Some(logits),speculative:false,shared:false,
+                            kind:"prompt_end_logits",born:Instant::now(),used:Instant::now()});
                         prompt_logit_cache["saved"]=json!(true);
                         prompt_logit_cache["image_charge_bytes"]=json!(charge);
                     }else{prompt_logit_cache["late_memory_refused"]=json!(true);}
@@ -3946,6 +4237,11 @@ impl Worker {
                     "idle heartbeat during an active request"
                 );
                 self.agree(&[])?;
+                // Disk tier: one write-behind / parking step while the cluster is quiet.
+                if self.disk_tier.is_some() {
+                    if self.disk_tier_backoff>0 {self.disk_tier_backoff-=1;}
+                    else if let Some(event)=self.disk_tier_idle_step()? {eprintln!("disk tier {event}");}
+                }
                 // config::idle_heartbeat: a short spin on this rank's GPU while the last request is recent.
                 if let (Some((_, spin, window, blocks)), Some(module)) = (self.heartbeat, self.heartbeat_module.as_ref()) {
                     if spin > 0 && self.last_active.elapsed() < Duration::from_secs(window) {
@@ -4136,6 +4432,27 @@ impl Worker {
                 // Serving's batched steps run this owner's Engram-overlap graphs, which it only switches to at
                 // its first batched step (batched_serving): switch first, or the captures land in the other set.
                 longer.ensure_batched_engram_overlap()?;
+                // Elastic serving regions: the captures write at every region's empty frontier, so regions 1.. need
+                // their spans mapped, and the image pool does not exist yet (it takes memory last). A temporary pool
+                // backs them for the warm-up and is released, every chunk returned, before the real pool. Addresses
+                // never change, so the graphs stay valid when serving maps the regions from the real pool.
+                let elastic = crate::config::elastic_regions()?;
+                if elastic {
+                    let mut chunks = 0usize;
+                    // Every owner's region key rows (the 6-row and 32-row owners' too, where they span the regions).
+                    for k in 1..4 {
+                        chunks += longer.serving_region_missing_chunks(k)? + longer.region_keys_missing_chunks(k)?
+                            + self.verify.region_keys_missing_chunks(k)?
+                            + self.copy32_verify.as_ref().map_or(Ok(0), |t| t.region_keys_missing_chunks(k))?;
+                    }
+                    let chunk = self.cuda.image_pool_chunk_bytes()?;
+                    let report = self.cuda.create_image_pool(chunks.max(1) * chunk)?;
+                    for k in 1..4 {
+                        ensure!(longer.map_serving_region(k)? && longer.map_region_keys(k)? && self.verify.map_region_keys(k)?
+                            && self.copy32_verify.as_ref().map_or(Ok(true), |t| t.map_region_keys(k))?, "warm-up map of serving region {k}");
+                    }
+                    eprintln!("batched warm-up regions mapped {}", json!({"chunks":chunks,"pool":report}));
+                }
                 for sessions in 2..=4usize {
                     let share = crate::target::batched_block(16, sessions);
                     let blocks: Vec<usize> = if crate::config::batched_tight_blocks() { (2..=share).collect() } else { vec![share] };
@@ -4154,6 +4471,17 @@ impl Worker {
                             batched_patterns += 1;
                         }
                     }
+                }
+                if elastic {
+                    self.stream.synchronize()?;
+                    for k in 1..4 {
+                        longer.unmap_region_keys(k)?;
+                        self.verify.unmap_region_keys(k)?;
+                        if let Some(t) = self.copy32_verify.as_ref() { t.unmap_region_keys(k)?; }
+                        longer.unmap_serving_region(k)?;
+                    }
+                    let released = self.cuda.release_image_pool()?;
+                    eprintln!("batched warm-up regions released {}", json!({"chunks":released}));
                 }
             }
             self.verify.handoff_from(longer)?;
@@ -5402,6 +5730,14 @@ pub fn run_http(path: &Path) -> Result<()> {
         Some(mib) => { let report = worker.cuda.create_image_pool(mib << 20)?; eprintln!("image pool {report}"); Some(report) },
         None => None,
     };
+    // Disk tier (config::disk_tier): files of an earlier process are worthless (their descriptors named its regions).
+    worker.disk_tier = crate::config::disk_tier()?;
+    if let Some(tier) = worker.disk_tier.as_ref() {
+        crate::disk_tier::reset_dir(&tier.dir)?;
+        worker.disk_tier_started = Instant::now();
+        eprintln!("disk tier {}", json!({"event":"enabled","dir":tier.dir,"cap_gib":tier.cap_bytes>>30,
+            "free_gib":crate::disk_tier::free_bytes(&tier.dir)?>>30,"park_after":tier.park_after_requests}));
+    }
     crate::cuda::SERVING_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
     worker.progress_next = progress_next;
     let mut ready = json!({"type":"ready","rank":p.rank,"identity":worker.identity,

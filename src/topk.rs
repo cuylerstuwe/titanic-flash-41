@@ -109,6 +109,12 @@ impl Windows {
     pub(crate) fn starts_ptr(&self) -> u64 {
         self.starts.ptr()
     }
+    pub(crate) fn offsets_ptr(&self) -> u64 {
+        self.offsets.ptr()
+    }
+    pub(crate) fn width(&self) -> usize {
+        self.width
+    }
     pub(crate) fn rows(&self) -> usize {
         self.rows
     }
@@ -332,6 +338,14 @@ impl Selection {
         ensure!(status == 0, "topk row-slice launch: {status}");
         self.ready.set(rows.end == self.rows);
         Ok(())
+    }
+    pub(crate) fn topk(&self) -> usize {
+        self.topk
+    }
+    /// The indices were written by another producer of this selection's layout (index_bf16): sorted ascending,
+    /// -1 padding, every row's at most `topk` keys.
+    pub(crate) fn note_written(&self) {
+        self.ready.set(true);
     }
     pub fn indices(&self) -> &Buffer<i32> {
         &self.indices

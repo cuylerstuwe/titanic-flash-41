@@ -99,6 +99,14 @@ pub struct Roce {
     native_row_flags:crate::launch_flags::NativeRowFlags,
     native_gather_rows: Cell<Option<ReductionRows>>,
     column_gather: Option<(crate::cuda::Module, RefCell<Buffer<u16>>)>,
+    /// config::oneshot_twin: the CUDA C++ twin of the exported one-shot sum (kernels/roce_oneshot_twin.cuh).
+    oneshot_twin: Option<crate::cuda::Module>,
+    oneshot_twin_active: Cell<bool>,
+    /// config::fused_boundary_blocks: the fused boundary sum's grid.
+    fused_blocks: Cell<usize>,
+    /// config::fused_boundary_poll: one polling block (ca_roce_oneshot_hc2_bf16) and its release word.
+    fused_poll: Cell<bool>,
+    fused_ready: Option<Buffer<u32>>,
     column_gather_live_rows: Cell<bool>,
     column_gather_prefix_calls: Cell<usize>,
     cuda: Cuda,
@@ -355,6 +363,11 @@ impl Roce {
             native_row_flags:crate::launch_flags::NativeRowFlags::from_env(),
             native_gather_rows: Cell::new(None),
             column_gather: None,
+            oneshot_twin: None,
+            oneshot_twin_active: Cell::new(false),
+            fused_blocks: Cell::new(16),
+            fused_poll: Cell::new(false),
+            fused_ready: None,
             column_gather_live_rows: Cell::new(std::env::var("CANADA_SCRATCH_PREFILL_ENGRAM_GATHER_ROWS").as_deref()!=Ok("0")),
             column_gather_prefix_calls: Cell::new(0),
             cuda: cuda.clone(),
@@ -459,6 +472,125 @@ impl Roce {
             "prefill reduction cannot replace a live communicator"
         );
         self.prefill_sum = Some(comm);
+        Ok(())
+    }
+    /// CANADA_SCRATCH_ONESHOT_TWIN=1 (Nov 18 2026, verify-layer stage 1 (a)): decode sums run the CUDA C++ twin of the
+    /// exported one-shot kernel (same protocol, counters, slots and arithmetic; collective_probe checks the bits). The
+    /// module is loaded either way when `load` (the probe switches it); active only with the flag.
+    pub(crate) fn attach_oneshot_twin(&mut self, core: &[u8], load: bool) -> Result<()> {
+        let active = crate::config::oneshot_twin()?;
+        let fused = crate::config::fused_boundary()? != 0;
+        if !(active || load || fused) { return Ok(()); }
+        let module = self.cuda.module(core)?;
+        module.function("ca_roce_oneshot_bf16")?;
+        module.function("ca_roce_oneshot_hc_bf16")?;
+        module.function("ca_roce_oneshot_hc2_bf16")?;
+        self.oneshot_twin = Some(module);
+        self.oneshot_twin_active.set(active);
+        self.fused_blocks.set(crate::config::fused_boundary_blocks()?);
+        self.fused_poll.set(crate::config::fused_boundary_poll()?);
+        let mut ready = self.cuda.allocate::<u32>(4)?;
+        ready.zero()?;
+        self.fused_ready = Some(ready);
+        Ok(())
+    }
+    /// Whether decode sums can carry the mHC boundary (config::fused_boundary): the core module is attached, the decode
+    /// reduction is selected and no component variant replaces the exported kernel.
+    pub(crate) fn fused_boundary_ready(&self) -> bool {
+        self.oneshot_twin.is_some() && self.native_sum_selected.get() && self.notification_probe_variant.get() == 0
+            && !self.poisoned.get()
+    }
+    pub(crate) fn set_fused_blocks_for_probe(&self, blocks: usize, stream: &Stream) -> Result<()> {
+        ensure!(blocks.is_power_of_two() && blocks <= 32, "fused boundary grid");
+        stream.synchronize()?;
+        self.fused_blocks.set(blocks);
+        Ok(())
+    }
+    pub(crate) fn set_fused_poll_for_probe(&self, single: bool, stream: &Stream) -> Result<()> {
+        stream.synchronize()?;
+        self.fused_poll.set(single);
+        Ok(())
+    }
+    /// Verify-layer stage 1 (config::fused_boundary): the decode one-shot sum of `input` (rows of 5,120 bf16; the
+    /// native row scope's live prefix as `sum_bf16`) with the mHC boundary in its epilogue
+    /// (kernels/roce_oneshot_hc.cuh). `output` gets the reduced sublayer exactly as `sum_bf16` stores it,
+    /// `stream_out` the new residual stream (hc_post of `residual` with `post` / `comb`) and `value_out` its collapse
+    /// with `pre`, for the first min(`min_rows`, rows summed) rows: the boundary's rows, past which the separate post-mix
+    /// would only mix padding rows the sum's live-row scope left stale; later rows keep their contents. Same protocol,
+    /// proxy, counters and slots as the exported kernel and its twin. Returns the rows summed.
+    ///
+    /// Safety: as `sum_bf16`; every buffer stays alive until the stream completes and all ranks issue the same
+    /// collective order and byte count (the boundary arguments are local).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sum_hc_bf16(&self, input: &Buffer<half::bf16>, output: &mut Buffer<half::bf16>,
+        residual: &Buffer<half::bf16>, post: &Buffer<f32>, comb: &Buffer<f32>, pre: &Buffer<f32>,
+        stream_out: &Buffer<half::bf16>, value_out: &Buffer<half::bf16>, min_rows: usize, stream: &Stream) -> Result<usize> {
+        self.health()?;
+        let module = self.oneshot_twin.as_ref().ok_or_else(|| anyhow::anyhow!("fused boundary module not attached"))?;
+        ensure!(self.fused_boundary_ready(), "fused boundary sum outside the decode reduction");
+        let capacity = input.len() / 5120;
+        ensure!(input.len() == capacity * 5120 && output.len() == input.len() && capacity > 0
+            && residual.len() == capacity * 20480 && stream_out.len() == capacity * 20480
+            && value_out.len() == capacity * 5120 && post.len() == capacity * 4 && pre.len() == capacity * 4
+            && comb.len() == capacity * 16, "fused boundary geometry");
+        for (ptr, owned) in [(input.ptr(), self.cuda.owns_buffer(input)), (output.ptr(), self.cuda.owns_buffer(output)),
+            (residual.ptr(), self.cuda.owns_buffer(residual)), (stream_out.ptr(), self.cuda.owns_buffer(stream_out)),
+            (value_out.ptr(), self.cuda.owns_buffer(value_out))] {
+            ensure!(owned && ptr % 16 == 0, "fused boundary storage/context/alignment");
+        }
+        ensure!(self.cuda.owns_buffer(post) && self.cuda.owns_buffer(comb) && self.cuda.owns_buffer(pre)
+            && self.cuda.owns_stream(stream), "fused boundary coefficient context");
+        let rows = match self.native_sum_rows.get() { Some(r) => r.count(input.len())? / 5120, None => capacity };
+        let bytes = rows * 5120 * 2;
+        ensure!(rows > 0 && bytes as u64 <= self.layout.slot_bytes, "RoCE buffer/capacity contract");
+        self.peak_native_bytes.set(self.peak_native_bytes.get().max(bytes));
+        let raw = stream.raw() as usize;
+        if let Some(prior) = self.stream.get() {
+            ensure!(prior == raw, "RoCE runtime requires one ordered CUDA stream");
+        } else {
+            self.stream.set(Some(raw));
+        }
+        let blocks = self.fused_blocks.get();
+        let class = blocks.ilog2() as u64;
+        ensure!(blocks.is_power_of_two() && class <= 5, "RoCE grid counter class");
+        let stage_word = if class < 4 { 1 + class } else { 10 + class - 4 };
+        let tail_word = if class < 4 { 5 + class } else { 12 + class - 4 };
+        crate::layer_clock::mark(stream, crate::layer_clock::Site::SumBefore)?;
+        let (mut input_ptr, mut out) = (input.ptr(), output.ptr());
+        let (mut packs, mut nbytes) = ((bytes / 16) as i32, bytes as i32);
+        let (mut recv, mut flag, mut send, mut ctrl) = (self.region.device_ptr() + self.layout.recv_off,
+            self.region.device_ptr() + self.layout.flag_off, self.region.device_ptr() + self.layout.send_off,
+            self.region.device_ptr() + self.layout.ctrl_off);
+        let mut slot_bytes = self.layout.slot_bytes;
+        let (mut epoch, mut stage, mut tail, mut poison) = (self.counters.ptr(), self.counters.ptr() + 4 * stage_word,
+            self.counters.ptr() + 4 * tail_word, self.counters.ptr() + 36);
+        let (mut spin, mut rank) = (20_000_000u32, self.rank as i32);
+        let (mut r, mut po, mut co, mut pr, mut so, mut vo) =
+            (residual.ptr(), post.ptr(), comb.ptr(), pre.ptr(), stream_out.ptr(), value_out.ptr());
+        let mut epilogue_rows = min_rows.min(rows) as i32;
+        let mut ready = self.fused_ready.as_ref().ok_or_else(|| anyhow::anyhow!("fused boundary release word"))?.ptr();
+        let mut args: Vec<*mut c_void> = vec![
+            (&mut input_ptr as *mut u64).cast(), (&mut out as *mut u64).cast(), (&mut packs as *mut i32).cast(),
+            (&mut nbytes as *mut i32).cast(), (&mut recv as *mut u64).cast(), (&mut flag as *mut u64).cast(),
+            (&mut send as *mut u64).cast(), (&mut ctrl as *mut u64).cast(), (&mut slot_bytes as *mut u64).cast(),
+            (&mut epoch as *mut u64).cast(), (&mut stage as *mut u64).cast(), (&mut tail as *mut u64).cast(),
+            (&mut poison as *mut u64).cast(), (&mut spin as *mut u32).cast(), (&mut rank as *mut i32).cast(),
+            (&mut r as *mut u64).cast(), (&mut po as *mut u64).cast(), (&mut co as *mut u64).cast(),
+            (&mut pr as *mut u64).cast(), (&mut so as *mut u64).cast(), (&mut vo as *mut u64).cast(),
+            (&mut epilogue_rows as *mut i32).cast(),
+        ];
+        let name = if self.fused_poll.get() {
+            args.push((&mut ready as *mut u64).cast());
+            "ca_roce_oneshot_hc2_bf16"
+        } else { "ca_roce_oneshot_hc_bf16" };
+        unsafe { module.function(name)?.launch([blocks as u32, 1, 1], [256, 1, 1], 0, stream, &mut args) }?;
+        crate::layer_clock::mark(stream, crate::layer_clock::Site::SumAfter)?;
+        Ok(rows)
+    }
+    pub(crate) fn set_oneshot_twin_for_probe(&self, enabled: bool, stream: &Stream) -> Result<()> {
+        ensure!(self.oneshot_twin.is_some(), "one-shot twin not attached");
+        stream.synchronize()?;
+        self.oneshot_twin_active.set(enabled);
         Ok(())
     }
     pub(crate) fn attach_precise_prefill(&mut self,core:&[u8],rows:usize)->Result<()> {
@@ -1065,6 +1197,28 @@ impl Roce {
         ensure!(class <= 5, "RoCE grid counter class");
         let stage_word = if class < 4 { 1 + class } else { 10 + class - 4 };
         let tail_word = if class < 4 { 5 + class } else { 12 + class - 4 };
+        // The twin speaks the exported kernel's protocol on the same counters: sums only, bf16 (the decode payload).
+        if row_packs.is_none() && std::mem::size_of::<T>() == 2 && self.notification_probe_variant.get() == 0
+            && self.oneshot_twin_active.get() && let Some(module) = &self.oneshot_twin {
+            let (mut input_ptr, mut out) = (input.ptr(), output_ptr);
+            let (mut packs, mut nbytes) = ((bytes / 16) as i32, bytes as i32);
+            let (mut recv, mut flag, mut send, mut ctrl) = (self.region.device_ptr() + self.layout.recv_off,
+                self.region.device_ptr() + self.layout.flag_off, self.region.device_ptr() + self.layout.send_off,
+                self.region.device_ptr() + self.layout.ctrl_off);
+            let mut slot_bytes = self.layout.slot_bytes;
+            let (mut epoch, mut stage, mut tail, mut poison) = (self.counters.ptr(), self.counters.ptr() + 4 * stage_word,
+                self.counters.ptr() + 4 * tail_word, self.counters.ptr() + 36);
+            let (mut spin, mut rank) = (20_000_000u32, self.rank as i32);
+            let mut args: Vec<*mut c_void> = vec![
+                (&mut input_ptr as *mut u64).cast(), (&mut out as *mut u64).cast(), (&mut packs as *mut i32).cast(),
+                (&mut nbytes as *mut i32).cast(), (&mut recv as *mut u64).cast(), (&mut flag as *mut u64).cast(),
+                (&mut send as *mut u64).cast(), (&mut ctrl as *mut u64).cast(), (&mut slot_bytes as *mut u64).cast(),
+                (&mut epoch as *mut u64).cast(), (&mut stage as *mut u64).cast(), (&mut tail as *mut u64).cast(),
+                (&mut poison as *mut u64).cast(), (&mut spin as *mut u32).cast(), (&mut rank as *mut i32).cast(),
+            ];
+            unsafe { module.function("ca_roce_oneshot_bf16")?.launch([blocks as u32, 1, 1], [256, 1, 1], 0, stream, &mut args) }?;
+            return Ok(());
+        }
         let kernels = if row_packs.is_some() {
             self.gather.as_ref().unwrap()
         } else {

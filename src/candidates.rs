@@ -136,7 +136,12 @@ impl Publisher {
         };
         if compact_build {
             publisher.enable_retained_publication()?;
-            ensure!(publisher.compact_mask&&publisher.score_storage_rows()==128
+            // Widths under 512 (Nov 18 2026: 256- and 384-row flex widths) keep the ordinary local-row selector, as 512
+            // does: each rank selects its quarter (rows / 4, under 128, inside the 128-row score storage) and the
+            // selections of all rows are gathered before the 128-row tail mask is built, so a tail that spans two
+            // ranks' quarters is complete. 512 and wider hold exactly 128 score rows a rank.
+            let expected = if rows < 512 { rows / 4 } else { 128 };
+            ensure!(publisher.compact_mask&&publisher.score_storage_rows()==expected
                 &&publisher.retained_raw_lengths.is_some(),"compact publisher constructor not finalized");
         }
         Ok(publisher)

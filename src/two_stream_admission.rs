@@ -202,7 +202,7 @@ pub(super) fn choose(w:&mut Worker, queue:&Queue, active:&mut Option<Job>,
         }
         // Wake immediately when a request arrives, just like the solo path;
         // polling sleep here would add avoidable first-token latency.
-        if let Some(job)=queue.next_fifo(Duration::from_millis(500))? {
+        if let Some(job)=queue.next_fifo(w.tier_idle_wait(Duration::from_millis(500)))? {
             ready.push_back((None,job));continue;
         }
         return Ok(Scheduled::Native(Command::Idle));

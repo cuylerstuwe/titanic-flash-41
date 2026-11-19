@@ -37,6 +37,10 @@ impl ParkedRequest {
             Storage::Resident(_)=>Ok(self.resident_bank(w)?.history.needs_prefix(prefix,media))}
     }
     pub(super) fn is_image(&self)->bool {matches!(self.storage,Storage::Image(_))}
+    /// Batched admission: the positions a paused image can reach (config::region_reach); None for a physical bank.
+    pub(super) fn reach(&self)->Result<Option<usize>> {
+        match &self.storage {Storage::Image(p)=>Ok(Some(p.reach()?)),Storage::Resident(_)=>Ok(None)}
+    }
 }
 
 pub(super) fn park(w:&mut Worker,images:&mut Vec<ParkedRequest>)->Result<Value> {

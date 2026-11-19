@@ -296,8 +296,11 @@ pub struct SwaLayer {
     /// (true: where Q-B forks; false: after the key store, the order without the fork).
     index_fork: Option<Rc<KeysFork>>,
     index_fork_on: Cell<bool>,
+    grouped_sum: Option<Box<GroupedSum>>,
 }
 struct KeysFork { side: Rc<Stream>, ready: crate::cuda::Event, done: crate::cuda::Event }
+/// config::prefill_grouped_sum: the side stream, fences and kernel of this layer's grouped expert sum.
+struct GroupedSum { groups: usize, rows: usize, module: Module, side: Rc<Stream>, ready: crate::cuda::Event, done: Vec<crate::cuda::Event> }
 /// Enqueue/capture-only state. A pooled projection must consume exactly the
 /// private normalization prepared from this predecessor, on the same stream.
 #[derive(Clone,Copy,PartialEq,Eq)]
@@ -695,6 +698,14 @@ impl SwaLayer {
             keys_fork_on: Cell::new(false),
             index_fork: None,
             index_fork_on: Cell::new(false),
+            grouped_sum: match crate::config::prefill_grouped_sum()? {
+                g if g > 0 && sp_rank.is_some() && crate::config::wide_rows(rows) && rows % 4 == 0 && (rows / 4) % g == 0 => {
+                    module.function("ca_moe_group_sum_rows")?;
+                    Some(Box::new(GroupedSum { groups: g, rows, module: module.clone(), side: cuda.auxiliary_stream(stream)?,
+                        ready: cuda.event()?, done: (0..g).map(|_| cuda.event()).collect::<Result<Vec<_>>>()? }))
+                }
+                _ => None,
+            },
             attn_reduced: cuda.allocate_rows(local_rows * 5120)?,
             ffn_reduced: cuda.allocate_rows(local_rows * 5120)?,
         })
@@ -817,28 +828,43 @@ impl SwaLayer {
                 stream,
             )?;
         }
-        self.ffn.prefetch_begin(stream)?;
-        let exchanged = unsafe { Self::reduce_attention(&mut self.sp, &self.attention, &mut self.attn_reduced, &self.ffn, comm, stream) }?;
-        let reduced = match self.sp.as_ref().and_then(|sp| sp.wob.as_ref()) {
-            Some(x) if exchanged => x.full.output(),
-            _ => &self.attn_reduced,
-        };
-        if self.attn_boundary.post_stats_enabled() {
-            self.attn_boundary.finish_with_next_stats(reduced, residual, &self.ffn_boundary, stream)?;
-        } else {
-            self.attn_boundary.finish(reduced, residual, stream)?;
-        }
-        self.ffn_boundary.prepare(
-            self.attn_boundary.output(),
-            Some(self.attn_boundary.pre()),
-            stream,
-        )?;
+        Self::attention_tail(&mut self.sp, &self.attention, &mut self.attn_reduced, &self.ffn, &self.attn_boundary,
+            &mut self.ffn_boundary, residual, comm, stream)?;
         if self.pair_deferred_ffn {return Ok(());}
         self.run_ffn(tokens, comm, stream)?;
         self.finish_ffn(comm,stream)
     }
     pub fn output(&self) -> &Buffer<bf16> {
         self.ffn_boundary.output()
+    }
+    /// The attention sublayer's sum, its boundary's finish and the FFN boundary's preparation. With
+    /// config::fused_boundary (six-row decode) one kernel sums, post-mixes and collapses (Boundary::finish_fused) and
+    /// the FFN boundary's norm-quant reads the collapsed row; the same bits as the separate kernels.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_tail(sp: &mut Option<Sp>, attention: &Attention, attn_reduced: &mut Buffer<bf16>, ffn: &LayerFfn,
+        attn_boundary: &Boundary, ffn_boundary: &mut Boundary, residual: &Buffer<bf16>, comm: &Roce, stream: &Stream)
+        -> Result<()> {
+        ffn.prefetch_begin(stream)?;
+        if sp.is_none() && attn_boundary.fusion_possible() && comm.fused_boundary_ready() {
+            crate::mhc::stats_point(crate::mhc::StatsPoint::BeforeAttentionSum, stream)?;
+            attn_boundary.finish_fused(attention.output(), attn_reduced, residual, comm, stream)?;
+        } else {
+            let exchanged = unsafe { Self::reduce_attention(sp, attention, attn_reduced, ffn, comm, stream) }?;
+            let reduced = match sp.as_ref().and_then(|sp| sp.wob.as_ref()) {
+                Some(x) if exchanged => x.full.output(),
+                _ => &*attn_reduced,
+            };
+            if attn_boundary.post_stats_enabled() {
+                attn_boundary.finish_with_next_stats(reduced, residual, ffn_boundary, stream)?;
+            } else {
+                attn_boundary.finish(reduced, residual, stream)?;
+            }
+        }
+        ffn_boundary.prepare(
+            attn_boundary.output(),
+            Some(attn_boundary.pre()),
+            stream,
+        )
     }
     /// Some(rank) when this layer's residual/pre are this rank's row shard.
     pub(crate) fn sp_rank(&self) -> Option<usize> {
@@ -943,6 +969,37 @@ impl SwaLayer {
         crate::mhc::stats_point(crate::mhc::StatsPoint::BeforeAttentionSum, stream)?;
         unsafe { Self::reduce(sp.is_some(), comm, attention.output(), attn_reduced, stream) }?;
         Ok(false)
+    }
+    /// config::prefill_grouped_sum: the experts' six-route sum in row groups on the side stream (each group laid out
+    /// [destination rank][rows] in the workspace's output storage, which the deferred sum leaves unused), each group's
+    /// reduce-scatter on the model stream once its sum is done, into this rank's rows of `ffn_reduced`. Every element
+    /// keeps its owner rank and its reduction order, so the result equals one sum pass and one reduce-scatter.
+    fn grouped_sum_scatter(&mut self, (routes, live): (u64, usize), comm: &Roce, stream: &Stream) -> Result<()> {
+        let g = self.grouped_sum.as_ref().ok_or_else(|| anyhow::anyhow!("grouped expert sum state"))?;
+        let (quarter, groups) = (g.rows / 4, g.groups);
+        let per = quarter / groups;
+        let out = self.moe_workspace.output();
+        ensure!(self.sp.is_some() && live <= g.rows && out.len() >= g.rows * 5120 && self.ffn_reduced.len() >= quarter * 5120
+            && routes % 16 == 0 && out.ptr() % 16 == 0, "grouped expert sum geometry");
+        g.ready.record(stream)?;
+        g.ready.wait(&g.side)?;
+        let function = g.module.function("ca_moe_group_sum_rows")?;
+        for k in 0..groups {
+            let (mut r, mut o) = (routes, out.ptr() + (k * 4 * per * 5120 * 2) as u64);
+            let (mut q, mut p, mut kk, mut l) = (quarter as i32, per as i32, k as i32, live as i32);
+            let mut args = [(&mut r as *mut u64).cast(), (&mut o as *mut u64).cast(), (&mut q as *mut i32).cast(),
+                (&mut p as *mut i32).cast(), (&mut kk as *mut i32).cast(), (&mut l as *mut i32).cast()];
+            let threads = 4 * per * (5120 / 8);
+            unsafe { function.launch([threads.div_ceil(256) as u32, 1, 1], [256, 1, 1], 0, &g.side, &mut args) }?;
+            g.done[k].record(&g.side)?;
+        }
+        for k in 0..groups {
+            g.done[k].wait(stream)?;
+            let input = unsafe { out.view(k * 4 * per * 5120, 4 * per * 5120)? };
+            let mut output = unsafe { self.ffn_reduced.view(k * per * 5120, per * 5120)? };
+            unsafe { comm.scatter_sum_bf16(&input, &mut output, stream) }?;
+        }
+        Ok(())
     }
     /// Sum a TP partial: all rows (all-reduce), or this rank's rows (SP).
     unsafe fn reduce(
@@ -1392,22 +1449,8 @@ impl SwaLayer {
             Some((auxiliary_cache, auxiliary_candidates)),
             stream,
         )?;
-        self.ffn.prefetch_begin(stream)?;
-        let exchanged = unsafe { Self::reduce_attention(&mut self.sp, &self.attention, &mut self.attn_reduced, &self.ffn, comm, stream) }?;
-        let reduced = match self.sp.as_ref().and_then(|sp| sp.wob.as_ref()) {
-            Some(x) if exchanged => x.full.output(),
-            _ => &self.attn_reduced,
-        };
-        if self.attn_boundary.post_stats_enabled() {
-            self.attn_boundary.finish_with_next_stats(reduced, residual, &self.ffn_boundary, stream)?;
-        } else {
-            self.attn_boundary.finish(reduced, residual, stream)?;
-        }
-        self.ffn_boundary.prepare(
-            self.attn_boundary.output(),
-            Some(self.attn_boundary.pre()),
-            stream,
-        )?;
+        Self::attention_tail(&mut self.sp, &self.attention, &mut self.attn_reduced, &self.ffn, &self.attn_boundary,
+            &mut self.ffn_boundary, residual, comm, stream)?;
         if self.pair_deferred_ffn {return Ok(());}
         self.run_ffn(tokens, comm, stream)?;
         self.finish_ffn(comm,stream)
@@ -1449,20 +1492,31 @@ impl SwaLayer {
         } else if let Some(hint) = &self.next_input_prefetch {
             hint.begin(stream)?;
         }
-        if self.ffn.local_shared_active() {
+        // config::fused_boundary: the sum, the post-mix and the next layer's collapse in one kernel (attention_tail).
+        let fused = !self.ffn.local_shared_active() && self.sp.is_none() && self.ffn_boundary.fusion_possible()
+            && comm.fused_boundary_ready();
+        if fused {
+            self.ffn_boundary.finish_fused(self.ffn.output(), &mut self.ffn_reduced, self.attn_boundary.output(), comm, stream)?;
+        } else if self.ffn.local_shared_active() {
             // Late start: the shared branch reads the unchanged local FFN rows beside the
             // routed reduce-scatter; add_local_shared joins it before the addition.
             if self.ffn.local_shared_late() {
                 self.ffn.begin_local_shared(self.ffn_boundary.input(), stream)?;
             }
             // Routed partial only; this rank's shared rows are added after the sum.
-            unsafe { Self::reduce(self.sp.is_some(), comm, self.moe_workspace.output(), &mut self.ffn_reduced, stream) }?;
+            if let Some(routes) = self.ffn.take_deferred_routes() {
+                self.grouped_sum_scatter(routes, comm, stream)?;
+            } else {
+                unsafe { Self::reduce(self.sp.is_some(), comm, self.moe_workspace.output(), &mut self.ffn_reduced, stream) }?;
+            }
             self.ffn.add_local_shared(&mut self.ffn_reduced, stream)?;
         } else {
             unsafe { Self::reduce(self.sp.is_some(), comm, self.ffn.output(), &mut self.ffn_reduced, stream) }?;
         }
-        self.ffn_boundary
-            .finish(&self.ffn_reduced, self.attn_boundary.output(), stream)?;
+        if !fused {
+            self.ffn_boundary
+                .finish(&self.ffn_reduced, self.attn_boundary.output(), stream)?;
+        }
         if queue.is_none() && let Some(hint) = &self.next_input_prefetch {
             hint.join(stream)?;
         }
@@ -1565,6 +1619,9 @@ impl SwaLayer {
         self.ffn_boundary.set_fullk(enabled)
     }
     fn run_ffn(&mut self, tokens: &TokenRows, comm: &Roce, stream: &Stream) -> Result<()> {
+        // Grouped expert sum (config::prefill_grouped_sum): the ordinary row path with the row-local shared expert only.
+        self.ffn.set_defer_wide_sum(self.grouped_sum.is_some() && self.sp.is_some() && self.ffn.local_shared_active()
+            && !self.ffn.row_transport_active() && !crate::knockout::has(crate::knockout::Site::Sums));
         if self.ffn.local_shared_active() && !self.ffn.local_shared_late() {
             self.ffn.begin_local_shared(self.ffn_boundary.input(), stream)?;
         }

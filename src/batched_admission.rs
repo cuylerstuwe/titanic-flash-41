@@ -61,6 +61,17 @@ fn first_turn_over(emitted: usize, quantum_start: usize, next_is_new: bool) -> b
     quantum_start == 0 && next_is_new && emitted >= FIRST_TURN
 }
 
+/// The waiting conversation `entry` can share the owner with the regions: the positions it can reach (its prompt
+/// or paused frontier plus its tokens, or the next lookahead positions: config::region_reach) fit one region.
+fn reach_fits(entry: &(Option<u64>, Job), images: &[ParkedRequest], capacity: usize) -> bool {
+    let reach = match entry.0 {
+        Some(id) => images.iter().find(|p| p.id == id).and_then(|p| p.reach().ok().flatten()),
+        None => entry.1.reach().ok(),
+    };
+    // Unknown (a physical bank, an unreadable setting): the old bound, prompt plus every token it may produce.
+    super::super::batched_serving::fits_one_region(reach.unwrap_or_else(|| entry.1.extent()), capacity)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn choose(w: &mut Worker, queue: &Queue, active: &mut Option<Job>,
     ready: &mut VecDeque<(Option<u64>, Job)>, region_jobs: &[(u64, Job)], next_id: &mut u64,
@@ -102,7 +113,8 @@ pub(super) fn choose(w: &mut Worker, queue: &Queue, active: &mut Option<Job>,
         let held = queue.router_hold();
         let mut skip = 0u8;
         for (id, job) in region_jobs.iter() {
-            if job.output_backpressured() || (held && job.background) {
+            // A region conversation at its region's end (lookahead admission) sits out too.
+            if job.output_backpressured() || (held && job.background) || w.peer_at_boundary(*id).unwrap_or(false) {
                 if let Some(r) = w.peer_region(*id) { skip |= 1u8 << r; }
             }
         }
@@ -122,14 +134,26 @@ pub(super) fn choose(w: &mut Worker, queue: &Queue, active: &mut Option<Job>,
             }
             let next = w.active_command(job.cancelled() || queue.stopping())?;
             if matches!(next, Command::Finish(_)) { return Ok(Scheduled::Native(next)); }
+            // Lookahead admission: region 0's conversation reached the first region's rows while regions are occupied.
+            // It sits out while they step; with nothing stepping it parks as an image (the regions' finished
+            // conversations can then move back) and waits for the regions to empty.
+            if w.active_at_boundary()? {
+                if stepping { return Ok(Scheduled::Batched(false, skip)); }
+                if !refused && images.len() < 2 { return Ok(Scheduled::Park(None)); }
+                if let Some(id) = w.finished_peer() { return Ok(Scheduled::PeerFinish(id, 2)); }
+                std::thread::sleep(Duration::from_millis(100));
+                return Ok(Scheduled::OutputWait);
+            }
+            let boundary = w.boundary_peer()?;
             // A waiting conversation takes region 0 once this one moves to a free region; when only
             // finished conversations (waiting for region 0) hold the regions, the oldest is dropped.
-            if !ready.is_empty() {
+            // A region conversation at its region's end waits for region 0: nothing new starts or moves meanwhile.
+            if !ready.is_empty() && boundary.is_none() {
                 // Room is made in region 0 for the conversation next in line only if it can share the owner
                 // with the regions: until Nov 14 2026 a short request was moved to a region to resume a paused
                 // conversation of ~950,000 tokens beside it (release stress panel, s1582).
                 let next = next_for_region0(ready.iter().map(|(_, j)| j.background), held);
-                let next_fits = next.is_none_or(|i| super::super::batched_serving::fits_one_region(ready[i].1.extent(), capacity));
+                let next_fits = next.is_none_or(|i| reach_fits(&ready[i], images, capacity));
                 if next_fits {
                     if w.free_region()?.is_none() {
                         if let Some(id) = w.finished_peer() { return Ok(Scheduled::PeerFinish(id, 2)); }
@@ -172,8 +196,18 @@ pub(super) fn choose(w: &mut Worker, queue: &Queue, active: &mut Option<Job>,
         // starts, and when nothing waits. Else the region conversations step.
         // One that can reach past a serving region waits while a region is occupied: the finished region
         // conversations move back (one below, each turn of this loop), the decoding ones step to their end.
+        // Lookahead admission: a region conversation at its region's end takes region 0 first (finished ones move
+        // back before it, other generating ones step on to their ends); nothing else starts ahead of it.
+        if let Some(id) = w.boundary_peer()? {
+            if let Some(finished) = w.finished_peer() { return Ok(Scheduled::SavePeer(finished)); }
+            let others = w.generating_peers() > 1;
+            if others && stepping { return Ok(Scheduled::Batched(false, skip)); }
+            if !others || (!refused && images.len() < 2) { return Ok(Scheduled::AttachPeer(id)); }
+            std::thread::sleep(Duration::from_millis(100));
+            return Ok(Scheduled::Native(Command::Idle));
+        }
         let next = next_for_region0(ready.iter().map(|(_, j)| j.background), held);
-        let next_fits = next.is_none_or(|i| super::super::batched_serving::fits_one_region(ready[i].1.extent(), capacity));
+        let next_fits = next.is_none_or(|i| reach_fits(&ready[i], images, capacity));
         let next = next.filter(|_| !waits_for_empty_regions(next_fits, w.regions_occupied()));
         if let Some(i) = next.filter(|&i| ready[i].0.is_some()) {
             let (saved, job) = ready.remove(i).unwrap();
@@ -199,7 +233,7 @@ pub(super) fn choose(w: &mut Worker, queue: &Queue, active: &mut Option<Job>,
             std::thread::sleep(Duration::from_millis(100));
             return Ok(Scheduled::Native(Command::Idle));
         }
-        if let Some(job) = queue.next_fifo(Duration::from_millis(500))? { ready.push_back((None, job)); continue; }
+        if let Some(job) = queue.next_fifo(w.tier_idle_wait(Duration::from_millis(500)))? { ready.push_back((None, job)); continue; }
         return Ok(Scheduled::Native(Command::Idle));
     }
 }
@@ -228,6 +262,26 @@ mod tests {
     }
     use crate::resident_worker::batched_serving::fits_one_region;
     #[test]
+    fn lookahead_admission_and_region_ends() {
+        use crate::resident_worker::batched_serving::{at_region_end, fits_one_region};
+        let capacity = 262_144;
+        // Admission by reach (config::region_reach_with): a 16K conversation with max_tokens 262,144 fits a region
+        // with a 16,384-position lookahead, not without one.
+        assert!(!fits_one_region(crate::config::region_reach_with(16_000, 262_144, 0), capacity));
+        assert!(fits_one_region(crate::config::region_reach_with(16_000, 262_144, 16_384), capacity));
+        assert_eq!(crate::config::region_reach_with(16_000, 100, 16_384), 16_100);
+        // The end: one more step (at most 16 tokens) plus the 64-position margin must fit.
+        assert!(!at_region_end(capacity - 64 - 16, 1_000, capacity) && at_region_end(capacity - 64 - 15, 1_000, capacity));
+        // A conversation that finishes within the margin may still step.
+        assert!(!at_region_end(capacity - 64 - 5, 5, capacity) && at_region_end(capacity - 64 - 5, 6, capacity));
+        // Admission with any lookahead of at least 16 leaves room for a step.
+        for lookahead in [256, 16_384] {
+            let position = capacity - 64 - lookahead;
+            assert!(fits_one_region(crate::config::region_reach_with(position, 1 << 20, lookahead), capacity));
+            assert!(!at_region_end(position, 1 << 20, capacity));
+        }
+    }
+    #[test]
     fn a_conversation_longer_than_a_region_waits_for_empty_regions() {
         // One region of a 1,048,576-token context split four ways holds 262,144 positions.
         let capacity = 262144;
@@ -237,6 +291,12 @@ mod tests {
         // The last 64 positions of a region are margin.
         assert!(fits_one_region(capacity - 64, capacity) && !fits_one_region(capacity - 63, capacity));
         assert!(!fits_one_region(usize::MAX, capacity));
+        // Full serving regions (Nov 18 2026): any conversation fits whatever its max_tokens, since its extent never
+        // passes the context; equal shares keep their 64-position margin.
+        use crate::resident_worker::batched_serving::fits_one_region_with;
+        let full = crate::config::MODEL_CONTEXT;
+        assert!(fits_one_region_with(full, full, true) && !fits_one_region_with(full + 1, full, true));
+        assert!(!fits_one_region_with(full, full, false) && fits_one_region_with(full - 64, full, false));
         // It waits only while a region is occupied; with the regions empty it takes region 0 like any other.
         assert!(waits_for_empty_regions(false, true));
         assert!(!waits_for_empty_regions(false, false));

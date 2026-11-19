@@ -431,6 +431,10 @@ pub struct LayerFfn {
     /// config::experts_tail: the gate launched on the shared branch after its activation (module, shared bytes).
     tail_gate: Option<(Module, u32)>,
     fused_sum_enabled: Cell<bool>,
+    /// config::prefill_grouped_sum: the next routed launch keeps its route outputs for the layer's grouped sum, and the
+    /// (address, live rows) it left.
+    defer_wide_sum: Cell<bool>,
+    deferred_routes: Cell<Option<(u64, usize)>>,
     activation: Buffer<bf16>,
     output: Buffer<bf16>,
     rows: usize,
@@ -737,6 +741,7 @@ impl LayerFfn {
             fused_sum,
             tail_gate,
             fused_sum_enabled:Cell::new(fused_sum_requested),
+            defer_wide_sum:Cell::new(false),deferred_routes:Cell::new(None),
             activation: cuda.allocate_rows(rows * 576)?,
             output: cuda.allocate_rows(rows * 5120)?,
             rows,
@@ -769,6 +774,7 @@ impl LayerFfn {
         Ok(Self {
             cuda: cuda.clone(), native, router, expert: Expert::new(weights, layout)?, shared_up, shared_down,
             shared_quant: None, fused_sum: None, tail_gate: None, fused_sum_enabled: Cell::new(false),
+            defer_wide_sum: Cell::new(false), deferred_routes: Cell::new(None),
             activation: cuda.allocate_rows(rows * 576)?, output: cuda.allocate_rows(rows * 5120)?, rows,
             shared_branch: None, prefetch: None, expert_prefetch: None, row_transport: None,
             use_row_transport: false, local_shared: None,
@@ -980,8 +986,15 @@ impl LayerFfn {
             // Routed experts only (no fused shared sum); the shared expert ran row-locally.
             self.router.run_routed(input, tokens, fused, stream)?;
             self.join_local_shared(stream)?;
-            workspace.run_live_for_ffn(&self.expert, input, self.router.ids(), self.router.routing(),
-                tokens.active_rows(), false, stream)?;
+            if self.defer_wide_sum.get() {
+                // The layer sums the route outputs itself, in groups beside their reduce-scatters.
+                let routes = workspace.run_live_deferred_wide(&self.expert, input, self.router.ids(), self.router.routing(),
+                    tokens.active_rows(), stream)?;
+                self.deferred_routes.set(Some(routes));
+            } else {
+                workspace.run_live_for_ffn(&self.expert, input, self.router.ids(), self.router.routing(),
+                    tokens.active_rows(), false, stream)?;
+            }
             if fused { crate::moe::route_taken()?; self.router.census(tokens, stream)?; }
             return Ok(());
         }
@@ -1261,6 +1274,8 @@ impl LayerFfn {
             out.ptr() as *mut c_void, stream.raw()) } == 0, "BF16 row add launch");
         Ok(())
     }
+    pub(crate) fn set_defer_wide_sum(&self, on: bool) { self.defer_wide_sum.set(on); }
+    pub(crate) fn take_deferred_routes(&self) -> Option<(u64, usize)> { self.deferred_routes.take() }
     pub(crate) fn local_shared_active(&self) -> bool {
         self.local_shared.is_some() && resolved(&LOCAL_SHARED, "CANADA_SCRATCH_PREFILL_LOCAL_SHARED")
     }

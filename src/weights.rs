@@ -214,6 +214,7 @@ pub struct Weights {
     pub source_sha256: String,
     expert_states: BTreeMap<usize, bool>,
     expert_scale_codes: BTreeMap<usize, Buffer<u8>>,
+    expert_scale_code1: BTreeMap<usize, Buffer<u32>>,
 }
 struct Source {
     file: File,
@@ -463,6 +464,16 @@ impl Weights {
     pub(crate) fn expert_scale_codes(&self,layer:usize)->Option<&Buffer<u8>> {
         self.expert_scale_codes.get(&layer)
     }
+    /// The experts' one-bit scale code of a target layer (config::moe_scale_code1), installed by expert_packing.
+    pub(crate) fn install_expert_scale_code1(&mut self, layer: usize, code: Buffer<u32>) -> Result<()> {
+        ensure!(self.expert_ready(layer) && layer < 40 && !self.expert_scale_code1.contains_key(&layer),
+            "expert scale-code ownership");
+        self.expert_scale_code1.insert(layer, code);
+        Ok(())
+    }
+    pub(crate) fn expert_scale_code1(&self, layer: usize) -> Option<&Buffer<u32>> {
+        self.expert_scale_code1.get(&layer)
+    }
     pub fn ptr(&self, name: &str) -> Result<u64> {
         let v = self.views.get(name).context("missing loaded weight")?;
         Ok(self.atlas.ptr() + v.offset as u64)
@@ -608,6 +619,7 @@ impl Weights {
             source_sha256: format!("{:x}", digest.finalize()),
             expert_states: BTreeMap::new(),
             expert_scale_codes: BTreeMap::new(),
+            expert_scale_code1: BTreeMap::new(),
         })
     }
     fn device_digest(&self, cp: &Checkpoint) -> Result<String> {
@@ -873,6 +885,7 @@ impl Weights {
             source_sha256: m.source_sha256,
             expert_states: BTreeMap::new(),
             expert_scale_codes: BTreeMap::new(),
+            expert_scale_code1: BTreeMap::new(),
         };
         let began=timing.tick();
         ensure!(

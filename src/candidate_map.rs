@@ -55,8 +55,9 @@ impl Map {
         cuda:&Cuda,core:&[u8],rows:usize,width:usize,capacity:usize,
         slots:&[i32],lengths:&[i32],mapped:bool,
     ) -> Result<Self> {
+        // Full serving regions: the batched owner's slot table spans every region (config::index_key_capacity_limit).
         ensure!(
-            (1..=1048576).contains(&slots.len())
+            (1..=crate::config::index_key_capacity_limit()?).contains(&slots.len())
                 && slots.iter().all(|&s| s >= 0 && (s as usize) < capacity),
             "physical candidate slot map"
         );

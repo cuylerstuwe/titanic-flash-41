@@ -145,6 +145,8 @@ pub struct Branch {
     bounded_gather: bool,
     shard_index_rows: bool,
     key_splits: u32,
+    /// config::index_bf16: this dense layer's scores and selection with the reference's bf16 arithmetic.
+    index16: Option<crate::index_bf16::IndexBf16>,
 }
 impl Branch {
     /// Plan screen: this branch's candidate consumer (if any) with the bounded mask kernel on or off.
@@ -208,6 +210,12 @@ impl Branch {
     /// alternative instead of the adaptive sparse, compact (grouped) or key-sharded scorer,
     /// without changing their states; the next ordinary step uses them again. The target
     /// captures region-mode steps in their own graph slots.
+    /// Full serving regions with elastic storage: pool chunks mapping region k's key rows would take (0 when this
+    /// branch's keys hold one region).
+    pub(crate) fn region_key_missing_chunks(&self, k: usize) -> Result<usize> { self.keys.region_missing_chunks(k) }
+    pub(crate) fn map_region_keys(&self, k: usize) -> Result<bool> { self.keys.map_region(k) }
+    pub(crate) fn unmap_region_keys(&self, k: usize) -> Result<()> { self.keys.unmap_region(k) }
+    pub(crate) fn key_regions(&self) -> usize { self.keys.regions() }
     pub(crate) fn set_region_mode(&self,enabled:bool)->Result<()> {
         ensure!(!enabled||!matches!(self.scorer,Scorer::Grouped(_)|Scorer::Sparse6(_)),
             "region mode needs a dense index scorer");
@@ -402,7 +410,15 @@ impl Branch {
         let shard_index_rows = crate::config::wide_rows(rows) &&
             ((shard_requested && columns == 524288 && [2, 8, 14].contains(&layer))
                 || (shard_publisher && columns == 1048576 && layer == 20));
-        ensure!(!(sparse6 || grouped) || key_rows == columns, "sparse index requires zero-based full key storage");
+        // Full serving regions (config::full_regions): the batched owner's key storage spans every region (key_rows =
+        // regions x columns, region k at k x columns); region 0 stays zero-based, so the scorers that need zero-based
+        // storage still see it on single-conversation steps (region steps use the dense scorer).
+        ensure!(key_rows % columns == 0 && (key_rows == columns || crate::config::full_regions()?),
+            "region key storage needs full serving regions");
+        // An unbounded gather walks every slot row, the empty (unmapped) regions' too: region storage needs the bound.
+        ensure!(key_rows == columns || std::env::var("CANADA_SCRATCH_BOUNDED_INDEX_GATHER").as_deref() == Ok("1"),
+            "region key storage needs the bounded index gather");
+        ensure!(!(sparse6 || grouped) || key_rows % columns == 0, "sparse index requires zero-based full key storage");
         let key_capacity=if grouped&&rows==16 {crate::grouped_sparse_index::key_capacity16(columns)}
             else if grouped {crate::grouped_sparse_index::key_capacity(columns)}
             else if sparse6&&!adaptive6 {crate::sparse_index::key_capacity(columns)} else{key_rows};
@@ -416,8 +432,12 @@ impl Branch {
                 &&owner.keys.rows()==key_capacity&&cuda.owns_buffer(&owner.keys.payload),
                 "sequential wide gathered-key loan geometry/owner");
             owner.keys.clone()
+        }else if key_capacity==key_rows&&key_rows>columns {
+            Rc::new(KeyMatrix::new_regions(cuda,columns,key_rows/columns,crate::config::elastic_regions()?)?)
         }else{Rc::new(KeyMatrix::new(cuda,key_capacity)?)};
-        let native = mqa::Native::open(cuda, &kernels.join("mqa-v1"))?;
+        // Region key storage (full serving regions) exceeds mqa-v1's 1,048,576-row adapter limit: mqa-v2 is the same
+        // scorer with the limit raised to the regions' bound.
+        let native = mqa::Native::open(cuda, &kernels.join(if key_rows > 1048576 {"mqa-v2"} else {"mqa-v1"}))?;
         let schedule=native.clone();
         let topk_native = topk::Native::open(cuda, &kernels.join("topk-v2"))?;
         let key_sharded_requested=match std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX") {
@@ -440,7 +460,7 @@ impl Branch {
             Err(std::env::VarError::NotPresent)=>false,
             Err(error)=>return Err(error.into()),
         };
-        let key_sharded=if (rows==6||(rows==16&&sixteen_requested))&&key_rows==columns&&shard_geometry
+        let key_sharded=if (rows==6||(rows==16&&sixteen_requested))&&key_rows%columns==0&&shard_geometry
             &&(branch_requested||std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX_SCREEN").as_deref()==Ok("1")) {
             Some(crate::key_sharded_index::KeySharded::new(cuda,core,native.clone(),topk_native.clone(),query.output(),columns)?)
         }else{None};
@@ -535,6 +555,12 @@ impl Branch {
         let consumer = (wide && [24, 28, 32, 36].contains(&layer))
             .then(|| crate::candidates::Consumer::new(cuda, core, rows, columns))
             .transpose()?;
+        // Dense scorers (source layers, and the consumers' dense mode): full-width keys, no row sharding.
+        let index16 = (crate::config::index_bf16()?
+            && matches!(scorer, Scorer::Dense(_) | Scorer::Adaptive6{..}) && key_capacity >= columns
+            && !shard_index_rows)
+            .then(|| crate::index_bf16::IndexBf16::new(cuda, kernels, rows, columns))
+            .transpose()?;
         ensure!(!serving_grouped16 || !crate::mhc::attention16_overlap_enabled()?
             || crate::mhc::compact16_overlap_enabled()?,
             "compact M16 requires serial attention or the pipeline-fenced overlap opt-in");
@@ -544,7 +570,7 @@ impl Branch {
         let compact_verifier=if compact_requested && columns==1048576 && consumer.is_some() {
             ensure!(((rows==16&&matches!(scorer,Scorer::Dense(_)))
                 ||(rows==32&&matches!(scorer,Scorer::Chunked(_))))
-                && !shard_index_rows && key_rows==columns && key_splits==12,
+                && !shard_index_rows && key_rows%columns==0 && key_splits==12,
                 "compact verifier comparison requires the native16-row12-way dense schedule");
             let mut grouped=crate::grouped_sparse_index::Grouped::new(cuda,core,schedule,
                 topk_native,query.output(),Rc::new(KeyMatrix::new(cuda,
@@ -572,6 +598,7 @@ impl Branch {
             bounded_gather: std::env::var("CANADA_SCRATCH_BOUNDED_INDEX_GATHER").as_deref()==Ok("1"),
             shard_index_rows,
             key_splits,
+            index16,
         };
         if compact_sparse_index_enabled(columns,adaptive6)? {branch.enable_compact_sparse6()?;}
         Ok(branch)
@@ -775,6 +802,7 @@ impl Branch {
         }
         // Block maxima read the raw scores and consumers mask them, both
         // before top-k consumes the row slice.
+        let mut bf16_selected = false;
         let level_one = |scores: &mut Buffer<f32>, stride: usize, rows: std::ops::Range<usize>| -> Result<()> {
             if let Some(p) = &self.publisher {
                 p.score_rows(scores, stride, &meta.windows, rows.clone(), stream)?;
@@ -799,6 +827,30 @@ impl Branch {
                 self.selection
                     .run(dense.output_mut(), &meta.windows, stream)?;
             }
+            Scorer::Dense(dense) | Scorer::Adaptive6{dense,active:false,..} if self.index16.is_some() => {
+                let b = self.index16.as_ref().expect("checked bf16 index");
+                ensure!(meta.windows.width() <= dense.stride(), "bf16 index window width");
+                if self.publisher.is_none() && self.consumer.is_none() {
+                    // Scores as 16-bit keys in the f32 score arena's bytes (half of each row), then the selection,
+                    // already ascending: no topk-v2, no sort.
+                    unsafe {
+                        b.run(&self.query.output(), &self.keys, meta.ranges.key_starts().ptr(),
+                            meta.windows.lengths().ptr(), meta.windows.offsets_ptr(), dense.output().ptr(),
+                            dense.stride() * 2, self.selection.indices(), self.selection.topk(), stream)?;
+                    }
+                    self.selection.note_written();
+                    bf16_selected = true;
+                } else {
+                    // The publisher / consumer read f32 scores: the same values as f32, then today's path.
+                    let stride = dense.stride();
+                    unsafe {
+                        b.run_scores_f32(&self.query.output(), &self.keys, meta.ranges.key_starts().ptr(),
+                            meta.windows.lengths().ptr(), dense.output(), stride, stream)?;
+                    }
+                    level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
+                    self.selection.run(dense.output_mut(), &meta.windows, stream)?;
+                }
+            }
             Scorer::Dense(dense) | Scorer::Adaptive6{dense,active:false,..} => {
                 dense.run(&meta.ranges, stream)?;
                 let stride = dense.stride();
@@ -807,8 +859,14 @@ impl Branch {
                     .run(dense.output_mut(), &meta.windows, stream)?;
             }
             Scorer::Adaptive6{dense,..} if region => {
-                dense.run(&meta.ranges, stream)?;
                 let stride = dense.stride();
+                if let Some(b) = &self.index16 {
+                    ensure!(meta.windows.width() <= stride, "bf16 index window width");
+                    unsafe {
+                        b.run_scores_f32(&self.query.output(), &self.keys, meta.ranges.key_starts().ptr(),
+                            meta.windows.lengths().ptr(), dense.output(), stride, stream)?;
+                    }
+                } else { dense.run(&meta.ranges, stream)?; }
                 level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
                 self.selection
                     .run(dense.output_mut(), &meta.windows, stream)?;
@@ -842,7 +900,7 @@ impl Branch {
         if let Some(rows) = &owned_rows {
             self.selection.gather_row_shard(rows.clone(), comm.expect("checked row-shard communicator"), stream)?;
         }
-        let already_sorted=sparse6_active && self.fused_compact_publication();
+        let already_sorted=(sparse6_active && self.fused_compact_publication()) || bf16_selected;
         if let Some(module) = self.sort_selected.as_ref().filter(|_|!already_sorted) {
             let mut indices = self.selection.indices().ptr();
             // Only the lengths passed to the native selector establish its

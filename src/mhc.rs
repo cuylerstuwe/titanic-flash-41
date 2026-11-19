@@ -15,6 +15,15 @@ use std::{cell::{Cell, RefCell}, path::Path, rc::Rc};
 thread_local! {
     static ACTIVE_ROWS:Cell<Option<(usize,usize,usize,bool)>>=const{Cell::new(None)};
 }
+/// Verify-layer stage 1 (config::fused_boundary): the collapsed row a fused boundary sum wrote for the boundary that
+/// prepares next. Keys: that boundary's residual (the fused boundary's output stream), the pre it collapsed with, the
+/// stream and the capture serial (one graph, or one eager run). The next `prepare` takes it and uses the row only when
+/// every key matches; otherwise it collapses the stream itself, as without the flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FusedValue { residual: u64, pre: u64, value: u64, stream: usize, serial: u64 }
+thread_local! {
+    static FUSED_VALUE: Cell<Option<FusedValue>> = const { Cell::new(None) };
+}
 /// Where a deferred statistics fork may be released later than its boundary's normalization
 /// (CANADA_SCRATCH_MHC_STATS_LATE, default off). The statistics read only the boundary's input residual and are
 /// joined before the boundary's post-mix, so any point inside the sublayer gives the same bits; the point decides
@@ -168,6 +177,10 @@ pub struct Boundary {
     /// and, between a `prepare` that issued this rank's partials and its `finish`, (pseudo-rows, live rows).
     quarter: Option<(Rc<QuarterLink>, Module)>,
     quarter_step: Cell<Option<(usize, usize)>>,
+    /// config::fused_boundary (six-row target boundaries with the layout8 norm-quant): the collapsed row this boundary's
+    /// fused sum writes for the next boundary, and the norm-quant variant that reads such a row. Boxed: the Boundary
+    /// stays small (the engine's main stack is near its limit).
+    fused: Option<Box<FusedBoundary>>,
 }
 /// CANADA_SCRATCH_PREFILL_MHC_POST_STATS=1 (default off): in sequence-parallel prefill layers the
 /// attention boundary's post-mix also forms the FFN boundary's mixing statistics in the same pass
@@ -204,6 +217,13 @@ struct NormQuant {
     values: Buffer<u8>,
     row_scales: Buffer<u8>,
     mma_scales: Buffer<u8>,
+}
+struct FusedBoundary {
+    value: Buffer<bf16>,
+    quant: Operator,
+    /// This boundary's finish is fused (config::fused_boundary's mode names it); every boundary with the box can
+    /// consume a collapsed row.
+    produce: bool,
 }
 struct FullStats {
     stats: Operator,
@@ -648,6 +668,27 @@ impl Boundary {
             std::mem::swap(&mut reduce, &mut pair.1);
             if !pdl_screen && !wide_screen { alternate_pdl_stats = None; }
         }
+        // Verify-layer stage 1: only where the variant exists (the six-row layout8 quantizer, plain or as the PDL pair's
+        // second kernel) and no screen swaps operators.
+        let fused_mode = crate::config::fused_boundary()?;
+        let fused = if fused_mode != 0 && rows == 6 && !id.is_draft() && norm_quant.is_some()
+            && std::env::var("CANADA_SCRATCH_NORM_QUANT_LAYOUT8").as_deref() == Ok("1")
+            && alternate_pdl_pair.is_none() && !wide_screen {
+            let quant = Operator::load(cuda, &kernels.join("mhc-value-norm-quant-v1"),
+                if pdl_pair {"hc_value_norm_quant_p2_pdl"} else {"hc_value_norm_quant_p2"})?;
+            abi(&quant, &[("V","*bf16"),("W","*bf16"),("Y","*bf16"),("Q","*fp8e4nv"),("SR","*u8"),("SM","*u8")])?;
+            let control = &norm_quant.as_ref().unwrap().op.entry;
+            ensure!(quant.entry.programmatic_stream_serialization == control.programmatic_stream_serialization
+                && quant.entry.grid.y == control.grid.y && quant.entry.grid.rows_div == control.grid.rows_div
+                && quant.entry.metadata.num_warps == control.metadata.num_warps,
+                "fused boundary norm-quant variant contract");
+            // Rows past a step's live rows keep finite values (the consumer quantizes all six rows, as today).
+            let mut value = cuda.allocate_rows::<bf16>(rows * 5120)?;
+            value.zero()?;
+            stream.join_default()?;
+            let produce = fused_mode == 1 || (fused_mode == 2 && branch == "attn") || (fused_mode == 3 && branch == "ffn");
+            Some(Box::new(FusedBoundary { value, quant, produce }))
+        } else { None };
         let result = Self {
             pdl_stats,
             alternate_pdl_stats,
@@ -718,6 +759,7 @@ impl Boundary {
             stats_precomputed: Cell::new(0),
             quarter: None,
             quarter_step: Cell::new(None),
+            fused,
         };
         stream.synchronize()?;
         Ok(result)
@@ -913,6 +955,10 @@ impl Boundary {
             "mHC prepare before prior stats join"
         );
         self.quant_ready = false;
+        // A collapsed row left by the boundary that finished just before (config::fused_boundary), if it is this one's.
+        let fused_value = FUSED_VALUE.with(|v| v.take()).filter(|f| f.residual == residual.ptr()
+            && previous_pre.is_some_and(|p| p.ptr() == f.pre) && f.stream == stream.raw() as usize
+            && f.serial == crate::cuda::capture_serial());
         // Only the dynamic-M stock statistics path may shorten its packed
         // partial stride. The fixed-M two-MMA and full-K paths stay unchanged.
         // A wide profile's M/4 sequence-parallel boundaries do not match its
@@ -933,9 +979,16 @@ impl Boundary {
                 "mHC predecessor pre shape/context"
             );
             if let Some(q) = self.norm_quant.as_ref().filter(|_| self.norm_quant_active) {
-                unsafe {q.op.launch(self.rows as u32,
-                    &[residual.ptr(),p.ptr(),self.norm_weight.ptr(),self.normalized.ptr(),
-                      q.values.ptr(),q.row_scales.ptr(),q.mma_scales.ptr()],stream)?;}
+                if let (Some(f), Some(fused)) = (fused_value, self.fused.as_ref()) {
+                    // The same RMS, normalized boundary and MXFP8 bytes from the row the fused sum collapsed.
+                    unsafe {fused.quant.launch(self.rows as u32,
+                        &[f.value,self.norm_weight.ptr(),self.normalized.ptr(),
+                          q.values.ptr(),q.row_scales.ptr(),q.mma_scales.ptr()],stream)?;}
+                } else {
+                    unsafe {q.op.launch(self.rows as u32,
+                        &[residual.ptr(),p.ptr(),self.norm_weight.ptr(),self.normalized.ptr(),
+                          q.values.ptr(),q.row_scales.ptr(),q.mma_scales.ptr()],stream)?;}
+                }
                 self.quant_ready = true;
             } else if self.use_fused_norm {
                 unsafe {
@@ -1162,7 +1215,28 @@ impl Boundary {
             crate::layer_clock::fine_from(stream, &branch.side, crate::layer_clock::FINE_SIDE_STATS)?;
             branch.done.wait(stream)?;
             self.stats_pending.set(false);
-        } else if let Some(branch) = self.deferred_stats.as_ref().filter(|_| !self.stats_knocked_out()) {
+        } else {
+            self.join_deferred_stats(residual, stream)?;
+        }
+        if crate::knockout::has(crate::knockout::Site::Post) { return Ok(()); }
+        unsafe {
+            self.post_op.launch(
+                self.prepared_rows.get() as u32,
+                &[
+                    sublayer.ptr(),
+                    residual.ptr(),
+                    self.post.ptr(),
+                    self.comb.ptr(),
+                    self.output.ptr(),
+                ],
+                stream,
+            )
+        }?;
+        crate::layer_clock::fine(stream, crate::layer_clock::FINE_POST)
+    }
+    /// The deferred statistics branch's join before this boundary consumes its coefficients (finish, finish_fused).
+    fn join_deferred_stats(&self, residual: &Buffer<bf16>, stream: &Stream) -> Result<()> {
+        if let Some(branch) = self.deferred_stats.as_ref().filter(|_| !self.stats_knocked_out()) {
             ensure!(
                 self.stats_pending.get(),
                 "mHC finish without deferred stats fork"
@@ -1185,20 +1259,34 @@ impl Boundary {
             branch.done.wait(stream)?;
             self.stats_pending.set(false);
         }
-        if crate::knockout::has(crate::knockout::Site::Post) { return Ok(()); }
-        unsafe {
-            self.post_op.launch(
-                self.prepared_rows.get() as u32,
-                &[
-                    sublayer.ptr(),
-                    residual.ptr(),
-                    self.post.ptr(),
-                    self.comb.ptr(),
-                    self.output.ptr(),
-                ],
-                stream,
-            )
-        }?;
+        Ok(())
+    }
+    /// Whether this boundary's next finish can be fused into the sublayer's sum (config::fused_boundary): the variant
+    /// is loaded, the quantizer is active and nothing replaces the plain sum / post-mix / statistics path.
+    pub(crate) fn fusion_possible(&self) -> bool {
+        self.fused.as_ref().is_some_and(|f| f.produce) && self.norm_quant_active && self.prepared.get() != 0
+            && self.quarter_step.get().is_none() && self.post_stats.is_none() && !self.stats_knocked_out()
+            && !crate::knockout::has(crate::knockout::Site::Post) && !crate::knockout::has(crate::knockout::Site::Sums)
+            && (self.deferred_stats.is_none() || self.stats_pending.get())
+    }
+    /// Verify-layer stage 1: `finish` with the sublayer's sum. Joins the statistics, then one kernel sums `partial`
+    /// over the four ranks into `reduced` (as the plain sum stores it), writes this boundary's output stream (as the
+    /// post-mix does) and its collapse with this boundary's pre (as the next boundary's norm-quant computes it before
+    /// its RMS), which the next `prepare` takes. Callers check `fusion_possible` first.
+    pub(crate) fn finish_fused(&self, partial: &Buffer<bf16>, reduced: &mut Buffer<bf16>, residual: &Buffer<bf16>,
+        comm: &crate::roce::Roce, stream: &Stream) -> Result<()> {
+        self.guard(residual, stream)?;
+        ensure!(self.fusion_possible() && comm.fused_boundary_ready() && self.prepared.get() == residual.ptr()
+            && partial.len() == self.rows * 5120 && reduced.len() == partial.len() && self.cuda.owns_buffer(partial)
+            && self.cuda.owns_buffer(reduced), "fused mHC finish requires a prepared fusable boundary");
+        let fused = self.fused.as_ref().unwrap();
+        self.join_deferred_stats(residual, stream)?;
+        // The kernel post-mixes min(prepared rows, rows summed): with a live-row sum scope and no mHC live-row scope the
+        // rows past the sum's are padding (the separate post-mix would mix stale sums there).
+        unsafe { comm.sum_hc_bf16(partial, reduced, residual, &self.post, &self.comb, &self.pre,
+            &self.output, &fused.value, self.prepared_rows.get(), stream) }?;
+        FUSED_VALUE.with(|v| v.set(Some(FusedValue { residual: self.output.ptr(), pre: self.pre.ptr(),
+            value: fused.value.ptr(), stream: stream.raw() as usize, serial: crate::cuda::capture_serial() })));
         crate::layer_clock::fine(stream, crate::layer_clock::FINE_POST)
     }
     /// Read-only diagnostics after a completed verification. Layer-owned inputs

@@ -227,7 +227,7 @@ impl Schedule {
     ) -> Result<Self> {
         ensure!(
             (1..=crate::config::MAX_WIDE_ROWS).contains(&positions.len())
-                && (1..=1052672).contains(&capacity)
+                && (1..=crate::config::index_key_capacity_limit()?).contains(&capacity)
                 && (1..=1048576).contains(&frequency_rows),
             "index schedule dimensions"
         );
@@ -295,7 +295,7 @@ impl KeyCache {
             [2, 8, 14, 20].contains(&layer)
                 && (1..=crate::config::MAX_WIDE_ROWS).contains(&rows)
                 && pages > 0
-                && pages <= 16448
+                && pages <= crate::config::index_key_capacity_limit()? / 64
                 && weights.in_context(cuda)
                 && frequency.compressed()
                 && cuda.owns_buffer(frequency.values()),
@@ -308,15 +308,19 @@ impl KeyCache {
             "index key norm weight"
         );
         let norm = weights.ptr(&name)?;
-        let mut data = cuda.allocate::<u8>(pages * 64 * 68)?;
-        data.zero()?;
+        let ratio = if layer == 20 { 1 } else { 2 };
+        let data = match crate::config::elastic_resident_slots(ratio)? {
+            // Elastic regions: region 0's key pages are resident (and zeroed); the others are mapped per region.
+            Some(slots) => cuda.allocate_elastic(pages * 64 * 68, slots.div_ceil(64).min(pages) * 64 * 68, &format!("index-keys layer {layer}"))?,
+            None => { let mut data = cuda.allocate::<u8>(pages * 64 * 68)?; data.zero()?; data }
+        };
         Ok(Self {
             cuda: cuda.clone(),
             native,
             _weights: weights,
             frequency,
             norm,
-            ratio: if layer == 20 { 1 } else { 2 },
+            ratio,
             rows,
             capacity: pages * 64,
             data: Rc::new(data),
@@ -380,10 +384,27 @@ impl KeyCache {
     }
     pub(crate) fn clear_state(&mut self, stream: &Stream) -> Result<()> {
         self.bind(stream)?;
+        if self.data.is_elastic() {
+            for (at, bytes) in self.data.elastic_mapped_extents()? { unsafe { self.cuda.zero_device(at, bytes, stream) }?; }
+            return Ok(());
+        }
         unsafe {
             self.cuda
                 .zero_device(self.data.ptr(), self.data.bytes(), stream)
         }
+    }
+    /// Map key pages [first, last) of an elastic key cache (64 keys of 68 bytes a page); Ok(false) without room.
+    pub(crate) fn map_pages(&self, first: usize, last: usize) -> Result<bool> {
+        ensure!(first < last && last * 64 <= self.capacity, "key page span");
+        self.data.elastic_map(first * 64 * 68, (last - first) * 64 * 68)
+    }
+    pub(crate) fn unmap_pages(&self, first: usize, last: usize) -> Result<()> {
+        ensure!(first < last && last * 64 <= self.capacity, "key page span");
+        self.data.elastic_unmap(first * 64 * 68, (last - first) * 64 * 68)
+    }
+    pub(crate) fn missing_chunks(&self, first: usize, last: usize) -> Result<usize> {
+        ensure!(first < last && last * 64 <= self.capacity, "key page span");
+        self.data.elastic_missing(first * 64 * 68, (last - first) * 64 * 68)
     }
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -424,9 +445,10 @@ impl KeySlots {
     pub(crate) fn capacity(&self) -> usize { self.capacity }
     pub fn new(cuda: &Cuda, capacity: usize, values: &[i32]) -> Result<Self> {
         ensure!(
-            (1..=1048576).contains(&values.len())
+            !values.is_empty()
+                && (values.len() <= 1048576 || values.len() <= crate::config::index_key_capacity_limit()?)
                 && capacity > 0
-                && capacity <= 1052672
+                && capacity <= crate::config::index_key_capacity_limit()?
                 && values.iter().all(|&v| v >= 0 && (v as usize) < capacity),
             "index gather slot bounds"
         );

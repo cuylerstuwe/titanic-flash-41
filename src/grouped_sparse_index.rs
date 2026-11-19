@@ -108,8 +108,13 @@ impl Grouped {
     pub(crate) fn run(&mut self, cache: &KeyCache, slots: &KeySlots,
         windows: &Windows, mask: &Buffer<u8>, output: &Selection, stream: &Stream) -> Result<()> {
         let blocks = self.columns / BLOCK;
+        // Full serving regions: the 16-row owner's slot table spans every region, region 0's columns first. A
+        // grouped step is never a region step (every step with batched rows runs the dense scorer in region mode,
+        // target.rs set_region_step), so its rows are region 0's and read the first `columns` slots.
+        let slot_table = slots.values().len() == self.columns
+            || (crate::config::full_regions()? && slots.values().len() % self.columns == 0);
         ensure!(windows.rows() == self.rows && mask.len() == self.rows * blocks
-            && slots.values().len() == self.columns && slots.capacity() == cache.capacity()
+            && slot_table && slots.capacity() == cache.capacity()
             && self.cuda.owns_buffer(cache.data()) && self.cuda.owns_buffer(slots.values())
             && self.cuda.owns_buffer(mask) && self.cuda.owns_buffer(windows.lengths())
             && self.cuda.owns_stream(stream), "grouped sparse cache/mask/windows/context");

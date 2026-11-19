@@ -1251,3 +1251,5 @@ extern "C" __global__ void ca_trace_copy_first(const uint32_t* current,
 #include "wob8_sum4.cuh"
 #include "mhc_post_stats.cuh"
 #include "moe_frontend.cuh"
+#include "roce_oneshot_twin.cuh"
+#include "roce_oneshot_hc.cuh"

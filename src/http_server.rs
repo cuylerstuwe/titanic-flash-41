@@ -313,6 +313,11 @@ impl Job {
     pub(crate) fn extent(&self) -> usize {
         self.prompt_tokens.max(self.tokens.len()).saturating_add(self.limit)
     }
+    /// The positions this request can reach for batched admission (config::region_reach): its prompt plus its
+    /// whole token limit, or the next lookahead positions.
+    pub(crate) fn reach(&self) -> Result<usize> {
+        crate::config::region_reach(self.prompt_tokens.max(self.tokens.len()), self.limit)
+    }
     /// Transitions only: no timer, lock or notification on an unchanged step.
     pub(crate) fn set_executing(&self, executing: bool) {
         if self.executing.replace(executing) != executing {

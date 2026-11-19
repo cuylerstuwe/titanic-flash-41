@@ -21,9 +21,23 @@ use crate::dspark_generation::BatchedSession;
 use crate::target::SessionBase;
 
 /// A conversation that can reach `extent` positions stays inside one serving region of `capacity` positions
-/// (64 positions of margin: a step's rows and the page a region's last rows share).
+/// (64 positions of margin: a step's rows and the page a region's last rows share). Full regions
+/// (config::full_regions) need no margin: every region is the whole model context, starts on a page boundary and
+/// no conversation's rows pass the context, so any conversation fits.
 pub(crate) fn fits_one_region(extent: usize, capacity: usize) -> bool {
-    extent.saturating_add(64) <= capacity
+    fits_one_region_with(extent, capacity, crate::config::full_regions().unwrap_or(false))
+}
+pub(crate) fn fits_one_region_with(extent: usize, capacity: usize, full: bool) -> bool {
+    extent.saturating_add(if full { 0 } else { 64 }) <= capacity
+}
+/// Tokens one batched step can add to a conversation at most (a step verifies at most six rows of a conversation;
+/// sixteen keeps a margin): with lookahead admission (config::region_lookahead) a conversation closer than this to
+/// its region's end sits out.
+const BOUNDARY_STEP: usize = 16;
+/// A generating conversation at `position` with `remaining` tokens to produce cannot take another batched step
+/// inside a region of `capacity` positions (only reachable with lookahead admission).
+pub(crate) fn at_region_end(position: usize, remaining: usize, capacity: usize) -> bool {
+    !fits_one_region(position.saturating_add(remaining.min(BOUNDARY_STEP)), capacity)
 }
 pub(crate) fn enabled() -> Result<bool> {
     match std::env::var("CANADA_SCRATCH_BATCHED_DECODE") {
@@ -44,7 +58,10 @@ fn pair_rows() -> Result<usize> {
 
 /// Startup validation of the batched decode serving profile.
 pub(crate) fn validate() -> Result<()> {
-    if !enabled()? { return Ok(()); }
+    if !enabled()? {
+        ensure!(!crate::config::full_regions()?, "full serving regions need batched decode");
+        return Ok(());
+    }
     ensure!(crate::config::batched_regions()? >= 2 && crate::config::reset_keeps_caches()?
         && crate::config::batch_screen_sessions()? == 1,
         "batched decode needs CANADA_SCRATCH_BATCHED_REGIONS >= 2 and the kept-cache reset");
@@ -53,6 +70,9 @@ pub(crate) fn validate() -> Result<()> {
     ensure!(std::env::var("CANADA_SCRATCH_COMPACT_STATE_IMAGE").as_deref() == Ok("1")
         && std::env::var("CANADA_SCRATCH_HTTP_INTERLEAVE").as_deref() == Ok("1"),
         "batched decode needs compact (region-0) state images and the HTTP interleave scheduler");
+    // The warm-up runs every batched pattern at the regions' empty frontiers before Ready, before the image pool
+    // exists: with elastic regions it maps regions 1.. from a temporary pool released before the real one
+    // (resident_worker::warm_before_ready).
     crate::dspark_generation::batched_gate_from_env()?;
     ensure!(std::env::var("CANADA_SCRATCH_RESIDENT_BANKS").as_deref() != Ok("1")
         && std::env::var("CANADA_SCRATCH_STATE_EXCHANGE").as_deref() != Ok("1"),
@@ -142,10 +162,32 @@ impl Worker {
     }
     /// A serving region holds a conversation: decoding, or finished and waiting to move back to region 0.
     pub(crate) fn regions_occupied(&self) -> bool { !self.peers.is_empty() }
-    /// Positions one serving region holds.
+    /// Positions one serving region holds: with full regions a whole conversation, so every conversation fits
+    /// whatever its `max_tokens` (Nov 18 2026), else an equal share of the one context.
     pub(crate) fn region_capacity(&self) -> Result<usize> {
-        Ok(SessionBase::region_capacity(self.verify.context_capacity(), crate::config::batched_regions()?))
+        let capacity = SessionBase::serving_capacity(self.verify.context_capacity(), crate::config::batched_regions()?)?;
+        Ok(crate::config::region_capacity_test()?.map_or(capacity, |test| test.min(capacity)))
     }
+    /// The first generating region conversation that has reached its region's end (lookahead admission): it sits out
+    /// and moves back to region 0 once it is the only conversation left (attach_peer).
+    pub(crate) fn boundary_peer(&self) -> Result<Option<u64>> {
+        let capacity = self.region_capacity()?;
+        Ok(self.peers.iter().filter(|p| p.finished.is_none()
+            && at_region_end(p.position(), p.limit.saturating_sub(p.emitted), capacity)).map(|p| p.id).min())
+    }
+    pub(crate) fn peer_at_boundary(&self, id: u64) -> Result<bool> {
+        let capacity = self.region_capacity()?;
+        let peer = self.peers.iter().find(|p| p.id == id).context("unknown region conversation")?;
+        Ok(peer.finished.is_none() && at_region_end(peer.position(), peer.limit.saturating_sub(peer.emitted), capacity))
+    }
+    /// Region 0's generating conversation has reached the first region's rows while regions are occupied: it sits out
+    /// until they are empty (lookahead admission).
+    pub(crate) fn active_at_boundary(&self) -> Result<bool> {
+        Ok(!self.peers.is_empty() && self.current.is_some() && self.pending_prefill.is_none()
+            && at_region_end(self.verify.position() as usize, self.limit.saturating_sub(self.emitted), self.region_capacity()?))
+    }
+    /// Region conversations still generating (not finished).
+    pub(crate) fn generating_peers(&self) -> usize { self.peers.iter().filter(|p| p.finished.is_none()).count() }
     /// Region 0 shares the owner's compressed address space with the serving regions: region k's rows start at
     /// k times a region's capacity, and region 0's at zero, without an upper bound of their own. A region-0
     /// conversation that reaches past one region's capacity therefore covers the regions' rows, and so does its
@@ -175,7 +217,15 @@ impl Worker {
             || !self.verify.profile_is_current() {
             return Ok(false);
         }
-        Ok(fits_one_region(self.verify.position() as usize + (self.limit - self.emitted), self.region_capacity()?))
+        // Elastic regions: the free region's spans must fit the image pool's free chunks now (rank 0 decides; every rank
+        // confirms in detach_active).
+        // Elastic regions: detach_active makes room by evicting images when it must; a conversation for which even that
+        // failed takes turns until a region frees up (elastic_declined is cleared then) or another one is current.
+        if crate::config::elastic_regions()? && self.elastic_declined.is_some() && self.elastic_declined == self.current {
+            return Ok(false);
+        }
+        Ok(fits_one_region(crate::config::region_reach(self.verify.position() as usize, self.limit - self.emitted)?,
+            self.region_capacity()?))
     }
     /// Move the decoding region-0 conversation into `region` and reset region 0 for the next prompt.
     pub(crate) fn detach_active(&mut self, region: usize) -> Result<Value> {
@@ -183,6 +233,21 @@ impl Worker {
         ensure!(enabled()? && self.can_detach()? && self.free_region()? .is_some()
             && !self.peers.iter().any(|p| p.region == region)
             && (1..crate::config::batched_regions()?).contains(&region), "batched detach eligibility");
+        // Elastic regions: map the region's cache spans first (the kept images below also take pool chunks). Every
+        // rank must have the room rank 0 saw; a rank that does not fails all of them alike instead of diverging.
+        let elastic = crate::config::elastic_regions()?;
+        let mut evicted = 0;
+        if elastic {
+            let (room, gave_way) = self.reclaim_for_region(region)?;
+            evicted = gave_way;
+            if !room {
+                // Nothing more may give way: this conversation stays in region 0 and takes turns, as without regions.
+                self.elastic_declined = self.current;
+                return Ok(json!({"type":"detach_declined","request_id":self.current,"region":region,
+                    "evicted_images":evicted,"seconds":began.elapsed().as_secs_f64()}));
+            }
+            ensure!(self.map_region(region)?, "elastic region map lost its room");
+        }
         let id = self.current.unwrap();
         // Cached images of this conversation are sparse: their prefix lives in region 0's bank, on the lineage the
         // reset below ends. Copy out the newest one (the conversation's next turn restores it) and every
@@ -216,7 +281,94 @@ impl Worker {
         self.verify.reset(self.target_lineage, &self.comm, &self.stream)?;
         self.control.agree(&serde_json::to_vec(&json!({"batched_detach_v1":[id, region as u64, position as u64]}))?)?;
         Ok(json!({"type":"detach","request_id":id,"region":region,"position":position,"relocation":moved,
-            "kept_images":kept,"peers":self.peers.len(),"seconds":began.elapsed().as_secs_f64()}))
+            "kept_images":kept,"peers":self.peers.len(),"elastic":elastic,"evicted_images":evicted,
+            "seconds":began.elapsed().as_secs_f64()}))
+    }
+    /// Elastic regions: evict cached images in the cache's pressure order (as the displaced reclaim does), one at a
+    /// time, until every rank's image pool can map serving region `region`. Ranks agree on each victim, so all evict
+    /// the same entries. Returns (room, images evicted); no room once nothing evictable is left.
+    /// Elastic regions: whether the image pool's free chunks can map `region`'s cache spans and, with full regions, the
+    /// 16-row owner's key rows of that region.
+    /// Elastic regions: the regions mapping `region` needs, 1..=region minus those already mapped. Every region up to the
+    /// highest occupied one stays mapped (release_regions): an index scorer bounds each block of query rows by the union
+    /// of its rows' key ranges, so a block holding rows of region 0 and region 3 also reads regions 1 and 2 (Nov 18,
+    /// fqa4: an MMU read fault in region 1's index key rows after its conversation left while region 3's stayed).
+    fn regions_to_map(&self, region: usize) -> Vec<usize> {
+        (1..=region).filter(|&j| self.elastic_mapped & (1u8 << j) == 0).collect()
+    }
+    fn region_room(&self, region: usize) -> Result<bool> {
+        let mut need = 0;
+        for j in self.regions_to_map(region) {
+            need += self.verify.serving_region_missing_chunks(j)?;
+            for owner in self.region_key_owners() { need += owner.region_keys_missing_chunks(j)?; }
+        }
+        Ok(need <= self.cuda.image_pool_free_chunks().unwrap_or(0))
+    }
+    /// Every owner whose index key matrices may span the regions: the 6-row, 16-row and 32-row owners (an owner without
+    /// region matrices maps nothing).
+    fn region_key_owners(&self) -> Vec<&crate::target::Target> {
+        [Some(&self.verify), self.long_verify.as_ref(), self.copy32_verify.as_ref()].into_iter().flatten().collect()
+    }
+    /// Map one region's cache spans and every owner's region key rows, all or nothing (Ok(false) without room).
+    fn map_one_region(&self, region: usize) -> Result<bool> {
+        if !self.verify.map_serving_region(region)? { return Ok(false); }
+        let owners = self.region_key_owners();
+        for (i, owner) in owners.iter().enumerate() {
+            if !owner.map_region_keys(region)? {
+                for done in &owners[..i] { done.unmap_region_keys(region)?; }
+                self.verify.unmap_serving_region(region)?;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    fn unmap_one_region(&self, region: usize) -> Result<()> {
+        for owner in self.region_key_owners() { owner.unmap_region_keys(region)?; }
+        self.verify.unmap_serving_region(region)
+    }
+    /// Map `region` and every unmapped region below it, all or nothing (Ok(false), nothing changed, without room).
+    fn map_region(&mut self, region: usize) -> Result<bool> {
+        if !self.region_room(region)? { return Ok(false); }
+        let mut done = Vec::new();
+        for j in self.regions_to_map(region) {
+            if !self.map_one_region(j)? {
+                for &d in done.iter().rev() { self.unmap_one_region(d)?; self.elastic_mapped &= !(1u8 << d); }
+                return Ok(false);
+            }
+            self.elastic_mapped |= 1u8 << j;
+            done.push(j);
+        }
+        Ok(true)
+    }
+    /// After a region conversation left (its peer already removed): unmap every mapped region above the highest region
+    /// still occupied, highest first. A vacated region below an occupied one stays mapped (see regions_to_map).
+    fn release_regions(&mut self) -> Result<()> {
+        let high = self.peers.iter().map(|p| p.region).max().unwrap_or(0);
+        for j in (high + 1..crate::config::batched_regions()?).rev() {
+            if self.elastic_mapped & (1u8 << j) != 0 {
+                self.unmap_one_region(j)?;
+                self.elastic_mapped &= !(1u8 << j);
+            }
+        }
+        Ok(())
+    }
+    fn reclaim_for_region(&mut self, region: usize) -> Result<(bool, usize)> {
+        let tokens = self.verify.position() as usize;
+        let mut evicted = 0;
+        loop {
+            let room = self.region_room(region)?;
+            if self.control.all_admit(room)? { return Ok((true, evicted)); }
+            let entries = self.cached_sessions.iter().map(|c| (c.prefix.len(), c.charge)).collect::<Vec<_>>();
+            let optional = self.optional_entries(tokens);
+            let superseded = vec![false; entries.len()];
+            let victim = pressure_cache_victim(&entries, &optional, &superseded, tokens, self.image_entry_limit(),
+                self.pressure_long_first(tokens), &[]);
+            self.control.agree(&serde_json::to_vec(&("region-reclaim-v1", region, victim, &entries))?)?;
+            let Some(victim) = victim else { return Ok((false, evicted)) };
+            self.stream.synchronize()?;
+            self.evict_cached(victim);
+            evicted += 1;
+        }
     }
     /// The oldest finished region conversation waiting for region 0.
     pub(crate) fn finished_peer(&self) -> Option<u64> {
@@ -245,6 +397,7 @@ impl Worker {
             peer.resident.finish(earlier)?;
             self.history.synchronize_request_ids(&mut peer.resident)?;
             self.spare_sessions.push(peer.session);
+            if crate::config::elastic_regions()? { self.release_regions()?; self.elastic_declined = None; }
             self.control.agree(&serde_json::to_vec(&json!({"batched_drop_v1":[id, region as u64]}))?)?;
             return Ok(json!({"type":"peer_dropped","request_id":id,"region":region,"frontier":frontier}));
         }
@@ -255,6 +408,7 @@ impl Worker {
             peer.resident.finish(reason)?;
             self.history.synchronize_request_ids(&mut peer.resident)?;
             self.spare_sessions.push(peer.session);
+            if crate::config::elastic_regions()? { self.release_regions()?; self.elastic_declined = None; }
         } else {
             self.peers[index].finished = Some(reason);
         }
@@ -287,6 +441,7 @@ impl Worker {
         self.target_lineage = self.target_lineage.checked_add(1).context("target lineage exhausted")?;
         self.verify.reset(self.target_lineage, &self.comm, &self.stream)?;
         let moved = self.verify.relocate_session(peer.base, SessionBase::default(), position, &self.stream)?;
+        if crate::config::elastic_regions()? { self.release_regions()?; self.elastic_declined = None; }
         self.verify.adopt_moved_history(peer.history.clone())?;
         peer.resident.finish(peer.finished.unwrap())?;
         peer.resident.synchronize_request_ids(&mut self.history)?;
@@ -298,6 +453,48 @@ impl Worker {
         self.control.agree(&serde_json::to_vec(&json!({"batched_save_v1":[id, peer.region as u64, position as u64]}))?)?;
         Ok(json!({"type":"peer_saved","request_id":id,"region":peer.region,"position":position,
             "relocation":moved,"displaced_resident":displaced,"seconds":began.elapsed().as_secs_f64()}))
+    }
+    /// Lookahead admission (config::region_lookahead): the region conversation `id`, at its region's end, moves back to
+    /// a free region 0 as its generating conversation (the inverse of detach_active; the moves are save_peer's). With
+    /// no other region occupied it continues there without bound; otherwise it is region 0's conversation at the
+    /// boundary and parks as an image (batched_admission) until the regions are empty. A resident finished
+    /// conversation in region 0 first keeps its cache image, as in save_peer.
+    pub(crate) fn attach_peer(&mut self, id: u64) -> Result<Value> {
+        let began = Instant::now();
+        ensure!(enabled()? && self.current.is_none() && self.pending_prefill.is_none() && !self.prefill_cancelled
+            && self.peer_at_boundary(id)?, "attach needs a free region 0 and a region conversation at its region's end");
+        let mut displaced = Value::Null;
+        if self.session.is_some() && !self.history.committed().is_empty() && self.session_cache_budget > 0 {
+            let prefix = self.history.committed().to_vec();
+            let pending = self.history.pending().context("resident conversation lacks its pending anchor")?;
+            let media = self.history.media().through(prefix.len());
+            displaced = self.retain_cached_prefix_reserved(&prefix, pending, media, 0, 0, self.displaced_snapshot)?;
+            if crate::config::batched_detach_keeps_images()? {
+                let kept = self.materialize_displaced_checkpoint(&[], &prefix, None)?;
+                if !kept.is_null() && displaced.is_object() { displaced["kept_images"] = kept; }
+            }
+        }
+        let index = self.peers.iter().position(|p| p.id == id).context("unknown region conversation")?;
+        let peer = self.peers.remove(index);
+        let position = peer.position();
+        self.batched_timing.last_end = None;
+        self.target_lineage = self.target_lineage.checked_add(1).context("target lineage exhausted")?;
+        self.verify.reset(self.target_lineage, &self.comm, &self.stream)?;
+        // Region 0's rows [0, position) stay below region 1's: the conversation stopped short of its own region's end.
+        let moved = self.verify.relocate_session(peer.base, SessionBase::default(), position, &self.stream)?;
+        if crate::config::elastic_regions()? { self.release_regions()?; self.elastic_declined = None; }
+        self.verify.adopt_moved_history(peer.history.clone())?;
+        let mut resident = peer.resident;
+        resident.synchronize_request_ids(&mut self.history)?;
+        self.history = resident;
+        let spare = self.session.replace(peer.session);
+        if let Some(spare) = spare { self.spare_sessions.push(spare); }
+        self.current = Some(id);
+        self.emitted = peer.emitted;
+        self.limit = peer.limit;
+        self.control.agree(&serde_json::to_vec(&json!({"batched_attach_v1":[id, peer.region as u64, position as u64]}))?)?;
+        Ok(json!({"type":"attach","request_id":id,"region":peer.region,"position":position,"emitted":self.emitted,
+            "limit":self.limit,"relocation":moved,"displaced_resident":displaced,"seconds":began.elapsed().as_secs_f64()}))
     }
     /// The region of a region conversation.
     pub(crate) fn peer_region(&self, id: u64) -> Option<usize> {
@@ -316,14 +513,24 @@ impl Worker {
                 "batched step needs a generating region-0 conversation");
         }
         self.peers.sort_by_key(|p| p.region);
-        let stepping = |p: &Peer| p.finished.is_none() && skip & (1u8 << p.region) == 0;
+        // Lookahead admission: a conversation at its region's end never takes a step (the scheduler also leaves it out).
+        let capacity = self.region_capacity()?;
+        if include_active {
+            ensure!(self.peers.is_empty() || !at_region_end(self.verify.position() as usize,
+                self.limit.saturating_sub(self.emitted), capacity), "region-0 conversation at the regions' rows");
+        }
+        let stepping = |p: &Peer| p.finished.is_none() && skip & (1u8 << p.region) == 0
+            && !at_region_end(p.position(), p.limit.saturating_sub(p.emitted), capacity);
         let decoding = self.peers.iter().filter(|p| stepping(p)).count();
         ensure!(include_active || decoding > 0, "batched step without decoding conversations");
         let parts_n = decoding + usize::from(include_active);
         // One conversation keeps the 6-row owner. Two take 3 rows each on it as well (101-103 tok/s in
         // the Nov 10 screens, against 93 at 6 rows each on the 16-row owner;
         // CANADA_SCRATCH_BATCHED_PAIR_ROWS=16 selects the latter). Three or four share the 16-row owner.
-        let rows = match parts_n { 1 => 6, 2 => pair_rows()?, _ => 16 };
+        // Full serving regions: only the 16-row owner's index branches hold the regions' keys (Target::key_regions_for),
+        // so every step with a region conversation runs there; region 0 alone keeps the 6-row owner.
+        let rows = if decoding > 0 && crate::config::full_regions()? { 16 }
+            else { match parts_n { 1 => 6, 2 => pair_rows()?, _ => 16 } };
         let per = crate::target::batched_block(rows, parts_n).min(6);
         let active_id = self.current;
         let mut ids = Vec::with_capacity(parts_n);

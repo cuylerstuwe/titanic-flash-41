@@ -173,6 +173,9 @@ fn prepare_named(
     }
     stream.synchronize()?;
     weights.finish_expert_layer(layer)?;
+    if layer < 40 && crate::config::moe_scale_code1()? {
+        code_layer_scales(cuda, module, weights, layer, experts, n, k, so, ds, &stream)?;
+    }
     if layer<40 && std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE_SCREEN").as_deref()==Ok("1") {
         let bytes=2*experts*sb;
         ensure!(cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+bytes,
@@ -201,6 +204,58 @@ fn prepare_named(
         resident_bytes: experts * (3 * wb + 3 * sb),
         temporary_bytes: wb,
     })
+}
+/// The experts' one-bit scale code of one target layer (config::moe_scale_code1; layout config::scale_code1_layout), coded
+/// on the GPU from the packed compact scales and decoded back with the kernels' formula before it is installed; any
+/// mismatch fails the load. The raw scales stay (other kernels and flagged rows read them).
+#[allow(clippy::too_many_arguments)]
+fn code_layer_scales(cuda: &Cuda, module: &Module, weights: &mut crate::weights::Weights, layer: usize,
+    experts: usize, n: usize, k: usize, s13_offset: usize, s2_offset: usize, stream: &crate::cuda::Stream) -> Result<()> {
+    let (f13, b13, c2, f2, b2, words) = crate::config::scale_code1_layout(experts, k, n);
+    ensure!(cuda.admission_memory()?.admitted_available >= crate::memory::floor_bytes() + words * 4,
+        "expert scale code must preserve the physical memory reserve");
+    let mut code = cuda.allocate::<u32>(words)?;
+    code.zero()?;
+    let mut error = cuda.allocate::<u32>(1)?;
+    error.zero()?;
+    let mut counts = cuda.allocate::<u64>(1)?;
+    counts.zero()?;
+    stream.join_default()?;
+    let base = code.ptr();
+    for (offset, matrices, rows, columns, c, f, b) in [
+        (s13_offset, 2 * experts, n, k / 32, 0usize, f13, b13),
+        (s2_offset, experts, k, n / 32, c2, f2, b2),
+    ] {
+        let units = rows.div_ceil(128) * columns.div_ceil(4);
+        let mut src = weights.pointer_at(offset, matrices * rows * columns)?;
+        let (mut cp, mut fp, mut bp) = (base + (c * 4) as u64, base + (f * 4) as u64, base + (b * 4) as u64);
+        let (mut nr, mut cols) = (i32::try_from(rows)?, i32::try_from(columns)?);
+        let mut args: Vec<*mut c_void> = vec![(&mut src as *mut u64).cast(), (&mut cp as *mut u64).cast(),
+            (&mut fp as *mut u64).cast(), (&mut bp as *mut u64).cast(), (&mut nr as *mut i32).cast(),
+            (&mut cols as *mut i32).cast()];
+        unsafe { module.function("ca_expert_scale_code1")?.launch([matrices as u32, 1, 1], [256, 1, 1], 0, stream, &mut args) }?;
+        let mut status = error.ptr();
+        let mut args: Vec<*mut c_void> = vec![(&mut src as *mut u64).cast(), (&mut cp as *mut u64).cast(),
+            (&mut fp as *mut u64).cast(), (&mut bp as *mut u64).cast(), (&mut status as *mut u64).cast(),
+            (&mut nr as *mut i32).cast(), (&mut cols as *mut i32).cast()];
+        unsafe { module.function("ca_expert_scale_code1_check")?.launch(
+            [u32::try_from((units * 128).div_ceil(256))?, matrices as u32, 1], [256, 1, 1], 0, stream, &mut args) }?;
+        let mut flags = fp;
+        let mut tally = counts.ptr();
+        let mut flag_words = matrices * units * 4;
+        let mut args: Vec<*mut c_void> = vec![(&mut flags as *mut u64).cast(), (&mut tally as *mut u64).cast(),
+            (&mut flag_words as *mut usize).cast()];
+        unsafe { module.function("ca_expert_scale_code1_census")?.launch(
+            [u32::try_from(flag_words.div_ceil(256))?, 1, 1], [256, 1, 1], 0, stream, &mut args) }?;
+    }
+    stream.synchronize()?;
+    let status = error.download()?[0];
+    ensure!(status == 0, "expert scale code failed its decode check (layer {layer}, error {status})");
+    if layer == 0 || layer == 39 {
+        eprintln!("expert scale code {}", serde_json::json!({"layer": layer, "bytes": words * 4,
+            "raw_rows": counts.download()?[0], "rows": experts * (2 * n.div_ceil(128) * k.div_ceil(128) + k.div_ceil(128) * (n / 32).div_ceil(4)) * 128}));
+    }
+    weights.install_expert_scale_code1(layer, code)
 }
 fn validate(n: usize, k: usize, group: usize) -> Result<()> {
     ensure!(

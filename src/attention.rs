@@ -104,6 +104,29 @@ impl PagedKv {
             layout,
         })
     }
+    /// An elastic cache (config::elastic_regions): the whole range is reserved, `resident_pages` (region 0) have memory
+    /// and are zeroed, the rest is mapped per serving region with map_pages.
+    pub(crate) fn new_layout_elastic(cuda: &Cuda, pages: usize, tokens: usize, layout: KvLayout, resident_pages: usize) -> Result<Self> {
+        let stride = layout_page_bytes(layout, tokens)?;
+        let bytes = pages.checked_mul(stride).filter(|&x| x > 0 && x <= 16 * 1024 * 1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("bounded KV allocation required"))?;
+        ensure!(resident_pages > 0 && resident_pages <= pages, "elastic KV resident pages");
+        let data = cuda.allocate_elastic(bytes, resident_pages * stride, &format!("compressed-kv pages {pages} tokens {tokens}"))?;
+        Ok(Self { data: Rc::new(data), stream: Rc::new(Cell::new(0)), pages, page_tokens: tokens, page_bytes: stride, layout })
+    }
+    /// Map pages [first, last) of an elastic cache (Ok(false), nothing changed, without room in the pool).
+    pub(crate) fn map_pages(&self, first: usize, last: usize) -> Result<bool> {
+        ensure!(first < last && last <= self.pages, "KV page span");
+        self.data.elastic_map(first * self.page_bytes, (last - first) * self.page_bytes)
+    }
+    pub(crate) fn unmap_pages(&self, first: usize, last: usize) -> Result<()> {
+        ensure!(first < last && last <= self.pages, "KV page span");
+        self.data.elastic_unmap(first * self.page_bytes, (last - first) * self.page_bytes)
+    }
+    pub(crate) fn missing_chunks(&self, first: usize, last: usize) -> Result<usize> {
+        ensure!(first < last && last <= self.pages, "KV page span");
+        self.data.elastic_missing(first * self.page_bytes, (last - first) * self.page_bytes)
+    }
     pub fn layout(&self) -> KvLayout {
         self.layout
     }
@@ -129,6 +152,7 @@ impl PagedKv {
         self.pages * self.page_tokens
     }
     pub fn upload(&mut self, bytes: &[u8]) -> Result<()> {
+        ensure!(!self.data.is_elastic(), "seeding an elastic KV cache");
         Rc::get_mut(&mut self.data)
             .ok_or_else(|| anyhow::anyhow!("shared KV seeding requires an exclusive owner"))?
             .upload(bytes)
@@ -142,6 +166,11 @@ impl PagedKv {
             "KV reset context"
         );
         self.bind_stream(stream)?;
+        if self.data.is_elastic() {
+            // Only the resident span and mapped regions exist.
+            for (at, bytes) in self.data.elastic_mapped_extents()? { unsafe { cuda.zero_device(at, bytes, stream) }?; }
+            return Ok(());
+        }
         unsafe { cuda.zero_device(self.data.ptr(), self.data.bytes(), stream) }
     }
 }

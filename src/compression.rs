@@ -660,7 +660,10 @@ impl Source {
             request_slots,
             ring_size,
             ring,
-            cache: PagedKv::new_layout(cuda, pages, page_tokens, layout)?,
+            cache: match crate::config::elastic_resident_slots(ratio)? {
+                Some(slots) => PagedKv::new_layout_elastic(cuda, pages, page_tokens, layout, slots.div_ceil(page_tokens))?,
+                None => PagedKv::new_layout(cuda, pages, page_tokens, layout)?,
+            },
             latent,
             stream: Cell::new(0),
         })

@@ -205,6 +205,47 @@ available on every rank.
 All memory-floor checks now use one function, with the same 8 GiB default.
 `CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB` overrides the floor and is for tests only.
 
+## November 19 disk-tier and regions release settings
+
+Native production (s1621) keeps every November 18 setting and adds four: one for the disk tier and three for decoding
+several conversations together. They are runtime settings read at startup; the portable profile is unchanged.
+
+- `CANADA_SCRATCH_DISK_TIER=1`: byte-exact copies of conversation snapshots on the device's local NVMe. When no request
+  has arrived for `CANADA_SCRATCH_DISK_TIER_IDLE_SECS` (3), the coldest resident snapshots are copied, prompt-end
+  snapshots with their first-token logits first, then completed turns of conversations not in use. A copy is written
+  with direct I/O in 32 MiB slices, so a request that arrives meanwhile waits for one slice at most, and it carries a
+  SHA-256 digest for every 4 MiB chunk. A snapshot with a copy is parked (its memory returns to the snapshot pool, the
+  copy stays) instead of dropped when the cache evicts it; prompt-end snapshots park as soon as their copy exists, and
+  completed turns of other conversations once `CANADA_SCRATCH_DISK_TIER_PARK_AFTER` (4) newer cache entries exist. A
+  request whose best prefix is parked reloads it, checking every digest, when the read is cheaper than prefilling the
+  tokens it saves over the best resident snapshot. The read is estimated at `CANADA_SCRATCH_DISK_TIER_READ_MBPS` (2,200)
+  plus `CANADA_SCRATCH_DISK_TIER_READ_FIXED_MS` (30), both measured; a reload takes room only under the cache's own
+  slot and byte limits, and all four devices agree on it before it runs. Budgets: `CANADA_SCRATCH_DISK_TIER_GIB` (64),
+  `CANADA_SCRATCH_DISK_TIER_WRITE_GIB_DAY` (200), `CANADA_SCRATCH_DISK_TIER_FREE_FLOOR_GIB` (free space kept on the
+  filesystem, 40) and `CANADA_SCRATCH_DISK_TIER_MAX_PARKED` (64). The directory is `CANADA_SCRATCH_DISK_TIER_DIR`
+  (`/scratch/disk-tier` in the container: bind-mount a directory on local NVMe there that the container can write).
+  The engine empties it at startup, so a copy never outlives the process that made it.
+- `CANADA_SCRATCH_FULL_REGIONS=1`: every serving region of batched decode holds a whole conversation (the full model
+  context), so the compressed caches and their index-key caches span four model contexts of address space. Before,
+  the four regions were equal shares of one model context, and longer conversations could not decode together.
+- `CANADA_SCRATCH_ELASTIC_REGIONS=1` (needs full regions and the snapshot pool): the regions' address range is reserved
+  at startup; region 0, where a conversation decoding alone runs, is resident, and regions 1-3 are mapped from the
+  snapshot pool only while conversations occupy them (about 1.45 GB a region and device). Entering region k maps every
+  region from 1 to k that is not mapped yet, all or nothing; when conversations leave, regions above the highest occupied
+  one are given back. A gap stays mapped because the index scorer bounds a block of query rows by the union of their key
+  ranges, which can include a gap region's rows. A conversation whose regions cannot be mapped takes turns until a
+  region frees up. The region graphs are warmed up at startup on a temporary pool that is released before the snapshot
+  pool is created.
+- `CANADA_SCRATCH_REGION_LOOKAHEAD=16384`: batched decode admits a conversation into a region by the positions it can
+  reach soon, its position plus the smaller of its remaining tokens and 16,384, instead of its position plus all of its
+  `max_tokens`. Clients often send a `max_tokens` far beyond what a turn uses (262,144, for example), which kept such
+  requests out of batched decode. A conversation that reaches its region's end sits out and continues alone once the
+  others are done; it is never truncated.
+
+The runtime also carries settings that stay off: `CANADA_SCRATCH_ELASTIC_TRACE` (logs every elastic map and unmap, for
+diagnosis); `CANADA_SCRATCH_INDEX_BF16` and `CANADA_SCRATCH_FUSED_BOUNDARY` (experiments, not faster yet); and `CANADA_SCRATCH_MOE_SCALE_CODE1`, a one-bit code for the experts' scales that was bit-exact but gave no
+end-to-end gain, so its export is not published.
+
 ## November 18 cache release settings
 
 Native production (s1599) keeps every November 17 setting and adds two, both about which conversation snapshot a turn

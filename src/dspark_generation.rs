@@ -694,6 +694,17 @@ pub(crate) struct StateImage {
 impl StateImage {
     pub(crate) fn exchangeable(&self)->bool {self.target.exchangeable()}
     pub(crate) fn device_bytes(&self)->usize {self.target.bytes()+self.draft.bytes()}
+    /// Disk tier: every copied image of the session (target, then drafter).
+    pub(crate) fn images_mut(&mut self)->Vec<&mut crate::state_image::Image> {
+        let mut out: Vec<&mut crate::state_image::Image> = self.target.image_mut().into_iter().collect();
+        out.push(self.draft.image_mut());
+        out
+    }
+    pub(crate) fn images(&self)->Vec<&crate::state_image::Image> {
+        let mut out: Vec<&crate::state_image::Image> = self.target.image().into_iter().collect();
+        out.push(self.draft.image());
+        out
+    }
     pub(crate) fn manifest(&self) -> serde_json::Value {
         serde_json::json!({"position":self.target.position(),"target":self.target.manifest(),
             "draft":self.draft.manifest(),"device_bytes":self.target.bytes()+self.draft.bytes(),

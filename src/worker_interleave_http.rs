@@ -50,6 +50,8 @@ enum Scheduled {
     PeerFinish(u64,u8),
     /// Region 0 takes back the finished region conversation as its resident one.
     SavePeer(u64),
+    /// Region 0 takes back a generating region conversation at its region's end (lookahead admission).
+    AttachPeer(u64),
 }
 impl Scheduled {
     fn follows_progress(&self,paused_ids:&[u64],remaining:usize)->bool {
@@ -61,7 +63,7 @@ impl Scheduled {
             Self::Exchange(id)=>paused_ids.contains(id)&&remaining>0,
             Self::PairStep(id)=>paused_ids.len()==1&&paused_ids.contains(id)&&remaining>=6,
             // Batched decode moves, steps and ends already admitted conversations only.
-            Self::Detach(_)|Self::Batched(..)|Self::PeerFinish(..)|Self::SavePeer(_)=>true,
+            Self::Detach(_)|Self::Batched(..)|Self::PeerFinish(..)|Self::SavePeer(_)|Self::AttachPeer(_)=>true,
             _=>false,
         }
     }
@@ -86,6 +88,7 @@ impl Scheduled {
                 let mut bytes=vec![22,*reason];bytes.extend(id.to_le_bytes());Ok(bytes)
             },
             Self::SavePeer(id)=>{ensure!(*id>0,"invalid region conversation identity");let mut bytes=vec![23];bytes.extend(id.to_le_bytes());Ok(bytes)},
+            Self::AttachPeer(id)=>{ensure!(*id>0,"invalid region conversation identity");let mut bytes=vec![24];bytes.extend(id.to_le_bytes());Ok(bytes)},
             Self::Park(None)=>Ok(vec![7]),
             Self::Park(Some(mask))=>{let mut bytes=vec![7];bytes.extend(mask.to_le_bytes());Ok(bytes)},
             Self::Exchange(id)=>{ensure!(*id>0,"invalid exchange request identity");let mut bytes=vec![17];bytes.extend(id.to_le_bytes());Ok(bytes)},
@@ -115,6 +118,10 @@ impl Scheduled {
             [23,..] if bytes.len()==9=>{
                 let id=u64::from_le_bytes(bytes[1..].try_into().unwrap());
                 ensure!(id>0,"invalid region conversation identity");Ok(Self::SavePeer(id))
+            },
+            [24,..] if bytes.len()==9=>{
+                let id=u64::from_le_bytes(bytes[1..].try_into().unwrap());
+                ensure!(id>0,"invalid region conversation identity");Ok(Self::AttachPeer(id))
             },
             [17,..]if bytes.len()==9=>{
                 let id=u64::from_le_bytes(bytes[1..].try_into().unwrap());ensure!(id>0,"invalid exchange request identity");Ok(Self::Exchange(id))
@@ -244,6 +251,7 @@ fn execute(w:&mut Worker,images:&mut Vec<ParkedRequest>,command:Scheduled,
         Scheduled::Batched(region0,skip)=>w.batched_decode_step(region0,skip),
         Scheduled::PeerFinish(id,reason)=>w.finish_peer(id,match reason {0=>Finish::Stop,1=>Finish::Length,_=>Finish::Cancelled}),
         Scheduled::SavePeer(id)=>w.save_peer(id),
+        Scheduled::AttachPeer(id)=>w.attach_peer(id),
         Scheduled::PairStep(id)=>{
             ensure!(images.len()==1&&images[0].id==id&&!images[0].is_image(),
                 "paired step requires exactly one physical peer");
@@ -481,7 +489,7 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
             let wire=if let Some(next)=authorized_next.take(){next}else{w.control.command(bytes.as_deref())?};
             let command=Scheduled::decode(&wire)?;
             let started=matches!(command,Scheduled::Native(Command::Begin{..})|Scheduled::BeginBackground(_));
-            let resumed=matches!(command,Scheduled::Resume(_));
+            let resumed=matches!(command,Scheduled::Resume(_)|Scheduled::AttachPeer(_));
             let finished=matches!(command,Scheduled::Native(Command::Finish(_)));
             let idle=matches!(command,Scheduled::Native(Command::Idle)|Scheduled::Hold|Scheduled::OutputWait);
             let shutdown=matches!(command,Scheduled::Native(Command::Shutdown));
@@ -560,6 +568,16 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                         }
                     }
                 }
+                Some("attach")=>{
+                    // The region conversation continues as region 0's: its HTTP owner becomes the active one.
+                    let id=event["request_id"].as_u64().context("attached request identity")?;
+                    ensure!(active.is_none(),"attach would replace an active HTTP owner");
+                    let index=region_jobs.iter().position(|(r,_)|*r==id).context("attached region HTTP owner lost")?;
+                    let (_,job)=region_jobs.remove(index);
+                    job.set_executing(true);
+                    event["http_request_id"]=json!(job.id);
+                    active=Some(job);
+                }
                 Some("finish") if event["peer"]==true=>{
                     let id=event["request_id"].as_u64().context("finished region request identity")?;
                     let index=region_jobs.iter().position(|(r,_)|*r==id).context("finished region HTTP owner lost")?;
@@ -574,7 +592,7 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                 }
                 _=>{}
             } }
-            let region_event=matches!(event["type"].as_str(),Some("detach"|"batched_tokens"|"peer_saved"|"peer_dropped"))||event["peer"]==true;
+            let region_event=matches!(event["type"].as_str(),Some("detach"|"batched_tokens"|"peer_saved"|"peer_dropped"|"detach_declined"|"attach"))||event["peer"]==true;
             if let Some(job)=active.as_ref().filter(|_|!discarded&&!region_event) {
                 if !input_refused && (started || event["resumed_prefill"]==true) {
                     job.record_prefill_timing(&event);
@@ -674,7 +692,7 @@ mod tests {
     #[test]
     fn batched_decode_commands_roundtrip_and_reject_invalid_frames() {
         for command in [Scheduled::Detach(1),Scheduled::Detach(3),Scheduled::Batched(false,0),Scheduled::Batched(true,0b1010),
-            Scheduled::PeerFinish(1,0),Scheduled::PeerFinish(u64::MAX,2),Scheduled::SavePeer(5)] {
+            Scheduled::PeerFinish(1,0),Scheduled::PeerFinish(u64::MAX,2),Scheduled::SavePeer(5),Scheduled::AttachPeer(7)] {
             let wire=command.encode().unwrap();
             assert_eq!(Scheduled::decode(&wire).unwrap().encode().unwrap(),wire);
             assert!(command.follows_progress(&[],6));

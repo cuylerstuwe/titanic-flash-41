@@ -11,6 +11,14 @@ pub(super) struct RequestCheckpoint {
     limit: usize,
     pub(super) charge: usize,
 }
+impl RequestCheckpoint {
+    /// The positions this paused conversation can reach for batched admission (config::region_reach).
+    pub(super) fn reach(&self) -> Result<usize> {
+        // A paused prefill first reaches the rest of its prompt.
+        let start = self.history.frontier().saturating_add(self.prefill_remaining().unwrap_or(0));
+        crate::config::region_reach(start, self.limit.saturating_sub(self.emitted))
+    }
+}
 
 impl RequestCheckpoint {
     pub(super) fn prefill_remaining(&self)->Option<usize> {
@@ -133,7 +141,7 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
     let evicted_protected=evictions.as_ref().map_or(0,|v|v.iter().filter(|&&i|protected.unwrap_or(0)&(1<<i)!=0).count());
     if let Some(mut indices)=evictions {
         indices.sort_unstable();evicted=indices.len();
-        for i in indices.into_iter().rev(){w.cached_sessions.remove(i);}
+        for i in indices.into_iter().rev(){w.evict_cached(i);}
     }
     // The plan counts every evicted entry's whole charge. Cached images that share ancestor pages with an entry
     // that stays give back less than that, and the save below must still leave the cache reserve, so the plan can
@@ -225,7 +233,7 @@ pub(super) fn try_exchange(w:&mut Worker,saved:&mut RequestCheckpoint)->Result<O
     }
     evictions.sort_unstable();
     let evicted=evictions.len();
-    for i in evictions.into_iter().rev(){w.cached_sessions.remove(i);}
+    for i in evictions.into_iter().rev(){w.evict_cached(i);}
     if !w.control.all_admit(w.cuda.image_admission_memory()?.admitted_available>=reserve+extra)?{return Ok(None);}
     w.cuda.synchronize_all()?;let began=Instant::now();
     let prepared=w.session.as_mut().unwrap().prepare_exchange(&w.verify,&saved.image,w.shared_image_budget,&w.comm,&w.stream)?;
@@ -307,7 +315,7 @@ pub(super) fn keep_displaced(w: &mut Worker, loaded_is_parked: bool) -> Result<V
 pub(super) fn restore(w: &mut Worker, saved: &RequestCheckpoint) -> Result<Value> {
     ensure!(w.current.is_none(),"probe restore would replace an active request");
     // Batched serving (Worker::region0_admits): the scheduler resumes such a conversation only with the regions empty.
-    ensure!(w.region0_admits(saved.history.frontier().saturating_add(saved.limit.saturating_sub(saved.emitted)))?,
+    ensure!(w.region0_admits(saved.reach()?)?,
         "a paused conversation that reaches past one serving region needs every region empty");
     let reserve=crate::memory::floor_bytes()+16*1024usize.pow(2);
     let mut admitted=w.control.all_admit(w.cuda.admission_memory()?.admitted_available>=reserve)?;

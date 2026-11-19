@@ -129,6 +129,9 @@ pub(crate) use bank_encoder_lineage::Witness as BankEncoderWitness;
 #[path = "bank_encoder_checkpoint.rs"]
 mod bank_encoder_checkpoint;
 impl EncoderPrefixImage {
+    /// Disk tier: the image's storage (None for exchange storage).
+    pub(crate) fn images_mut(&mut self)->Vec<&mut crate::state_image::Image> {self.0.image.image_mut().into_iter().collect()}
+    pub(crate) fn images(&self)->Vec<&crate::state_image::Image> {self.0.image.image().into_iter().collect()}
     pub(crate) fn bytes(&self)->usize {self.0.bytes()}
     pub(crate) fn reusable_storage(&self,bytes:usize)->bool {
         self.bytes()==bytes&&matches!(&self.0.image,crate::state_image::Storage::Copy(_))
@@ -245,6 +248,9 @@ pub(crate) fn defer_checkpoint_decoder128()->Result<bool> {
     }
 }
 impl StateImage {
+    /// Disk tier: the copied image (None for exchange storage).
+    pub(crate) fn image_mut(&mut self)->Option<&mut crate::state_image::Image> {self.image.image_mut()}
+    pub(crate) fn image(&self)->Option<&crate::state_image::Image> {self.image.image()}
     pub(crate) fn exchangeable(&self)->bool {matches!(self.image,crate::state_image::Storage::Exchange(_))}
     pub(crate) fn manifest(&self) -> serde_json::Value {
         let mut value=self.image.manifest();value["compact"]=serde_json::json!(self.compact);value
@@ -427,9 +433,13 @@ impl SessionBase {
     /// request slot k and the k-th share of the compressed address space.
     pub(crate) fn serving_region(index: usize, regions: usize, context: usize,
         layout: crate::swa_layout::Layout) -> Result<Self> {
+        Self::serving_region_with(index, regions, context, layout, crate::config::full_regions()?)
+    }
+    pub(crate) fn serving_region_with(index: usize, regions: usize, context: usize,
+        layout: crate::swa_layout::Layout, full: bool) -> Result<Self> {
         ensure!(index < regions && regions <= 4 && layout.ring().is_some(), "serving region geometry");
         if index == 0 { return Ok(Self::default()); }
-        let capacity = Self::region_capacity(context, regions);
+        let capacity = Self::serving_capacity_with(context, regions, full)?;
         let small = crate::swa_layout::Layout::Ring;
         Ok(Self { request: index as i64,
             window: layout.pages(context)? * 64 + (index - 1) * small.pages(context)? * 64,
@@ -439,6 +449,17 @@ impl SessionBase {
     /// positions so every region's compressed and key addresses start on a 64-slot page.
     pub(crate) fn region_capacity(context: usize, regions: usize) -> usize {
         context / regions.max(1) / 128 * 128
+    }
+    /// Positions one serving region holds in this process: a whole conversation with full regions
+    /// (config::full_regions: the caches span regions x context), else region_capacity's equal share.
+    pub(crate) fn serving_capacity(context: usize, regions: usize) -> Result<usize> {
+        Self::serving_capacity_with(context, regions, crate::config::full_regions()?)
+    }
+    pub(crate) fn serving_capacity_with(context: usize, regions: usize, full: bool) -> Result<usize> {
+        if !full { return Ok(Self::region_capacity(context, regions)); }
+        ensure!(crate::config::compressed_address_context_with(context, regions, true)? == context * regions,
+            "full serving regions need the full context in every region");
+        Ok(context)
     }
     /// Session `index` of `sessions`, each with `capacity` positions, where one
     /// window region spans `window_slots` slots including the shared offset.
@@ -1115,10 +1136,13 @@ impl Target {
         } else {
             32
         };
-        let pair_pages = compressed_pages(context, 2, page_tokens, 4);
-        let single_pages = compressed_pages(context, 1, page_tokens, 8);
-        let pair_key_pages = compressed_pages(context, 2, 64, 2);
-        let single_key_pages = compressed_pages(context, 1, 64, 4);
+        // Full serving regions (config::full_regions): the compressed caches and their key caches hold every
+        // region's whole conversation; positions, slots and the frequency tables stay per conversation.
+        let address = crate::config::compressed_address_context(context)?;
+        let pair_pages = compressed_pages(address, 2, page_tokens, 4);
+        let single_pages = compressed_pages(address, 1, page_tokens, 8);
+        let pair_key_pages = compressed_pages(address, 2, 64, 2);
+        let single_key_pages = compressed_pages(address, 1, 64, 4);
         // Reject an inconsistent retained-state geometry before loading all
         // forty weight atlases, rather than at later cache activation.
         crate::decoder_tail::Cache::validate_capacity(context, single_pages * page_tokens)?;
@@ -1788,10 +1812,14 @@ impl Target {
         let early_caches=if independent {self.early_caches.iter()
             .map(|c|PagedKv::new_layout(cuda,c.pages(),c.page_tokens(),c.layout())).collect::<Result<Vec<_>>>()?}
             else {self.early_caches.clone()};
-        let pair_slots = (COMPRESSED_OFFSET..COMPRESSED_OFFSET + self.context / 2)
+        // Full serving regions (config::full_regions): the 16-row verify owner runs every batched region step, so its
+        // index branches hold every region's keys (region k's slots k x context / ratio + 32 onward, contiguous over the
+        // regions); key matrices of the other regions are mapped while occupied (map_region_keys).
+        let key_regions = Self::key_regions_for(rows, phase, self.context)?;
+        let pair_slots = (COMPRESSED_OFFSET..COMPRESSED_OFFSET + key_regions * self.context / 2)
             .map(|s| s as i32)
             .collect::<Vec<_>>();
-        let single_slots = (COMPRESSED_OFFSET..COMPRESSED_OFFSET + self.context)
+        let single_slots = (COMPRESSED_OFFSET..COMPRESSED_OFFSET + key_regions * self.context)
             .map(|s| s as i32)
             .collect::<Vec<_>>();
         let medium_woa = if rows > 8 {
@@ -2736,15 +2764,103 @@ impl Target {
             "scope":"Two real pending target M6 forwards. Original routers and shared experts; only routed expert work pooled into twelve live M16 rows. Includes packing and split addition. All local FFN output bits match the original whole-model forward. Excludes attention, TP4 reductions, residual boundaries and weight lookahead; not whole-model throughput."}))
     }
     /// Read-only (weight read census): the four sources' compressed KV caches and index key caches as
-    /// (name, address, bytes).
+    /// (name, address, bytes). Elastic caches list only what exists (the resident span and mapped regions).
     pub(crate) fn cache_arenas(&self) -> Vec<(String, u64, usize)> {
         let mut out = Vec::new();
         for source in [&self.source2, self.group8.source(), self.group14.source(), self.late.source()] {
             let id = source.layer_id();
-            out.push((format!("kv{id}"), source.cache().data().ptr(), source.cache().data().bytes()));
-            out.push((format!("keys{id}"), source.keys().data().ptr(), source.keys().data().bytes()));
+            for (name, data) in [(format!("kv{id}"), source.cache().data()), (format!("keys{id}"), source.keys().data())] {
+                match data.elastic_mapped_extents() {
+                    Ok(extents) => for (i, (at, bytes)) in extents.into_iter().enumerate() { out.push((format!("{name}.{i}"), at, bytes)); },
+                    Err(_) => out.push((name, data.ptr(), data.bytes())),
+                }
+            }
         }
         out
+    }
+    /// Regions whose keys a profile's index branches hold: every serving region for the batched (16-row verify) owner
+    /// under full serving regions, else one.
+    pub(crate) fn key_regions_for(rows: usize, phase: Phase, context: usize) -> Result<usize> {
+        if rows == 16 && phase == Phase::Verify && crate::config::full_regions()? {
+            ensure!(context == crate::config::MODEL_CONTEXT, "full serving regions need the model context");
+            return crate::config::batched_regions();
+        }
+        Ok(1)
+    }
+    /// Full serving regions: image-pool chunks that mapping region `k`'s rows of this profile's index key matrices
+    /// would take (0 unless they are elastic region matrices).
+    pub(crate) fn region_keys_missing_chunks(&self, k: usize) -> Result<usize> {
+        let mut chunks = 0;
+        for q in self.index_queries().into_iter().flatten() { chunks += q.region_key_missing_chunks(k)?; }
+        Ok(chunks)
+    }
+    /// Map region `k`'s rows of every index key matrix of this profile, all or nothing: Ok(false), with nothing mapped,
+    /// without room. Call before the region's first step.
+    pub(crate) fn map_region_keys(&self, k: usize) -> Result<bool> {
+        if self.region_keys_missing_chunks(k)? > self.cuda.image_pool_free_chunks().unwrap_or(0) { return Ok(false); }
+        let queries: Vec<_> = self.index_queries().into_iter().flatten().collect();
+        for (i, q) in queries.iter().enumerate() {
+            if !q.map_region_keys(k)? {
+                for done in &queries[..i] { done.unmap_region_keys(k)?; }
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    /// Release region `k`'s key rows (its conversation left; the unmap drains the context first).
+    pub(crate) fn unmap_region_keys(&self, k: usize) -> Result<()> {
+        for q in self.index_queries().into_iter().flatten() { q.unmap_region_keys(k)?; }
+        Ok(())
+    }
+    /// Pages [first, last) that serving region `k` of whole conversations (full regions) occupies in a cache of
+    /// `ratio` with `page_tokens` slots a page: its slots are k x context / ratio + 32 onward, one conversation long.
+    fn serving_region_pages(k: usize, ratio: usize, page_tokens: usize) -> (usize, usize) {
+        let context = crate::config::MODEL_CONTEXT;
+        let first = k * context / ratio + COMPRESSED_OFFSET;
+        let last = first + context / ratio;
+        (first / page_tokens, last.div_ceil(page_tokens))
+    }
+    /// Elastic regions (config::elastic_regions): image-pool chunks that mapping serving region `k` would take now.
+    pub(crate) fn serving_region_missing_chunks(&self, k: usize) -> Result<usize> {
+        ensure!(k >= 1 && crate::config::elastic_regions()?, "elastic serving region");
+        let mut chunks = 0;
+        for source in [&self.source2, self.group8.source(), self.group14.source(), self.late.source()] {
+            let ratio = if source.layer_id() == 20 { 1 } else { 2 };
+            let (a, b) = Self::serving_region_pages(k, ratio, source.cache().page_tokens());
+            chunks += source.cache().missing_chunks(a, b)?;
+            let (a, b) = Self::serving_region_pages(k, ratio, 64);
+            chunks += source.keys().missing_chunks(a, b)?;
+        }
+        Ok(chunks)
+    }
+    /// Whether the image pool's free chunks can map serving region `k` now.
+    pub(crate) fn serving_region_room(&self, k: usize) -> Result<bool> {
+        Ok(self.serving_region_missing_chunks(k)? <= self.cuda.image_pool_free_chunks().unwrap_or(0))
+    }
+    /// Map serving region `k`'s spans of the four sources' compressed and key caches from the image pool, all or
+    /// nothing: Ok(false), with nothing mapped, without room. Call before anything is copied into the region.
+    pub(crate) fn map_serving_region(&self, k: usize) -> Result<bool> {
+        if !self.serving_region_room(k)? { return Ok(false); }
+        for source in [&self.source2, self.group8.source(), self.group14.source(), self.late.source()] {
+            let ratio = if source.layer_id() == 20 { 1 } else { 2 };
+            let (a, b) = Self::serving_region_pages(k, ratio, source.cache().page_tokens());
+            ensure!(source.cache().map_pages(a, b)?, "elastic region map lost its room");
+            let (a, b) = Self::serving_region_pages(k, ratio, 64);
+            ensure!(source.keys().map_pages(a, b)?, "elastic region map lost its room");
+        }
+        Ok(true)
+    }
+    /// Release serving region `k`'s spans (after its conversation left; the unmap drains the context first).
+    pub(crate) fn unmap_serving_region(&self, k: usize) -> Result<()> {
+        ensure!(k >= 1 && crate::config::elastic_regions()?, "elastic serving region");
+        for source in [&self.source2, self.group8.source(), self.group14.source(), self.late.source()] {
+            let ratio = if source.layer_id() == 20 { 1 } else { 2 };
+            let (a, b) = Self::serving_region_pages(k, ratio, source.cache().page_tokens());
+            source.cache().unmap_pages(a, b)?;
+            let (a, b) = Self::serving_region_pages(k, ratio, 64);
+            source.keys().unmap_pages(a, b)?;
+        }
+        Ok(())
     }
     pub(crate) fn layer_owners(&self) -> Vec<&SwaLayer> {
         self.early
@@ -8930,6 +9046,48 @@ mod tests {
                 assert!(windows.windows(2).all(|w| w[0].1 <= w[1].0) && windows.last().unwrap().1 <= pages * 64);
                 assert!(shares.windows(2).all(|w| w[0].1 <= w[1].0) && shares.last().unwrap().1 <= context);
             }
+        }
+    }
+    #[test]
+    fn full_serving_regions_hold_whole_conversations() {
+        use crate::swa_layout::Layout;
+        let context = crate::config::MODEL_CONTEXT;
+        for regions in 2..=4 {
+            let address = crate::config::compressed_address_context_with(context, regions, true).unwrap();
+            assert_eq!(address, context * regions);
+            assert_eq!(crate::config::compressed_address_context_with(context, regions, false).unwrap(), context);
+            assert!(crate::config::compressed_address_context_with(65536, regions, true).is_err());
+            assert!(crate::config::compressed_address_context_with(context, 1, true).is_err());
+            assert_eq!(SessionBase::serving_capacity_with(context, regions, true).unwrap(), context);
+            assert_eq!(SessionBase::serving_capacity_with(context, regions, false).unwrap(),
+                SessionBase::region_capacity(context, regions));
+            // Every cache spans every region's whole conversation; key pages stay inside the admitted index domain
+            // (config::index_key_capacity_limit with full regions: address + 4096 rows).
+            let single = compressed_pages(address, 1, 64, 8) * 64;
+            let pair = compressed_pages(address, 2, 64, 4) * 64;
+            for ratio in [1, 2] {
+                let pages = compressed_pages(address, ratio, 64, 4);
+                assert!(pages * 64 >= 32 + address / ratio && pages <= (address + 4096) / 64);
+            }
+            assert!(crate::decoder_tail::Cache::validate_capacity(context, single).is_ok());
+            let layout = Layout::WideRing8192;
+            let mut shares = Vec::new();
+            for k in 0..regions {
+                let b = SessionBase::serving_region_with(k, regions, context, layout, true).unwrap();
+                assert_eq!((b.raw_pair, b.raw_single, b.request), (k * context, k * context, k as i64));
+                shares.push((b.raw_single, b.raw_single + context));
+                for position in [0u64, 1, 128, 262144, 524288, (context - 6) as u64] {
+                    let p = Plan::batched(&[(b, position, 6)], 16, context, layout).unwrap();
+                    for row in 0..6 {
+                        let (raw_single, pair_slot) = (p.raw_single[row] as usize, p.raw_pair[row] as usize / 2);
+                        assert!(raw_single >= COMPRESSED_OFFSET + k * context && raw_single < COMPRESSED_OFFSET + (k + 1) * context);
+                        assert!(raw_single < single && pair_slot < pair);
+                        assert_eq!(p.single_starts[row] as usize, k * context);
+                        assert_eq!(p.pair_starts[row] as usize, k * context / 2);
+                    }
+                }
+            }
+            assert!(shares.windows(2).all(|w| w[0].1 <= w[1].0) && shares.last().unwrap().1 <= address);
         }
     }
     #[test]

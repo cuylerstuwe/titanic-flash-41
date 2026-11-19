@@ -62,6 +62,9 @@ pub(crate) struct StateImage {
     frontier: u64,
 }
 impl StateImage {
+    /// Disk tier: the drafter's copied image.
+    pub(crate) fn image_mut(&mut self) -> &mut crate::state_image::Image { &mut self.image }
+    pub(crate) fn image(&self) -> &crate::state_image::Image { &self.image }
     pub(crate) fn manifest(&self) -> serde_json::Value { self.image.manifest() }
     pub(crate) fn digest(&self) -> Result<String> { self.image.digest() }
     pub(crate) fn bytes(&self) -> usize { self.image.bytes() }

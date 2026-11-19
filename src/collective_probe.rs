@@ -57,6 +57,12 @@ pub fn run(rank: usize, endpoint: &str, nonce: &[u8], root: &Path, core: &Path) 
     if std::env::var("CANADA_SCRATCH_PREFILL_SUM_SCREEN").as_deref()==Ok("1") {
         return run_prefill(rank,endpoint,nonce,root,core);
     }
+    if std::env::var("CANADA_SCRATCH_ONESHOT_TWIN_SCREEN").as_deref()==Ok("1") {
+        return run_oneshot_twin(rank,endpoint,nonce,root,core);
+    }
+    if std::env::var("CANADA_SCRATCH_ONESHOT_HC_SCREEN").as_deref()==Ok("1") {
+        return run_oneshot_hc(rank,endpoint,nonce,root,core);
+    }
     let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;
     let stream=cuda.stream()?;let module=cuda.module(&std::fs::read(core)?)?;
     let native=Roce::local(&cuda,&root.join("roce-v0"),rank)?;
@@ -481,4 +487,254 @@ fn run_prefill(rank:usize,endpoint:&str,nonce:&[u8],root:&Path,core:&Path)->Resu
     stream.synchronize()?;nccl.check_async()?;native.health()?;
         Ok(json!({"rank":rank,"variants":["NCCL BF16","NCCL FP32 with conversions","BF16 quarter exchange plus local FP32 sum","native FP32 sum in 16 MiB chunks, then row slice"],"records":records,
         "small_payload_screen":small,"all_candidate_gpu_bounds_pass":true,"scope":"Four payload sizes; full sum (also row scatter in broad mode); changed narrow-range/cancellation inputs through captured graphs; four rotated timing pairs. GPU FP64 oracle. No model/output-quality or serving claim."}))
+}
+
+/// Verify-layer stage 1 (a), Nov 18 2026: the CUDA C++ twin of the exported b12x one-shot sum
+/// (kernels/roce_oneshot_twin.cuh) against the exported kernel on the same proxy and counters: every shape and
+/// fixture must give identical bytes, eager and inside captured graphs, with the two kernels alternating (they share
+/// the epoch and counters); then balanced timing pairs of eight-sum graphs.
+fn run_oneshot_twin(rank:usize,endpoint:&str,nonce:&[u8],root:&Path,core:&Path)->Result<Value> {
+    let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;let stream=cuda.stream()?;
+    let core_bytes=std::fs::read(core)?;let module=cuda.module(&core_bytes)?;
+    let mut comm=Roce::local(&cuda,&root.join("roce-v0"),rank)?;
+    let all=crate::rendezvous::exchange_blob(rank,endpoint.parse()?,nonce,&comm.blob()?)?;comm.connect(&all)?;
+    comm.attach_oneshot_twin(&core_bytes,true)?;
+    let digest=|b:&Buffer<u16>|->Result<String>{
+        Ok(format!("{:x}",Sha256::digest(b.download()?.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>())))};
+    let mut results=Vec::new();
+    for (rows,columns) in [(1,5120),(2,5120),(3,5120),(6,5120),(16,5120),(128,5120),(1,6144),(6,6144)] {
+        let n=rows*columns;
+        let mut input=cuda.allocate::<u16>(n)?;
+        let mut exported=cuda.allocate::<u16>(n)?;let mut twin=cuda.allocate::<u16>(n)?;
+        let mut checks=Vec::new();
+        for pattern in 0..3 {
+            fixture(&module,&mut input,rank,pattern,&stream)?;
+            // Eager, alternating twice: exported, twin, exported, twin (the epoch passes between the kernels).
+            let mut sums=Vec::new();
+            for round in 0..2 {
+                for twin_on in [false,true] {
+                    comm.set_oneshot_twin_for_probe(twin_on,&stream)?;
+                    let out=if twin_on {&mut twin} else {&mut exported};
+                    out.zero()?;stream.join_default()?;
+                    unsafe { comm.sum_bf16(&input,out,&stream)?; }
+                    stream.synchronize()?;comm.health()?;
+                    sums.push((round,twin_on,digest(if twin_on {&twin} else {&exported})?));
+                }
+            }
+            let first=&sums[0].2;
+            ensure!(sums.iter().all(|(_,_,d)|d==first),"one-shot twin differs from the exported kernel: rows{rows} columns{columns} pattern{pattern}: {sums:?}");
+            let nonzero=exported.download()?.iter().filter(|&&x|x!=0).count();
+            ensure!(nonzero>0,"one-shot sums are all zero");
+            checks.push(json!({"pattern":pattern,"identical":true,"sha256":first,"nonzero":nonzero}));
+        }
+        // Captured graphs of eight sums each; launched alternately, outputs compared after each launch.
+        comm.set_oneshot_twin_for_probe(false,&stream)?;
+        let g0=stream.capture(||{for _ in 0..8 {unsafe{comm.sum_bf16(&input,&mut exported,&stream)?;}}Ok(())})?;
+        comm.set_oneshot_twin_for_probe(true,&stream)?;
+        let g1=stream.capture(||{for _ in 0..8 {unsafe{comm.sum_bf16(&input,&mut twin,&stream)?;}}Ok(())})?;
+        comm.set_oneshot_twin_for_probe(false,&stream)?;
+        for _ in 0..3 {
+            unsafe{g0.launch(&stream)?;g1.launch(&stream)?;}stream.synchronize()?;comm.health()?;
+            ensure!(digest(&exported)?==digest(&twin)?,"captured one-shot twin differs from the exported kernel: rows{rows} columns{columns}");
+        }
+        let mut pairs=Vec::new();
+        for repeat in 0..6 {
+            let mut times=[0f32;2];
+            for v in [repeat%2,1-repeat%2] {
+                let g=if v==0{&g0}else{&g1};
+                for _ in 0..4 {unsafe{g.launch(&stream)?;}}stream.synchronize()?;
+                let start=cuda.event()?;let end=cuda.event()?;
+                start.record(&stream)?;
+                for _ in 0..32 {unsafe{g.launch(&stream)?;}}
+                end.record(&stream)?;times[v]=end.elapsed_since(&start)?/256.;
+                comm.health()?;
+            }
+            pairs.push(json!({"repeat":repeat,"first_variant":repeat%2,"milliseconds_exported_twin":times}));
+        }
+        ensure!(digest(&exported)?==digest(&twin)?,"timed replays changed the comparison");
+        results.push(json!({"rows":rows,"columns":columns,"checks":checks,"pairs":pairs}));
+    }
+    stream.synchronize()?;comm.health()?;
+    Ok(json!({"rank":rank,"results":results,"all_identical":true,"serving_policy_changed":false,
+        "scope":"Exported b12x one-shot BF16 sum versus its CUDA C++ twin on the same proxy, counters and slots: three GPU fixtures, eight shapes, eager alternation and captured graphs, bytes compared; six balanced timing pairs of eight-sum graphs, 256 sums an interval. Component screen only."}))
+}
+
+/// splitmix64 values for the boundary screen's host fixtures (the same seed on every rank: the engine's residual
+/// stream and coefficients are replicated; the partial sums differ by rank).
+struct Fixture(u64);
+impl Fixture {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+    /// Roughly normal (sum of four uniforms, centred), times `scale`.
+    fn normal(&mut self, scale: f32) -> f32 {
+        let s: f32 = (0..4).map(|_| (self.next() >> 40) as f32 / (1u64 << 24) as f32).sum();
+        (s - 2.0) * 1.7320508 * scale
+    }
+}
+/// The boundary screen's buffers: shared inputs, then the reference chain's (r_) and the fused chain's (f_) outputs.
+struct HcBuffers {
+    partial: Buffer<half::bf16>, residual: Buffer<half::bf16>, post: Buffer<f32>, comb: Buffer<f32>, pre: Buffer<f32>,
+    weight: Buffer<half::bf16>, value: Buffer<half::bf16>,
+    r_sum: Buffer<half::bf16>, f_sum: Buffer<half::bf16>, r_stream: Buffer<half::bf16>, f_stream: Buffer<half::bf16>,
+    r_y: Buffer<half::bf16>, f_y: Buffer<half::bf16>, r_q: Buffer<u8>, f_q: Buffer<u8>,
+    r_sr: Buffer<u8>, f_sr: Buffer<u8>, r_sm: Buffer<u8>, f_sm: Buffer<u8>,
+}
+impl HcBuffers {
+    fn new(cuda: &Cuda, rows: usize) -> Result<Self> {
+        let mut b = Self {
+            partial: cuda.allocate(rows * 5120)?, residual: cuda.allocate(rows * 20480)?, post: cuda.allocate(rows * 4)?,
+            comb: cuda.allocate(rows * 16)?, pre: cuda.allocate(rows * 4)?, weight: cuda.allocate(5120)?,
+            value: cuda.allocate(rows * 5120)?, r_sum: cuda.allocate(rows * 5120)?, f_sum: cuda.allocate(rows * 5120)?,
+            r_stream: cuda.allocate(rows * 20480)?, f_stream: cuda.allocate(rows * 20480)?, r_y: cuda.allocate(rows * 5120)?,
+            f_y: cuda.allocate(rows * 5120)?, r_q: cuda.allocate(rows * 5120)?, f_q: cuda.allocate(rows * 5120)?,
+            r_sr: cuda.allocate(rows * 160)?, f_sr: cuda.allocate(rows * 160)?, r_sm: cuda.allocate(20480)?,
+            f_sm: cuda.allocate(20480)?,
+        };
+        b.clear()?;
+        Ok(b)
+    }
+    fn clear(&mut self) -> Result<()> {
+        for x in [&mut self.r_sum, &mut self.f_sum, &mut self.r_stream, &mut self.f_stream, &mut self.r_y, &mut self.f_y,
+            &mut self.value] { x.zero()?; }
+        for x in [&mut self.r_q, &mut self.f_q, &mut self.r_sr, &mut self.f_sr, &mut self.r_sm, &mut self.f_sm] { x.zero()?; }
+        Ok(())
+    }
+}
+/// Production's six-row chain: the exported one-shot sum, the PDL pair's post-mix, its layout8 norm-quant.
+fn hc_reference(comm: &Roce, post_op: &crate::triton_ops::Operator, quant: &crate::triton_ops::Operator, b: &mut HcBuffers,
+    rows: usize, stream: &Stream) -> Result<()> {
+    unsafe {
+        comm.sum_bf16(&b.partial, &mut b.r_sum, stream)?;
+        post_op.launch(rows as u32, &[b.r_sum.ptr(), b.residual.ptr(), b.post.ptr(), b.comb.ptr(), b.r_stream.ptr()], stream)?;
+        quant.launch(rows as u32, &[b.r_stream.ptr(), b.pre.ptr(), b.weight.ptr(), b.r_y.ptr(), b.r_q.ptr(), b.r_sr.ptr(),
+            b.r_sm.ptr()], stream)
+    }
+}
+/// The fused chain: the one-shot sum with the boundary epilogue, then the norm-quant variant on the collapsed row.
+fn hc_fused(comm: &Roce, variant: &crate::triton_ops::Operator, b: &mut HcBuffers, rows: usize, stream: &Stream) -> Result<()> {
+    unsafe {
+        comm.sum_hc_bf16(&b.partial, &mut b.f_sum, &b.residual, &b.post, &b.comb, &b.pre, &b.f_stream, &b.value, rows, stream)?;
+        variant.launch(rows as u32, &[b.value.ptr(), b.weight.ptr(), b.f_y.ptr(), b.f_q.ptr(), b.f_sr.ptr(), b.f_sm.ptr()], stream)
+    }
+}
+fn hc_compare(b: &HcBuffers, label: &str, rows: usize) -> Result<Value> {
+    let b16 = |x: &Buffer<half::bf16>| -> Result<Vec<u8>> { Ok(x.download()?.into_iter().flat_map(|v| v.to_bits().to_le_bytes()).collect()) };
+    let pairs = [("sum", b16(&b.r_sum)?, b16(&b.f_sum)?), ("stream", b16(&b.r_stream)?, b16(&b.f_stream)?),
+        ("normalized", b16(&b.r_y)?, b16(&b.f_y)?), ("values", b.r_q.download()?, b.f_q.download()?),
+        ("row_scales", b.r_sr.download()?, b.f_sr.download()?), ("mma_scales", b.r_sm.download()?, b.f_sm.download()?)];
+    let mut digests = serde_json::Map::new();
+    for (name, x, y) in &pairs {
+        let d = x.iter().zip(y).filter(|(u, v)| u != v).count();
+        ensure!(d == 0, "fused boundary differs from production's chain: {label} rows{rows} {name}: {d} of {} bytes", x.len());
+        digests.insert(name.to_string(), json!(format!("{:x}", Sha256::digest(x))));
+    }
+    let nonzero = pairs[2].1.chunks(2).filter(|c| c[0] != 0 || c[1] != 0).count();
+    Ok(json!({"case": label, "identical": true, "sha256": digests, "normalized_nonzero": nonzero}))
+}
+/// Verify-layer stage 1 (b/c/d), Nov 18 2026: the fused boundary sum (kernels/roce_oneshot_hc.cuh) followed by the
+/// norm-quant variant reading its collapsed row (primitive-exports/mhc-value-norm-quant-v1, PDL form) against
+/// production's six-row chain on the same inputs: the exported one-shot sum, the PDL pair's post-mix and its layout8
+/// norm-quant. Every output byte must agree (reduced sum, new stream, normalized row, MXFP8 values, both scale layouts)
+/// for six fixtures, four row counts and every fused grid, eager and inside captured graphs; then balanced timing pairs
+/// of eight-boundary graphs.
+fn run_oneshot_hc(rank:usize,endpoint:&str,nonce:&[u8],root:&Path,core:&Path)->Result<Value> {
+    use half::bf16;
+    use crate::triton_ops::Operator;
+    let cuda=Cuda::open(0)?;cuda.qualify_gb10()?;let stream=cuda.stream()?;
+    let core_bytes=std::fs::read(core)?;
+    let mut comm=Roce::local(&cuda,&root.join("roce-v0"),rank)?;
+    let all=crate::rendezvous::exchange_blob(rank,endpoint.parse()?,nonce,&comm.blob()?)?;comm.connect(&all)?;
+    comm.attach_oneshot_twin(&core_bytes,true)?;
+    comm.set_oneshot_twin_for_probe(false,&stream)?;
+    comm.select_decode_reduction(true,&stream)?;
+    let post_op=Operator::load(&cuda,&root.join("mhc-pdl-pair-v1"),"hc_post_b128_w1")?;
+    let quant=Operator::load(&cuda,&root.join("mhc-pdl-pair-v1"),"hc_norm_quant_p2")?;
+    let variant=Operator::load(&cuda,&root.join("mhc-value-norm-quant-v1"),"hc_value_norm_quant_p2_pdl")?;
+    ensure!(post_op.entry.programmatic_stream_serialization && quant.entry.programmatic_stream_serialization
+        && variant.entry.programmatic_stream_serialization,"production PDL pair forms");
+    let cases=["normal","signed_zero","large","tiny_weight","mixed_scales","cancel"];
+    let mut results=Vec::new();
+    for rows in [1usize,2,3,6] {
+        let mut b=HcBuffers::new(&cuda,rows)?;
+        stream.join_default()?;
+        let mut checks=Vec::new();
+        for (index,case) in cases.iter().enumerate() {
+            let mut shared=Fixture(0x5eed_0000+index as u64*977+rows as u64);
+            let mut own=Fixture(0xa11_0000+index as u64*131+rows as u64*7+rank as u64*1_000_003);
+            let scale=match *case {"large"=>1.0e10f32,_=>1.0};
+            let mut p:Vec<f32>=(0..rows*5120).map(|_|own.normal(scale)).collect();
+            let mut x:Vec<f32>=(0..rows*20480).map(|_|shared.normal(scale)).collect();
+            let mut w:Vec<f32>=(0..5120).map(|_|shared.normal(1.0)).collect();
+            match *case {
+                "signed_zero"=>{for (i,v) in x.iter_mut().enumerate(){*v=if i%2==1{-0.0}else{0.0};}
+                                for (i,v) in p.iter_mut().enumerate(){*v=if i%2==1{-0.0}else{0.0};}}
+                "tiny_weight"=>{for v in w.iter_mut(){*v*=1.0e-30;}}
+                "mixed_scales"=>{for v in w.iter_mut(){*v=2f32.powi((shared.next()%200) as i32-100);}}
+                "cancel"=>{let mut same=Fixture(0xc0ffee+rows as u64);let sign=if rank%2==0{1.0}else{-1.0};
+                           for v in p.iter_mut(){*v=sign*same.normal(1.0);}}
+                _=>{}
+            }
+            b.partial.upload(&p.iter().map(|&v|bf16::from_f32(v)).collect::<Vec<_>>())?;
+            b.residual.upload(&x.iter().map(|&v|bf16::from_f32(v)).collect::<Vec<_>>())?;
+            b.weight.upload(&w.iter().map(|&v|bf16::from_f32(v)).collect::<Vec<_>>())?;
+            b.post.upload(&(0..rows*4).map(|_|shared.normal(1.0)).collect::<Vec<_>>())?;
+            b.comb.upload(&(0..rows*16).map(|_|shared.normal(0.5)).collect::<Vec<_>>())?;
+            b.pre.upload(&(0..rows*4).map(|_|shared.normal(1.0)).collect::<Vec<_>>())?;
+            for (poll,blocks) in [false,true].into_iter().flat_map(|p|[4usize,8,16,32].map(move|b|(p,b))) {
+                comm.set_fused_poll_for_probe(poll,&stream)?;
+                comm.set_fused_blocks_for_probe(blocks,&stream)?;
+                b.clear()?;stream.join_default()?;
+                hc_reference(&comm,&post_op,&quant,&mut b,rows,&stream)?;
+                hc_fused(&comm,&variant,&mut b,rows,&stream)?;
+                stream.synchronize()?;comm.health()?;
+                let mut record=hc_compare(&b,case,rows)?;
+                record["blocks"]=json!(blocks);record["single_poller"]=json!(poll);
+                if blocks==16 && !poll { checks.push(record); }
+            }
+        }
+        // Captured: eight boundaries a graph, launched alternately, compared after each launch pair.
+        comm.set_fused_blocks_for_probe(16,&stream)?;
+        let g_reference=stream.capture(||{for _ in 0..8 {hc_reference(&comm,&post_op,&quant,&mut b,rows,&stream)?;}Ok(())})?;
+        let mut graphs=Vec::new();
+        for (poll,blocks) in [false,true].into_iter().flat_map(|p|[4usize,8,16,32].map(move|b|(p,b))) {
+            comm.set_fused_poll_for_probe(poll,&stream)?;
+            comm.set_fused_blocks_for_probe(blocks,&stream)?;
+            graphs.push(((poll,blocks),stream.capture(||{for _ in 0..8 {hc_fused(&comm,&variant,&mut b,rows,&stream)?;}Ok(())})?));
+        }
+        comm.set_fused_poll_for_probe(false,&stream)?;
+        for (_,g) in &graphs {
+            for _ in 0..2 {
+                unsafe{g_reference.launch(&stream)?;g.launch(&stream)?;}
+                stream.synchronize()?;comm.health()?;hc_compare(&b,"captured",rows)?;
+            }
+        }
+        let mut timing=Vec::new();
+        for ((poll,blocks),g) in &graphs {
+            let mut pairs=Vec::new();
+            for repeat in 0..6 {
+                let mut times=[0f32;2];
+                for v in [repeat%2,1-repeat%2] {
+                    let graph=if v==0{&g_reference}else{g};
+                    for _ in 0..4 {unsafe{graph.launch(&stream)?;}}stream.synchronize()?;
+                    let start=cuda.event()?;let end=cuda.event()?;
+                    start.record(&stream)?;
+                    for _ in 0..32 {unsafe{graph.launch(&stream)?;}}
+                    end.record(&stream)?;times[v]=end.elapsed_since(&start)?/256.;
+                    comm.health()?;
+                }
+                pairs.push(json!({"repeat":repeat,"milliseconds_reference_fused":times}));
+            }
+            stream.synchronize()?;hc_compare(&b,"timed",rows)?;
+            timing.push(json!({"blocks":blocks,"single_poller":poll,"pairs":pairs}));
+        }
+        results.push(json!({"rows":rows,"checks":checks,"timing":timing}));
+    }
+    stream.synchronize()?;comm.health()?;
+    Ok(json!({"rank":rank,"results":results,"all_identical":true,"serving_policy_changed":false,
+        "scope":"Fused one-shot sum + mHC post-mix + collapse (every block polling, and one polling block), then the value-reading layout8 norm-quant (PDL), versus the exported sum, the PDL pair's post-mix and norm-quant: six host fixtures, rows 1/2/3/6, fused grids 4-32, eager and captured; six balanced timing pairs of eight-boundary graphs per grid, 256 boundaries an interval. Component screen only."}))
 }

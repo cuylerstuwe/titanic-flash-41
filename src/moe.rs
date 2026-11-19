@@ -58,6 +58,8 @@ struct Contract {
     #[serde(default)]
     fc1_input_address_overlay: Option<serde_json::Value>,
     #[serde(default)]
+    scale_code1: Option<serde_json::Value>,
+    #[serde(default)]
     input_bytes: usize,
     #[serde(default)]
     routed_quantizer_entry: Option<usize>,
@@ -251,6 +253,9 @@ pub struct Workspace {
     late_fc_pdl_enabled: Cell<bool>,
     cache_ca: Option<PackedInput>,
     cache_ca_enabled: Cell<bool>,
+    /// The experts' one-bit scale code plan (config::moe_scale_code1): the cache-ca kernels reading the code.
+    scale_code1: Option<PackedInput>,
+    scale_code1_enabled: Cell<bool>,
     /// Fewest live rows (2..=6) at which the six-row owner takes its cache-ca plan / hands the FFN a fused sum.
     /// Both were qualified at six live rows only (default 6); steps of 2, 4 and 5 rows run the plain plan.
     cache_ca_min_live: Cell<usize>,
@@ -461,6 +466,8 @@ impl Workspace {
             late_fc_pdl_enabled: Cell::new(false),
             cache_ca: None,
             cache_ca_enabled: Cell::new(false),
+            scale_code1: None,
+            scale_code1_enabled: Cell::new(false),
             cache_ca_min_live: Cell::new(live_variant_floor("CANADA_SCRATCH_MOE_CACHE_CA_MIN_LIVE")?),
             fuse_min_live: Cell::new(live_variant_floor("CANADA_SCRATCH_MOE_FUSED_SUM_MIN_LIVE")?),
             fc_pdl_other_lives: Cell::new(std::env::var("CANADA_SCRATCH_MOE_FC_PDL_OTHER_LIVES").as_deref()==Ok("1")),
@@ -675,6 +682,12 @@ impl Workspace {
             grouped.enable_cache_ca(&kernels.join("moe-runtime-m6-cache-ca-v1"))?;
             grouped.cache_ca_enabled.set(cache_ca);
         }
+        let scale_code1=crate::config::moe_scale_code1()?;
+        if scale_code1 || std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE1_SCREEN").as_deref()==Ok("1") {
+            ensure!(cache_ca,"the expert scale-code plan extends the cache-ca plan");
+            grouped.enable_scale_code1(&kernels.join("moe-runtime-m6-scale1-v1"))?;
+            grouped.scale_code1_enabled.set(scale_code1);
+        }
         if std::env::var("CANADA_SCRATCH_MOE_LATE_PDL_SCREEN").as_deref()==Ok("1") {
             grouped.enable_late_fc_pdl(&kernels.join("moe-runtime-m6-fc-pdl-late-v1"))?;
         }
@@ -816,6 +829,30 @@ impl Workspace {
             "unqualified MoE cache-ca ABI");
         self.cache_ca=Some(PackedInput{primitives:alternate.primitives,contract:alternate.contract});Ok(())
     }
+    /// The scale-code plan must be the cache-ca plan's kernels plus the code pointer: same scratch, scalars and every
+    /// cache-ca pointer at the same role and offset; extra pointers only for the role "scale_code".
+    fn enable_scale_code1(&mut self,root:&Path)->Result<()> {
+        let alternate=Self::new(&self.cuda,root)?;let c=&alternate.contract;
+        let base=self.cache_ca.as_ref().context("the expert scale-code plan needs the cache-ca plan")?;
+        let code=c.scale_code1.as_ref().context("MoE scale-code provenance absent")?;
+        let patch=c.fc1_input_address_overlay.as_ref().context("MoE scale-code pipeline provenance absent")?;
+        ensure!(self.scale_code1.is_none()&&self.live_bounds&&self.input_address_enabled.get()
+            &&code["version"]==1&&code["role"]=="scale_code"
+            &&patch["async_copy_cache_operator"]=="ca"&&patch["scale_code1"]==true
+            &&(c.rows,c.experts,c.hidden,c.intermediate,c.topk)==(6,384,5120,576,6)
+            &&c.scratch_bytes==base.contract.scratch_bytes&&c.nodes.len()==base.contract.nodes.len()
+            &&c.nodes.iter().zip(&base.contract.nodes).all(|(a,b)|a.kernel_id==b.kernel_id&&a.scalars==b.scalars
+                &&b.pointers.iter().all(|(k,v)|a.pointers.get(k)==Some(v))
+                &&a.pointers.iter().all(|(k,v)|b.pointers.contains_key(k)||v.role=="scale_code")),
+            "unqualified MoE scale-code ABI");
+        self.scale_code1=Some(PackedInput{primitives:alternate.primitives,contract:alternate.contract});Ok(())
+    }
+    pub(crate) fn set_scale_code1_for_probe(&self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE1_SCREEN").as_deref()==Ok("1")&&self.scale_code1.is_some(),
+            "MoE scale-code screen admission");
+        self.guard_stream(stream)?;self.scale_code1_enabled.set(enabled);Ok(())
+    }
+    pub(crate) fn scale_code1_enabled(&self)->bool { self.scale_code1_enabled.get() }
     /// Plan screen: the live-row floors of the cache-ca plan and of the fused FFN sum (6 = as qualified).
     pub(crate) fn set_live_variant_floors_for_probe(&self,cache_ca:usize,fuse:usize,fc_pdl_other:bool,stream:&Stream)->Result<()> {
         ensure!(self.contract.rows==6&&self.live_bounds&&(2..=6).contains(&cache_ca)&&(2..=6).contains(&fuse)
@@ -970,8 +1007,18 @@ impl Workspace {
         self.run_live_inner(expert,input,ids,routing_weights,live,fuse,stream)?;
         Ok(region)
     }
+    /// A wide (prefill) launch without its topk_sum node (config::prefill_grouped_sum): the route outputs
+    /// ([live][6][5120] BF16, gate-weighted) stay in this workspace's scratch for the caller's grouped sum. Returns their
+    /// address and the live row count.
+    pub(crate) fn run_live_deferred_wide(&self,expert:&Expert,input:&Buffer<bf16>,ids:&Buffer<i32>,
+        routing_weights:&Buffer<f32>,live:usize,stream:&Stream)->Result<(u64,usize)> {
+        ensure!(crate::config::wide_rows(self.contract.rows),"deferred expert sum is for wide workspaces");
+        let offset=Self::sum_input_offset(&self.contract)?;
+        self.run_live_inner(expert,input,ids,routing_weights,live,true,stream)?;
+        Ok((self.scratch.ptr()+offset as u64,live))
+    }
     fn sum_input_offset(c:&Contract)->Result<usize> {
-        ensure!(matches!(c.rows,6|16|32)&&c.hidden==5120&&c.topk==6
+        ensure!((matches!(c.rows,6|16|32)||crate::config::wide_rows(c.rows))&&c.hidden==5120&&c.topk==6
             && c.projection_dtype.is_none(),"fused FFN sum requires BF16 route outputs");
         let tail=c.nodes.last().context("missing expert sum")?;
         ensure!(tail.kernel_id=="moe.w4a16.topk_sum"
@@ -1022,6 +1069,10 @@ impl Workspace {
         if self.fc_pdl_mode.get()==1 || (self.fc_pdl_mode.get()==3
             && (live==3 || (self.fc_pdl_other_lives.get() && matches!(live,2|4|5)))) {
             let p=self.fc_pdl.as_ref().context("expert FC PDL plan absent")?;
+            return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
+        }
+        if self.scale_code1_enabled.get() && live>=2 {
+            let p=self.scale_code1.as_ref().context("expert one-bit scale-code plan absent")?;
             return self.launch_plan(&p.contract,&p.primitives,expert,input.ptr(),input.len()*2,ids,routing_weights,live,defer_sum,stream);
         }
         if self.scale_codes_enabled.get() {
@@ -1137,6 +1188,9 @@ impl Workspace {
         ]);
         for role in ["w13", "s13", "w2", "s2"] {
             roles.insert(role, expert.region(role)?);
+        }
+        if let Some(code)=expert.weights.expert_scale_code1(expert.layout.layer) {
+            roles.insert("scale_code",(code.ptr(),code.len()*4));
         }
         if c.kernel_library_sha256=="db4df4136bb446dfe5167a908d1fa336a2240c947af931125da37dc6a5b339ca" {
             let codes=expert.weights.expert_scale_codes(expert.layout.layer)

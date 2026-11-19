@@ -21,6 +21,19 @@ pub(crate) fn requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| dir().is_some())
 }
+/// CANADA_SCRATCH_ROUTE_CENSUS_PREFILL_ONLY=1 (Nov 18 2026, item 4: how many distinct experts an append touches per
+/// layer): count only routers of more than 16 rows (prefill chunks), so decode steps do not add their experts.
+fn prefill_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_ROUTE_CENSUS_PREFILL_ONLY").as_deref() == Ok("1"))
+}
+/// CANADA_SCRATCH_ROUTE_CENSUS_EACH=1: every dump is also kept as route-census-r<rank>-<n>.json (n = 1, 2, ... a
+/// process), so per-request counts are differences of consecutive tables.
+fn each() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_ROUTE_CENSUS_EACH").as_deref() == Ok("1"))
+}
+thread_local! { static DUMPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 /// Arm once a process (no-op when the census is not requested or already armed).
 pub(crate) fn arm_once(cuda: &Cuda, core: &[u8]) -> Result<()> {
     let Some(dir) = dir() else { return Ok(()) };
@@ -37,6 +50,7 @@ pub(crate) fn add(key: usize, experts: usize, ids: u64, live: u64, rows: usize, 
     STATE.with(|s| {
         let guard = s.borrow();
         let Some(state) = guard.as_ref() else { return Ok(()) };
+        if prefill_only() && rows <= 16 { return Ok(()); }
         ensure!(key < KEYS && experts <= EXPERTS && rows > 0 && topk > 0 && state.cuda.owns_stream(stream), "route census operands");
         let (mut ids, mut live, mut rows_, mut topk_) = (ids, live, rows as i32, topk as i32);
         let (mut counters, mut experts_) = (state.counters.ptr() + (key * EXPERTS * 4) as u64, experts as i32);
@@ -56,8 +70,13 @@ pub(crate) fn dump(rank: usize) -> Result<()> {
         std::fs::create_dir_all(&state.dir)?;
         let path = state.dir.join(format!("route-census-r{rank}.json"));
         let temporary = state.dir.join(format!("route-census-r{rank}.json.tmp"));
-        std::fs::write(&temporary, serde_json::to_vec(&serde_json::json!({"rank": rank, "keys": KEYS, "experts": EXPERTS, "counts": table}))?)?;
+        let body = serde_json::to_vec(&serde_json::json!({"rank": rank, "keys": KEYS, "experts": EXPERTS, "counts": table}))?;
+        std::fs::write(&temporary, &body)?;
         std::fs::rename(&temporary, &path)?;
+        if each() {
+            let n = DUMPS.with(|d| { d.set(d.get() + 1); d.get() });
+            std::fs::write(state.dir.join(format!("route-census-r{rank}-{n}.json")), &body)?;
+        }
         Ok(())
     })
 }

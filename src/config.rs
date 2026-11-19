@@ -1093,6 +1093,99 @@ pub(crate) fn extend_rows(rows: usize) -> bool {
 pub(crate) fn target_rows(rows: usize) -> bool {
     verification_rows(rows) || extend_rows(rows)
 }
+/// CANADA_SCRATCH_REGION_LOOKAHEAD=N (Nov 18 2026; the owner: a high `max_tokens` must not disable batched decode):
+/// batched decode admits a conversation into a serving region by the positions it can reach soon, its position plus
+/// min(remaining tokens, N), instead of its position plus all of its `max_tokens`. A conversation that then grows
+/// to its region's end sits out (Worker::boundary_peer / active_at_boundary) and continues alone once the others are
+/// done: never truncated. Unset or 0: today's rule (position + remaining tokens).
+pub(crate) fn region_lookahead() -> Result<usize> {
+    match std::env::var("CANADA_SCRATCH_REGION_LOOKAHEAD") {
+        Ok(v) => { let n: usize = v.parse()?; ensure!(n == 0 || (256..=1048576).contains(&n), "region lookahead"); Ok(n) }
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+/// The positions a conversation at `position` with `remaining` tokens to produce can reach for admission: all of
+/// them, or the next config::region_lookahead positions.
+pub(crate) fn region_reach(position: usize, remaining: usize) -> Result<usize> {
+    Ok(region_reach_with(position, remaining, region_lookahead()?))
+}
+pub(crate) fn region_reach_with(position: usize, remaining: usize, lookahead: usize) -> usize {
+    position.saturating_add(if lookahead == 0 { remaining } else { remaining.min(lookahead) })
+}
+/// CANADA_SCRATCH_REGION_CAPACITY_TEST=N (tests only): the scheduler treats a serving region as holding at most N
+/// positions (the layout keeps its real size, so this only moves the boundary earlier).
+pub(crate) fn region_capacity_test() -> Result<Option<usize>> {
+    match std::env::var("CANADA_SCRATCH_REGION_CAPACITY_TEST") {
+        Ok(v) => { let n: usize = v.parse()?; ensure!((4096..=1048576).contains(&n), "region capacity test"); Ok(Some(n)) }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_ONESHOT_TWIN=1 (Nov 18 2026, verify-layer stage 1 (a)): decode sums use the CUDA C++ twin of the
+/// exported b12x one-shot kernel (kernels/roce_oneshot_twin.cuh). Default off.
+pub(crate) fn oneshot_twin() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_ONESHOT_TWIN") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid one-shot twin policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_FUSED_BOUNDARY (Nov 18 2026, verify-layer stage 1): the six-row decode boundaries sum with the mHC
+/// post-mix and the next collapse in the one-shot kernel's epilogue (kernels/roce_oneshot_hc.cuh), and the next
+/// boundary's norm-quant reads the collapsed row (primitive-exports/mhc-value-norm-quant-v1). Bit-identical to the
+/// separate kernels by construction. 0 (default) off, 1 both boundaries, 2 the attention boundary only, 3 the FFN
+/// boundary only (its statistics must finish before the sum; see CANADA_SCRATCH_MHC_STATS_LATE).
+pub(crate) fn fused_boundary() -> Result<u8> {
+    match std::env::var("CANADA_SCRATCH_FUSED_BOUNDARY") {
+        Ok(v) => { ensure!(["0", "1", "2", "3"].contains(&v.as_str()), "invalid fused boundary policy"); Ok(v.parse()?) }
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_FUSED_BOUNDARY_BLOCKS: the fused boundary sum's grid (a power of two, 1..32: the one-shot protocol's
+/// counter classes). Default 16 (the plain six-row sum uses 4; the epilogue moves ~100 KB a row).
+pub(crate) fn fused_boundary_blocks() -> Result<usize> {
+    match std::env::var("CANADA_SCRATCH_FUSED_BOUNDARY_BLOCKS") {
+        Ok(v) => {
+            let blocks: usize = v.parse().map_err(|_| anyhow::anyhow!("invalid fused boundary grid"))?;
+            ensure!(blocks.is_power_of_two() && blocks <= 32, "fused boundary grid must be a power of two up to 32");
+            Ok(blocks)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(16),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_FUSED_BOUNDARY_POLL=1: the fused boundary sum polls the peers' flags from one block, which releases
+/// the others through a device word (ca_roce_oneshot_hc2_bf16), so wide grids do not multiply host-memory polling.
+/// Same protocol and bits. Default 0 (every block polls, as the exported kernel).
+pub(crate) fn fused_boundary_poll() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_FUSED_BOUNDARY_POLL") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid fused boundary polling policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_INDEX_BF16_DENSE=1 (Nov 18 2026, bf16 index route step 2): with config::index_bf16, groups of up to
+/// eight rows score and select in one persistent launch (index_bf16.cu ca_idx16_dense; the same keys and selection as
+/// the two launches, checked by the probe). Default off.
+pub(crate) fn index_bf16_dense() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_INDEX_BF16_DENSE") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid fused bf16 index policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_INDEX_BF16=1 (Nov 18 2026, the owner approved the bf16 index route): the dense index layers without
+/// a candidate publisher or consumer (source layers 2 / 8 / 14) score and select with the reference's bf16
+/// arithmetic (index_bf16.rs). Default off; a numeric change qualified by the reference KL gate.
+pub(crate) fn index_bf16() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_INDEX_BF16") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid bf16 index policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
 
 /// Explicit target profiles; M32 additionally requires the finite screen or
 /// the independently admitted serving proposal capability.
@@ -1144,6 +1237,162 @@ pub(crate) fn batched_regions() -> Result<usize> {
         Err(std::env::VarError::NotPresent) => Ok(1),
         Err(e) => Err(e.into()),
     }
+}
+/// CANADA_SCRATCH_DISK_TIER=1 (Nov 18 2026; default off): conversation
+/// snapshots get byte-exact copies on local NVMe (crate::disk_tier). In idle time (no request for
+/// CANADA_SCRATCH_DISK_TIER_IDLE_SECS, default 3) the coldest resident snapshots are written one per idle tick:
+/// prompt-end images with exact logits first, then completed turns of conversations not in use, then the rest. A
+/// snapshot with a copy is parked (RAM freed, kept on disk) instead of dropped when the cache evicts it; prompt-end
+/// images park as soon as their copy exists, completed turns of other conversations once
+/// CANADA_SCRATCH_DISK_TIER_PARK_AFTER newer cache entries (default 4) exist. A request whose best prefix is parked
+/// reloads it (every chunk's digest checked) before restoring, when the read (at CANADA_SCRATCH_DISK_TIER_READ_MBPS,
+/// default 2200, plus CANADA_SCRATCH_DISK_TIER_READ_FIXED_MS, default 30) beats prefilling the rows it saves over the best resident entry (disk_tier::reload_pays), and only
+/// within the cache's slot and byte limits. Budgets: CANADA_SCRATCH_DISK_TIER_GIB (disk, 64),
+/// CANADA_SCRATCH_DISK_TIER_WRITE_GIB_DAY (200), CANADA_SCRATCH_DISK_TIER_FREE_FLOOR_GIB (free space kept on the
+/// filesystem, 40), CANADA_SCRATCH_DISK_TIER_MAX_PARKED (64). Directory CANADA_SCRATCH_DISK_TIER_DIR (/scratch/disk-tier),
+/// emptied at startup.
+#[derive(Clone, Debug)]
+pub(crate) struct DiskTierConfig {
+    pub dir: std::path::PathBuf,
+    pub cap_bytes: u64,
+    pub write_bytes_per_day: u64,
+    pub free_floor_bytes: u64,
+    pub idle_secs: u64,
+    pub park_after_requests: u64,
+    pub max_parked: usize,
+    /// Read rate and fixed cost the reload decision assumes (CANADA_SCRATCH_DISK_TIER_READ_MBPS, default 2200 MB/s;
+    /// CANADA_SCRATCH_DISK_TIER_READ_FIXED_MS, default 30). Measured Nov 18 on s1620 (six reloads, 45-134 MB): 35-82 ms =
+    /// ~25-30 ms of all-rank agreement and allocation plus a read at ~2.2 GB/s (digests and upload a few ms).
+    pub read_bytes_per_s: f64,
+    pub read_fixed_s: f64,
+}
+pub(crate) fn disk_tier() -> Result<Option<DiskTierConfig>> {
+    match std::env::var("CANADA_SCRATCH_DISK_TIER") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid disk tier policy"); if v == "0" { return Ok(None); } }
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let number = |name: &str, default: u64| -> Result<u64> {
+        match std::env::var(name) {
+            Ok(v) => Ok(v.parse::<u64>().map_err(|e| anyhow::anyhow!("{name}: {e}"))?),
+            Err(std::env::VarError::NotPresent) => Ok(default),
+            Err(e) => Err(e.into()),
+        }
+    };
+    let gib = 1u64 << 30;
+    let config = DiskTierConfig {
+        dir: std::env::var("CANADA_SCRATCH_DISK_TIER_DIR").unwrap_or_else(|_| "/scratch/disk-tier".into()).into(),
+        cap_bytes: number("CANADA_SCRATCH_DISK_TIER_GIB", 64)? * gib,
+        write_bytes_per_day: number("CANADA_SCRATCH_DISK_TIER_WRITE_GIB_DAY", 200)? * gib,
+        free_floor_bytes: number("CANADA_SCRATCH_DISK_TIER_FREE_FLOOR_GIB", 40)? * gib,
+        idle_secs: number("CANADA_SCRATCH_DISK_TIER_IDLE_SECS", 3)?,
+        park_after_requests: number("CANADA_SCRATCH_DISK_TIER_PARK_AFTER", 4)?,
+        max_parked: number("CANADA_SCRATCH_DISK_TIER_MAX_PARKED", 64)? as usize,
+        read_bytes_per_s: number("CANADA_SCRATCH_DISK_TIER_READ_MBPS", 2200)? as f64 * 1e6,
+        read_fixed_s: number("CANADA_SCRATCH_DISK_TIER_READ_FIXED_MS", 30)? as f64 / 1e3,
+    };
+    ensure!(config.cap_bytes > 0 && config.max_parked > 0 && config.dir.is_absolute() && config.read_bytes_per_s > 0.0,
+        "disk tier budgets");
+    Ok(Some(config))
+}
+/// CANADA_SCRATCH_MOE_SCALE_CODE1=1 (Nov 18 2026; default off): the experts' one-bit scale code. At load every target
+/// layer's compact expert scales are coded on the GPU (expert_packing::code_layer_scales: per matrix a base b, per 128-row
+/// tile and K128 slice one bit a scale over {b, b + 1} and flags for rows read raw), and the six-row owner runs the
+/// expert kernels that read the code (primitive-exports/moe-runtime-m6-scale1-v1) for two or more live rows. The same
+/// scale bytes reach the same MMAs: outputs are bit-identical (the export checks it against moe-runtime-m6-cache-ca-v1).
+/// Memory: +48,012 bytes an expert a layer (~0.69 GiB a rank at 384 experts x 40 layers); the raw scales stay.
+pub(crate) fn moe_scale_code1() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE1") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid expert scale-code policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+/// Word offsets of one layer's scale-code buffer (u32 words): c13 [E][2][T13][S13][16], f13 [E][2][T13][S13][4],
+/// b13 [2E padded to 4], c2 [E][T2][S2][16], f2 [E][T2][S2][4], b2 [E]. T13 / S13: 128-row tiles of the intermediate
+/// rows and K128 slices of the hidden size; T2 / S2 the same for the down projection. Returns (f13, b13, c2, f2, b2, words).
+pub(crate) fn scale_code1_layout(experts: usize, hidden: usize, intermediate: usize) -> (usize, usize, usize, usize, usize, usize) {
+    let (t13, s13) = (intermediate.div_ceil(128), hidden.div_ceil(128));
+    let (t2, s2) = (hidden.div_ceil(128), (intermediate / 32).div_ceil(4));
+    let (u13, u2) = (t13 * s13, t2 * s2);
+    let f13 = experts * 2 * u13 * 16;
+    let b13 = f13 + experts * 2 * u13 * 4;
+    let c2 = b13 + (2 * experts).div_ceil(4) * 4;
+    let f2 = c2 + experts * u2 * 16;
+    let b2 = f2 + experts * u2 * 4;
+    (f13, b13, c2, f2, b2, b2 + experts)
+}
+#[cfg(test)]
+mod scale_code1_layout_tests {
+    /// The offsets the patched expert kernels compute (moe_scale_code1_patch.py): phase 1 f13 = E*2*U*16 and
+    /// b13 = f13 + E*2*U*4 (U = 5 tiles x 40 slices); phase 2 c2 = E*2*U13*20 + 4*ceil(2E/4), f2 = c2 + E*U2*16,
+    /// b2 = f2 + E*U2*4 (U2 = 40 tiles x 5 slices).
+    #[test]
+    fn offsets_match_the_patched_kernels() {
+        let (f13, b13, c2, f2, b2, words) = super::scale_code1_layout(384, 5120, 576);
+        assert_eq!((f13, b13), (384 * 2 * 200 * 16, 384 * 2 * 200 * 20));
+        assert_eq!(c2, 384 * 2 * 200 * 20 + 768);
+        assert_eq!((f2, b2), (c2 + 384 * 200 * 16, c2 + 384 * 200 * 20));
+        assert_eq!(words * 4, 384 * 48_012);
+        let (_, _, c2_small, _, _, _) = super::scale_code1_layout(3, 5120, 576);
+        assert_eq!(c2_small, 3 * 2 * 200 * 20 + 8);
+    }
+}
+/// CANADA_SCRATCH_FULL_REGIONS=1 (Nov 18 2026; the owner: a high `max_tokens` must not disable batched decode, and four
+/// 1M conversations should decode together): every serving region holds a whole conversation (MODEL_CONTEXT
+/// positions), so the compressed caches and their index-key caches span regions x MODEL_CONTEXT positions. Unset or 0:
+/// today's layout, where the regions are equal shares of one MODEL_CONTEXT space.
+pub(crate) fn full_regions() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_FULL_REGIONS") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid full-region policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+/// Positions the compressed and index-key caches span for conversations of `context` positions: `context`, or
+/// regions x `context` with full regions (which need the full model context and two or more regions).
+pub(crate) fn compressed_address_context(context: usize) -> Result<usize> {
+    compressed_address_context_with(context, batched_regions()?, full_regions()?)
+}
+pub(crate) fn compressed_address_context_with(context: usize, regions: usize, full: bool) -> Result<usize> {
+    if !full { return Ok(context); }
+    ensure!(regions >= 2 && context == MODEL_CONTEXT, "full regions need two or more regions of the full model context");
+    Ok(context * regions)
+}
+/// CANADA_SCRATCH_PREFILL_GROUPED_SUM=G (2 or 4; unset or 0: off; Nov 18 2026, item 4): in a sequence-parallel prefill
+/// layer with the row-local shared expert, the experts' six-route sum runs in G row groups on a side stream, and each
+/// group's reduce-scatter starts on the model stream as soon as its sum is done, instead of one sum pass followed by
+/// one reduce-scatter. Same arithmetic and the same row ownership per element: bit-identical outputs.
+pub(crate) fn prefill_grouped_sum() -> Result<usize> {
+    match std::env::var("CANADA_SCRATCH_PREFILL_GROUPED_SUM") {
+        Ok(v) => { let g: usize = v.parse()?; ensure!(matches!(g, 0 | 2 | 4), "grouped prefill sum must be 0, 2 or 4"); Ok(g) }
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_ELASTIC_REGIONS=1 (with full regions and the image pool; Nov 18 2026): the compressed and index-key
+/// caches are elastic ranges (cuda::Cuda::allocate_elastic) whose region-0 span is resident and whose other regions'
+/// spans are mapped from the image pool only while a conversation occupies them.
+pub(crate) fn elastic_regions() -> Result<bool> {
+    let on = match std::env::var("CANADA_SCRATCH_ELASTIC_REGIONS") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid elastic-region policy"); v == "1" }
+        Err(std::env::VarError::NotPresent) => false,
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(!on || (full_regions()? && std::env::var("CANADA_SCRATCH_IMAGE_POOL_MIB").is_ok()),
+        "elastic regions need full regions and the image pool");
+    Ok(on)
+}
+/// Slots of a compressed or key cache of `ratio` that region 0 uses (slot 0 sentinel, 32 offset, one whole conversation):
+/// the resident span of an elastic cache, or None without elastic regions.
+pub(crate) fn elastic_resident_slots(ratio: usize) -> Result<Option<usize>> {
+    ensure!(ratio == 1 || ratio == 2, "compressed ratio");
+    Ok(if elastic_regions()? { Some(32 + MODEL_CONTEXT / ratio) } else { None })
+}
+/// The largest index-key cache (rows) the index kernels are admitted for: one full-context conversation plus a page
+/// of padding, or one per region with full regions.
+pub(crate) fn index_key_capacity_limit() -> Result<usize> {
+    Ok(compressed_address_context(MODEL_CONTEXT).unwrap_or(MODEL_CONTEXT) + 4096)
 }
 /// Sessions a verify owner's caches hold: the finite screen's count, or the serving regions.
 pub(crate) fn session_slots() -> Result<usize> {

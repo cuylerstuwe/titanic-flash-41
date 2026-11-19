@@ -198,7 +198,7 @@ impl Metadata {
             query: query_index::Metadata::new(
                 cuda,
                 source.keys.capacity(),
-                slots.len(),
+                index_columns(source.ratio, slots.len()),
                 positions,
                 slots,
                 &vec![0; source.rows],
@@ -207,6 +207,12 @@ impl Metadata {
             )?,
         })
     }
+}
+/// Index columns of a branch whose key storage has `slots` rows: one conversation's keys (the model context over the
+/// compression ratio) or fewer for a smaller target context. Full serving regions give the batched owner's branches
+/// several conversations' rows (config::full_regions); each query row still reads one conversation's keys.
+pub(crate) fn index_columns(ratio: usize, slots: usize) -> usize {
+    slots.min(crate::config::MODEL_CONTEXT / ratio.max(1))
 }
 pub struct Layer {
     rows: usize,
@@ -456,7 +462,7 @@ impl Layer {
             frequency,
             core,
             slots.len(),
-            slots.len(),
+            index_columns(if layer == 20 { 1 } else { 2 }, slots.len()),
             rows,
             if crate::config::wide_rows(rows)
                 &&std::env::var("CANADA_SCRATCH_WIDE_INDEX_KEYS_SCREEN").as_deref()==Ok("1") {
@@ -789,7 +795,8 @@ impl ReadIndex {
             [24, 28, 32, 36].contains(&layer)
                 && owner.layer == 20
                 && !slots.is_empty()
-                && slots.len() <= crate::config::MODEL_CONTEXT,
+                // Full serving regions: the batched owner's slot table spans every region.
+                && slots.len() <= crate::config::index_key_capacity_limit()?,
             "read-only index source requires source20 and an admitted candidate window"
         );
         Ok(Self {
@@ -806,7 +813,7 @@ impl ReadIndex {
                 frequency,
                 core,
                 slots.len(),
-                slots.len(),
+                index_columns(1, slots.len()),
                 owner.rows,
                 None,
             )?,
@@ -880,4 +887,19 @@ fn compressor_bundle(rows: usize) -> Result<&'static str> {
         (true, true) => "compression-verify32-fp4-v1",
         (false, true) => "compression-fp4-v1",
     })
+}
+
+#[cfg(test)]
+mod index_columns_tests {
+    #[test]
+    fn one_conversation_of_columns_whatever_the_regions() {
+        let context = crate::config::MODEL_CONTEXT;
+        // Single-region profiles: every slot row is a column, at the full and at a smaller context.
+        assert_eq!(super::index_columns(2, context / 2), context / 2);
+        assert_eq!(super::index_columns(1, context), context);
+        assert_eq!(super::index_columns(1, 65536), 65536);
+        // Full serving regions: four conversations' rows, one conversation's columns.
+        assert_eq!(super::index_columns(2, 4 * context / 2), context / 2);
+        assert_eq!(super::index_columns(1, 4 * context), context);
+    }
 }

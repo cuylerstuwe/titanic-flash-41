@@ -209,7 +209,11 @@ thread_local! {
     static CAPTURE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SWAPS: std::cell::RefCell<Vec<NodeSwap>> = const { std::cell::RefCell::new(Vec::new()) };
     static SWAPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CAPTURE_SERIAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+/// Advances at every `Stream::capture` begin on this thread: work enqueued under one serial belongs to one graph
+/// (or, outside captures, to one eager run between captures).
+pub(crate) fn capture_serial() -> u64 { CAPTURE_SERIAL.with(|s| s.get()) }
 /// Whether this thread is inside exactly one `Stream::capture` body (the only place `graph_swap` is legal).
 pub(crate) fn capturing() -> bool { CAPTURE_DEPTH.with(|d| d.get() == 1) }
 pub(crate) fn graph_swap(swap: NodeSwap) -> Result<()> {
@@ -404,6 +408,80 @@ pub(crate) struct ChunkPool {
 }
 /// Snapshots smaller than this keep ordinary allocations (small blocks are never scarce; a chunk would waste most of itself).
 pub(crate) const POOLED_IMAGE_MIN: usize = 8 << 20;
+/// CANADA_SCRATCH_ELASTIC_TRACE=1 (diagnostic, default off): one line per elastic map and unmap (range, span).
+fn elastic_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_ELASTIC_TRACE").as_deref() == Ok("1"))
+}
+/// An elastic range (Nov 18 2026): one reserved address range
+/// whose resident prefix has its own memory and whose later chunks are mapped from the image pool only while a span
+/// holding them is mapped. Addresses never change, so captured graphs stay valid. A chunk is mapped while any mapped
+/// span covers it (reference counts: two serving regions share one page at their boundary). No kernel may touch an
+/// unmapped chunk; unmapping drains the context first, as every VMM unmap here does.
+struct ElasticAllocation {
+    owner: Rc<ContextOwner>,
+    ptr: u64,
+    span: usize,
+    chunk: usize,
+    resident: usize,
+    resident_handle: u64,
+    /// Chunk i >= resident / chunk: Some((pool handle, references)) while mapped.
+    chunks: RefCell<Vec<Option<(u64, u32)>>>,
+}
+impl ElasticAllocation {
+    fn chunk_range(&self, offset: usize, len: usize) -> Result<std::ops::Range<usize>> {
+        let end = offset.checked_add(len).context("elastic span overflow")?;
+        ensure!(len > 0 && end <= self.span, "elastic span outside its range");
+        // Chunks wholly inside the resident prefix are always mapped.
+        let first = (offset / self.chunk).max(self.resident / self.chunk);
+        let last = end.div_ceil(self.chunk);
+        Ok(first..last.max(first))
+    }
+    /// Pool chunks a map of this span would take now.
+    fn missing(&self, offset: usize, len: usize) -> Result<usize> {
+        let range = self.chunk_range(offset, len)?;
+        let base = self.resident / self.chunk;
+        let chunks = self.chunks.borrow();
+        Ok(range.filter(|&i| chunks[i - base].is_none()).count())
+    }
+    fn mapped_extents(&self) -> Vec<(u64, usize)> {
+        let mut out: Vec<(u64, usize)> = Vec::new();
+        if self.resident > 0 { out.push((self.ptr, self.resident)); }
+        let base = self.resident / self.chunk;
+        for (j, slot) in self.chunks.borrow().iter().enumerate() {
+            if slot.is_none() { continue; }
+            let at = self.ptr + ((base + j) * self.chunk) as u64;
+            match out.last_mut() {
+                Some(last) if last.0 + last.1 as u64 == at => last.1 += self.chunk,
+                _ => out.push((at, self.chunk)),
+            }
+        }
+        out
+    }
+}
+impl Drop for ElasticAllocation {
+    fn drop(&mut self) {
+        let pool = self.owner.image_pool.borrow().clone();
+        let mut returned = Vec::new();
+        if self.owner.current().is_ok() {
+            let api = &self.owner.api;
+            unsafe {
+                (api.context_sync)();
+                let base = self.resident / self.chunk;
+                for (j, slot) in self.chunks.borrow().iter().enumerate() {
+                    if let Some((handle, _)) = slot {
+                        (api.mem_unmap)(self.ptr + ((base + j) * self.chunk) as u64, self.chunk);
+                        returned.push(*handle);
+                    }
+                }
+                if self.resident > 0 { (api.mem_unmap)(self.ptr, self.resident); }
+                if self.ptr != 0 { (api.address_free)(self.ptr, self.span); }
+                if self.resident_handle != 0 { (api.mem_release)(self.resident_handle); }
+            }
+        }
+        if let Some(pool) = pool { pool.free.borrow_mut().extend(returned); }
+    }
+}
 struct PooledAllocation {
     owner: Rc<ContextOwner>,
     pool: Rc<ChunkPool>,
@@ -911,8 +989,40 @@ impl Cuda {
         Ok(serde_json::json!({"chunks":count,"chunk_bytes":chunk,"bytes":count*chunk,"granularity":granularity,
             "seconds":began.elapsed().as_secs_f64(),"memory_before":before,"memory_after":self.admission_memory()?}))
     }
+    /// The image pool's chunk size (16 MiB rounded up to the VMM granularity), as create_image_pool and
+    /// allocate_elastic compute it.
+    pub(crate) fn image_pool_chunk_bytes(&self) -> Result<usize> {
+        self.owner.current()?;
+        let api = &self.owner.api;
+        let prop = MemAllocationProp {kind:1,location:MemLocation {kind:1,id:self.owner.device},..MemAllocationProp::default()};
+        let mut granularity = 0usize;
+        api.check(unsafe{(api.mem_granularity)(&mut granularity,&prop,0)},"query image pool granularity")?;
+        ensure!(granularity.is_power_of_two(),"invalid VMM granularity");
+        Ok((16usize << 20).max(granularity).div_ceil(granularity) * granularity)
+    }
+    /// Release the image pool and its memory (Nov 18 2026: the temporary pool that backs elastic serving regions
+    /// during the batched graph warm-up, before the real pool exists). Every chunk must be free and no pooled
+    /// snapshot may hold the pool; otherwise nothing changes. Returns the chunks released.
+    pub(crate) fn release_image_pool(&self) -> Result<usize> {
+        let pool = self.owner.image_pool.borrow_mut().take().context("no image pool to release")?;
+        let free = pool.free.borrow().len();
+        if free != pool.count || Rc::strong_count(&pool) != 1 {
+            let count = pool.count;
+            *self.owner.image_pool.borrow_mut() = Some(pool);
+            anyhow::bail!("image pool still in use ({free} of {count} chunks free)");
+        }
+        self.owner.current()?;
+        let api = &self.owner.api;
+        api.check(unsafe{(api.context_sync)()},"drain before releasing the image pool")?;
+        let handles: Vec<u64> = pool.free.borrow_mut().drain(..).collect();
+        for h in handles { api.check(unsafe{(api.mem_release)(h)},"release image pool chunk")?; }
+        Ok(pool.count)
+    }
     pub(crate) fn image_pool_free_bytes(&self) -> Option<usize> {
         self.owner.image_pool.borrow().as_ref().map(|p| p.free.borrow().len() * p.chunk)
+    }
+    pub(crate) fn image_pool_free_chunks(&self) -> Option<usize> {
+        self.owner.image_pool.borrow().as_ref().map(|p| p.free.borrow().len())
     }
     pub(crate) fn image_pool_total_bytes(&self) -> Option<usize> {
         self.owner.image_pool.borrow().as_ref().map(|p| p.count * p.chunk)
@@ -947,6 +1057,40 @@ impl Cuda {
         api.check(unsafe{(api.mem_access)(a.ptr,span,&access,1)},"set pooled image access")?;
         let ptr = a.ptr;
         Ok(Some(Buffer {owner:self.owner.clone(),ptr,len:bytes,storage:Storage::Pooled(a),_element:PhantomData}))
+    }
+    /// An elastic range of `bytes` (see ElasticAllocation): `resident` bytes (rounded up to a pool chunk) get their own
+    /// memory now and are zeroed; the rest stays unmapped until Buffer::elastic_map. The chunk size is the image
+    /// pool's (16 MiB rounded to the VMM granularity), so it can be computed before the pool exists.
+    pub(crate) fn allocate_elastic(&self, bytes: usize, resident: usize, label: &str) -> Result<Buffer<u8>> {
+        ensure!(bytes > 0 && resident <= bytes, "elastic range geometry");
+        self.owner.current()?;
+        let api = &self.owner.api;
+        let prop = MemAllocationProp {kind:1,location:MemLocation {kind:1,id:self.owner.device},..MemAllocationProp::default()};
+        let mut granularity = 0usize;
+        api.check(unsafe{(api.mem_granularity)(&mut granularity,&prop,0)},"query elastic granularity")?;
+        ensure!(granularity.is_power_of_two(),"invalid VMM granularity");
+        let chunk = (16usize << 20).max(granularity).div_ceil(granularity) * granularity;
+        if let Some(pool) = self.owner.image_pool.borrow().as_ref() { ensure!(pool.chunk == chunk, "elastic chunk differs from the pool's"); }
+        let span = bytes.div_ceil(chunk) * chunk;
+        let resident = (resident.div_ceil(chunk) * chunk).min(span);
+        let chunks = (span - resident) / chunk;
+        let mut a = ElasticAllocation {owner:self.owner.clone(),ptr:0,span,chunk,resident:0,resident_handle:0,
+            chunks:RefCell::new(vec![None; chunks])};
+        api.check(unsafe{(api.address_reserve)(&mut a.ptr,span,chunk,0,0)},"reserve elastic addresses")?;
+        if resident > 0 {
+            api.check(unsafe{(api.mem_create)(&mut a.resident_handle,resident,&prop,0)},"create elastic resident memory")?;
+            api.check(unsafe{(api.mem_map)(a.ptr,resident,0,a.resident_handle,0)},"map elastic resident memory")?;
+            a.resident = resident;
+            let access = MemAccessDesc {location:MemLocation {kind:1,id:self.owner.device},flags:3};
+            api.check(unsafe{(api.mem_access)(a.ptr,resident,&access,1)},"set elastic resident access")?;
+            api.check(unsafe{(api.zero)(a.ptr,0,resident)},"zero elastic resident memory")?;
+        }
+        let ptr = a.ptr;
+        // Nov 18: every elastic range, so a fault address can be traced to its cache (fqa3: an MMU read fault at one
+        // address on all four ranks once a region conversation passed 16K positions).
+        eprintln!("elastic range {}", serde_json::json!({"label":label,"ptr":format!("{ptr:#x}"),"end":format!("{:#x}",ptr+span as u64),
+            "span":span,"resident":resident,"chunk":chunk}));
+        Ok(Buffer {owner:self.owner.clone(),ptr,len:bytes,storage:Storage::Elastic(Box::new(a)),_element:PhantomData})
     }
     /// Admission for conversation snapshots only: with the pool, its free chunks are where a snapshot goes, so they count
     /// as room. Every other allocation still answers to host memory through admission_memory().
@@ -1228,6 +1372,10 @@ enum Storage {
     Vmm(#[allow(dead_code)] VmmAllocation),
     // A conversation snapshot mapped from the startup chunk pool; dropping returns the chunks.
     Pooled(#[allow(dead_code)] PooledAllocation),
+    // A reserved range with a resident prefix; later chunks come from the image pool while mapped (ElasticAllocation).
+    // Boxed: inline it was the largest variant and grew every Buffer from 88 to 112 bytes, which overflowed the main
+    // thread's stack while the wide targets were built (s1604 small probe, Nov 18 2026).
+    Elastic(Box<ElasticAllocation>),
     // Created only by the scoped integer-metadata allocator above.
     MappedMetadata(MappedHost),
     StagedMetadata { arena: Rc<MetadataStaging>, offset: usize },
@@ -1377,6 +1525,98 @@ impl<T: DeviceElement> Buffer<T> {
     pub fn len(&self) -> usize {
         self.len
     }
+    /// Whether this is an elastic range (Cuda::allocate_elastic): only its resident prefix and mapped spans exist.
+    pub(crate) fn is_elastic(&self) -> bool { matches!(self.storage, Storage::Elastic(_)) }
+    /// Pool chunks elastic_map(offset, len) would take now (0 for a span already mapped or resident).
+    pub(crate) fn elastic_missing(&self, offset: usize, len: usize) -> Result<usize> {
+        let Storage::Elastic(e) = &self.storage else { anyhow::bail!("not an elastic range") };
+        e.missing(offset, len)
+    }
+    /// The resident prefix and every mapped chunk, as merged (address, bytes) extents.
+    pub(crate) fn elastic_mapped_extents(&self) -> Result<Vec<(u64, usize)>> {
+        let Storage::Elastic(e) = &self.storage else { anyhow::bail!("not an elastic range") };
+        Ok(e.mapped_extents())
+    }
+    /// Map a span of an elastic range from the image pool's free chunks (byte offsets). Ok(false), changing nothing, when
+    /// the pool has too few free chunks. New chunks are zeroed; every chunk of the span gains a reference.
+    pub(crate) fn elastic_map(&self, offset: usize, len: usize) -> Result<bool> {
+        let Storage::Elastic(e) = &self.storage else { anyhow::bail!("not an elastic range") };
+        self.owner.current()?;
+        let range = e.chunk_range(offset, len)?;
+        let base = e.resident / e.chunk;
+        let pool = self.owner.image_pool.borrow().clone().context("an elastic map needs the image pool")?;
+        ensure!(pool.chunk == e.chunk, "elastic chunk differs from the pool's");
+        let missing: Vec<usize> = { let c = e.chunks.borrow(); range.clone().filter(|&i| c[i - base].is_none()).collect() };
+        let handles = {
+            let mut free = pool.free.borrow_mut();
+            if free.len() < missing.len() { return Ok(false); }
+            let n = free.len();
+            free.split_off(n - missing.len())
+        };
+        let api = &self.owner.api;
+        let access = MemAccessDesc {location:MemLocation {kind:1,id:self.owner.device},flags:3};
+        let mut mapped: Vec<(usize, u64)> = Vec::new();
+        let mut result = Ok(());
+        for (&i, &handle) in missing.iter().zip(&handles) {
+            let at = e.ptr + (i * e.chunk) as u64;
+            result = api.check(unsafe{(api.mem_map)(at,e.chunk,0,handle,0)},"map elastic chunk");
+            if result.is_err() { break; }
+            mapped.push((i, handle));
+            result = api.check(unsafe{(api.mem_access)(at,e.chunk,&access,1)},"set elastic chunk access")
+                .and_then(|_| api.check(unsafe{(api.zero)(at,0,e.chunk)},"zero elastic chunk"));
+            if result.is_err() { break; }
+        }
+        if let Err(error) = result {
+            unsafe { for &(i, _) in &mapped { (api.mem_unmap)(e.ptr + (i * e.chunk) as u64, e.chunk); } }
+            pool.free.borrow_mut().extend(handles);
+            return Err(error);
+        }
+        // The zeroing ran on the legacy stream, unordered with the model's streams: finish it before anything is
+        // copied into the new chunks (maps are rare: a conversation moving into a serving region).
+        if !mapped.is_empty() { api.check(unsafe{(api.context_sync)()},"finish elastic zeroing")?; }
+        let mut chunks = e.chunks.borrow_mut();
+        for &(i, handle) in &mapped { chunks[i - base] = Some((handle, 0)); }
+        if elastic_trace() {
+            eprintln!("elastic map {}", serde_json::json!({"range":format!("{:#x}",e.ptr),"from":format!("{:#x}",e.ptr+offset as u64),
+                "to":format!("{:#x}",e.ptr+(offset+len) as u64),"new_chunks":mapped.len()}));
+        }
+        for i in range { if let Some((_, references)) = chunks[i - base].as_mut() { *references += 1; } }
+        Ok(true)
+    }
+    /// Drop one reference from every chunk of a span mapped with elastic_map; chunks left without references are
+    /// unmapped (after draining the context) and return to the pool.
+    pub(crate) fn elastic_unmap(&self, offset: usize, len: usize) -> Result<()> {
+        let Storage::Elastic(e) = &self.storage else { anyhow::bail!("not an elastic range") };
+        if elastic_trace() {
+            eprintln!("elastic unmap {}", serde_json::json!({"range":format!("{:#x}",e.ptr),"from":format!("{:#x}",e.ptr+offset as u64),
+                "to":format!("{:#x}",e.ptr+(offset+len) as u64)}));
+        }
+        let range = e.chunk_range(offset, len)?;
+        let base = e.resident / e.chunk;
+        let release: Vec<(usize, u64)> = {
+            let mut chunks = e.chunks.borrow_mut();
+            ensure!(range.clone().all(|i| chunks[i - base].is_some_and(|(_, r)| r > 0)), "elastic unmap of an unmapped span");
+            let mut out = Vec::new();
+            for i in range {
+                let slot = &mut chunks[i - base];
+                let (handle, references) = slot.as_mut().unwrap();
+                *references -= 1;
+                if *references == 0 { out.push((i, *handle)); *slot = None; }
+            }
+            out
+        };
+        if release.is_empty() { return Ok(()); }
+        self.owner.current()?;
+        let api = &self.owner.api;
+        api.check(unsafe{(api.context_sync)()},"drain before an elastic unmap")?;
+        for &(i, _) in &release {
+            api.check(unsafe{(api.mem_unmap)(e.ptr + (i * e.chunk) as u64, e.chunk)},"unmap elastic chunk")?;
+        }
+        if let Some(pool) = self.owner.image_pool.borrow().as_ref() {
+            pool.free.borrow_mut().extend(release.iter().map(|&(_, handle)| handle));
+        }
+        Ok(())
+    }
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -1388,6 +1628,7 @@ impl<T: DeviceElement> Buffer<T> {
             data.len() == self.len,
             "upload length differs from allocation"
         );
+        ensure!(!matches!(self.storage, Storage::Elastic(_)), "whole-range upload into an elastic range");
         if let Storage::StagedMetadata {arena,offset} = &self.storage {
             // The scoped allocator's owner orders writes and its explicit flush.
             unsafe {std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(),
@@ -1408,6 +1649,7 @@ impl<T: DeviceElement> Buffer<T> {
         )
     }
     pub fn download(&self) -> Result<Vec<T>> {
+        ensure!(!matches!(self.storage, Storage::Elastic(_)), "whole-range download of an elastic range");
         self.owner.current()?;
         let mut v = vec![T::default(); self.len];
         self.owner.api.check(
@@ -1417,6 +1659,13 @@ impl<T: DeviceElement> Buffer<T> {
         Ok(v)
     }
     pub fn zero(&mut self) -> Result<()> {
+        if let Storage::Elastic(e) = &self.storage {
+            self.owner.current()?;
+            for (at, bytes) in e.mapped_extents() {
+                self.owner.api.check(unsafe { (self.owner.api.zero)(at, 0, bytes) }, "zero elastic extent")?;
+            }
+            return Ok(());
+        }
         if let Storage::StagedMetadata {arena,offset} = &self.storage {
             unsafe {std::ptr::write_bytes(arena.host.host.cast::<u8>().add(*offset),0,self.bytes());}
             return Ok(());
@@ -1644,8 +1893,10 @@ impl Stream {
             "begin graph capture",
         )?;
         CAPTURE_DEPTH.with(|d| d.set(d.get() + 1));
+        CAPTURE_SERIAL.with(|s| s.set(s.get() + 1));
         let body = f();
         CAPTURE_DEPTH.with(|d| d.set(d.get() - 1));
+        CAPTURE_SERIAL.with(|s| s.set(s.get() + 1));
         // Replacement records belong to this capture alone, also when it fails.
         let swaps = SWAPS.with(|s| std::mem::take(&mut *s.borrow_mut()));
         let mut graph = ptr::null_mut();
