@@ -14,9 +14,207 @@ use crate::{
 use anyhow::{Result, ensure};
 use half::bf16;
 use std::{cell::Cell, path::Path, rc::Rc};
+/// config::index_bf16_check counters per (layer kind x reach) class: kind plain / publisher / consumer, reach up to or
+/// beyond 16,384 keys (where source20's candidate mask starts to drop blocks). Per class: non-empty rows, sum of shares
+/// (x 1e6), rows under 0.9, rows with a pick outside the range or another count, rows whose bf16-only picks sit earlier /
+/// later in the range than the regular-only picks; then calls and lines logged.
+static BF16_CHECK: [[std::sync::atomic::AtomicU64; 6]; 20] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 6] }; 20];
+static BF16_CHECK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BF16_CHECK_LOGGED: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+fn bf16_check_compare(regular: &[i32], bf16: &[i32], k: usize, meta: &Metadata, region: bool, id: u64) {
+    bf16_check_compare_kind(regular, bf16, k, meta, region, id, "plain", false)
+}
+/// config::index_bf16_check: per row, the regular selection against bf16's over the row's first min(keys, k) entries (sets:
+/// the regular picks are not sorted yet where this runs). Rows under 0.9 shared picks, with a pick outside the row's range
+/// or another count (or, on plain layers, not ascending: that path skips the sort) are logged, 20 per class.
+#[allow(clippy::too_many_arguments)]
+fn bf16_check_compare_kind(regular: &[i32], bf16: &[i32], k: usize, meta: &Metadata, region: bool, id: u64, kind: &str,
+    masked: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let kind_index = match kind { "publisher" => 1, "consumer" => 2, "publisher-u16" => 3, "consumer-u16" => 4, _ => 0 };
+    for r in 0..meta.rows {
+        let (s, e) = meta.host_ranges[r];
+        let n = e.saturating_sub(s).min(k);
+        if n == 0 { continue; }
+        let class = (kind_index * 2 + usize::from(e - s > crate::candidates::WINDOW)) * 2 + usize::from(s > 0);
+        let pick = |v: &[i32]| -> std::collections::BTreeSet<i32> {
+            v[r * k..r * k + n].iter().copied().filter(|&x| x >= 0).collect()
+        };
+        let (b, a) = (pick(regular), pick(bf16));
+        let both = a.intersection(&b).count();
+        let share = if b.is_empty() { if a.is_empty() { 1.0 } else { 0.0 } } else { both as f64 / b.len() as f64 };
+        let outside = a.iter().filter(|&&x| (x as usize) < s || (x as usize) >= e).count();
+        let span = e.saturating_sub(s).max(1) as f64;
+        let mean_pos = |v: Vec<i32>| -> Option<f64> {
+            (!v.is_empty()).then(|| v.iter().map(|&x| (x as f64 - s as f64) / span).sum::<f64>() / v.len() as f64)
+        };
+        let a_only = mean_pos(a.difference(&b).copied().collect());
+        let b_only = mean_pos(b.difference(&a).copied().collect());
+        let row = &bf16[r * k..(r + 1) * k];
+        let ascending = row[..n].windows(2).all(|w| w[0] < w[1]) && row[n..].iter().all(|&x| x == -1);
+        let c = &BF16_CHECK[class];
+        c[0].fetch_add(1, Relaxed);
+        c[1].fetch_add((share * 1e6) as u64, Relaxed);
+        if share < 0.9 { c[2].fetch_add(1, Relaxed); }
+        if outside > 0 || a.len() != b.len() { c[3].fetch_add(1, Relaxed); }
+        if let (Some(x), Some(y)) = (a_only, b_only) { c[if x < y { 4 } else { 5 }].fetch_add(1, Relaxed); }
+        let bad = share < 0.9 || outside > 0 || a.len() != b.len() || (kind_index == 0 && !ascending);
+        if bad && BF16_CHECK_LOGGED[class].fetch_add(1, Relaxed) < 10 {
+            eprintln!("bf16 index check {}", serde_json::json!({"branch": format!("{id:x}"), "kind": kind, "masked": masked,
+                "rows": meta.rows, "row": r, "range": [s, e], "region": region, "parts": meta.parts, "regular": b.len(),
+                "bf16": a.len(), "share": (share * 1000.0).round() / 1000.0, "outside": outside, "ascending": ascending,
+                "bf16_only_pos": a_only.map(|x| (x * 1000.0).round() / 1000.0),
+                "regular_only_pos": b_only.map(|x| (x * 1000.0).round() / 1000.0)}));
+        }
+    }
+    if BF16_CHECK_CALLS.fetch_add(1, Relaxed) % 100 == 99 {
+        bf16_check_selection_summary();
+    }
+}
+fn bf16_check_selection_summary() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let classes: Vec<serde_json::Value> = (0..20).filter(|&i| BF16_CHECK[i][0].load(Relaxed) > 0).map(|i| {
+        let c = &BF16_CHECK[i];
+        let rows = c[0].load(Relaxed);
+        serde_json::json!({"kind": (["plain", "publisher", "consumer", "publisher-u16", "consumer-u16"][i / 4]),
+            "beyond_16384": (i / 2) % 2 == 1, "past_region0": i % 2 == 1, "rows": rows,
+            "mean_share": c[1].load(Relaxed) as f64 / 1e6 / rows.max(1) as f64, "under_0_9": c[2].load(Relaxed),
+            "outside_or_count": c[3].load(Relaxed), "bf16_only_earlier": c[4].load(Relaxed),
+            "bf16_only_later": c[5].load(Relaxed)})
+    }).collect();
+    eprintln!("bf16 index check summary {}", serde_json::json!({"calls": BF16_CHECK_CALLS.load(Relaxed), "classes": classes}));
+}
+/// config::index_bf16_check (s1632, Nov 20): raw scores of every row with keys, for the value check below; at most
+/// ~4,000 row reads per process (16K windows: ~0.25 GB of read-backs in all).
+static BF16_VALUE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn bf16_check_values_due() -> bool { BF16_VALUE_READS.load(std::sync::atomic::Ordering::Relaxed) < 4000 }
+fn bf16_check_values(cuda: &Cuda, scores: u64, stride: usize, meta: &Metadata) -> Result<Vec<Vec<f32>>> {
+    let mut out = Vec::with_capacity(meta.rows);
+    for r in 0..meta.rows {
+        let (s, e) = meta.host_ranges[r];
+        let n = e.saturating_sub(s);
+        if n == 0 { out.push(Vec::new()); continue; }
+        let bytes = unsafe { cuda.read_device(scores + (r * stride * 4) as u64, n * 4)? };
+        out.push(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect());
+    }
+    BF16_VALUE_READS.fetch_add(meta.rows as u64, std::sync::atomic::Ordering::Relaxed);
+    Ok(out)
+}
+/// Exact host top-k of one row's raw scores (value descending, equal values by lower position, NaN last), as absolute
+/// key positions (s + j).
+fn host_topk(v: &[f32], s: usize, k: usize) -> std::collections::BTreeSet<i32> {
+    let key = |i: usize| if v[i].is_nan() { f32::NEG_INFINITY } else { v[i] };
+    let mut idx: Vec<usize> = (0..v.len()).collect();
+    idx.sort_by(|&a, &b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+    idx.into_iter().take(k.min(v.len())).map(|i| (s + i) as i32).collect()
+}
+/// config::index_bf16_check (s1632): per class (publisher / consumer x past region 0): rows, sum of share(host top-k of
+/// the regular scores, host top-k of the bf16 f32 scores) x 1e6, sum of share(host top-k of the bf16 scores, the GPU
+/// f32-path picks) x 1e6, rows with NaN (unwritten) entries, entries more than 5 % apart, entries compared; lines logged.
+static BF16_VALUE: [[std::sync::atomic::AtomicU64; 6]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 6] }; 4];
+static BF16_VALUE_LOGGED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static BF16_VALUE_ROWS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Tells the two halves of the f32 path apart: wrong scores (host regular vs host bf16 far apart) or a wrong selection
+/// downstream of right scores (host bf16 vs the GPU picks far apart; publisher rows: no mask on their own selection).
+#[allow(clippy::too_many_arguments)]
+fn bf16_check_value_compare(regular: &[Vec<f32>], bf16: &[Vec<f32>], gpu: &[i32], k: usize, meta: &Metadata, kind: &str,
+    masked: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for r in 0..meta.rows {
+        let (s, e) = meta.host_ranges[r];
+        let n = e.saturating_sub(s);
+        if n == 0 || regular.get(r).is_none_or(|v| v.len() != n) || bf16.get(r).is_none_or(|v| v.len() != n) { continue; }
+        let class = usize::from(kind == "consumer") * 2 + usize::from(s > 0);
+        let (rv, fv) = (&regular[r], &bf16[r]);
+        let a = host_topk(rv, s, k);
+        let b = host_topk(fv, s, k);
+        let g: std::collections::BTreeSet<i32> = gpu[r * k..r * k + n.min(k)].iter().copied().filter(|&x| x >= 0).collect();
+        let share = |x: &std::collections::BTreeSet<i32>, y: &std::collections::BTreeSet<i32>|
+            if x.is_empty() { 1.0 } else { x.intersection(y).count() as f64 / x.len() as f64 };
+        let (ab, bg) = (share(&a, &b), share(&b, &g));
+        let nan = fv.iter().filter(|x| x.is_nan()).count();
+        let far: Vec<usize> = (0..n).filter(|&i| !fv[i].is_nan()
+            && (rv[i] - fv[i]).abs() > 0.05 * rv[i].abs().max(fv[i].abs()) + 1e-6).collect();
+        let c = &BF16_VALUE[class];
+        c[0].fetch_add(1, Relaxed);
+        c[1].fetch_add((ab * 1e6) as u64, Relaxed);
+        c[2].fetch_add((bg * 1e6) as u64, Relaxed);
+        if nan > 0 { c[3].fetch_add(1, Relaxed); }
+        c[4].fetch_add(far.len() as u64, Relaxed);
+        c[5].fetch_add(n as u64, Relaxed);
+        if (ab < 0.9 || bg < 0.9 || nan > 0 || far.len() * 100 > n) && BF16_VALUE_LOGGED[class].fetch_add(1, Relaxed) < 12 {
+            let sample: Vec<serde_json::Value> = far.iter().take(6).map(|&i| serde_json::json!([i, rv[i], fv[i]])).collect();
+            eprintln!("bf16 index values {}", serde_json::json!({"kind": kind, "masked": masked, "rows": meta.rows, "row": r,
+                "range": [s, e], "parts": meta.parts, "host_regular_vs_host_bf16": (ab * 1000.0).round() / 1000.0,
+                "host_bf16_vs_gpu": (bg * 1000.0).round() / 1000.0, "nan": nan, "far": far.len(), "far_sample": sample}));
+        }
+    }
+    if BF16_VALUE_ROWS_SEEN.fetch_add(meta.rows as u64, Relaxed) % 1600 < meta.rows as u64 {
+        eprintln!("bf16 index values summary {}", serde_json::json!((0..4).filter(|&i| BF16_VALUE[i][0].load(Relaxed) > 0).map(|i| {
+            let c = &BF16_VALUE[i]; let rows = c[0].load(Relaxed).max(1) as f64;
+            serde_json::json!({"kind": (["publisher", "consumer"][i / 2]), "past_region0": i % 2 == 1, "rows": c[0].load(Relaxed),
+                "mean_host_regular_vs_host_bf16": c[1].load(Relaxed) as f64 / 1e6 / rows,
+                "mean_host_bf16_vs_gpu": c[2].load(Relaxed) as f64 / 1e6 / rows, "rows_with_nan": c[3].load(Relaxed),
+                "far_entries": c[4].load(Relaxed), "entries": c[5].load(Relaxed)})
+        }).collect::<Vec<_>>()));
+    }
+}
+/// config::index_bf16_check: rows scanned for unwritten (NaN) score entries by class (past region 0 or not), rows with
+/// any, positions in all, lines logged.
+static BF16_UNWRITTEN: [[std::sync::atomic::AtomicU64; 4]; 2] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 2];
+fn bf16_check_writes_summary() {
+    use std::sync::atomic::Ordering::Relaxed;
+    eprintln!("bf16 index unwritten summary {}", serde_json::json!((0..2).map(|i| serde_json::json!({
+        "past_region0": i == 1, "rows": BF16_UNWRITTEN[i][0].load(Relaxed), "rows_with_unwritten": BF16_UNWRITTEN[i][1].load(Relaxed),
+        "unwritten_entries": BF16_UNWRITTEN[i][2].load(Relaxed)})).collect::<Vec<_>>()));
+}
+/// A short diagnostic run can finish between two periodic summaries. Publish all of the
+/// per-rank checks after the last request has drained, before the worker exits.
+pub(crate) fn finish_bf16_checks() {
+    if crate::config::index_bf16_check() {
+        bf16_check_selection_summary();
+        bf16_check_writes_summary();
+        eprintln!("bf16 index checks finalized");
+    }
+}
+/// config::index_bf16_check: after a NaN fill and the bf16 f32-score pass, the entries of each row's [0, length) still NaN.
+fn bf16_check_unwritten(cuda: &Cuda, scores: u64, stride: usize, meta: &Metadata, kind: &str) -> Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    for r in 0..meta.rows {
+        let (s, e) = meta.host_ranges[r];
+        let n = e.saturating_sub(s);
+        if n == 0 { continue; }
+        let bytes = unsafe { cuda.read_device(scores + (r * stride * 4) as u64, n * 4)? };
+        let nan: Vec<usize> = bytes.chunks_exact(4).enumerate()
+            .filter(|(_, b)| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).is_nan()).map(|(i, _)| i).collect();
+        let c = &BF16_UNWRITTEN[usize::from(s > 0)];
+        c[0].fetch_add(1, Relaxed);
+        if !nan.is_empty() {
+            c[1].fetch_add(1, Relaxed);
+            c[2].fetch_add(nan.len() as u64, Relaxed);
+            if c[3].fetch_add(1, Relaxed) < 12 {
+                // Runs of unwritten entries: (first, last) of up to 6 runs.
+                let mut runs: Vec<(usize, usize)> = Vec::new();
+                for &i in &nan { match runs.last_mut() { Some(r) if r.1 + 1 == i => r.1 = i, _ => runs.push((i, i)) } }
+                eprintln!("bf16 index unwritten {}", serde_json::json!({"kind": kind, "rows": meta.rows, "row": r,
+                    "range": [s, e], "length": n, "unwritten": nan.len(), "runs": runs.iter().take(6).collect::<Vec<_>>(),
+                    "run_count": runs.len(), "parts": meta.parts}));
+            }
+        }
+    }
+    let scanned = BF16_UNWRITTEN[0][0].load(Relaxed) + BF16_UNWRITTEN[1][0].load(Relaxed);
+    if scanned % 2000 < meta.rows as u64 {
+        bf16_check_writes_summary();
+    }
+    Ok(())
+}
+/// Steps whose per-conversation scoring matched the whole launch (config::region_scorer_parts_check).
+pub(crate) static REGION_SCORER_PARTS_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub struct Metadata {
     rows: usize,
     zero_based: bool,
+    /// Host selection hint for a new graph. Both kernels read live windows from the GPU on replay.
+    pub(super) two_row_solo_verify: bool,
     query: index::Schedule,
     ranges: Ranges,
     windows: Windows,
@@ -25,6 +223,8 @@ pub struct Metadata {
     gather_starts: Buffer<i32>,
     /// Host copies of each row's key range (the gather check's ranges).
     host_ranges: Vec<(usize, usize)>,
+    /// Batched steps of several conversations: each conversation's block of rows (row0, rows); empty otherwise.
+    parts: Vec<(usize, usize)>,
 }
 impl Metadata {
     pub fn update(&mut self, positions: &[i32], starts: &[i32], lengths: &[i32]) -> Result<()> {
@@ -36,8 +236,14 @@ impl Metadata {
         self.ranges.update(starts, lengths)?;
         self.windows.update(&vec![0; self.rows], lengths, starts)?;
         self.zero_based = starts.iter().all(|&s| s == 0);
+        self.two_row_solo_verify = false;
         self.host_ranges = starts.iter().zip(lengths).map(|(&s, &l)| (s.max(0) as usize, (s + l).max(0) as usize)).collect();
         Ok(())
+    }
+    /// Batched steps: the conversations' row blocks (config::region_scorer_parts); empty for one conversation.
+    pub(crate) fn set_parts(&mut self, parts: &[(usize, usize)]) -> Result<()> {
+        ensure!(parts.iter().all(|&(r, n)| n >= 1 && r + n <= self.rows), "index metadata parts");
+        self.parts.clear(); self.parts.extend_from_slice(parts); Ok(())
     }
     /// Every row's key range holds at most `keys` keys (host copy of the latest update).
     pub(crate) fn rows_within(&self, keys: usize) -> bool {
@@ -71,6 +277,7 @@ impl Metadata {
         Ok(Self {
             rows: positions.len(),
             zero_based: starts.iter().all(|&s| s == 0),
+            two_row_solo_verify: false,
             query: index::Schedule::new(
                 cuda,
                 cache_capacity,
@@ -83,6 +290,7 @@ impl Metadata {
             slots: KeySlots::new(cuda, cache_capacity, slots)?,
             gather_starts: { let mut b = cuda.allocate::<i32>(positions.len())?; b.upload(starts)?; b },
             host_ranges: starts.iter().zip(lengths).map(|(&s, &l)| (s.max(0) as usize, (s + l).max(0) as usize)).collect(),
+            parts: Vec::new(),
         })
     }
 }
@@ -215,6 +423,11 @@ impl Branch {
     pub(crate) fn region_key_missing_chunks(&self, k: usize) -> Result<usize> { self.keys.region_missing_chunks(k) }
     pub(crate) fn map_region_keys(&self, k: usize) -> Result<bool> { self.keys.map_region(k) }
     pub(crate) fn unmap_region_keys(&self, k: usize) -> Result<()> { self.keys.unmap_region(k) }
+    pub(crate) fn region_key_span_missing_chunks(&self, k: usize, from: usize, to: usize) -> Result<usize> {
+        self.keys.region_span_missing_chunks(k, from, to)
+    }
+    pub(crate) fn map_region_key_span(&self, k: usize, from: usize, to: usize) -> Result<bool> { self.keys.map_region_span(k, from, to) }
+    pub(crate) fn unmap_region_key_span(&self, k: usize, from: usize, to: usize) -> Result<()> { self.keys.unmap_region_span(k, from, to) }
     pub(crate) fn key_regions(&self) -> usize { self.keys.regions() }
     pub(crate) fn set_region_mode(&self,enabled:bool)->Result<()> {
         ensure!(!enabled||!matches!(self.scorer,Scorer::Grouped(_)|Scorer::Sparse6(_)),
@@ -462,7 +675,8 @@ impl Branch {
         };
         let key_sharded=if (rows==6||(rows==16&&sixteen_requested))&&key_rows%columns==0&&shard_geometry
             &&(branch_requested||std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX_SCREEN").as_deref()==Ok("1")) {
-            Some(crate::key_sharded_index::KeySharded::new(cuda,core,native.clone(),topk_native.clone(),query.output(),columns)?)
+            Some(crate::key_sharded_index::KeySharded::new(cuda,core,native.clone(),topk_native.clone(),
+                query.output(),columns,key_rows)?)
         }else{None};
         let key_sharded_auto=Cell::new(key_sharded.is_some()&&branch_requested
             &&std::env::var("CANADA_SCRATCH_KEY_SHARDED_INDEX_SCREEN").as_deref()!=Ok("1"));
@@ -508,6 +722,9 @@ impl Branch {
                 SCORE_BUDGET,
             )?)
         };
+        if crate::config::region_scorer_parts()? && crate::config::full_regions()? {
+            if let Scorer::Dense(d) | Scorer::Adaptive6 { dense: d, .. } = &mut scorer { d.prepare_parts()?; }
+        }
         match &mut scorer {
             Scorer::Sparse6(s)|Scorer::Adaptive6{sparse:s,..}=>s.configure_packed_gather(kernels)?,
             Scorer::Grouped(g) if [16,32].contains(&rows)=>g.configure_packed_gather(kernels)?,
@@ -556,9 +773,11 @@ impl Branch {
             .then(|| crate::candidates::Consumer::new(cuda, core, rows, columns))
             .transpose()?;
         // Dense scorers (source layers, and the consumers' dense mode): full-width keys, no row sharding.
-        let index16 = (crate::config::index_bf16()?
+        // config::index_bf16_plain_only: not in the layers with a candidate publisher / consumer (20, 24-36).
+        let index16 = (crate::config::index_bf16()? && crate::config::index_bf16_scope_admits(rows)?
             && matches!(scorer, Scorer::Dense(_) | Scorer::Adaptive6{..}) && key_capacity >= columns
-            && !shard_index_rows)
+            && !shard_index_rows
+            && !(crate::config::index_bf16_plain_only() && (publisher.is_some() || consumer.is_some())))
             .then(|| crate::index_bf16::IndexBf16::new(cuda, kernels, rows, columns))
             .transpose()?;
         ensure!(!serving_grouped16 || !crate::mhc::attention16_overlap_enabled()?
@@ -831,28 +1050,135 @@ impl Branch {
                 let b = self.index16.as_ref().expect("checked bf16 index");
                 ensure!(meta.windows.width() <= dense.stride(), "bf16 index window width");
                 if self.publisher.is_none() && self.consumer.is_none() {
+                    // config::index_bf16_check (diagnostic, eager steps): the regular dense selection of the same rows
+                    // first, read back, then bf16's below; bf16_check_compare logs the rows where they differ.
+                    // Eager steps only (a captured step cannot read back): batched steps with CANADA_SCRATCH_BATCHED_GRAPHS=0.
+                    let regular = if crate::config::index_bf16_check() && !crate::cuda::capturing() {
+                        if region && meta.parts.len() > 1 && dense.has_parts() { dense.run_parts(&meta.ranges, &meta.parts, stream)?; }
+                        else { dense.run(&meta.ranges, stream)?; }
+                        self.selection.run(dense.output_mut(), &meta.windows, stream)?;
+                        stream.synchronize()?;
+                        Some(self.selection.indices().download()?)
+                    } else { None };
                     // Scores as 16-bit keys in the f32 score arena's bytes (half of each row), then the selection,
                     // already ascending: no topk-v2, no sort.
                     unsafe {
                         b.run(&self.query.output(), &self.keys, meta.ranges.key_starts().ptr(),
                             meta.windows.lengths().ptr(), meta.windows.offsets_ptr(), dense.output().ptr(),
-                            dense.stride() * 2, self.selection.indices(), self.selection.topk(), stream)?;
+                            dense.stride() * 2, self.selection.indices(), self.selection.topk(),
+                            meta.two_row_solo_verify && !region && meta.zero_based, stream)?;
                     }
                     self.selection.note_written();
                     bf16_selected = true;
+                    if let Some(regular) = regular {
+                        stream.synchronize()?;
+                        let fresh = self.selection.indices().download()?;
+                        bf16_check_compare(&regular, &fresh, self.selection.topk(), meta, region, self.selection.indices().ptr());
+                    }
                 } else {
                     // The publisher / consumer read f32 scores: the same values as f32, then today's path.
                     let stride = dense.stride();
+                    // config::index_bf16_check (eager steps): the regular scores, block publication / mask and selection
+                    // of the same rows first (the bf16 pass below publishes again, so its own mask stays in force).
+                    // s1632: the regular and bf16 raw scores of the same rows (bf16_check_value_compare).
+                    let mut regular_values: Option<Vec<Vec<f32>>> = None;
+                    let regular = if crate::config::index_bf16_check() && !crate::cuda::capturing() {
+                        if region && meta.parts.len() > 1 && dense.has_parts() { dense.run_parts(&meta.ranges, &meta.parts, stream)?; }
+                        else { dense.run(&meta.ranges, stream)?; }
+                        if bf16_check_values_due() {
+                            stream.synchronize()?;
+                            regular_values = Some(bf16_check_values(dense.cuda(), dense.output().ptr(), stride, meta)?);
+                        }
+                        level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
+                        self.selection.run(dense.output_mut(), &meta.windows, stream)?;
+                        stream.synchronize()?;
+                        let regular = self.selection.indices().download()?;
+                        // Three-way (Nov 19): the plain layers' bf16 kernel path (u16 keys, its own selection) on these
+                        // rows too, to tell a kernel fault from the f32 path's.
+                        unsafe {
+                            b.run(&self.query.output(), &self.keys, meta.ranges.key_starts().ptr(),
+                                meta.windows.lengths().ptr(), meta.windows.offsets_ptr(), dense.output().ptr(),
+                                dense.stride() * 2, self.selection.indices(), self.selection.topk(), false, stream)?;
+                        }
+                        stream.synchronize()?;
+                        let u16_path = self.selection.indices().download()?;
+                        let kind = if self.publisher.is_some() { "publisher-u16" } else { "consumer-u16" };
+                        bf16_check_compare_kind(&regular, &u16_path, self.selection.topk(), meta, region,
+                            self.selection.indices().ptr(), kind, mask.is_some());
+                        Some(regular)
+                    } else { None };
+                    // config::index_bf16_publish_fp32 (Nov 19): source20's candidate blocks from the regular fp32 scores.
+                    // bf16 block maxima tie at the 2048-block cut and the cut keeps the lower (older) block, so later
+                    // layers lost recent context (floor bxe: consumer layers shared ~81 % of the regular picks, plain
+                    // layers 99.6 %); this layer's own key selection still uses the bf16 scores.
+                    let publish_fp32 = self.publisher.is_some() && crate::config::index_bf16_publish_fp32();
+                    if publish_fp32 {
+                        if region && meta.parts.len() > 1 && dense.has_parts() { dense.run_parts(&meta.ranges, &meta.parts, stream)?; }
+                        else { dense.run(&meta.ranges, stream)?; }
+                        level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
+                    }
+                    // config::index_bf16_check: NaN-fill the score rows first, then count the positions of each row's
+                    // range the f32 pass leaves unwritten (the region rows' 45-80 % shared picks pointed at stale entries).
+                    if regular.is_some() {
+                        unsafe { dense.cuda().fill_device_for_bf16_check(dense.output().ptr(),
+                            meta.windows.rows() * stride * 4, 0xFF, stream)?; }
+                    }
+                    // Eager diagnostics read the raw scores. Only the dense consumers can
+                    // combine their score and mask writes. Their windows are row-relative.
+                    let score_mask = match (&self.consumer, mask) {
+                        (Some(consumer), Some(mask)) if self.publisher.is_none() && regular.is_none() => consumer.score_mask(mask)?,
+                        _ => None,
+                    };
                     unsafe {
                         b.run_scores_f32(&self.query.output(), &self.keys, meta.ranges.key_starts().ptr(),
-                            meta.windows.lengths().ptr(), dense.output(), stride, stream)?;
+                            meta.windows.lengths().ptr(), dense.output(), stride, score_mask, stream)?;
                     }
-                    level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
+                    let mut bf16_values: Option<Vec<Vec<f32>>> = None;
+                    if regular.is_some() {
+                        stream.synchronize()?;
+                        let kind = if self.publisher.is_some() { "publisher" } else { "consumer" };
+                        bf16_check_unwritten(dense.cuda(), dense.output().ptr(), stride, meta, kind)?;
+                        if regular_values.is_some() {
+                            bf16_values = Some(bf16_check_values(dense.cuda(), dense.output().ptr(), stride, meta)?);
+                        }
+                    }
+                    if !publish_fp32 && score_mask.is_none() {
+                        level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
+                    }
                     self.selection.run(dense.output_mut(), &meta.windows, stream)?;
+                    if let Some(regular) = regular {
+                        stream.synchronize()?;
+                        let fresh = self.selection.indices().download()?;
+                        let kind = if self.publisher.is_some() { "publisher" } else { "consumer" };
+                        bf16_check_compare_kind(&regular, &fresh, self.selection.topk(), meta, region,
+                            self.selection.indices().ptr(), kind, mask.is_some());
+                        if let (Some(rv), Some(fv)) = (&regular_values, &bf16_values) {
+                            bf16_check_value_compare(rv, fv, &fresh, self.selection.topk(), meta, kind, mask.is_some());
+                        }
+                    }
                 }
             }
             Scorer::Dense(dense) | Scorer::Adaptive6{dense,active:false,..} => {
-                dense.run(&meta.ranges, stream)?;
+                if region && meta.parts.len() > 1 && dense.has_parts() {
+                    if crate::config::region_scorer_parts_check() {
+                        // Diagnostic (eager steps only): the whole launch's logits inside every row's own range must equal
+                        // the per-conversation launches' bit for bit.
+                        ensure!(!crate::config::batched_graphs_requested(), "region scorer parts check needs eager steps");
+                        dense.run(&meta.ranges, stream)?; stream.synchronize()?;
+                        let read = |d: &Dense| -> Result<Vec<Vec<u8>>> {
+                            meta.parts.iter().flat_map(|&(r0, n)| r0..r0 + n).map(|r| {
+                                let (s, e) = meta.host_ranges[r];
+                                if e <= s { Ok(Vec::new()) } else { d.read_output_row(r, e - s) }
+                            }).collect()
+                        };
+                        let whole = read(dense)?;
+                        dense.run_parts(&meta.ranges, &meta.parts, stream)?; stream.synchronize()?;
+                        let split = read(dense)?;
+                        ensure!(whole == split, "region scorer parts differ from the whole launch");
+                        REGION_SCORER_PARTS_CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else { dense.run_parts(&meta.ranges, &meta.parts, stream)?; }
+                }
+                else { dense.run(&meta.ranges, stream)?; }
                 let stride = dense.stride();
                 level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
                 self.selection
@@ -860,16 +1186,31 @@ impl Branch {
             }
             Scorer::Adaptive6{dense,..} if region => {
                 let stride = dense.stride();
+                // config::index_bf16_check: the regular selection of the same rows first (see the dense arm).
+                let regular = if self.index16.is_some() && crate::config::index_bf16_check() && !crate::cuda::capturing() {
+                    if meta.parts.len() > 1 && dense.has_parts() { dense.run_parts(&meta.ranges, &meta.parts, stream)?; }
+                    else { dense.run(&meta.ranges, stream)?; }
+                    level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
+                    self.selection.run(dense.output_mut(), &meta.windows, stream)?;
+                    stream.synchronize()?;
+                    Some(self.selection.indices().download()?)
+                } else { None };
                 if let Some(b) = &self.index16 {
                     ensure!(meta.windows.width() <= stride, "bf16 index window width");
                     unsafe {
                         b.run_scores_f32(&self.query.output(), &self.keys, meta.ranges.key_starts().ptr(),
-                            meta.windows.lengths().ptr(), dense.output(), stride, stream)?;
+                            meta.windows.lengths().ptr(), dense.output(), stride, None, stream)?;
                     }
-                } else { dense.run(&meta.ranges, stream)?; }
+                } else if meta.parts.len() > 1 && dense.has_parts() { dense.run_parts(&meta.ranges, &meta.parts, stream)?; }
+                else { dense.run(&meta.ranges, stream)?; }
                 level_one(dense.output_mut(), stride, 0..meta.windows.rows())?;
                 self.selection
                     .run(dense.output_mut(), &meta.windows, stream)?;
+                if let Some(regular) = regular {
+                    stream.synchronize()?;
+                    let fresh = self.selection.indices().download()?;
+                    bf16_check_compare(&regular, &fresh, self.selection.topk(), meta, region, self.selection.indices().ptr());
+                }
             }
             Scorer::Chunked(chunked) => {
                 let stride = chunked.stride();

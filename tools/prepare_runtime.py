@@ -17,15 +17,37 @@ def digest(path):
     with path.open('rb') as f:
         return hashlib.file_digest(f, 'sha256').hexdigest()
 
-# Fenced builds named by the loader's registry that this package does not carry: options that are off in every
-# shipped profile (the narrow six-row QKV lowering; the 4,096-row per-rank bundles of a 16,384-row prefill profile).
+# The narrow six-row QKV lowering is disabled in the shipped profile.
 UNPACKAGED_OPTIONAL_FENCES = {
     'fp8-flashinfer-narrow-qkv-m6-v1-pipeline-fence-v1',
-    'claude-fp8-engram-wkv-full-m4096-v1-pipeline-fence-v1',
-    'claude-fp8-wob-full-m4096-v1-pipeline-fence-v1',
-    'claude-fp8-shared-w13-full-m4096-v1-pipeline-fence-v1',
-    'claude-fp8-shared-w2-full-m4096-v1-pipeline-fence-v1',
 }
+
+def validate_serving_kernels(inventory, profile):
+    files = inventory['files']
+    def verify(directory, metadata, entries):
+        prefix = f'kernels/{directory}/'
+        relative = prefix + metadata
+        assert relative in files, f'missing serving kernel manifest: {relative}'
+        manifest = json.loads((ROOT/'runtime'/relative).read_bytes())
+        for name, field in entries:
+            assert files.get(prefix+name) == manifest[field], f'serving kernel digest mismatch: {prefix}{name}'
+        return manifest
+
+    if profile.get('CANADA_SCRATCH_INDEX_BF16') == '1':
+        source = digest(ROOT/'kernels/index_bf16.cu')
+        manifest = verify('index-bf16-'+source[:16], 'manifest.json',
+                          [('index_bf16.cu', 'source_sha256'), ('index16.cubin', 'artifact_sha256')])
+        assert manifest['source_sha256'] == source, 'BF16 index was built from different source'
+    mode = profile.get('CANADA_SCRATCH_PREFETCH_SPARSE_PAGES', '0')
+    if mode != '0':
+        assert mode in ('1', '2'), 'unknown sparse attention variant'
+        verify('attention-dsv41-decode-prefetch-v'+mode, 'manifest.json',
+               [('decode.cu', 'adapter_sha256'), ('libcanada_decode.so', 'library_sha256')])
+    if profile.get('CANADA_SCRATCH_FULL_REGIONS') == '1':
+        verify('mqa-v2', 'native.json', [('mqa.cu','adapter_sha256'), ('libcanada_mqa.so','library_sha256')])
+        if profile.get('CANADA_SCRATCH_KEY_SPLIT_MQA', '0') != '0' or profile.get('CANADA_SCRATCH_KEY_SPLIT_PREFILL') == '1':
+            verify('mqa-keysplit-v2', 'manifest.json', [('mqa_keysplit.cu','adapter_sha256'),
+                   ('mqa_keysplit.cuh','adapted_source_sha256'), ('libcanada_mqa_keysplit.so','library_sha256')])
 
 def validate_fenced_bundles(inventory):
     """Require every compiled projection replacement before copying runtime data."""
@@ -60,6 +82,7 @@ def validate_fenced_bundles(inventory):
             assert inventory['files'].get(relative) == bundle[field], f'compiled kernel pin mismatch: {relative}'
 
     profile = json.loads((ROOT/'deploy/profile.json').read_text())
+    validate_serving_kernels(inventory, profile)
     optional = {
         'CANADA_SCRATCH_HEAD_WEIGHT_CG': ['target-head-lossless-weight-cg-v1'],
         'CANADA_SCRATCH_MARKOV_HEAD_CG': ['draft-markov-gemv-cg-v1'],

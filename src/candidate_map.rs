@@ -5,12 +5,13 @@ use crate::{
     attention::Candidates,
     cuda::{Buffer, Cuda, MappedHost, Module, Stream},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::{cell::Cell, ffi::c_void};
 pub struct Map {
     cuda: Cuda,
     module: Module,
-    slots: Buffer<i32>,
+    /// Immutable after construction; shared by identical maps under config::shared_slot_tables.
+    slots: std::rc::Rc<Buffer<i32>>,
     keys: usize,
     capacity: usize,
     output: Candidates,
@@ -70,8 +71,7 @@ impl Map {
             .map(|&n| n.min(width as i32))
             .collect::<Vec<_>>();
         let output = Candidates::device_output(cuda, rows, width, capacity, &clipped)?;
-        let mut table = cuda.allocate(slots.len())?;
-        table.upload(slots)?;
+        let table = cuda.shared_immutable_i32(slots)?;
         let error=if mapped {ErrorFlag::Mapped(cuda.mapped_host(4)?)} else {
             let mut flag=cuda.allocate(1)?;flag.zero()?;ErrorFlag::Device(flag)
         };
@@ -254,7 +254,7 @@ fn probe_mode(core:&std::path::Path,mapped:bool)->Result<serde_json::Value> {
     );
     // Inject a corrupted device slot after normal host admission to exercise
     // the defense immediately before attention can consume an address.
-    map.slots.upload(&[0, 16, 9])?;
+    std::rc::Rc::get_mut(&mut map.slots).context("the fault probe needs an unshared slot table")?.upload(&[0, 16, 9])?;
     stream.join_default()?;
     map.run_admitted(&ids, &lengths, &stream)?;
     stream.synchronize()?;

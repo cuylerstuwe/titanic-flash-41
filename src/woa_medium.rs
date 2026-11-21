@@ -100,7 +100,9 @@ pub struct Scratch {
     module: Module,
     blas: Blas,
     rows: usize,
-    decoded: Buffer<bf16>,
+    /// None under config::woa_decoded_on_demand while immutable decoded operands serve every run (allocated by
+    /// set_cached_for_probe when a probe turns them off).
+    decoded: Option<Buffer<bf16>>,
     grouped: Buffer<bf16>,
     stream: Cell<Option<usize>>,
     cache_enabled: Cell<bool>,
@@ -127,7 +129,7 @@ impl Scratch {
             module: cuda.module(core)?,
             blas,
             rows,
-            decoded: cuda.allocate(2048 * 4096)?,
+            decoded: if crate::config::woa_decoded_on_demand() && cached_policy()? { None } else { Some(cuda.allocate(2048 * 4096)?) },
             grouped: cuda.allocate_chunk_scratch(crate::cuda::ChunkScratch::WoaGrouped, rows * 2048)?,
             stream: Cell::new(None),
             cache_enabled: Cell::new(true),
@@ -138,7 +140,7 @@ impl Scratch {
         })))
     }
     pub fn owned_scratch_bytes(&self) -> usize {
-        self.decoded.bytes() + self.grouped.bytes() + 32 * 1024 * 1024
+        self.decoded.as_ref().map_or(0, |d| d.bytes()) + self.grouped.bytes() + 32 * 1024 * 1024
             +self.compact.as_ref().map_or(0,|c|c.partial.bytes())
     }
 }
@@ -221,7 +223,7 @@ impl Grouped {
         );
         let rows = {
             let s = scratch.try_borrow()?;
-            ensure!(cuda.owns_buffer(&s.decoded), "medium WO-A scratch context");
+            ensure!(cuda.owns_buffer(&s.grouped), "medium WO-A scratch context");
             s.rows
         };
         Ok(Self {
@@ -278,7 +280,9 @@ impl Grouped {
     }
     pub(crate) fn set_cached_for_probe(&self, enabled: bool) -> Result<()> {
         ensure!(self.cached.is_some(), "WO-A probe requires prepared immutable operands");
-        self.scratch.try_borrow()?.cache_enabled.set(enabled);
+        let mut s = self.scratch.try_borrow_mut()?;
+        if !enabled && s.decoded.is_none() { s.decoded = Some(s.cuda.allocate(2048 * 4096)?); }
+        s.cache_enabled.set(enabled);
         Ok(())
     }
     pub fn run(&mut self, input: &Buffer<bf16>, stream: &Stream) -> Result<()> {
@@ -326,13 +330,18 @@ impl Grouped {
         }
         let mut w = self.weight;
         let mut scales = self.scales;
-        let mut decoded = s.decoded.ptr();
+        let cached = self.cached.as_ref().filter(|_| s.cache_enabled.get());
+        // config::woa_decoded_on_demand: the scratch exists whenever no immutable operand serves this run.
+        let mut decoded = match (&s.decoded, cached) {
+            (Some(d), _) => d.ptr(),
+            (None, Some(_)) => 0,
+            (None, None) => anyhow::bail!("medium WO-A decoded scratch absent without an immutable operand"),
+        };
         let mut args = [
             (&mut w as *mut u64).cast(),
             (&mut scales as *mut u64).cast(),
             (&mut decoded as *mut u64).cast(),
         ];
-        let cached = self.cached.as_ref().filter(|_| s.cache_enabled.get());
         if cached.is_none() { unsafe {
             s.module.function("ca_woa_decode_weight")?.launch(
                 [32768, 1, 1],
@@ -349,7 +358,7 @@ impl Grouped {
             grouped,
             ..
         } = &mut *s;
-        let operand = cached.map_or(&*decoded, |v| &v.values);
+        let operand = match cached { Some(v) => &v.values, None => decoded.as_ref().context("medium WO-A decoded scratch")? };
         let compute=PREFILL_ROWS.with(|slot|slot.get()
             .filter(|(_,owner)|self.rows==128&&*owner==stream.raw()as usize)
             .map_or(self.rows,|(rows,_)|rows));

@@ -1,0 +1,134 @@
+--- a/prefetched.cu
++++ b/staged.cu
+@@ -42,6 +42,31 @@
+     if (tidx < vh) mid_lse[((size_t)t * mh + hs + tidx) * scratch_split_stride + split] = -1e30f;
+     return;
+   }
++  // Start the first cache request during query staging and the next during attention.
++  auto prefetch_chunk = [&](int following) __attribute__((always_inline)) {
++    static_assert(R::CANDIDATES == 64 && R::BLOCK_THREADS == 256);
++    const bool next_extra = following >= main_chunks;
++    const bool next_fp4 = EXTRA_FP4 && next_extra;
++    const int offset = (next_extra ? following - main_chunks : following) * R::CANDIDATES + tidx / 4;
++    const int limit = next_extra ? elen : len, segment = tidx % 4;
++    if (offset < limit && (!next_fp4 || segment < 2)) {
++      const int32_t* candidates = next_extra ? extra_indices + (size_t)t * extra_indices_stride_elems
++                                            : indices + (size_t)t * indices_stride_elems;
++      const int candidate = candidates[offset];
++      if (candidate >= 0) {
++        size_t slot;
++        const auto page = Cache::locate(next_extra ? extra_KV_cache : KV_cache, candidate, 64,
++                                        next_extra ? extra_page_stride_bytes : page_stride_bytes, true, slot);
++        const auto data = page + Cache::data_offset(next_fp4, slot) + 128 * segment;
++        asm volatile("prefetch.global.L2 [%0];" :: "l"(data));
++        if (segment == 0) {
++          const auto scales = page + Cache::scale_offset(next_fp4, 64, slot);
++          asm volatile("prefetch.global.L2 [%0];" :: "l"(scales));
++        }
++      }
++    }
++  };
++  prefetch_chunk(lo);
+   extern __shared__ __align__(16) unsigned char storage[];
+   auto& sm = *reinterpret_cast<Dsv41Bf16Smem*>(storage);
+   for (int i = tidx; i < R::HEADS_PER_CTA * R::QK_VECTORS; i += R::BLOCK_THREADS) {
+@@ -66,28 +91,44 @@
+     __syncthreads();
+     auto gather = [&](auto format) __attribute__((always_inline)) {
+       constexpr bool fixed_fp4 = decltype(format)::value;
+-      for (int task = tidx; task < R::CANDIDATES * R::QK_VECTORS; task += R::BLOCK_THREADS) {
+-        const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
+-        const int index = sm.valid[row];
+-        uint64_t raw = 0;
+-        __nv_bfloat162 scale = __floats2bfloat162_rn(0.f, 0.f);
+-        if (index >= 0) {
+-          size_t slot;
+-          const uint8_t* base = Cache::locate(cache, index, 64, stride, true, slot);
+-          const uint8_t* src = base + Cache::data_offset(fixed_fp4, slot) + (fixed_fp4 ? d / 2 : d);
+-          raw = fixed_fp4 ? uint64_t(*reinterpret_cast<const uint32_t*>(src))
+-                    : *reinterpret_cast<const uint64_t*>(src);
+-          const uint8_t sc =
+-              base[Cache::scale_offset(fixed_fp4, 64, slot) +
+-                   d / (fixed_fp4 ? Dsv41Fp4Layout::SCALE_GROUP : Dsv41Fp8Layout::QUANT_TILE)];
+-          scale = decode_e4m3_or_ue8m0_scale_bf16(sc, fixed_fp4);
++      // Issue independent cache reads together before decoding their packed vectors.
++      constexpr int batch = 16;
++      static_assert((R::CANDIDATES * R::QK_VECTORS) % (batch * R::BLOCK_THREADS) == 0);
++      for (int first = tidx; first < R::CANDIDATES * R::QK_VECTORS; first += batch * R::BLOCK_THREADS) {
++        uint64_t packed_data[batch];
++        uint8_t scale_code[batch];
++        bool valid[batch];
++#pragma unroll
++        for (int b = 0; b < batch; ++b) {
++          const int task = first + b * R::BLOCK_THREADS;
++          const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
++          const int index = sm.valid[row];
++          valid[b] = index >= 0;
++          packed_data[b] = 0;
++          scale_code[b] = 0;
++          if (valid[b]) {
++            size_t slot;
++            const auto page = Cache::locate(cache, index, 64, stride, true, slot);
++            const auto src = page + Cache::data_offset(fixed_fp4, slot) + (fixed_fp4 ? d / 2 : d);
++            packed_data[b] = fixed_fp4 ? uint64_t(*reinterpret_cast<const uint32_t*>(src))
++                                       : *reinterpret_cast<const uint64_t*>(src);
++            scale_code[b] = page[Cache::scale_offset(fixed_fp4, 64, slot) +
++                                 d / (fixed_fp4 ? Dsv41Fp4Layout::SCALE_GROUP : Dsv41Fp8Layout::QUANT_TILE)];
++          }
+         }
+-        __nv_bfloat162 pairs[4];
+-#pragma unroll
+-        for (int j = 0; j < 4; ++j)
+-          pairs[j] = __hmul2(
+-              decode_e2m1_or_e4m3_pair_bf16(uint32_t(raw >> (j * (fixed_fp4 ? 8 : 16))), fixed_fp4), scale);
+-        *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
++#pragma unroll
++        for (int b = 0; b < batch; ++b) {
++          const int task = first + b * R::BLOCK_THREADS;
++          const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
++          const auto scale = valid[b] ? decode_e4m3_or_ue8m0_scale_bf16(scale_code[b], fixed_fp4)
++                                      : __floats2bfloat162_rn(0.f, 0.f);
++          __nv_bfloat162 pairs[4];
++#pragma unroll
++          for (int j = 0; j < 4; ++j)
++            pairs[j] = __hmul2(decode_e2m1_or_e4m3_pair_bf16(
++                uint32_t(packed_data[b] >> (j * (fixed_fp4 ? 8 : 16))), fixed_fp4), scale);
++          *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
++        }
+       }
+     };
+     if (fp4) {
+@@ -96,32 +137,7 @@
+       gather(std::false_type{});
+     }
+     __syncthreads();
+-    // Warm the next chunk of this split while QK and PV consume the current one.
+-    // Up to four disjoint 128-byte offsets cover one packed candidate row.
+-    static_assert(R::CANDIDATES == 64 && R::BLOCK_THREADS == 256);
+-    if (chunk + 1 < hi) {
+-      const int following = chunk + 1;
+-      const bool next_extra = following >= main_chunks;
+-      const bool next_fp4 = EXTRA_FP4 && next_extra;
+-      const int offset = (next_extra ? following - main_chunks : following) * R::CANDIDATES + tidx / 4;
+-      const int limit = next_extra ? elen : len, segment = tidx % 4;
+-      if (offset < limit && (!next_fp4 || segment < 2)) {
+-        const int32_t* candidates = next_extra ? extra_indices + (size_t)t * extra_indices_stride_elems
+-                                              : indices + (size_t)t * indices_stride_elems;
+-        const int candidate = candidates[offset];
+-        if (candidate >= 0) {
+-          size_t slot;
+-          const auto page = Cache::locate(next_extra ? extra_KV_cache : KV_cache, candidate, 64,
+-                                          next_extra ? extra_page_stride_bytes : page_stride_bytes, true, slot);
+-          const auto data = page + Cache::data_offset(next_fp4, slot) + 128 * segment;
+-          asm volatile("prefetch.global.L2 [%0];" :: "l"(data));
+-          if (segment == 0) {
+-            const auto scales = page + Cache::scale_offset(next_fp4, 64, slot);
+-            asm volatile("prefetch.global.L2 [%0];" :: "l"(scales));
+-          }
+-        }
+-      }
+-    }
++    if (chunk + 1 < hi) prefetch_chunk(chunk + 1);
+     float qk[4] = {};
+ #pragma unroll
+     for (int k = 0; k < Geometry::D_QK; k += R::MMA_K) {

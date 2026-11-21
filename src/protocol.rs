@@ -47,6 +47,7 @@ pub struct ImageReference {
     /// The processed patches while they are live; otherwise `stored` holds the image's encoded bytes
     /// (CANADA_SCRATCH_IMAGE_SOURCE_STORE_MIB) and the planner defers its pixels like a full-source image.
     pub input: Option<Arc<crate::worker_media::PatchInput>>,
+    #[cfg(feature = "vision-protocol")]
     pub stored: Option<Arc<crate::image_input_cache::StoredSource>>,
     pub identity: [u8; 32],
     pub detail: deepseek_recipe_core::multimodal::ImageDetail,

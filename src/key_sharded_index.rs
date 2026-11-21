@@ -7,7 +7,7 @@ use anyhow::{ensure,Result};
 use std::{cell::Cell,ffi::c_void,rc::Rc};
 macro_rules! args {($($v:ident),* $(,)?)=>{[$(std::ptr::addr_of_mut!($v).cast::<c_void>()),*]};}
 pub(crate) struct KeySharded {
-    cuda:Cuda,module:Module,columns:usize,rows:usize,keys:Rc<KeyMatrix>,scorer:Dense,
+    cuda:Cuda,module:Module,columns:usize,slot_count:usize,rows:usize,keys:Rc<KeyMatrix>,scorer:Dense,
     ranges:Ranges,windows:Windows,selection:Selection,
     merge_windows:Windows,merge:Selection,merge_scores:Buffer<f32>,ids:Buffer<i32>,
     send:Buffer<f32>,receive:Buffer<f32>,valid:Buffer<i32>,dirty:Cell<bool>,
@@ -16,9 +16,14 @@ pub(crate) struct KeySharded {
 }
 impl KeySharded {
     pub(crate) fn new(cuda:&Cuda,core:&[u8],native:Rc<Native>,topk:Rc<topk::Native>,
-        query:Rc<QueryRows>,columns:usize)->Result<Self>{
+        query:Rc<QueryRows>,columns:usize,slot_count:usize)->Result<Self>{
         let rows=query.rows();
         ensure!([6,16].contains(&rows)&&[524288,1048576].contains(&columns),"key-shard verification geometry");
+        // The 16-row verifier also serves solo history copies. Its immutable slot map
+        // spans all configured conversations, even when this step only reads region 0.
+        ensure!(slot_count == columns || (rows == 16 && crate::config::full_regions()?
+            && columns.checked_mul(crate::config::batched_regions()?) == Some(slot_count)),
+            "key-shard slot table does not match the configured regions");
         let local=columns/4;let zero=vec![0;rows];
         let keys=Rc::new(KeyMatrix::new(cuda,local)?);
         let scorer=Dense::new(cuda,native,query,keys.clone(),local,rows.div_ceil(4)*4*local*4)?;
@@ -26,7 +31,7 @@ impl KeySharded {
         let publisher=(columns==1048576).then(||crate::key_sharded_publisher::Publisher::new(cuda,core,topk.clone(),local,rows)).transpose()?;
         let words=if publisher.is_some(){crate::key_sharded_publisher::PACKED_WORDS_PER_ROW}else{1024};
         let mut valid=cuda.allocate(1)?;valid.zero()?;
-        Ok(Self{cuda:cuda.clone(),module:cuda.module(core)?,columns,rows,keys,scorer,
+        Ok(Self{cuda:cuda.clone(),module:cuda.module(core)?,columns,slot_count,rows,keys,scorer,
             ranges:Ranges::new(cuda,local,local,&zero,&zero)?,
             windows:Windows::new(cuda,local,&zero,&zero,&zero)?,selection,
             merge_windows:Windows::new(cuda,2048,&zero,&vec![2048;rows],&zero)?,
@@ -53,9 +58,13 @@ impl KeySharded {
     pub(crate) fn run(&mut self,cache:&KeyCache,slots:&KeySlots,ends:&Buffer<i32>,
         windows:&Windows,output:&Selection,comm:&Roce,stream:&Stream)->Result<()>{
         ensure!(!self.dirty.get()&&comm.rank()<4&&ends.len()==self.rows&&windows.rows()==self.rows
-            &&slots.values().len()==self.columns&&slots.capacity()==cache.capacity()&&slots.contiguous()
+            &&windows.width()==self.columns&&slots.values().len()==self.slot_count
+            &&slots.capacity()==cache.capacity()&&slots.contiguous()
             &&self.cuda.owns_buffer(cache.data())&&self.cuda.owns_buffer(slots.values())
-            &&self.cuda.owns_buffer(ends)&&self.cuda.owns_stream(stream),"key-shard cache/metadata ownership");
+            &&self.cuda.owns_buffer(ends)&&self.cuda.owns_stream(stream),
+            "key-shard cache/metadata ownership: rows={} columns={} window={} slots={}/{} capacities={}/{} contiguous={} dirty={}",
+            self.rows,self.columns,windows.width(),slots.values().len(),self.slot_count,
+            slots.capacity(),cache.capacity(),slots.contiguous(),self.dirty.get());
         let binding=(cache.data().ptr(),slots.values().ptr(),comm.rank());
         ensure!(self.binding.get()==(0,0,usize::MAX)||self.binding.get()==binding,"key-shard immutable storage/rank changed");
         self.binding.set(binding);cache.bind(stream)?;self.keys.bind(stream)?;

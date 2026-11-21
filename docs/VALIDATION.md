@@ -1,5 +1,22 @@
 # Validation status
 
+## November 21 serving release (s1682)
+
+The native qualification used four GB10s, the canonical 1017 weights, and a 2350 MHz cap. The following s1621 and s1682 measurements use the same head-local client at temperature 1 and top-p 1. Time to first token includes serving the request. Cold prefill measures server processing.
+
+| Single-stream check | s1621 | s1682 |
+|---|---:|---:|
+| 500–588 new prompt tokens, median time to first token | 285 ms | 267 ms |
+| 2,073–2,290 new prompt tokens, median time to first token | 447 ms | 445 ms |
+| 129,553 prompt tokens, cold prefill | 14.10 s | 13.65 s |
+| Approximately 131K context, six matched coding seeds, 384 generated tokens each, pooled decode | 85.6 tok/s | 90.0 tok/s |
+
+Four of the six coding seeds favored s1682. Maximum-effort tasks finished naturally and passed their graders on both releases. Sparse staging matched full-vocabulary logits and retained state in 576 paired verification checks, including the alternative implementations and duplicate control. The BF16 index follows the reference scoring arithmetic. Near ties can select different keys from the previous FP32 implementation, so its qualification used reference distribution checks.
+
+Four independent conversations reached 997,425–997,477 tokens and completed 16/16 answer checks. After 17 unrelated short requests, a returning conversation reused 997,422 tokens and reached its first token in 0.27 s. On a separate 28-image cancellation and rewind, the return reused all 974,056 prompt tokens. Appending another image processed 980 new tokens in 354 ms. A harness continuation with 34 screenshots also returned the correct answer across the routed transport.
+
+The native hosts restored their original memory settings after worker exits, guard failures and abandoned startup. The installed release passed a clean boot with one load per host, routed server timing and a live rollback rehearsal. Portable packaging was checked separately with CPU tests, simulated four-rank launcher commands, hashes of the distributed artifacts and comparison to files opened in native qualification. A new four-GPU launch of the portable wrapper was outside this publication pass. [Release record](../validation/serving-release-2026-11-21.json)
+
 ## November 19 disk-tier and regions release (s1621)
 
 s1621 keeps every setting of s1599 and adds four: a disk tier for conversation snapshots, and full serving regions with

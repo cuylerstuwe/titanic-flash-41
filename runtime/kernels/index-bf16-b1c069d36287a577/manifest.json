@@ -1,0 +1,17 @@
+{
+ "schema": 1,
+ "architecture": "sm_121a",
+ "functions": [
+  "ca_idx16_score",
+  "ca_idx16_select",
+  "ca_idx16_dense",
+  "ca_idx16_dense_pair",
+  "ca_idx16_mask_row",
+  "ca_idx16_dense_solo"
+ ],
+ "source_version": "s1660",
+ "source_sha256": "b1c069d36287a577f76d799edec4884a930cc744a9cd9968f8cfd73368e53a2e",
+ "artifact_sha256": "578634826bc7bfab4b4786a51aa0d915dc2d8ebec039907d7fc9983dda3adf30",
+ "build": "nvcc release 13.0 --cubin -arch=sm_121a -std=c++17 -O3",
+ "contract": "Index scores with the reference's bf16 arithmetic (DeepSeek model.py: einsum, relu, mul, sum in bf16) written relative to each row's key start, as 16-bit order-preserving keys or f32 values for topk windows; each row's exact top-k (ties at the cut by ascending column) written as offset + (column - start), ascending, -1 padded; the fused score + select of up to two independent eight-row groups. Adapted from pico's indexer (MIT, Copyright (c) 2026 Andy Shu)."
+}

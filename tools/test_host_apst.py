@@ -251,6 +251,16 @@ class PolicyTests(unittest.TestCase):
 
     def test_partial_group_arm_can_restore_an_unreached_rank(self):
         self.assertEqual(self.policy.execute('restore')['action'], 'not-armed')
+        with self.assertRaisesRegex(RuntimeError, 'retired before activation'):
+            self.policy.execute('arm')
+        self.assertEqual(self.actions, [])
+
+    def test_interrupted_baseline_write_retires_before_guard_or_device_change(self):
+        with patch.object(apst, 'atomic_bytes', side_effect=OSError('interrupted table write')):
+            with self.assertRaisesRegex(OSError, 'interrupted'):
+                self.policy.execute('arm')
+        self.assertTrue(self.policy.control.exists())
+        self.assertEqual(self.policy.execute('restore')['action'], 'not-armed')
         self.assertEqual(self.actions, [])
 
     def test_new_owner_is_immune_to_delayed_old_checks(self):

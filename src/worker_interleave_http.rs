@@ -30,7 +30,7 @@ mod batched_admission;
 use idle_anchor_policy::Policy as IdlePolicy;
 enum Scheduled {
     Native(Command),
-    Park(Option<u16>),
+    Park(Option<u32>),
     BeginBackground(Command),
     Prefill,
     Resume(u64),
@@ -102,7 +102,7 @@ impl Scheduled {
     fn decode(bytes:&[u8])->Result<Self> {
         match bytes {
             [7]=>Ok(Self::Park(None)),
-            [7,low,high]=>Ok(Self::Park(Some(u16::from_le_bytes([*low,*high])))),
+            [7,a,b,c,d]=>Ok(Self::Park(Some(u32::from_le_bytes([*a,*b,*c,*d])))),
             [11]=>Ok(Self::Prefill),
             [14,..] if bytes.len()==10 && bytes[9]<=1=>Ok(Self::Priority(PrioritySnapshot{
                 revision:u64::from_le_bytes(bytes[1..9].try_into().unwrap()),hold:bytes[9]!=0})),
@@ -223,7 +223,7 @@ fn execute(w:&mut Worker,images:&mut Vec<ParkedRequest>,command:Scheduled,
                 "host_allocator_trim":w.state_pressure_trim.take(),
                 "refusal":w.park_refusal.take(),
                 "prefill_working_allowance_bytes":prefill_working_allowance,
-                "protected_cache_entries":protected.map_or(0,u16::count_ones),
+                "protected_cache_entries":protected.map_or(0,u32::count_ones),
                 "seconds":began.elapsed().as_secs_f64()}))}
         }
         Scheduled::Resume(id)|Scheduled::Discard(id)=>{
@@ -728,18 +728,20 @@ mod tests {
         assert!(Scheduled::decode(&[8,0,0,0,0,0,0,0,0]).is_err());
         assert!(Scheduled::decode(&[18,0,0,0,0,0,0,0,0]).is_err());
         assert_eq!(Scheduled::decode(&[7]).unwrap().encode().unwrap(),[7]);
-        for mask in (0..=u16::MAX).step_by(257).chain([1,255,256,u16::MAX]) {
-            let [low,high]=mask.to_le_bytes();
-            assert_eq!(Scheduled::decode(&[7,low,high]).unwrap().encode().unwrap(),[7,low,high]);
+        for mask in (0..=u32::MAX).step_by(16_777_259).chain([1,255,256,65_535,65_536,u32::MAX]) {
+            let [a,b,c,d]=mask.to_le_bytes();
+            assert_eq!(Scheduled::decode(&[7,a,b,c,d]).unwrap().encode().unwrap(),[7,a,b,c,d]);
         }
         // Wire parsing cannot know the live cache extent; all ranks validate
         // the same mask against that extent before optional eviction or save.
-        for entries in 0..=16 {for mask in (0..=u16::MAX).step_by(97).chain([0,1,u16::MAX]) {
-            assert_eq!(cache_protection_mask_valid(mask,entries),u32::from(mask)<(1u32<<entries));
+        for entries in 0..=32 {for mask in (0..=u32::MAX).step_by(6_700_417).chain([0,1,65_535,u32::MAX]) {
+            assert_eq!(cache_protection_mask_valid(mask,entries),u64::from(mask)<(1u64<<entries));
         }}
-        assert!(!cache_protection_mask_valid(0,17));
+        assert!(!cache_protection_mask_valid(0,33));
         assert!(Scheduled::decode(&[7,0]).is_err());
+        assert!(Scheduled::decode(&[7,0,0]).is_err());
         assert!(Scheduled::decode(&[7,0,0,0]).is_err());
+        assert!(Scheduled::decode(&[7,0,0,0,0,0]).is_err());
     }
     #[test]
     fn batched_decode_keeps_the_timing_contract_and_drops_only_the_two_slot_gate() {

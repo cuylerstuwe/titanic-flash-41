@@ -478,6 +478,10 @@ struct CachedSession {
     kind:&'static str,
     born:Instant,
     used:Instant,
+    // config::cache_keep_latest: the Begin that saved the entry (Worker::cache_serial) and the Begin that last checked
+    // it out (0: never restored); keep_latest_earlier reads both.
+    serial:u64,
+    restored_serial:u64,
 }
 impl CachedSession {
     /// [prefix tokens, charge, kind, seconds since saved, seconds since last checked out, disk state] for the cache trace.
@@ -570,16 +574,18 @@ fn parse_short_reserve(value:Option<&str>,slots:usize)->Result<usize> {
     Ok(reserve)
 }
 
-/// Sixteen slots keep four long conversations' prompt checkpoints and ladder rungs resident at once; the
-/// protection mask is 16 bits wide to match.
-const MAX_SESSION_CACHE_SLOTS:usize=16;
-fn cache_protection_mask_valid(mask:u16,entries:usize)->bool {
-    entries<=MAX_SESSION_CACHE_SLOTS && u32::from(mask)<(1u32<<entries)
+/// Sixteen slots keep four long conversations' prompt checkpoints and ladder rungs resident at once. The protection mask
+/// is 32 bits wide (Nov 20; was 16): CANADA_SCRATCH_SESSION_CACHE_SLOTS=24 leaves room for the parking extra slots
+/// (image_entry_limit) under the same mask. Bank-retained checkpoints cannot park, so with many long conversations the
+/// slot count binds before the byte budget (the 4 x 256K multibench sat at 16 entries throughout).
+const MAX_SESSION_CACHE_SLOTS:usize=32;
+fn cache_protection_mask_valid(mask:u32,entries:usize)->bool {
+    entries<=MAX_SESSION_CACHE_SLOTS && u64::from(mask)<(1u64<<entries)
 }
 fn session_cache_slots(value:Option<&str>)->Result<usize> {
     match value {
-        None|Some("4")=>Ok(4),Some("8")=>Ok(8),Some("16")=>Ok(16),
-        _=>anyhow::bail!("session cache slots must be 4, 8 or 16"),
+        None|Some("4")=>Ok(4),Some("8")=>Ok(8),Some("16")=>Ok(16),Some("24")=>Ok(24),
+        _=>anyhow::bail!("session cache slots must be 4, 8, 16 or 24"),
     }
 }
 fn configured_session_cache_slots()->Result<usize> {
@@ -1021,6 +1027,26 @@ struct DiskPending {
 }
 
 impl Worker {
+    /// config::cache_keep_latest: which cache entries are earlier checkpoints (keep_latest_earlier_flags over this list).
+    fn keep_latest_earlier(&self) -> Vec<bool> {
+        let c = &self.cached_sessions;
+        let n = c.len();
+        let ext: Vec<Vec<bool>> = (0..n).map(|j| (0..n).map(|i| j != i && prefix_extends(&c[j].prefix, &c[i].prefix)
+            && c[j].media.matches_prefix(&c[i].media, c[i].prefix.len())).collect()).collect();
+        let facts: Vec<EntryFacts> = c.iter().map(|e| EntryFacts { serial: e.serial, restored: e.restored_serial,
+            shared: e.shared || e.kind == "shared_prefix" }).collect();
+        keep_latest_earlier_flags(&facts, &ext)
+    }
+    /// config::cache_keep_latest: put the cache list in keep-latest order (keep_latest_order) before a request's saves and
+    /// evictions, so every planner's "oldest eligible entry" is an earlier checkpoint while one is left and a
+    /// conversation's latest image only after that. Called where no index into the list is held (command start).
+    fn order_cache_keep_latest(&mut self) {
+        if !crate::config::cache_keep_latest() || self.cached_sessions.len() < 2 { return; }
+        let order = keep_latest_order(&self.keep_latest_earlier());
+        if order.iter().enumerate().all(|(k, &i)| k == i) { return; }
+        let mut slots: Vec<Option<CachedSession>> = self.cached_sessions.drain(..).map(Some).collect();
+        self.cached_sessions = order.into_iter().map(|i| slots[i].take().expect("each entry once")).collect();
+    }
     /// Disk tier (config::disk_tier): evict cache entry `i`, parking it (RAM freed, kept on disk) when it has a disk copy,
     /// else dropping it as before. Every rank holds the same entries and copies, so every rank does the same.
     pub(crate) fn evict_cached(&mut self, i: usize) {
@@ -1030,8 +1056,141 @@ impl Worker {
             self.push_parked(entry);
         }
     }
+    /// Disk tier, save on evict (DiskTierConfig::save_on_evict_tokens; 0 = off): before cache pressure evicts entry `i`,
+    /// write its missing disk copies now when it holds at least that many tokens and the tier's budgets allow, so the
+    /// eviction parks it (RAM freed, kept on disk) instead of dropping it. The idle-time copier only reaches entries in
+    /// quiet gaps; under a burst a long conversation's only snapshot could fall out first and cost a cold re-prefill
+    /// later (Nov 18, fqm5: a fourth 254K conversation re-prefilled for 34 s after the regions' maps evicted it). A
+    /// 256K-token snapshot is ~0.23 GiB a box, a fraction of a second to write. Every rank writes its own shard; the
+    /// choice uses only state every rank shares and every outcome goes through an all-rank vote, so all ranks keep the
+    /// same entries. A failed copy leaves the entry as it was (the eviction drops it).
+    pub(crate) fn save_before_evict(&mut self, i: usize) -> Result<Option<Value>> {
+        let Some(tier) = self.disk_tier.clone() else { return Ok(None) };
+        if tier.save_on_evict_tokens == 0 || i >= self.cached_sessions.len() { return Ok(None); }
+        let began = Instant::now();
+        {
+            let c = &self.cached_sessions[i];
+            // Nov 19 (r2b): optional entries (prompt-end images with exact logits) are not worth a write in the request
+            // path: ten such saves cost 0.09-0.11 s each to keep images that only serve an exact retry.
+            if c.prefix.len() < tier.save_on_evict_tokens || !c.parkable() || !c.resident_now() || c.disk_clean()
+                || c.speculative || c.opportunistic_logits() { return Ok(None); }
+        }
+        // A copy the idle-time writer has in progress for this entry is abandoned: the loop below writes every missing
+        // image whole (the same on every rank: the pending copy is replicated state).
+        if self.disk_pending.as_ref().is_some_and(|p| {
+            let c = &self.cached_sessions[i]; p.born == c.born && p.tokens == c.prefix.len() }) { self.disk_pending = None; }
+        let bytes = self.cached_sessions[i].images().iter().filter(|im| !im.has_disk_copy()).map(|im| im.bytes()).sum::<usize>() as u64;
+        while self.disk_tier_bytes() as u64 + bytes > tier.cap_bytes && !self.parked_sessions.is_empty() {
+            self.parked_sessions.remove(0);
+        }
+        let days = (self.disk_tier_started.elapsed().as_secs_f64() / 86400.0).max(1.0);
+        let budget = (crate::disk_tier::written_bytes() + bytes) as f64 <= tier.write_bytes_per_day as f64 * days;
+        let space = crate::disk_tier::free_bytes(&tier.dir).is_ok_and(|f| f >= tier.free_floor_bytes + bytes);
+        let cap = self.disk_tier_bytes() as u64 + bytes <= tier.cap_bytes;
+        if !self.control.all_admit(budget && space && cap)? {
+            return Ok(Some(json!({"event":"save_on_evict_refused","tokens":self.cached_sessions[i].prefix.len(),
+                "budget":budget,"space":space,"cap":cap})));
+        }
+        self.stream.synchronize()?;
+        let mut failed = None;
+        let n = self.cached_sessions[i].images().len();
+        for k in 0..n {
+            if self.cached_sessions[i].images()[k].has_disk_copy() { continue; }
+            let path = crate::disk_tier::path_for(&tier.dir, self.cached_sessions[i].kind);
+            let result = (|| -> Result<()> {
+                let mut w = self.cached_sessions[i].images()[k].disk_write_begin(&path)?;
+                while !w.done() { self.cached_sessions[i].images()[k].disk_write_step(&mut w)?; }
+                self.cached_sessions[i].images_mut()[k].disk_write_finish(w)
+            })();
+            if let Err(error) = result { failed = Some(error); break; }
+        }
+        if let Some(error) = &failed { eprintln!("disk tier save on evict failed: {error:#}"); }
+        let tokens = self.cached_sessions[i].prefix.len();
+        if !self.control.all_admit(failed.is_none())? {
+            self.cached_sessions[i].drop_disk_copies();
+            return Ok(Some(json!({"event":"save_on_evict_failed","tokens":tokens})));
+        }
+        let event = json!({"event":"save_on_evict","kind":self.cached_sessions[i].kind,"tokens":tokens,"bytes":bytes,
+            "seconds":began.elapsed().as_secs_f64(),"disk_bytes":self.disk_tier_bytes(),
+            "written_total":crate::disk_tier::written_bytes()});
+        eprintln!("disk tier {event}");
+        Ok(Some(event))
+    }
+    /// evict_cached after save_before_evict: what cache pressure (not policy parking) uses.
+    pub(crate) fn evict_cached_saving(&mut self, i: usize) -> Result<()> {
+        self.save_before_evict(i)?;
+        self.evict_cached(i);
+        Ok(())
+    }
     fn evict_all_cached(&mut self) {
         while !self.cached_sessions.is_empty() { self.evict_cached(0); }
+    }
+    /// config::wide16_elastic (Nov 19 2026): before a prefill of `uncached` new tokens (a prompt of `total`), lend the
+    /// 16,384-row profile its extension from the image pool, so the planner can offer 16,384-row chunks. Free chunks
+    /// first, keeping room for this request's own prompt-end and near-end images; then the policy's snapshots give way
+    /// (wide16_victim). Every rank decides alike: the cache list is agreed and every room check is an all-rank vote.
+    /// Returns a report, Null when not applicable; without the room nothing changes and the prefill uses 8,192 rows.
+    fn borrow_wide16(&mut self, uncached: usize, total: usize) -> Result<Value> {
+        let policy = crate::config::wide16_elastic()?;
+        if policy == 0 || !self.cuda.wide16_configured() || uncached < 16384 { return Ok(Value::Null); }
+        if self.cuda.wide16_mapped() { return Ok(json!({"lent":true,"already_mapped":true})); }
+        let began = Instant::now();
+        let chunk = self.cuda.image_pool_chunk_bytes()?;
+        let need = self.cuda.wide16_missing_chunks()?;
+        let reserve = (2 * self.large.encoder_checkpoint_image_bytes_by_layout(total.min(self.large.context_capacity()))?).div_ceil(chunk);
+        let mut proof = b"wide16-borrow-v1".to_vec();
+        for v in [need, reserve, uncached, total, self.cached_sessions.len()] { proof.extend_from_slice(&(v as u64).to_le_bytes()); }
+        for c in &self.cached_sessions {
+            proof.push(c.owner); proof.extend_from_slice(&(c.prefix.len() as u64).to_le_bytes());
+            proof.extend_from_slice(&[u8::from(c.disk_clean()), u8::from(c.resident_now()), u8::from(c.parkable())]);
+        }
+        self.control.agree(&proof)?;
+        let free_before = self.cuda.image_pool_free_chunks().unwrap_or(0);
+        let mut gave_way = Vec::new();
+        let lent = loop {
+            let free = self.cuda.image_pool_free_chunks().unwrap_or(0);
+            if self.control.all_admit(free >= need + reserve)? { break true; }
+            let Some(i) = self.wide16_victim(policy, total) else { break false };
+            let c = &self.cached_sessions[i];
+            gave_way.push(json!({"tokens":c.prefix.len(),"parked":self.disk_tier.is_some()&&c.parkable()&&c.disk_clean(),
+                "optional":self.optional_entries(total)[i],"bytes":c.logical_bytes()}));
+            self.evict_cached(i);
+        };
+        let mapped = lent && self.cuda.wide16_map()?;
+        let agreed = lent && self.control.all_admit(mapped)?;
+        if mapped && !agreed { self.cuda.wide16_unmap()?; }
+        self.wide16_held = agreed;
+        let report = json!({"lent":agreed,"policy":policy,"uncached":uncached,"need_chunks":need,"reserve_chunks":reserve,
+            "free_chunks_before":free_before,"free_chunks_after":self.cuda.image_pool_free_chunks().unwrap_or(0),
+            "gave_way":gave_way,"seconds":began.elapsed().as_secs_f64()});
+        eprintln!("wide16 borrow {report}");
+        Ok(report)
+    }
+    /// The next snapshot that gives way to the 16K extension (identical on every rank: it reads only the shared cache
+    /// list), or None. Policy 1 (approved Nov 18): optional and superseded snapshots only, those with a disk copy first
+    /// (they park, nothing is lost), oldest first; policy 2 then parks any resident snapshot that has a disk copy.
+    fn wide16_victim(&self, policy: u8, incoming: usize) -> Option<usize> {
+        let optional = self.optional_entries(incoming);
+        let entries = &self.cached_sessions;
+        // Superseded = an earlier checkpoint by the keep-latest rule (keep_latest_earlier: a request has gone past it); a
+        // conversation's latest images and the one it last restored stay, since that is what its next turn resumes from.
+        let earlier = self.keep_latest_earlier();
+        let superseded = |i: usize| earlier[i];
+        let parks = |i: usize| self.disk_tier.is_some() && entries[i].parkable() && entries[i].disk_clean();
+        let resident: Vec<usize> = (0..entries.len()).filter(|&i| entries[i].resident_now()).collect();
+        let allowed = |i: usize| optional[i] || superseded(i);
+        resident.iter().copied().find(|&i| allowed(i) && parks(i))
+            .or_else(|| resident.iter().copied().find(|&i| allowed(i)))
+            .or_else(|| (policy >= 2).then(|| resident.iter().copied().find(|&i| parks(i))).flatten())
+    }
+    /// Return the 16K extension to the pool once no prefill holds it (no paused prefill of this worker). Every rank
+    /// runs the same commands, so every rank returns it at the same point.
+    fn release_wide16_if_idle(&mut self) -> Result<()> {
+        if self.wide16_held && self.pending_prefill.is_none() {
+            self.cuda.wide16_unmap()?;
+            self.wide16_held = false;
+        }
+        Ok(())
     }
     /// Add a parked entry (newest last) and keep the parked list within its count and the disk cap.
     fn push_parked(&mut self, entry: CachedSession) {
@@ -1067,7 +1226,7 @@ impl Worker {
         let mut victims = victims.unwrap_or_default();
         victims.sort_unstable();
         let planned = began.elapsed().as_secs_f64();
-        for i in victims.into_iter().rev() { self.evict_cached(i); evicted += 1; }
+        for i in victims.into_iter().rev() { self.evict_cached_saving(i)?; evicted += 1; }
         let evicting = began.elapsed().as_secs_f64() - planned;
         let mut phases = [0.0f64; 4];
         loop {
@@ -1207,6 +1366,44 @@ impl Worker {
     }
 }
 
+/// Whether the cached prefix `longer` extends `shorter` (config::cache_keep_latest). Only the eviction order depends on
+/// it, never a restore, so it compares the lengths, the first 1,024 tokens and the 1,024 tokens ending where `shorter`
+/// ends instead of whole prefixes (up to 1M tokens each); every rank holds the same prefixes and decides alike.
+fn prefix_extends(longer: &[u32], shorter: &[u32]) -> bool {
+    if longer.len() <= shorter.len() { return false; }
+    let head = shorter.len().min(1024);
+    let tail = shorter.len().saturating_sub(1024);
+    longer[..head] == shorter[..head] && longer[tail..shorter.len()] == shorter[tail..]
+}
+/// config::cache_keep_latest: what the earlier-checkpoint rule reads of an entry: the Begin that saved it, the Begin that
+/// last restored it (0: never) and whether it is a prefix several conversations share.
+#[derive(Clone, Copy)]
+struct EntryFacts { serial: u64, restored: u64, shared: bool }
+/// config::cache_keep_latest (v4, Nov 20): entry i is an earlier checkpoint when a request has gone past it: some other
+/// entry R that a request restored (and not a shared prefix), restored after i was saved (i.serial < R.restored), either
+/// extends i (i is an ancestor of where that conversation went on) or shares a cached ancestor A with i (A not a
+/// shared prefix; A == R or R extends A, and i extends A: a branch or answer image the conversation left behind).
+/// What a conversation last restored, and every image saved since, stays latest; so does a conversation's only image,
+/// however long ago it was used. `ext[j][i]`: entry j extends entry i (strictly longer, same media).
+/// k16b / kx (Nov 20): v1 (every extended entry earlier) and v2 (extended by a later request's prompt-side image)
+/// evicted the near-end images later turns resumed from: one request's images extend one another, and follow-ups that
+/// branch from one base each save images extending it, though none of those images is ever restored.
+fn keep_latest_earlier_flags(facts: &[EntryFacts], ext: &[Vec<bool>]) -> Vec<bool> {
+    let n = facts.len();
+    (0..n).map(|i| (0..n).any(|r| {
+        let fr = facts[r];
+        r != i && fr.restored > 0 && !fr.shared && facts[i].serial < fr.restored
+            && (ext[r][i] || (0..n).any(|a| a != i && !facts[a].shared && ext[i][a] && (a == r || ext[r][a])))
+    })).collect()
+}
+/// The keep-latest order of a cache list (config::cache_keep_latest): every earlier checkpoint first, then every latest
+/// image; each group keeps its existing order (oldest / least recently used first, restores refresh age). Returns the
+/// new order as indices into the old list.
+fn keep_latest_order(earlier: &[bool]) -> Vec<usize> {
+    let n = earlier.len();
+    (0..n).filter(|&i| earlier[i]).chain((0..n).filter(|&i| !earlier[i])).collect()
+}
+
 /// Only completed cache entries participate. Borrowed parents and unfinished
 /// request images are absent. Prefer obsolete copies of this conversation;
 /// preserve the ordinary long-parent protection for unrelated short requests.
@@ -1288,10 +1485,20 @@ struct Worker {
     parked_sessions: Vec<CachedSession>,
     disk_tier: Option<crate::config::DiskTierConfig>,
     disk_tier_started: Instant,
+    /// config::wide16_elastic: this worker lent the 16,384-row profile its extension for a request's prefill.
+    wide16_held: bool,
+    /// config::cache_keep_latest: counts Begin commands (the same on every rank); cache entries record the one that saved them.
+    cache_serial: u64,
     disk_tier_backoff: u32,
     disk_pending: Option<DiskPending>,
     /// Elastic serving regions: bit k set while region k's spans are mapped (batched_serving::map_region / release_regions).
     elastic_mapped: u8,
+    /// Map by reach (config::region_map_by_reach): positions of region k's compressed and key caches mapped now, in
+    /// granules of config::REGION_MAP_GRANULE (0: none; elastic_mapped then covers the owners' key matrices only).
+    region_cache_reach: [usize; 4],
+    /// Map by reach: when region k's caches could not grow, the position of its conversation from which a retry is due
+    /// (0: none; replicated state only, so every rank retries alike).
+    region_grow_retry: [usize; 4],
     /// Copies wait to be written (the leader shortens its idle wait: tier_idle_wait).
     disk_tier_busy: bool,
     draft_tails: std::collections::VecDeque<DraftTail>,
@@ -2060,6 +2267,12 @@ impl Worker {
         control.agree(&[0x6e,u8::from(crate::config::near_end_after_restore()?)])?;
         // Nov 18: redundant prompt-end images yield first; it changes eviction victims on every rank.
         control.agree(&[0x6f,u8::from(crate::config::redundant_prompt_image()?)])?;
+        // Nov 19: exact window pages move every serving region's window base; every rank must lay them out alike.
+        control.agree(&[0x6d,u8::from(crate::config::validate_swa_exact_pages()?)])?;
+        // Nov 19: the keep-latest order decides eviction victims on every rank.
+        control.agree(&[0x6c,u8::from(crate::config::validate_cache_keep_latest()?)])?;
+        // Nov 19: profile dedup (config::validate_profile_dedup) moves profiles' buffers only; every rank runs one layout.
+        control.agree(&[0x6b,crate::config::validate_profile_dedup()?])?;
         // Host waits (Nov 12): the control socket's spin budget and the worker thread's timer slack
         // (CANADA_SCRATCH_TIMER_SLACK_NS, 1000-50000; default: the system's 50 us): a 25 us completion poll
         // sleeps ~80 us with the default slack.
@@ -2208,9 +2421,13 @@ impl Worker {
             parked_sessions:Vec::new(),
             disk_tier:None,
             disk_tier_started:Instant::now(),
+            wide16_held:false,
+            cache_serial:0,
             disk_tier_backoff:0,
             disk_pending:None,
             elastic_mapped:0,
+            region_cache_reach:[0; 4],
+            region_grow_retry:[0; 4],
             disk_tier_busy:false,
             draft_tails: Default::default(),
             #[cfg(feature = "storage-fault-injection")]
@@ -2660,9 +2877,13 @@ impl Worker {
             .saturating_add(wanted.map_or(0,|c|c.charge));
         let reserve=self.cache_reserve()?;
         let available=self.cuda.admission_memory()?.admitted_available;
-        let fits=full<=2*1024usize.pow(3)&&charged.saturating_add(delta)<=budget&&available>=reserve+full;
+        let pooled=self.cuda.image_pool_fits(full);
+        let fits=full<=2*1024usize.pow(3)&&charged.saturating_add(delta)<=budget
+            &&crate::state_image::image_storage_fits(available,reserve,full,pooled);
         let mut removed:Vec<usize>=Vec::new();
         if !self.control.all_admit(fits)? {
+            cache_trace(||json!({"path":"displaced_admission","available":available,"reserve":reserve,
+                "bytes":full,"pool_free":self.cuda.image_pool_free_bytes(),"pool_fits":pooled,"budget":budget,"charged":charged}));
             let refused=|evicted:usize|json!({"materialized":false,"candidate":true,"refused":true,"bytes":full,
                 "charged":charged,"budget":budget,"gave_way":evicted});
             if !(self.displaced_reclaim&&self.cache_pressure_reclaim&&full<=2*1024usize.pow(3)) {return Ok((refused(0),removed));}
@@ -2682,7 +2903,7 @@ impl Worker {
             loop {
                 let reclaim=removed.iter().map(|&i|entries[i].1).sum::<usize>();
                 let local=charged.saturating_sub(reclaim).saturating_add(delta)<=budget
-                    &&available.saturating_add(reclaim)>=reserve+full;
+                    &&crate::state_image::image_storage_fits(available.saturating_add(reclaim),reserve,full,pooled);
                 if self.control.all_admit(local)? {break;}
                 let excluded=removed.iter().chain(keep).copied().chain(std::iter::once(index)).collect::<Vec<_>>();
                 let Some(next)=pressure_cache_victim(&entries,&optional,&superseded,tokens,self.image_entry_limit(),
@@ -2696,11 +2917,12 @@ impl Worker {
                     "entries":self.cached_sessions.iter().map(|c|c.trace()).collect::<Vec<_>>()}));
             }
             self.stream.synchronize()?;
-            for &i in removed.iter().rev() {self.evict_cached(i);}
+            for &i in removed.iter().rev() {self.evict_cached_saving(i)?;}
             index-=removed.iter().filter(|&&r|r<index).count();
             // The estimate never authorizes the allocation: recheck actual memory after the release.
             let available=self.cuda.admission_memory()?.admitted_available;
-            if !self.control.all_admit(available>=reserve+full)? {return Ok((refused(removed.len()),removed));}
+            let fits=crate::state_image::image_storage_fits(available,reserve,full,self.cuda.image_pool_fits(full));
+            if !self.control.all_admit(fits)? {return Ok((refused(removed.len()),removed));}
         }
         let CachedState::Encoder{image,..}=&self.cached_sessions[index].image else {unreachable!()};
         // The copy writes only the new image; any refusal or mismatch leaves live state untouched.
@@ -2753,7 +2975,7 @@ impl Worker {
             let began=Instant::now();
             if let Some(image)=self.try_save_cached_session_image(pending,device_bytes)? {
                 ensure!(image.device_bytes()==device_bytes,"cached image estimate differs from allocation");
-                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,image:CachedState::Complete{image,pending},charge,prompt_logits:None,kind:"completed",born:Instant::now(),used:Instant::now(),speculative:false,shared:false});
+                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,image:CachedState::Complete{image,pending},charge,prompt_logits:None,kind:"completed",born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0,speculative:false,shared:false});
                 saved=true;
             }
             saved_seconds=began.elapsed().as_secs_f64();
@@ -2817,7 +3039,7 @@ impl Worker {
                     "victims":indices.iter().map(|&i|self.cached_sessions[i].trace()).collect::<Vec<_>>(),
                     "entries":self.cached_sessions.iter().map(|c|c.trace()).collect::<Vec<_>>()}));
             }
-            for i in indices.into_iter().rev(){self.evict_cached(i);}
+            for i in indices.into_iter().rev(){self.evict_cached_saving(i)?;}
             Some((self.large.snapshot_prompt_logits(&self.stream)?,device,charge))
         }else{None};
         Ok((ready,json!({"enabled":true,"saved":false,"admitted":admitted,
@@ -2875,7 +3097,8 @@ impl Worker {
             "hit":hit.map(|i|self.cached_sessions[i].trace()),
             "entries":self.cached_sessions.iter().map(|c|c.trace()).collect::<Vec<_>>(),
             "parked":self.parked_sessions.iter().map(|c|c.trace()).collect::<Vec<_>>()}));
-        let wanted=hit.map(|i|{let mut cached=self.cached_sessions.remove(i);cached.speculative=false;cached.used=Instant::now();cached});
+        let wanted=hit.map(|i|{let mut cached=self.cached_sessions.remove(i);cached.speculative=false;cached.used=Instant::now();
+            cached.restored_serial=self.cache_serial;cached});
         let current_prefix=self.history.committed().to_vec();
         // A displaced unfinished request already owns an immutable image.
         // Do not copy that same loaded prefix into the optional cache too.
@@ -3058,7 +3281,7 @@ impl Worker {
                                     "victims":indices.iter().map(|&i|json!([entries[i].0,entries[i].1])).collect::<Vec<_>>(),
                                     "entries":entries.iter().map(|e|json!([e.0,e.1])).collect::<Vec<_>>()}));
                             }
-                            for i in indices.into_iter().rev(){self.evict_cached(i);}
+                            for i in indices.into_iter().rev(){self.evict_cached_saving(i)?;}
                             self.stream.synchronize()?;
                             let image=self.try_save_cached_session_image(pending,device)?;
                             // Test builds can decline one rank's vote after the
@@ -3100,7 +3323,7 @@ impl Worker {
                                     "victims":evictions.iter().map(|&i|json!([entries[i].0,entries[i].1])).collect::<Vec<_>>(),
                                     "entries":entries.iter().map(|e|json!([e.0,e.1])).collect::<Vec<_>>()}));
                             }
-                            for i in evictions.into_iter().rev(){self.evict_cached(i);}
+                            for i in evictions.into_iter().rev(){self.evict_cached_saving(i)?;}
                             self.cached_sessions.push(cached);
                             retained_image=true;
                         }
@@ -3673,7 +3896,7 @@ impl Worker {
         if let Some(image)=image {
             ensure!(image.bytes()==device_bytes&&image.position()==checkpoint,"encoder cache saved extent");
             self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,charge,prompt_logits:None,speculative:false,shared:shared_image,
-                kind:if shared_image {"shared_prefix"} else {"prompt_checkpoint"},born:Instant::now(),used:Instant::now(),
+                kind:if shared_image {"shared_prefix"} else {"prompt_checkpoint"},born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0,
                 image:CachedState::Encoder{image,history:checkpoint_history.unwrap(),
                     policy:self.session.as_ref().unwrap().proposal_policy_image()?}});
         }
@@ -3683,7 +3906,7 @@ impl Worker {
             ensure!(image.bytes()==device2&&image.position()==at,"extra encoder cache saved extent");
             self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt[..at].to_vec(),media:media2,
                 charge:charge2,prompt_logits:None,speculative:false,shared:false,
-                kind:"near_end",born:Instant::now(),used:Instant::now(),
+                kind:"near_end",born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0,
                 image:CachedState::Encoder{image,history,policy:self.session.as_ref().unwrap().proposal_policy_image()?}});
         }
         if retained.get("extra_near_end").is_some() {retained["extra_near_end"]["saved"]=json!(extra_saved);}
@@ -3713,7 +3936,7 @@ impl Worker {
             if let Some(image)=self.try_save_cached_session_image(anchor,device)? {
                 ensure!(image.device_bytes()==device,"encoder final prompt image estimate differs");
                 self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt.clone(),media:plan.media.clone(),charge,prompt_logits:Some(logits),speculative:false,shared:false,
-                    kind:"prompt_end_logits",born:Instant::now(),used:Instant::now(),
+                    kind:"prompt_end_logits",born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0,
                     image:CachedState::Complete{image,pending:anchor}});
                 prompt_logit_cache["saved"]=json!(true);
             }else{prompt_logit_cache["late_memory_refused"]=json!(true);}
@@ -3773,7 +3996,7 @@ impl Worker {
                     "evicted":plan.as_ref().map(Vec::len),"parent_dropped":plan.is_none()}));
                 let Some(mut victims)=plan else {return Ok(false);};
                 victims.sort_unstable();
-                for i in victims.into_iter().rev(){self.evict_cached(i);}
+                for i in victims.into_iter().rev(){self.evict_cached_saving(i)?;}
             }
             self.cached_sessions.push(parent);
             Ok(true)
@@ -3818,6 +4041,17 @@ impl Worker {
 
     fn execute_with_prefill_cancel(&mut self,command:Command,
         should_cancel:&mut impl FnMut(&mut ControlChannel,usize,&[CachedSession],Option<&CachedSession>)->Result<PrefillDirective>)->Result<Value> {
+        let result=self.execute_with_prefill_cancel_inner(command,should_cancel);
+        // config::wide16_elastic: a request's prefill that finished (or never paused) gives the extension back.
+        if result.is_ok() {self.release_wide16_if_idle()?;}
+        result
+    }
+    fn execute_with_prefill_cancel_inner(&mut self,command:Command,
+        should_cancel:&mut impl FnMut(&mut ControlChannel,usize,&[CachedSession],Option<&CachedSession>)->Result<PrefillDirective>)->Result<Value> {
+        // config::cache_keep_latest: requests save and evict images in Begin and Finish; order the cache first. A Begin's
+        // prompt-side images carry its serial.
+        if matches!(command, Command::Begin{..}) { self.cache_serial += 1; }
+        if matches!(command, Command::Begin{..} | Command::Finish(_)) { self.order_cache_keep_latest(); }
         let started = Instant::now();
         crate::route_census::arm_once(&self.cuda, &self.core)?;
         if !matches!(command, Command::Idle) { self.last_active = started; }
@@ -3870,6 +4104,10 @@ impl Worker {
                     },
                 }
                 let encoder_previous=deferred_encoder.as_ref().map_or(if plan.reuse {plan.previous}else{0},|c|c.prefix.len());
+                // config::wide16_elastic: lend the 16,384-row profile its extension before this request plans any chunk
+                // (the inline checkpoint's admission plans with the same widths as the prefill).
+                let wide16=self.borrow_wide16(plan.prompt.len()-encoder_previous,plan.prompt.len())?;
+                if !wide16.is_null() {retained_session_cache["wide16"]=wide16;}
                 let encoder_checkpoint=self.prompt_checkpoint_positions(plan.prompt.len())[0].max(encoder_previous);
                 let short_deferred=deferred_encoder.is_some()&&plan.prompt.len()-encoder_previous<128;
                 if self.encoder_prompt_checkpoint&&encoder_checkpoint>=crate::config::prompt_checkpoint_min()
@@ -4006,7 +4244,7 @@ impl Worker {
                         ensure!(image.device_bytes()==device,"exact prompt image estimate disagrees");
                         self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt.clone(),media:plan.media.clone(),
                             image:CachedState::Complete{image,pending:anchor},charge,prompt_logits:Some(logits),speculative:false,shared:false,
-                            kind:"prompt_end_logits",born:Instant::now(),used:Instant::now()});
+                            kind:"prompt_end_logits",born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0});
                         prompt_logit_cache["saved"]=json!(true);
                         prompt_logit_cache["image_charge_bytes"]=json!(charge);
                     }else{prompt_logit_cache["late_memory_refused"]=json!(true);}
@@ -4229,6 +4467,7 @@ impl Worker {
                     "shutdown requires completed/cancelled request"
                 );
                 self.agree(&[])?;
+                crate::query_index::finish_bf16_checks();
                 Ok(json!({"type":"shutdown","frontier":self.history.frontier()}))
             }
             Command::Idle => {
@@ -4299,24 +4538,31 @@ impl Worker {
 
     /// Optional wide-prefill warmup (CANADA_SCRATCH_WIDE_STARTUP_WARMUP=1), after the public
     /// startup warmup: one public 8,320-token Begin, then one Begin of exactly each configured
-    /// wide width (each from its own part of the fixture, so no prompt extends another), with
-    /// prompt/encoder checkpoints and the session cache disabled, each cancelled after its first
+    /// wide width (each from its own part of the fixture, so no prompt extends another), and for
+    /// a 16,384-row widest width one prompt of two such chunks and a tail (its multi-chunk path),
+    /// with prompt/encoder checkpoints and the session cache disabled, each cancelled after its first
     /// token and never published. First-use library loads, captures and NCCL connections of
     /// every wide profile then happen before ready instead of in a client's first request.
     /// The reset and empty-state checks are exactly those of warm_before_ready.
     #[cfg(feature = "serving")]
-    fn warm_wide_before_ready(&mut self, rank: usize, widths: &[usize]) -> Result<Value> {
+    fn warm_wide_before_ready(&mut self, rank: usize, widths: &[usize], pass: WideWarmupPass) -> Result<Value> {
         ensure!(self.current.is_none() && self.history.frontier()==0 && !self.progress_next
             && self.large.context_capacity()>=16384,
             "wide startup warmup needs an unpublished fresh worker");
         let raw=include_bytes!("../tests/fixtures/long-context-continuation-v2.json");
         let corpus:Value=serde_json::from_slice(raw)?;
         let ids:Vec<u32>=serde_json::from_value(corpus["tokens"].clone())?;
-        // The original 8,320-token prompt, then every width largest first, each at its own offset.
-        let mut prompts=vec![(0usize,8320usize)];
-        let mut widths_desc=widths.to_vec();widths_desc.sort_unstable_by(|a,b|b.cmp(a));
-        for (k,&width) in widths_desc.iter().enumerate() {prompts.push((10000*(k+1),width));}
-        ensure!(prompts.iter().all(|&(at,len)|len>0&&at+len<=ids.len()),"wide startup warmup fixture extent");
+        let prompts=wide_warmup_prompts(widths,ids.len()).context("wide startup warmup fixture extent")?;
+        let (first_prompt, prompts) = match pass {
+            WideWarmupPass::All => (0, prompts.as_slice()),
+            WideWarmupPass::BeforePool | WideWarmupPass::RealPool => {
+                let last = prompts.len() - 1;
+                ensure!(widths.contains(&16384) && prompts[last].1 == 2 * 16384 + 128,
+                    "split wide warmup requires the 16K multi-chunk fixture");
+                if matches!(pass, WideWarmupPass::RealPool) { (last, &prompts[last..]) }
+                else { (0, &prompts[..last]) }
+            }
+        };
         let started=Instant::now();
         // After the public warmup's reset the verify owner holds the lease; its digests are the
         // initial empty state that warm_before_ready itself verified.
@@ -4329,7 +4575,7 @@ impl Worker {
         let run=(|| -> Result<usize> {
             let mut events=0;
             for (round,&(at,len)) in prompts.iter().enumerate() {
-                let wire=Command::Begin{images:Vec::new(),id:2+round as u64,seed:0,greedy:false,limit:1,
+                let wire=Command::Begin{images:Vec::new(),id:2+(first_prompt+round) as u64,seed:0,greedy:false,limit:1,
                     tokens:ids[at..at+len].to_vec()}.encode()?;
                 let command=self.control.command((rank==0).then_some(wire.as_slice()))?;
                 self.execute(Command::decode(&command)?)?;
@@ -5706,9 +5952,21 @@ pub fn run_http(path: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     #[cfg(feature = "serving")]
+    let warm_real_pool = std::env::var("CANADA_SCRATCH_WIDE16_WARM_REAL_POOL").as_deref() == Ok("1");
+    #[cfg(feature = "serving")]
+    worker.control.agree(&[0xea, u8::from(warm_real_pool)])?;
+    #[cfg(feature = "serving")]
     let wide_startup_warmup = if std::env::var("CANADA_SCRATCH_WIDE_STARTUP_WARMUP").as_deref()==Ok("1") {
         ensure!(startup_warmup.is_some(),"wide startup warmup follows the public startup warmup");
-        Some(worker.warm_wide_before_ready(p.rank,&p.wide_widths)?)
+        {
+            // config::wide16_elastic: the 16,384-row width warms (and captures its graphs) with its extension mapped
+            // from a temporary pool, returned before the real pool exists.
+            worker.cuda.wide16_begin_temporary()?;
+            let pass = if warm_real_pool { WideWarmupPass::BeforePool } else { WideWarmupPass::All };
+            let warmed=worker.warm_wide_before_ready(p.rank,&p.wide_widths,pass);
+            worker.cuda.wide16_end_temporary()?;
+            Some(warmed?)
+        }
     } else {None};
     #[cfg(not(feature = "serving"))]
     let wide_startup_warmup:Option<Value> = None;
@@ -5730,6 +5988,18 @@ pub fn run_http(path: &Path) -> Result<()> {
         Some(mib) => { let report = worker.cuda.create_image_pool(mib << 20)?; eprintln!("image pool {report}"); Some(report) },
         None => None,
     };
+    #[cfg(feature = "serving")]
+    if warm_real_pool {
+        ensure!(wide_startup_warmup.is_some() && worker.cuda.wide16_configured() && image_pool.is_some(),
+            "real-pool warmup requires wide startup warmup and an elastic 16K profile");
+        let free = worker.cuda.image_pool_free_chunks();
+        // This public Begin follows the same borrow/release path as a served request.
+        // The final fixture is moved here from the temporary-pool warmup.
+        let report = worker.warm_wide_before_ready(p.rank, &p.wide_widths, WideWarmupPass::RealPool)?;
+        ensure!(!worker.wide16_held && !worker.cuda.wide16_mapped() && worker.cuda.image_pool_free_chunks() == free,
+            "real-pool warmup retained an image or an arena loan");
+        eprintln!("wide16 real pool warmup {}", json!({"rank":p.rank, "free_chunks":free, "warmup":report}));
+    }
     // Disk tier (config::disk_tier): files of an earlier process are worthless (their descriptors named its regions).
     worker.disk_tier = crate::config::disk_tier()?;
     if let Some(tier) = worker.disk_tier.as_ref() {
@@ -6546,7 +6816,7 @@ mod tests {
     #[test]
     fn cache_slots_remain_bounded_without_raising_the_byte_budget() {
         assert_eq!(session_cache_slots(None).unwrap(),4);
-        for slots in [4,8,16] {
+        for slots in [4,8,16,24] {
             assert_eq!(session_cache_slots(Some(&slots.to_string())).unwrap(),slots);
             let entries=vec![(2700usize,46usize);slots];
             let victims=cache_evictions(&entries,(2700,46),slots*46,true,slots).unwrap();
@@ -6712,5 +6982,181 @@ mod tests {
         for cut in 0..wire.len() {assert!(Command::decode(&wire[..cut]).is_err());}
         let mut extra=wire.clone();extra.push(0);assert!(Command::decode(&extra).is_err());
         let mut text=wire;text[0]=1;assert!(Command::decode(&text).is_err());
+    }
+}
+
+#[cfg(feature = "serving")]
+#[derive(Clone, Copy)]
+enum WideWarmupPass { All, BeforePool, RealPool }
+
+/// Wide startup warmup prompts as (offset, length) in the fixture: the original 8,320-token prompt at 0, then every
+/// width largest first, each at its own offset so no prompt extends another. Offsets are 10,000 apart while that fits
+/// the fixture (unchanged for up to 26 widths); a longer list (C22's 26 widths plus 16,384 needs 270,000 of the
+/// fixture's 262,656 tokens) steps the spacing down by 500 until every prompt fits. None if no spacing fits.
+///
+/// A widest width of 16,384 or more (the 16K extension) also gets one prompt of two such chunks and a 128-token tail,
+/// at the fixture's end (its own start): the single-width prompts run as one chunk each, so a real prompt's
+/// multi-chunk path at that width (a chunk with followers, layer 20 deferred, the next chunk's lookahead, a chunk after
+/// a 16K chunk) first ran in a client's first long request: ky, Nov 20, +3.4 / +6.2 s on the first 32K prompt after
+/// load (8K: +0.1 s, its multi-chunk path is warmed by the 8,320-token prompt). Lists without such a width are unchanged.
+#[cfg(any(feature = "serving", test))]
+fn wide_warmup_prompts(widths: &[usize], fixture: usize) -> Option<Vec<(usize, usize)>> {
+    let mut widths_desc = widths.to_vec();
+    widths_desc.sort_unstable_by(|a, b| b.cmp(a));
+    if widths_desc.iter().any(|&w| w == 0) || 8320 > fixture { return None; }
+    let mut prompts = (2..=20).rev().map(|half| half * 500).find_map(|step| {
+        let prompts: Vec<(usize, usize)> = std::iter::once((0, 8320))
+            .chain(widths_desc.iter().enumerate().map(|(k, &w)| (step * (k + 1), w))).collect();
+        prompts.iter().all(|&(at, len)| at + len <= fixture).then_some(prompts)
+    })?;
+    if let Some(&widest) = widths_desc.first().filter(|&&w| w >= 16384) {
+        let len = 2 * widest + 128;
+        let mut at = fixture.checked_sub(len)?;
+        while prompts.iter().any(|&(start, _)| start == at) { at = at.checked_sub(1)?; }
+        prompts.push((at, len));
+    }
+    Some(prompts)
+}
+
+#[cfg(test)]
+mod wide_warmup_tests {
+    use super::wide_warmup_prompts;
+    const FIXTURE: usize = 262_656;
+    const C22: [usize; 26] = [256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 2048, 2304, 2560, 2816,
+        3072, 3328, 3584, 3840, 4096, 4608, 5120, 6656, 7680, 8192];
+    /// The 8,320-token prompt, one prompt of each width, and (a widest width of 16,384 or more) the multi-chunk prompt
+    /// last; every prompt inside the fixture at its own start.
+    fn check(widths: &[usize], prompts: &[(usize, usize)]) {
+        let widest = widths.iter().copied().max().unwrap_or(0);
+        let multi = usize::from(widest >= 16384);
+        assert_eq!(prompts.len(), widths.len() + 1 + multi);
+        assert_eq!(prompts[0], (0, 8320));
+        assert!(prompts.iter().all(|&(at, len)| len > 0 && at + len <= FIXTURE));
+        let mut starts: Vec<usize> = prompts.iter().map(|p| p.0).collect();
+        starts.sort_unstable();
+        starts.dedup();
+        assert_eq!(starts.len(), prompts.len(), "every prompt starts at its own offset");
+        let mut lens: Vec<usize> = prompts[1..prompts.len() - multi].iter().map(|p| p.1).collect();
+        let mut want = widths.to_vec();
+        lens.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(lens, want, "every width warms once");
+        if multi == 1 { assert_eq!(prompts.last().unwrap().1, 2 * widest + 128, "two widest chunks and a tail"); }
+    }
+    #[test]
+    fn lists_that_fit_keep_the_ten_thousand_spacing() {
+        let p = wide_warmup_prompts(&C22, FIXTURE).unwrap();
+        check(&C22, &p);
+        assert_eq!(p[1], (10_000, 8192));
+        assert_eq!(p[26], (260_000, 256));
+        let short = [256, 512, 1024, 2048, 4096, 8192, 16384];
+        let p = wide_warmup_prompts(&short, FIXTURE).unwrap();
+        check(&short, &p);
+        assert_eq!(p[1], (10_000, 16384));
+    }
+    #[test]
+    fn the_sixteen_k_list_steps_the_spacing_down() {
+        let mut w = C22.to_vec();
+        w.push(16384);
+        let p = wide_warmup_prompts(&w, FIXTURE).unwrap();
+        check(&w, &p);
+        assert_eq!(p[1], (9_500, 16384));
+        assert_eq!(*p.last().unwrap(), (FIXTURE - 32_896, 32_896), "the multi-chunk prompt ends the fixture");
+    }
+    #[test]
+    fn only_a_sixteen_k_list_gets_the_multi_chunk_prompt() {
+        let p = wide_warmup_prompts(&C22, FIXTURE).unwrap();
+        assert!(p.iter().all(|&(_, len)| len <= 8320), "C22's list warms exactly as before");
+        let p = wide_warmup_prompts(&[8192, 16384], FIXTURE).unwrap();
+        check(&[8192, 16384], &p);
+        assert_eq!(p, vec![(0, 8320), (10_000, 16384), (20_000, 8192), (FIXTURE - 32_896, 32_896)]);
+        // A start already taken (a 42,896-token fixture puts the multi-chunk prompt at 10,000, the 16,384 prompt's
+        // start) moves it down by one token.
+        let p = wide_warmup_prompts(&[16384], 42_896).unwrap();
+        assert_eq!(p, vec![(0, 8320), (10_000, 16384), (9_999, 32_896)]);
+    }
+    #[test]
+    fn no_spacing_fits_gives_none() {
+        assert!(wide_warmup_prompts(&[300_000], FIXTURE).is_none());
+        assert!(wide_warmup_prompts(&[0], FIXTURE).is_none());
+        let many: Vec<usize> = (1..=300).map(|k| 256 + k).collect();
+        assert!(wide_warmup_prompts(&many, FIXTURE).is_none());
+        // The width fits once, but two of it and a tail do not.
+        assert!(wide_warmup_prompts(&[140_000], FIXTURE).is_none());
+    }
+}
+
+#[cfg(test)]
+mod keep_latest_tests {
+    use super::{cache_evictions, keep_latest_earlier_flags, keep_latest_order, prefix_extends, EntryFacts};
+    fn ext_of(list: &[&Vec<u32>]) -> Vec<Vec<bool>> {
+        (0..list.len()).map(|j| (0..list.len()).map(|i| j != i && prefix_extends(list[j], list[i])).collect()).collect()
+    }
+    fn f(serial: u64, restored: u64) -> EntryFacts { EntryFacts { serial, restored, shared: false } }
+    #[test]
+    fn follow_ups_branching_from_one_base_keep_the_base() {
+        // Warm rounds: base E (near-end of request 11) restored by requests 15, 16, 18; each saved its own prompt-end image.
+        let e: Vec<u32> = (0..30_000).collect();
+        let leaf = |k: u32| -> Vec<u32> { let mut v = e.clone(); v.extend((0..20 * k).map(|x| 900_000 + 1000 * k + x)); v };
+        let (p15, p16, p18) = (leaf(1), leaf(2), leaf(3));
+        let list = [&e, &p15, &p16, &p18];
+        let facts = [f(11, 18), f(15, 0), f(16, 0), f(18, 0)];
+        let earlier = keep_latest_earlier_flags(&facts, &ext_of(&list));
+        assert_eq!(earlier, vec![false, true, true, false], "the base stays; leaves saved before its last restore go first");
+        assert_eq!(keep_latest_order(&earlier), vec![1, 2, 0, 3]);
+    }
+    #[test]
+    fn a_conversation_that_moved_on_yields_before_an_idle_conversations_only_image() {
+        // A: E restored by conc2 (Begin 26), which saved N2 and its answer image C2; conc3 (29) restored N2.
+        let e: Vec<u32> = (0..30_000).collect();
+        let mut c1 = e.clone(); c1.extend(500_000..500_900u32);           // conc1's answer image (reasoning kept)
+        let mut n2 = e.clone(); n2.extend(600_000..600_700u32);           // conc2's near-end image
+        let mut c2 = n2.clone(); c2.extend(700_000..701_000u32);          // conc2's answer image
+        let mut n3 = n2.clone(); n3.extend(800_000..800_400u32);          // conc3's near-end image
+        let d: Vec<u32> = (2_000_000..2_025_000).collect();               // D: restored at warm4 (Begin 24) only
+        let list = [&d, &e, &c1, &n2, &c2, &n3];
+        let facts = [f(14, 24), f(11, 26), f(25, 0), f(26, 29), f(26, 0), f(29, 0)];
+        let earlier = keep_latest_earlier_flags(&facts, &ext_of(&list));
+        assert_eq!(earlier, vec![false, true, true, false, true, false]);
+        // The planner evicts the oldest eligible entry: in keep-latest order A's left-behind images, never D's.
+        let order = keep_latest_order(&earlier);
+        let entries: Vec<(usize, usize)> = order.iter().map(|&i| (list[i].len(), 10)).collect();
+        let victims = cache_evictions(&entries, (31_000, 10), 1_000, false, 4).unwrap();
+        let named: Vec<usize> = victims.iter().map(|&k| order[k]).collect();
+        assert!(!named.contains(&0) && named.iter().all(|&i| earlier[i]), "{named:?}");
+    }
+    #[test]
+    fn a_shared_prefix_never_links_two_conversations() {
+        let s: Vec<u32> = (0..10_000).collect();
+        let mut x = s.clone(); x.extend(50_000..60_000u32);
+        let mut y = s.clone(); y.extend(70_000..75_000u32);
+        let list = [&s, &x, &y];
+        let facts = [EntryFacts { serial: 5, restored: 0, shared: true }, f(6, 9), f(7, 0)];
+        let earlier = keep_latest_earlier_flags(&facts, &ext_of(&list));
+        assert_eq!(earlier, vec![true, false, false], "X's restore passes the shared prefix but never Y");
+    }
+    #[test]
+    fn images_saved_by_the_restoring_request_stay_latest() {
+        // One request restores E and saves its checkpoint, near-end, prompt-end and answer images in the same Begin.
+        let e: Vec<u32> = (0..30_000).collect();
+        let mut k = e.clone(); k.extend(10_000_000..10_000_300u32);
+        let mut ne = k.clone(); ne.extend(11_000_000..11_000_099u32);
+        let mut pe = ne.clone(); pe.push(12_000_000);
+        let mut ans = pe.clone(); ans.extend(13_000_000..13_000_500u32);
+        let list = [&e, &k, &ne, &pe, &ans];
+        let facts = [f(11, 30), f(30, 0), f(30, 0), f(30, 0), f(30, 0)];
+        assert_eq!(keep_latest_earlier_flags(&facts, &ext_of(&list)), vec![false; 5]);
+    }
+    #[test]
+    fn prefix_extension_compares_the_head_and_the_tail_window() {
+        let a: Vec<u32> = (0..3_000).collect();
+        let mut b = a.clone(); b.extend(9_000..9_500u32);
+        assert!(prefix_extends(&b, &a) && !prefix_extends(&a, &b) && !prefix_extends(&a, &a));
+        let mut head = b.clone(); head[5] = 1;
+        assert!(!prefix_extends(&head, &a));
+        let mut tail = b.clone(); tail[2_999] = 1;
+        assert!(!prefix_extends(&tail, &a));
+        let short: Vec<u32> = vec![4, 5];
+        assert!(prefix_extends(&[4, 5, 6], &short) && !prefix_extends(&[4, 6, 6], &short));
     }
 }

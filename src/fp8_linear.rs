@@ -446,12 +446,23 @@ impl Linear {
                 cuda.allocate(len)
             }
         };
-        let mut values = input_storage(g.rows * matrix.padded_k)?;
-        values.zero()?;
+        // config::shared_padded_inputs (Nov 19 2026): a sequential wide profile's padded-K input takes the prefix of one
+        // zeroed backing per operand (its canonical weights and scales, the buffer kind), sized by the widest profile;
+        // only this operand's producers write it, k columns a row, so its pad columns stay zero for every profile.
+        let shared_padded = matrix.padded_k != matrix.k && g.rows > 128 && crate::config::wide_rows(g.rows)
+            && crate::config::shared_padded_inputs();
+        let (weights_at, scales_at) = matrix.canonical_source();
+        let padded_input = |kind: u8, len: usize| -> Result<Buffer<u8>> {
+            if shared_padded && let Some(shared) = cuda.shared_padded_input((weights_at, scales_at, kind), len)? {
+                return Ok(shared);
+            }
+            let mut owned = input_storage(len)?;
+            owned.zero()?;
+            Ok(owned)
+        };
+        let values = padded_input(0, g.rows * matrix.padded_k)?;
         let scale_rows = if matches!(m.backend, Backend::B12x) {
-            let mut rows = input_storage(g.rows * matrix.padded_k / 32)?;
-            rows.zero()?;
-            Some(rows)
+            Some(padded_input(1, g.rows * matrix.padded_k / 32)?)
         } else {
             None
         };

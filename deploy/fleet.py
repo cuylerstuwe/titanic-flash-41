@@ -89,6 +89,7 @@ def validate(cfg):
     assert re.fullmatch(r'[A-Za-z0-9_./:@-]+', cfg['image'])
     assert type(cfg.get('gpu_clock_cap_mhz')) is int and cfg['gpu_clock_cap_mhz'] in (0, 2350), \
         'choose the qualified 2350 MHz cap or explicit stock-clock override 0'
+    assert type(cfg.get('serving_memory_policy', True)) is bool, 'serving_memory_policy must be a boolean'
     assert 1024 <= cfg['rendezvous_port'] <= 65530
     host, port = cfg['http_bind'].rsplit(':', 1)
     ip = ipaddress.ip_address(host)
@@ -134,12 +135,15 @@ class Fleet:
     def prepare_host_policy(self):
         cap = self.cfg['gpu_clock_cap_mhz']
         apst = [rank for rank, node in enumerate(self.cfg['nodes']) if node['disable_nvme0_apst']]
-        if not cap and not apst:
+        memory = self.cfg.get('serving_memory_policy', True)
+        if not cap and not apst and not memory:
             return None
         # Timer commands point to immutable code, so updating the checkout
         # cannot change how an already armed generation restores its settings.
-        files = {name:(SOURCE/'deploy'/name).read_bytes()
-                 for name in ['host_state.py', 'host_clock.py', 'host_apst.py']}
+        helpers = ['host_state.py', 'host_clock.py', 'host_apst.py']
+        if memory:
+            helpers.append('host_memory.py')
+        files = {name:(SOURCE/'deploy'/name).read_bytes() for name in helpers}
         fingerprint = hashlib.sha256(b''.join(name.encode()+b'\0'+raw
                                     for name, raw in sorted(files.items()))).hexdigest()
         directory = self.state_dir/'host-policy-code'/fingerprint
@@ -159,11 +163,31 @@ class Fleet:
             observed = self.run(['sha256sum', *[directory/name for name in files]], rank).stdout.splitlines()
             assert [line.split()[0] for line in observed] == [hashlib.sha256(raw).hexdigest() for raw in files.values()], \
                 'host-policy source differs on a node'
-        return dict(code=str(directory), source_sha256=fingerprint, cap_mhz=cap, apst_ranks=apst)
+        return dict(code=str(directory), source_sha256=fingerprint, cap_mhz=cap, apst_ranks=apst, memory=memory)
+
+    def memory_policy(self, action, state):
+        policy = state.get('host_policy') or {}
+        if not policy.get('memory'):
+            return
+        directory = self.state_dir/'host-policy-code'/policy['source_sha256']
+        assert directory == Path(policy['code'])
+        errors = []
+        for rank, container in enumerate(state['containers']):
+            cmd = ['python3', directory/'host_memory.py', action, state['generation']]
+            if action == 'arm':
+                cmd.extend([container, f'/state/rank{rank}.json', '--zero-swappiness'])
+            try:
+                self.run(cmd, rank, timeout=90)
+            except Exception as e:
+                errors.append(f'rank {rank}: {e}')
+                if action == 'arm':
+                    break
+        if errors:
+            raise RuntimeError('host memory policy '+action+' incomplete: '+str(errors))
 
     def host_policies(self, action, state):
         policy = state.get('host_policy')
-        if not policy:
+        if not policy or not state.get('device_policies_started', True):
             return []
         results, errors = [], []
         directory = Path(policy['code'])
@@ -262,6 +286,11 @@ class Fleet:
             pending = [pool.submit(stop_rank, rank, name)
                        for rank, name in enumerate(state['containers'])]
             errors.extend(error for future in pending if (error := future.result()))
+        if not errors:
+            try:
+                self.memory_policy('retire', state)
+            except Exception as e:
+                errors.append(str(e))
         try:
             self.host_policies('restore', state)
         except Exception as e:
@@ -313,7 +342,9 @@ class Fleet:
                     dspark_staged=f'/data/staged/dspark-mtp-v1/r{rank}',
                     endpoint=f"{self.cfg['nodes'][0]['fabric_ipv4'][0]}:{self.cfg['rendezvous_port']}",
                     ticket='/state/rendezvous.ticket', context=1048576,
-                    wide_widths=[512, 1024, 2048, 4096, 8192], events=f'/state/events-r{rank}.jsonl', requests=None,
+                    wide_widths=[256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792,
+                                 2048, 2304, 2560, 2816, 3072, 3328, 3584, 3840, 4096, 4608, 5120,
+                                 6656, 7680, 8192, 16384], events=f'/state/events-r{rank}.jsonl', requests=None,
                     vision=dict(checkpoint='/data/model/checkpoint.json', stage='/data/staged/vision-v1/r0',
                                 kernel='/data/runtime/vision.cubin',
                                 attention='/data/kernels/vision-attention-split-v1' if self.vision_split
@@ -346,10 +377,13 @@ class Fleet:
         containers = [f'titanic-{generation}-r{r}' for r in range(4)]
         state = dict(generation=generation, inventory_sha256=self.digest, image=image,
                      containers=containers, started_epoch=time.time(), stopped=False,
-                     host_policy=host_policy)
+                     host_policy=host_policy, device_policies_started=False)
         atomic(self.state_file, state)
         profile = self.profile
         try:
+            self.memory_policy('arm', state)
+            state['device_policies_started'] = True
+            atomic(self.state_file, state)
             self.host_policies('arm', state)
             for rank, node in enumerate(self.cfg['nodes']):
                 config = run_dir/f'rank{rank}.json'; atomic(config, self.config(rank))
@@ -371,6 +405,13 @@ class Fleet:
                        '--security-opt', 'seccomp=unconfined', '--memory', '96g', '--memory-swap', '96g',
                        '-v', str(self.root/'data')+':/data:ro', '-v', str(run_dir)+':/state',
                        '--entrypoint', '/data/runtime/titanic-flash']
+                if profile.get('CANADA_SCRATCH_DISK_TIER') == '1':
+                    # A dedicated per-node SSD directory outlives the container. On startup
+                    # the worker removes orphan snapshots from its previous generation.
+                    cache = self.state_dir/'disk-tier'
+                    self.run(['install', '-d', '-m', '0700', cache], rank)
+                    cmd.extend(['-v', str(cache)+':/cache'])
+                    env['CANADA_SCRATCH_DISK_TIER_DIR'] = '/cache'
                 for k, v in env.items():
                     cmd.extend(['-e', k+'='+v])
                 cmd += [image, 'resident-http-peer', f'/state/rank{rank}.json']

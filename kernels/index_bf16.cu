@@ -44,9 +44,14 @@ __device__ __forceinline__ void mma_fp4(float (&d)[4], uint32_t a0, uint32_t a1,
 // bf16 bits -> an unsigned key with the same order (0 stays free for "no key": it sits below -inf)
 __device__ __forceinline__ uint32_t key_from_bf16(uint32_t b) { return (b & 0x8000) ? (~b & 0xFFFF) : (b | 0x8000); }
 
-// Words t, 4 + t, 8 + t, 12 + t of a plain 64-byte e2m1 vector: lane t's operands for both K steps.
-__device__ __forceinline__ uint4 words_of(const uint32_t* v, int t) {
-  return make_uint4(v[t], v[4 + t], v[8 + t], v[12 + t]);
+// In each group of eight heads, lanes 4*g+t read operand t of head g.
+__device__ __forceinline__ int shared_query_vector(int i) {
+  // External vector order is (head, operand). Shared order is (operand, head) within each MMA.
+  return (i & ~31) + ((i & 3) << 3) + ((i >> 2) & 7);
+}
+__device__ __forceinline__ uint4 shared_query_words(const uint32_t* row, int h, int t) {
+  const uint32_t* p = row + (h >> 3) * 128 + (h & 7) * 4 + t;
+  return make_uint4(p[0], p[32], p[64], p[96]);
 }
 __device__ __forceinline__ uint4 ldg_words_of(const uint32_t* v, int t) {
   return make_uint4(__ldg(v + t), __ldg(v + 4 + t), __ldg(v + 8 + t), __ldg(v + 12 + t));
@@ -134,7 +139,7 @@ extern "C" __global__ void __launch_bounds__(128)
   __shared__ __align__(16) uint32_t sq[kScoreRows][kHeads][16];
   __shared__ uint32_t ssc[kScoreRows][kHeads];
   __shared__ float sw[kScoreRows][kHeads];
-  __shared__ int slo[kScoreRows], shi[kScoreRows], sspan[2];
+  __shared__ int slo[kScoreRows], shi[kScoreRows], span_lo[kScoreRows], span_hi[kScoreRows], spans, longest;
   const int r0 = blockIdx.y * kScoreRows, nr = min(kScoreRows, rows - r0);
   if (nr <= 0) return;
   if (threadIdx.x < nr) {
@@ -144,72 +149,103 @@ extern "C" __global__ void __launch_bounds__(128)
   }
   __syncthreads();
   if (threadIdx.x == 0) {
-    int lo = columns, hi = 0;
-    for (int rr = 0; rr < nr; ++rr)
-      if (shi[rr] > slo[rr]) lo = min(lo, slo[rr]), hi = max(hi, shi[rr]);
-    sspan[0] = lo & ~(kScorePos - 1);
-    sspan[1] = hi;
+    int lo = columns, hi = 0, last_begin = 0, first_end = columns;
+    for (int rr = 0; rr < nr; ++rr) {
+      if (shi[rr] <= slo[rr]) continue;
+      lo = min(lo, slo[rr]); hi = max(hi, shi[rr]);
+      last_begin = max(last_begin, slo[rr]); first_end = min(first_end, shi[rr]);
+    }
+    spans = 0; longest = 0;
+    if (hi > lo && last_begin <= first_end) {
+      spans = 1; span_lo[0] = lo & ~(kScorePos - 1); span_hi[0] = hi;
+      longest = hi - span_lo[0];
+    } else if (hi > lo) {
+      // Form the union of the row windows at 256-column CTA granularity.
+      // Reorder independent tiles only; one warp still owns each output score.
+      int n = 0;
+      for (int rr = 0; rr < nr; ++rr) {
+        if (shi[rr] <= slo[rr]) continue;
+        int at = n++;
+        const int begin = slo[rr] & ~(kScorePos - 1), end = shi[rr];
+        while (at && span_lo[at-1] > begin) {
+          span_lo[at] = span_lo[at-1]; span_hi[at] = span_hi[at-1]; --at;
+        }
+        span_lo[at] = begin; span_hi[at] = end;
+      }
+      int used = 0;
+      for (int i = 0; i < n; ++i) {
+        const int begin = span_lo[i], end = span_hi[i];
+        if (used && begin <= ((span_hi[used-1] + kScorePos - 1) & ~(kScorePos - 1))) {
+          span_hi[used-1] = max(span_hi[used-1], end);
+        } else {
+          span_lo[used] = begin; span_hi[used] = end; ++used;
+        }
+      }
+      spans = used;
+      for (int i = 0; i < used; ++i) longest = max(longest, span_hi[i] - span_lo[i]);
+    }
   }
   __syncthreads();
-  const int first = sspan[0] + blockIdx.x * kScorePos, span_hi = sspan[1];
-  if (first >= span_hi) return;  // CTA-uniform: no column of this group's windows for this CTA
+  const int first = blockIdx.x * kScorePos;
+  if (first >= longest) return;
   const uint4* qsrc = reinterpret_cast<const uint4*>(q + (size_t)r0 * kHeads * 64);
-  for (int i = threadIdx.x; i < nr * kHeads * 4; i += blockDim.x) reinterpret_cast<uint4*>(&sq[0][0][0])[i] = qsrc[i];
+  for (int i = threadIdx.x; i < nr * kHeads * 4; i += blockDim.x) reinterpret_cast<uint4*>(&sq[0][0][0])[shared_query_vector(i)] = qsrc[i];
   for (int i = threadIdx.x; i < nr * kHeads; i += blockDim.x) {
     (&ssc[0][0])[i] = qsc[(size_t)r0 * kHeads + i];
     (&sw[0][0])[i] = w[(size_t)r0 * kHeads + i];
   }
   __syncthreads();
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-  for (int base = first; base < span_hi; base += gridDim.x * kScorePos) {
-    for (int tile = 0; tile < kScoreTiles; ++tile) {
-      const int i0 = base + (warp * kScoreTiles + tile) * 16;
-      if (i0 >= span_hi) break;  // warp-uniform
-      bool any = false;
-      for (int rr = 0; rr < nr; ++rr) any |= i0 < shi[rr] && i0 + 16 > slo[rr];
-      if (!any) continue;  // warp-uniform
-      const int p0 = i0 + g, p1 = i0 + 8 + g;
-      uint4 k0 = make_uint4(0, 0, 0, 0), k1 = k0;
-      uint32_t s0 = 0x7f7f7f7fu, s1 = 0x7f7f7f7fu;
-      if (p0 < span_hi) {
-        k0 = ldg_words_of(reinterpret_cast<const uint32_t*>(k + (size_t)p0 * 64), t);
-        s0 = __ldg(ksc + p0);
-      }
-      if (p1 < span_hi) {
-        k1 = ldg_words_of(reinterpret_cast<const uint32_t*>(k + (size_t)p1 * 64), t);
-        s1 = __ldg(ksc + p1);
-      }
-      const uint32_t sa = (t & 1) ? s1 : s0;
-      for (int rr = 0; rr < nr; ++rr) {
-        const int lo = slo[rr], hi = shi[rr];
-        if (i0 >= hi || i0 + 16 <= lo) continue;  // warp-uniform
-        float acc0 = 0.f, acc1 = 0.f;
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-          const int h = nt * 8 + g;
-          const uint4 qv = words_of(sq[rr][h], t);
-          const uint32_t qs = ssc[rr][h];
-          float d[4] = {0.f, 0.f, 0.f, 0.f};
-          mma_fp4(d, k0.x, k1.x, k0.y, k1.y, qv.x, qv.y, sa & 0xffff, qs & 0xffff);
-          mma_fp4(d, k0.z, k1.z, k0.w, k1.w, qv.z, qv.w, sa >> 16, qs >> 16);
-          const float w0 = sw[rr][nt * 8 + 2 * t], w1 = sw[rr][nt * 8 + 2 * t + 1];
-          acc0 = __fadd_rn(acc0, bfround(__fmul_rn(fmaxf(bfround(d[0]), 0.f), w0)));
-          acc0 = __fadd_rn(acc0, bfround(__fmul_rn(fmaxf(bfround(d[1]), 0.f), w1)));
-          acc1 = __fadd_rn(acc1, bfround(__fmul_rn(fmaxf(bfround(d[2]), 0.f), w0)));
-          acc1 = __fadd_rn(acc1, bfround(__fmul_rn(fmaxf(bfround(d[3]), 0.f), w1)));
+  for (int index = 0; index < spans; ++index) {
+    const int span_end = span_hi[index];
+    for (int base = span_lo[index] + first; base < span_end; base += gridDim.x * kScorePos) {
+      for (int tile = 0; tile < kScoreTiles; ++tile) {
+        const int i0 = base + (warp * kScoreTiles + tile) * 16;
+        if (i0 >= span_end) break;  // warp-uniform
+        const int p0 = i0 + g, p1 = i0 + 8 + g;
+        uint4 k0 = make_uint4(0, 0, 0, 0), k1 = k0;
+        uint32_t s0 = 0x7f7f7f7fu, s1 = 0x7f7f7f7fu;
+        if (p0 < span_end) {
+          k0 = ldg_words_of(reinterpret_cast<const uint32_t*>(k + (size_t)p0 * 64), t);
+          s0 = __ldg(ksc + p0);
         }
-        acc0 = __fadd_rn(acc0, __shfl_xor_sync(0xffffffffu, acc0, 1));
-        acc0 = __fadd_rn(acc0, __shfl_xor_sync(0xffffffffu, acc0, 2));
-        acc1 = __fadd_rn(acc1, __shfl_xor_sync(0xffffffffu, acc1, 1));
-        acc1 = __fadd_rn(acc1, __shfl_xor_sync(0xffffffffu, acc1, 2));
-        if (fscores) {
-          float* frow = fscores + (size_t)(r0 + rr) * fstride - lo;
-          if (t == 0 && p0 >= lo && p0 < hi) frow[p0] = bfround(acc0);
-          if (t == 1 && p1 >= lo && p1 < hi) frow[p1] = bfround(acc1);
-        } else {
-          uint16_t* krow = keys + (size_t)(r0 + rr) * keys_stride - lo;
-          if (t == 0 && p0 >= lo && p0 < hi) krow[p0] = (uint16_t)key_from_bf16(f2bf(acc0));
-          if (t == 1 && p1 >= lo && p1 < hi) krow[p1] = (uint16_t)key_from_bf16(f2bf(acc1));
+        if (p1 < span_end) {
+          k1 = ldg_words_of(reinterpret_cast<const uint32_t*>(k + (size_t)p1 * 64), t);
+          s1 = __ldg(ksc + p1);
+        }
+        const uint32_t sa = (t & 1) ? s1 : s0;
+        for (int rr = 0; rr < nr; ++rr) {
+          const int lo = slo[rr], hi = shi[rr];
+          if (i0 >= hi || i0 + 16 <= lo) continue;  // warp-uniform
+          float acc0 = 0.f, acc1 = 0.f;
+
+#pragma unroll
+          for (int nt = 0; nt < 4; ++nt) {
+            const int h = nt * 8 + g;
+            const uint4 qv = shared_query_words(&sq[rr][0][0], h, t);
+            const uint32_t qs = ssc[rr][h];
+            float d[4] = {0.f, 0.f, 0.f, 0.f};
+            mma_fp4(d, k0.x, k1.x, k0.y, k1.y, qv.x, qv.y, sa & 0xffff, qs & 0xffff);
+            mma_fp4(d, k0.z, k1.z, k0.w, k1.w, qv.z, qv.w, sa >> 16, qs >> 16);
+            const float w0 = sw[rr][nt * 8 + 2 * t], w1 = sw[rr][nt * 8 + 2 * t + 1];
+            acc0 = __fadd_rn(acc0, bfround(__fmul_rn(fmaxf(bfround(d[0]), 0.f), w0)));
+            acc0 = __fadd_rn(acc0, bfround(__fmul_rn(fmaxf(bfround(d[1]), 0.f), w1)));
+            acc1 = __fadd_rn(acc1, bfround(__fmul_rn(fmaxf(bfround(d[2]), 0.f), w0)));
+            acc1 = __fadd_rn(acc1, bfround(__fmul_rn(fmaxf(bfround(d[3]), 0.f), w1)));
+          }
+          acc0 = __fadd_rn(acc0, __shfl_xor_sync(0xffffffffu, acc0, 1));
+          acc0 = __fadd_rn(acc0, __shfl_xor_sync(0xffffffffu, acc0, 2));
+          acc1 = __fadd_rn(acc1, __shfl_xor_sync(0xffffffffu, acc1, 1));
+          acc1 = __fadd_rn(acc1, __shfl_xor_sync(0xffffffffu, acc1, 2));
+          if (fscores) {
+            float* frow = fscores + (size_t)(r0 + rr) * fstride;
+            if (t == 0 && p0 >= lo && p0 < hi) frow[p0 - lo] = bfround(acc0);
+            if (t == 1 && p1 >= lo && p1 < hi) frow[p1 - lo] = bfround(acc1);
+          } else {
+            uint16_t* krow = keys + (size_t)(r0 + rr) * keys_stride;
+            if (t == 0 && p0 >= lo && p0 < hi) krow[p0 - lo] = (uint16_t)key_from_bf16(f2bf(acc0));
+            if (t == 1 && p1 >= lo && p1 < hi) krow[p1 - lo] = (uint16_t)key_from_bf16(f2bf(acc1));
+          }
         }
       }
     }
@@ -463,8 +499,8 @@ __device__ void select_dense_row(const uint16_t* row, uint32_t* gh, int lo, int 
 // most one CTA per SM (all co-resident; the last R spin on the grid ticket), 1024 threads, kDenseSmem dynamic shared
 // bytes. scratch: 2 counters, then [rows][2048] u32 histograms; zero before the first launch, left zero after each.
 // keys: [rows][keys_stride] 16-bit keys (every window column written). out: [rows][out_stride] positions, -1 padded.
-extern "C" __global__ void __launch_bounds__(kSelThreads, 1)
-    ca_idx16_dense(const uint8_t* __restrict__ q, const uint32_t* __restrict__ qsc, const float* __restrict__ w,
+template <bool common_start = false>
+__device__ __forceinline__ void dense_row_group(const uint8_t* __restrict__ q, const uint32_t* __restrict__ qsc, const float* __restrict__ w,
                    const uint8_t* __restrict__ k, const uint32_t* __restrict__ ksc, const int* __restrict__ starts,
                    const int* __restrict__ lengths, const int* __restrict__ offsets, int rows, int columns,
                    uint16_t* __restrict__ keys, int keys_stride, int kmax, int* __restrict__ out, int out_stride,
@@ -494,7 +530,7 @@ extern "C" __global__ void __launch_bounds__(kSelThreads, 1)
     sspan[1] = hi;
   }
   const uint4* qsrc = reinterpret_cast<const uint4*>(q);
-  for (int i = tid; i < R * kHeads * 4; i += kSelThreads) reinterpret_cast<uint4*>(&sq[0][0][0])[i] = qsrc[i];
+  for (int i = tid; i < R * kHeads * 4; i += kSelThreads) reinterpret_cast<uint4*>(&sq[0][0][0])[shared_query_vector(i)] = qsrc[i];
   for (int i = tid; i < R * kHeads; i += kSelThreads) {
     ssc[i] = qsc[i];
     sw[i] = w[i];
@@ -503,10 +539,21 @@ extern "C" __global__ void __launch_bounds__(kSelThreads, 1)
   const int span_lo = sspan[0], span_hi = sspan[1];
   for (int base = span_lo + blockIdx.x * kDensePos; base < span_hi; base += G * kDensePos) {
     const int i0 = base + warp * 16;
-    if (i0 >= span_hi) continue;  // warp-uniform
-    bool any = false;
-    for (int rr = 0; rr < R; ++rr) any |= i0 < shi[rr] && i0 + 16 > slo[rr];
-    if (!any) continue;  // warp-uniform
+    if (i0 >= span_hi) break;  // warp-uniform
+    if constexpr (!common_start) {
+      bool any = false;
+      for (int rr = 0; rr < R; ++rr) any |= i0 < shi[rr] && i0 + 16 > slo[rr];
+      if (!any) {
+        // Keep each warp's 16-key tiles when skipping gaps between separate conversations.
+        int next = span_hi;
+        for (int rr = 0; rr < R; ++rr)
+          if (shi[rr] > slo[rr] && slo[rr] >= i0 + 16) next = min(next, slo[rr]);
+        if (next == span_hi) break;
+        const int step = G * kDensePos;
+        base += ((next - i0 - 16) / step) * step;
+        continue;
+      }
+    }
     const int p0 = i0 + g, p1 = i0 + 8 + g;
     uint4 k0 = make_uint4(0, 0, 0, 0), k1 = k0;
     uint32_t s0 = 0x7f7f7f7fu, s1 = 0x7f7f7f7fu;
@@ -526,7 +573,7 @@ extern "C" __global__ void __launch_bounds__(kSelThreads, 1)
 #pragma unroll
       for (int nt = 0; nt < 4; ++nt) {
         const int h = nt * 8 + g;
-        const uint4 qv = words_of(sq[rr][h], t);
+        const uint4 qv = shared_query_words(&sq[rr][0][0], h, t);
         const uint32_t qs = ssc[rr * kHeads + h];
         float d[4] = {0.f, 0.f, 0.f, 0.f};
         mma_fp4(d, k0.x, k1.x, k0.y, k1.y, qv.x, qv.y, sa & 0xffff, qs & 0xffff);
@@ -541,15 +588,15 @@ extern "C" __global__ void __launch_bounds__(kSelThreads, 1)
       acc0 = __fadd_rn(acc0, __shfl_xor_sync(0xffffffffu, acc0, 2));
       acc1 = __fadd_rn(acc1, __shfl_xor_sync(0xffffffffu, acc1, 1));
       acc1 = __fadd_rn(acc1, __shfl_xor_sync(0xffffffffu, acc1, 2));
-      uint16_t* krow = keys + (size_t)rr * keys_stride - lo;  // relative to the row's range start
+      uint16_t* krow = keys + (size_t)rr * keys_stride;  // relative to the row's range start
       if (t == 0 && p0 >= lo && p0 < hi) {
         const uint32_t key = key_from_bf16(f2bf(acc0));
-        krow[p0] = (uint16_t)key;
+        krow[p0 - lo] = (uint16_t)key;
         hist_add(hk + rr * 1024, key);
       }
       if (t == 1 && p1 >= lo && p1 < hi) {
         const uint32_t key = key_from_bf16(f2bf(acc1));
-        krow[p1] = (uint16_t)key;
+        krow[p1 - lo] = (uint16_t)key;
         hist_add(hk + rr * 1024, key);
       }
     }
@@ -576,4 +623,130 @@ extern "C" __global__ void __launch_bounds__(kSelThreads, 1)
     scratch[0] = 0;
     scratch[1] = 0;
   }
+}
+
+extern "C" __global__ void __launch_bounds__(kSelThreads, 1)
+    ca_idx16_dense(const uint8_t* __restrict__ q, const uint32_t* __restrict__ qsc, const float* __restrict__ w,
+                   const uint8_t* __restrict__ k, const uint32_t* __restrict__ ksc, const int* __restrict__ starts,
+                   const int* __restrict__ lengths, const int* __restrict__ offsets, int rows, int columns,
+                   uint16_t* __restrict__ keys, int keys_stride, int kmax, int* __restrict__ out, int out_stride,
+                   uint32_t* __restrict__ scratch) {
+  dense_row_group(q, qsc, w, k, ksc, starts, lengths, offsets, rows, columns, keys, keys_stride, kmax, out, out_stride, scratch);
+}
+
+// Six rows of one conversation share a key start. Read the windows at replay
+// time so a graph also works after a cache restore or a change of live width.
+// Previously valid rows must still publish -1 after their window becomes empty.
+extern "C" __global__ void __launch_bounds__(kSelThreads, 1)
+    ca_idx16_dense_solo(const uint8_t* __restrict__ q, const uint32_t* __restrict__ qsc, const float* __restrict__ w,
+                   const uint8_t* __restrict__ k, const uint32_t* __restrict__ ksc, const int* __restrict__ starts,
+                   const int* __restrict__ lengths, const int* __restrict__ offsets, int rows, int columns,
+                   uint16_t* __restrict__ keys, int keys_stride, int kmax, int* __restrict__ out, int out_stride,
+                   uint32_t* __restrict__ scratch) {
+  const int lane = threadIdx.x & 31;
+  const unsigned active = __ballot_sync(0xffffffffu, lane < rows && lengths[lane] > 0);
+  const int live = 32 - __clz(active);
+  for (int i = blockIdx.x * kSelThreads + threadIdx.x; i < (rows - live) * kmax; i += gridDim.x * kSelThreads)
+    out[(live + i / kmax) * out_stride + i % kmax] = -1;
+  if (live > 0)
+    dense_row_group<true>(q, qsc, w, k, ksc, starts, lengths, offsets, live, columns, keys, keys_stride, kmax, out, out_stride, scratch);
+}
+
+// Two independent eight-row work groups. The two Y slices may finish in either order.
+extern "C" __global__ void __launch_bounds__(kSelThreads, 1)
+    ca_idx16_dense_pair(const uint8_t* __restrict__ q, const uint32_t* __restrict__ qsc, const float* __restrict__ w,
+                   const uint8_t* __restrict__ k, const uint32_t* __restrict__ ksc, const int* __restrict__ starts,
+                   const int* __restrict__ lengths, const int* __restrict__ offsets, int rows, int columns,
+                   uint16_t* __restrict__ keys, int keys_stride, int kmax, int* __restrict__ out, int out_stride,
+                   uint32_t* __restrict__ scratch) {
+  const int first = blockIdx.y * kDenseRows;
+  if (first >= rows) return;
+  dense_row_group(q + (size_t)first * kHeads * 64, qsc + first * kHeads, w + first * kHeads,
+                  k, ksc, starts + first, lengths + first, offsets + first, rows - first, columns,
+                  keys + (size_t)first * keys_stride, keys_stride, kmax, out + (size_t)first * out_stride,
+                  out_stride, scratch + (size_t)blockIdx.y * (2 + kDenseRows * 2048));
+}
+
+// Each warp owns 16 row-relative positions, hence exactly two publisher bytes.
+// Read those bytes before fetching any packed keys. All lanes execute the
+// canonical MMA and shuffle sequence whenever at least one half is selected.
+__device__ __forceinline__ void score_masked_row(
+    const uint8_t* q, const uint32_t* qsc, const float* weights,
+    const uint8_t* k, const uint32_t* ksc, const int* starts, const int* lengths,
+    int rows, int columns, float* fscores, int fstride, const uint8_t* mask, int mask_stride) {
+  const int first_row = blockIdx.y * kScoreRows;
+  const int in_group = min(kScoreRows, rows - first_row);
+  if (in_group <= 0) return;
+  const int which = blockIdx.x % in_group;
+  const int r = first_row + which;
+  const int x = blockIdx.x / in_group;
+  const int grid = (gridDim.x - 1 - which) / in_group + 1;
+  const int start = starts[r], count = min(lengths[r], columns - start);
+  if (x * 64 >= count) return;
+
+  __shared__ __align__(16) uint32_t sq[1][kHeads][16];
+  __shared__ uint32_t ssc[1][kHeads];
+  __shared__ float sw[1][kHeads];
+  const uint4* qsrc = reinterpret_cast<const uint4*>(q + (size_t)r * kHeads * 64);
+  if (threadIdx.x < kHeads * 4)
+    reinterpret_cast<uint4*>(&sq[0][0][0])[shared_query_vector(threadIdx.x)] = qsrc[threadIdx.x];
+  if (threadIdx.x < kHeads) {
+    ssc[0][threadIdx.x] = qsc[(size_t)r * kHeads + threadIdx.x];
+    sw[0][threadIdx.x] = weights[(size_t)r * kHeads + threadIdx.x];
+  }
+  __syncthreads();
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const uint8_t* kept = mask + (size_t)r * mask_stride;
+  float* dest = fscores + (size_t)r * fstride;
+  for (int base = x * 64 + warp * 16; base < count; base += grid * 64) {
+    const bool first = kept[base / 8] != 0;
+    const bool second = base + 8 < count && kept[base / 8 + 1] != 0;
+    if (!first && !second) {
+      if (lane < 16 && base + lane < count) dest[base + lane] = __int_as_float(0xff800000u);
+      continue;
+    }
+    const int p0 = base + g, p1 = p0 + 8;
+    uint4 k0 = make_uint4(0, 0, 0, 0), k1 = k0;
+    uint32_t s0 = 0x7f7f7f7fu, s1 = s0;
+    if (first && p0 < count) {
+      k0 = ldg_words_of(reinterpret_cast<const uint32_t*>(k + (size_t)(start + p0) * 64), t);
+      s0 = __ldg(ksc + start + p0);
+    }
+    if (second && p1 < count) {
+      k1 = ldg_words_of(reinterpret_cast<const uint32_t*>(k + (size_t)(start + p1) * 64), t);
+      s1 = __ldg(ksc + start + p1);
+    }
+    const uint32_t sa = (t & 1) ? s1 : s0;
+    constexpr int rr = 0;
+              float acc0 = 0.f, acc1 = 0.f;
+
+#pragma unroll
+          for (int nt = 0; nt < 4; ++nt) {
+            const int h = nt * 8 + g;
+            const uint4 qv = shared_query_words(&sq[rr][0][0], h, t);
+            const uint32_t qs = ssc[rr][h];
+            float d[4] = {0.f, 0.f, 0.f, 0.f};
+            mma_fp4(d, k0.x, k1.x, k0.y, k1.y, qv.x, qv.y, sa & 0xffff, qs & 0xffff);
+            mma_fp4(d, k0.z, k1.z, k0.w, k1.w, qv.z, qv.w, sa >> 16, qs >> 16);
+            const float w0 = sw[rr][nt * 8 + 2 * t], w1 = sw[rr][nt * 8 + 2 * t + 1];
+            acc0 = __fadd_rn(acc0, bfround(__fmul_rn(fmaxf(bfround(d[0]), 0.f), w0)));
+            acc0 = __fadd_rn(acc0, bfround(__fmul_rn(fmaxf(bfround(d[1]), 0.f), w1)));
+            acc1 = __fadd_rn(acc1, bfround(__fmul_rn(fmaxf(bfround(d[2]), 0.f), w0)));
+            acc1 = __fadd_rn(acc1, bfround(__fmul_rn(fmaxf(bfround(d[3]), 0.f), w1)));
+          }
+          acc0 = __fadd_rn(acc0, __shfl_xor_sync(0xffffffffu, acc0, 1));
+          acc0 = __fadd_rn(acc0, __shfl_xor_sync(0xffffffffu, acc0, 2));
+          acc1 = __fadd_rn(acc1, __shfl_xor_sync(0xffffffffu, acc1, 1));
+          acc1 = __fadd_rn(acc1, __shfl_xor_sync(0xffffffffu, acc1, 2));
+
+    if (t == 0 && p0 < count) dest[p0] = first ? bfround(acc0) : __int_as_float(0xff800000u);
+    if (t == 1 && p1 < count) dest[p1] = second ? bfround(acc1) : __int_as_float(0xff800000u);
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(128) ca_idx16_mask_row(const uint8_t* __restrict__ q, const uint32_t* __restrict__ qsc, const float* __restrict__ w,
+                   const uint8_t* __restrict__ k, const uint32_t* __restrict__ ksc, const int* __restrict__ starts,
+                   const int* __restrict__ lengths, int rows, int columns, uint16_t* __restrict__ keys,
+                   int keys_stride, float* __restrict__ fscores, int fstride, const uint8_t* __restrict__ mask, int mask_stride) {
+  score_masked_row(q, qsc, w, k, ksc, starts, lengths, rows, columns, fscores, fstride, mask, mask_stride);
 }

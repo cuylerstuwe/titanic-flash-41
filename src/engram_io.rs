@@ -45,9 +45,11 @@ struct Submitted {
     inner_of: [u16; ENTRIES],
 }
 pub(crate) struct Reader {
+    // The ring is dropped before its registered storage. Drop drains any outstanding request.
     ring: IoUring,
     rows: Vec<u8>,
     direct: Option<Aligned>,
+    fixed_direct: bool,
     active: bool,
     submitted: Option<Box<Submitted>>,
 }
@@ -58,9 +60,44 @@ impl Reader {
                 .context("explicit Engram io_uring experiment unavailable")?,
             rows: vec![0; ENTRIES * ROW_BYTES],
             direct: None,
+            fixed_direct: false,
             active: false,
             submitted: None,
         })
+    }
+    fn prepare_direct(&mut self) -> Result<()> {
+        if self.direct.is_none() {
+            let storage = Aligned::new(ENTRIES * 2 * BLOCK)?;
+            if std::env::var("CANADA_SCRATCH_ENGRAM_FIXED_DIRECT").as_deref() == Ok("1") {
+                let region = libc::iovec { iov_base: storage.ptr.cast(), iov_len: storage.len };
+                // The allocation stays at this address until the ring closes. Each SQE references a
+                // disjoint slot in buffer zero and the existing completion checks still apply.
+                match unsafe { self.ring.submitter().register_buffers(&[region]) } {
+                    Ok(()) => {
+                        self.fixed_direct = true;
+                        static REGISTERED: std::sync::Once = std::sync::Once::new();
+                        REGISTERED.call_once(|| eprintln!("Engram direct-read buffer registered ({} bytes)", storage.len));
+                    }
+                    Err(error) => {
+                        // A low memlock allowance can prevent registration. The original O_DIRECT
+                        // read uses this same allocation with identical alignment and offsets.
+                        static UNREGISTERED: std::sync::Once = std::sync::Once::new();
+                        UNREGISTERED.call_once(|| eprintln!("Engram using unregistered direct-read buffer: {error}"));
+                    }
+                }
+            }
+            self.direct = Some(storage);
+        }
+        Ok(())
+    }
+    fn direct_entry(&self, file: &File, slot: usize, offset: u64, length: usize) -> io_uring::squeue::Entry {
+        let ptr = unsafe { self.direct.as_ref().unwrap().ptr.add(slot * 2 * BLOCK) };
+        let fd = types::Fd(file.as_raw_fd());
+        if self.fixed_direct {
+            opcode::ReadFixed::new(fd, ptr, length as u32, 0).offset(offset).build()
+        } else {
+            opcode::Read::new(fd, ptr, length as u32).offset(offset).build()
+        }
     }
     /// Submit reads of one file WITHOUT waiting for them (a read-ahead; config::engram_anchor_prefetch). Nothing else
     /// may use this reader until `finish_submitted` has returned; the store that owns the reader enforces it.
@@ -71,9 +108,7 @@ impl Reader {
             !self.active && self.submitted.is_none() && self.ring.submission().is_empty() && self.ring.completion().is_empty(),
             "Engram I/O queue was not drained"
         );
-        if direct && self.direct.is_none() {
-            self.direct = Some(Aligned::new(ENTRIES * 2 * BLOCK)?);
-        }
+        if direct { self.prepare_direct()?; }
         let mut state = Box::new(Submitted { count, direct, need: [ROW_BYTES as i32; ENTRIES], inner_of: [0u16; ENTRIES] });
         self.active = true;
         for (i, &offset) in offsets.iter().enumerate() {
@@ -81,21 +116,15 @@ impl Reader {
                 let (block, len, inner) = direct_span(offset);
                 state.need[i] = (inner + ROW_BYTES) as i32;
                 state.inner_of[i] = inner as u16;
-                opcode::Read::new(
-                    types::Fd(file.as_raw_fd()),
-                    unsafe { self.direct.as_ref().unwrap().ptr.add(i * 2 * BLOCK) },
-                    len as u32,
-                )
-                .offset(block)
+                self.direct_entry(file, i, block, len)
             } else {
                 opcode::Read::new(
                     types::Fd(file.as_raw_fd()),
                     unsafe { self.rows.as_mut_ptr().add(i * ROW_BYTES) },
                     ROW_BYTES as u32,
                 )
-                .offset(offset)
+                .offset(offset).build()
             }
-            .build()
             .user_data(i as u64);
             unsafe {
                 self.ring
@@ -181,9 +210,7 @@ impl Reader {
         let fault_offset = injected_read_offset(request(0).0)?;
         // From here until every CQE is consumed, an abnormal drop must fail the
         // process rather than free memory that the kernel could still write.
-        if direct && self.direct.is_none() {
-            self.direct = Some(Aligned::new(ENTRIES * 2 * BLOCK)?);
-        }
+        if direct { self.prepare_direct()?; }
         // Per request: the bytes a completion must report, and (direct) where the row sits in its blocks.
         let mut need = [ROW_BYTES as i32; ENTRIES];
         let mut inner_of = [0u16; ENTRIES];
@@ -196,21 +223,15 @@ impl Reader {
                 let (block, len, inner) = direct_span(offset);
                 need[i] = (inner + ROW_BYTES) as i32;
                 inner_of[i] = inner as u16;
-                opcode::Read::new(
-                    types::Fd(file.as_raw_fd()),
-                    unsafe { self.direct.as_ref().unwrap().ptr.add(i * 2 * BLOCK) },
-                    len as u32,
-                )
-                .offset(block)
+                self.direct_entry(file, i, block, len)
             } else {
                 opcode::Read::new(
                     types::Fd(file.as_raw_fd()),
                     unsafe { self.rows.as_mut_ptr().add(i * ROW_BYTES) },
                     ROW_BYTES as u32,
                 )
-                .offset(offset)
+                .offset(offset).build()
             }
-            .build()
             .user_data(i as u64);
             // Distinct disjoint rows in one allocation, never resized in flight.
             unsafe {

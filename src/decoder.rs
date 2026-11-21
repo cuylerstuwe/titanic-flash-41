@@ -127,6 +127,12 @@ impl WideBuild {
             crate::config::wide_rows(rows) && sp_rank.is_none_or(|r| r < 4),
             "wide build width/rank"
         );
+        // Nov 19 (config::wide16_elastic): a 16,384-row widest profile keeps only the 8,192-row sizes of its shared
+        // arenas resident; the upper halves are the 16K extension, pool chunks mapped only while lent (Cuda::wide16_map).
+        // Every narrower profile carves inside the resident halves (fork_wide_bank checks it), so they never need it.
+        let elastic16 = rows == 16384 && share.is_none() && crate::config::wide16_elastic()? > 0;
+        let arena = |bytes: usize, label: &str| if elastic16 { cuda.row_arena_wide16(bytes, bytes / 2, label) }
+            else { cuda.row_arena(bytes) };
         let arenas = if let Some(prior) = share {
             ensure!(prior.rows >= rows && prior.sp_rank == sp_rank
                 && prior.arenas.iter().all(|a| a.bytes() >= arena_bytes),
@@ -139,7 +145,7 @@ impl WideBuild {
             // only through the separately gated peer-bank construction.
             prior.arenas.clone()
         } else {
-            [cuda.row_arena(arena_bytes)?, cuda.row_arena(arena_bytes)?]
+            [arena(arena_bytes, "wide parity arena 0")?, arena(arena_bytes, "wide parity arena 1")?]
         };
         let scratch_level = shared_wide_scratch_level()?;
         let scratch_kinds = shared_wide_scratch_kinds()?;
@@ -152,9 +158,19 @@ impl WideBuild {
                     arena.rewind();
                     arena
                 }
-                None => cuda.row_arena(rows * SCRATCH_ARENA_BYTES_PER_ROW[scratch_level as usize])?,
+                None => arena(rows * SCRATCH_ARENA_BYTES_PER_ROW[scratch_level as usize], "wide source scratch")?,
             })
         } else { None };
+        let io_pool=std::env::var("CANADA_SCRATCH_WIDE_IO_ARENAS_SCREEN").as_deref()==Ok("1");
+        ensure!(!io_pool || (sp_rank.is_some()
+            &&crate::config::shared_owner_profiles_requested()),
+            "wide IO arena loan requires the finite sequential full-profile screen");
+        // The 16K extension's IO arenas come before anything touches the extension, so one temporary pool maps it all
+        // for the construction (released by fork_wide_bank once this profile exists).
+        let early_io = if elastic16 && io_pool {
+            Some((arena(rows*30720*2, "wide input IO")?, arena(rows*(20480*2+4*4), "wide gather IO")?))
+        } else { None };
+        if elastic16 { cuda.wide16_begin_temporary()?; }
         let peer_moe=std::env::var("CANADA_SCRATCH_PEER_WIDE_MOE_SHARE_SCREEN").as_deref()==Ok("1")
             &&share.is_some_and(|p|p.rows==rows);
         let moe=if peer_moe {
@@ -177,14 +193,12 @@ impl WideBuild {
             }
             Rc::new(moe)
         };
-        let io_pool=std::env::var("CANADA_SCRATCH_WIDE_IO_ARENAS_SCREEN").as_deref()==Ok("1");
-        ensure!(!io_pool || (sp_rank.is_some()
-            &&crate::config::shared_owner_profiles_requested()),
-            "wide IO arena loan requires the finite sequential full-profile screen");
         let (input_arena,gather_arena)=if io_pool {
             if let Some(prior)=share {
                 (Some(prior.input_arena.as_ref().ok_or_else(||anyhow::anyhow!("missing wide input arena donor"))?.clone()),
                  Some(prior.gather_arena.as_ref().ok_or_else(||anyhow::anyhow!("missing wide gather arena donor"))?.clone()))
+            }else if let Some((input,gather))=early_io {
+                (Some(input),Some(gather))
             }else{
                 (Some(cuda.row_arena(rows*30720*2)?),Some(cuda.row_arena(rows*(20480*2+4*4))?))
             }

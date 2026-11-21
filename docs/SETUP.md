@@ -51,7 +51,9 @@ Edit `state/fleet.json` with the four actual `hostname` outputs, the three SSH a
 
 The example explicitly selects a **2350 MHz** maximum GPU clock and temporary APST disablement on `/dev/nvme0` on each Spark. Before using the NVMe option, confirm that this controller backs the local Engram files and supports feature 12 with a 256-byte APST table (`sudo nvme get-feature /dev/nvme0 -f 12 -H`). Set a node's `disable_nvme0_apst` to `false` if that option is inapplicable. The helper does not alter another NVMe controller. Set `gpu_clock_cap_mhz` to `0` to leave clocks under host control; for a stock-clock comparison, restore stock clocks before startup. No lower automatic thermal cap is enabled.
 
-Host-policy helpers run as the deployment account and need noninteractive administrative access to the documented `nvidia-smi`, `nvme`, runtime-directory provisioning and systemd timer operations. Have an administrator establish that access on the selected nodes; do not rely on an expiring cached sudo password. If unavailable, select the explicit host-policy overrides above. Arming fails before model startup if independent restoration cannot be established. Keep the original host settings and do not run a second host-policy manager over the same devices.
+The s1682 example also enables `serving_memory_policy`. On each node, confirm `/proc/sys/vm/compaction_proactiveness` and `/proc/sys/vm/swappiness` are readable, `/run` is tmpfs, and `python3 -c 'import os; assert hasattr(os, "pidfd_open")'` succeeds. The helper temporarily sets these two sysctls to zero and restores the prior values. Set the inventory field to `false` for a host-managed configuration. The policy is recorded per generation so the controller can stop an earlier installation with its saved settings.
+
+Host-policy helpers run as the deployment account and need noninteractive administrative access to the documented `nvidia-smi`, `nvme`, runtime-directory provisioning, the two memory-policy sysctls and systemd transient service/timer operations. Have an administrator establish that access on the selected nodes; do not rely on an expiring cached sudo password. If unavailable, select the explicit host-policy overrides above. Arming fails before model startup if independent restoration cannot be established. Keep the original host settings and do not run a second host-policy manager over the same devices.
 
 Leave `http_bind` at `127.0.0.1:8000` for an on-head client or SSH tunnel. To serve a trusted LAN, choose one specific private interface address and set `allow_remote: true`; wildcard binds are rejected. The API port must not overlap the five reserved cohort ports.
 
@@ -173,6 +175,8 @@ python3 tools/sync_fleet.py /srv/titanic-flash-41/state/fleet.json
 This copies the runtime, kernels (including the derived matrices) and model metadata to every worker, plus each rank's own shards. The controller's startup checks confirm that every rank holds the same derived matrices, built from the atlases it serves. The worker deployment roots must be writable by the SSH account. Generated container files can be root-owned; they only need to be readable for distribution/runtime. If administrative ownership adjustment is needed, scope it to this new deployment directory. Keep the original checkpoint until staging, distribution and a full startup have succeeded. Engram backing and the rank's staged atlases must stay on each node's local SSD during serving.
 
 ## 6. Start and validate
+
+Keep the deployment’s `state/` on each node’s local NVMe. The launcher creates `state/disk-tier/` with mode 0700 and mounts it at `/cache`. Dedicate that directory to this installation. On startup the worker removes orphan snapshot images there, and the disk tier only writes while its space and write-budget checks permit it.
 
 Ensure all four GPUs are idle. Start the controller on the head in a persistent terminal:
 

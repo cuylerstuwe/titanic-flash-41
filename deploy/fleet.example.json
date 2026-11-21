@@ -66,5 +66,6 @@
       "disable_nvme0_apst": true
     }
   ],
-  "gpu_clock_cap_mhz": 2350
+  "gpu_clock_cap_mhz": 2350,
+  "serving_memory_policy": true
 }

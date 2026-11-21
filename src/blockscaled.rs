@@ -122,6 +122,9 @@ impl Matrix {
     pub fn scales(&self) -> u64 {
         self.scales.ptr()
     }
+    /// The checkpoint's weights and scales pointers: one logical operand, whichever profile built this matrix
+    /// (Cuda::shared_padded_input keys on it).
+    pub(crate) fn canonical_source(&self) -> (u64, u64) { (self.source_pointer, self.source_scales) }
     /// The checkpoint's own [N/32][K/32] UE8M0 scales (the direct-read GEMV reads them where the atlas holds them).
     pub(crate) fn canonical_scales(&self) -> u64 { self.source_scales }
     /// Whether values() is the checkpoint's row-major [N][K] itself (no K padding copy).

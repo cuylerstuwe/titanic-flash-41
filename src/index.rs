@@ -434,7 +434,8 @@ impl KeyCache {
 /// Admitted logical-to-physical slot map. Aliased reads are legal for shared
 /// retained prefixes; every destination key row is distinct.
 pub struct KeySlots {
-    values: Buffer<i32>,
+    /// Immutable after construction; shared by identical slot maps under config::shared_slot_tables.
+    values: Rc<Buffer<i32>>,
     capacity: usize,
     rows: usize,
     contiguous: bool,
@@ -452,10 +453,8 @@ impl KeySlots {
                 && values.iter().all(|&v| v >= 0 && (v as usize) < capacity),
             "index gather slot bounds"
         );
-        let mut b = cuda.allocate(values.len())?;
-        b.upload(values)?;
         Ok(Self {
-            values: b,
+            values: cuda.shared_immutable_i32(values)?,
             capacity,
             rows: values.len(),
             contiguous: values.windows(2).all(|w| w[1] == w[0] + 1),

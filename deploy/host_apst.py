@@ -42,6 +42,7 @@ class Policy:
         self.directory = root / 'apst' / session
         self.control = self.directory / 'control.json'
         self.table = self.directory / 'original-table.bin'
+        self.retired = self.directory / 'retired-before-arm'
         self.root_digest = hashlib.sha256(str(root).encode()).hexdigest()
         # A last SSH logout may remove user-owned /dev/shm objects under
         # logind RemoveIPC, independently of this system service's lifetime.
@@ -182,14 +183,27 @@ class Policy:
         # Serialize all deployment roots and generations targeting /dev/nvme0.
         with (self.runtime_base / 'nvme0-control.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if action == 'restore' and not self.control.exists():
-                assert not self.mine(self.owner()), 'APST owner lost its restoration intent'
-                return dict(action='not-armed', original_table_exact=False)
+            if action == 'restore' and not self.control.exists() and not self.table.exists():
+                return self.retire_unarmed()
             if action == 'arm':
+                if self.retired.exists():
+                    raise RuntimeError('APST session retired before activation')
                 assert self.owner() is None, 'restore the previous APST owner before arming'
             elif self.owner() is not None and not self.mine(self.owner()):
                 return self.restore({}, b'', 'superseded')
             return self.execute_owned(action)
+
+    def retire_unarmed(self):
+        # The global NVMe lock also serializes a late arm with this tombstone.
+        assert not self.mine(self.owner()), 'APST owner lost its restoration intent'
+        units = run(['systemctl', 'is-active', '--quiet', self.timer+'.timer',
+                     self.timer+'.service'], check=False)
+        if units.returncode not in (3, 4) or self.lease_file.exists():
+            raise RuntimeError('cannot establish that the APST session was never armed')
+        if not self.retired.exists():
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            atomic_bytes(self.retired, b'')
+        return dict(action='not-armed', original_table_exact=False)
 
     def execute_owned(self, action):
         if action == 'arm':
@@ -210,14 +224,18 @@ class Policy:
                 assert value in [0, 1]
                 # Baseline bytes and containing directory are durable before
                 # creating the guard or applying the temporary policy.
-                atomic_bytes(self.table, raw)
                 state = dict(schema=2, session=self.session, root_sha256=self.root_digest,
                              original_value=value, table_sha256=hashlib.sha256(raw).hexdigest(),
                              captured_epoch=time.time(), expires_epoch=time.time(), restored=True)
                 atomic(self.control, state)
+                atomic_bytes(self.table, raw)
                 return self.activate(state, raw, 'armed')
 
             state = json.loads(self.control.read_text())
+            if (action == 'restore' and not self.table.exists() and state.get('schema') == 2
+                    and state.get('session') == self.session and state.get('root_sha256') == self.root_digest
+                    and state.get('restored') is True and 'transitions' not in state):
+                return self.retire_unarmed()
             raw = self.table.read_bytes()
             assert len(raw) == 256 and state['original_value'] in [0, 1], 'invalid APST baseline'
             assert hashlib.sha256(raw).hexdigest() == state['table_sha256'], 'APST baseline table changed'

@@ -373,6 +373,20 @@ struct ContextOwner {
     allocation_floor_pending: std::cell::Cell<usize>,
     allocation_sites: Option<RefCell<std::collections::BTreeMap<u64,(&'static std::panic::Location<'static>,usize)>>>,
     image_pool: RefCell<Option<Rc<ChunkPool>>>,
+    /// config::wide16_elastic: the widest (16,384-row) profile's shared arenas, each with its resident prefix length
+    /// (the 8,192-row size); the spans above it are mapped from the image pool only while lent (Cuda::wide16_map).
+    wide16: RefCell<Vec<(Weak<RowArena>, usize)>>,
+    wide16_mapped: std::cell::Cell<bool>,
+    /// The image pool was created by wide16_begin_temporary (released by wide16_end_temporary).
+    wide16_temporary_pool: std::cell::Cell<bool>,
+    /// config::shared_padded_inputs: each padded-K operand's backing (key: canonical weights, scales, buffer kind) and
+    /// the last profile scope that took it. Weak: the takers' carves keep a backing alive, never this registry.
+    padded_inputs: RefCell<std::collections::HashMap<(u64, u64, u8), (Weak<RowArena>, u64)>>,
+    /// The sequential wide profile under construction (Cuda::with_padded_share_scope), if any, and the next scope id.
+    padded_scope: std::cell::Cell<Option<u64>>,
+    padded_next: std::cell::Cell<u64>,
+    /// config::shared_slot_tables: immutable i32 tables by length and SHA-256 of their bytes (Weak, as above).
+    immutable_i32: RefCell<std::collections::HashMap<(usize, [u8; 32]), Weak<Buffer<i32>>>>,
 }
 impl ContextOwner {
     fn current(&self) -> Result<()> {
@@ -596,6 +610,16 @@ impl Cuda {
         self.owner.api.check(unsafe{(self.owner.api.zero_async)(destination,value,bytes,stream.raw())},
             "poison obsolete decoder bytes asynchronously")
     }
+    /// config::index_bf16_check (Nov 19 diagnostic): fill a score range with byte `value` (0xFF: NaN floats) before a bf16
+    /// pass, to find positions it leaves unwritten. Safety: as poison_device_for_probe.
+    pub(crate) unsafe fn fill_device_for_bf16_check(&self, destination: u64, bytes: usize, value: u8, stream: &Stream)
+        -> Result<()> {
+        ensure!(crate::config::index_bf16_check() && destination != 0 && bytes > 0 && self.owns_stream(stream),
+            "bf16 check fill admission");
+        self.owner.current()?;
+        self.owner.api.check(unsafe { (self.owner.api.zero_async)(destination, value, bytes, stream.raw()) },
+            "fill a score range for the bf16 check")
+    }
     /// Safety: the range is a live initialized device allocation in this context;
     /// any producer stream has completed. Diagnostic copy, never numeric execution.
     pub unsafe fn read_device(&self, source: u64, bytes: usize) -> Result<Vec<u8>> {
@@ -704,6 +728,13 @@ impl Cuda {
                     .then(||RefCell::new(std::collections::BTreeMap::new())),
                 allocation_floor_pending: std::cell::Cell::new(0),
                 image_pool: RefCell::new(None),
+                wide16: RefCell::new(Vec::new()),
+                wide16_mapped: std::cell::Cell::new(false),
+                wide16_temporary_pool: std::cell::Cell::new(false),
+                padded_inputs: RefCell::new(std::collections::HashMap::new()),
+                padded_scope: std::cell::Cell::new(None),
+                padded_next: std::cell::Cell::new(0),
+                immutable_i32: RefCell::new(std::collections::HashMap::new()),
             }),
             mapped_metadata_bytes: None,
             staged_metadata: None,
@@ -850,6 +881,7 @@ impl Cuda {
         );
         arena.next.set(end);
         arena.high_water.set(arena.high_water.get().max(end));
+        arena.profile_high.set(arena.profile_high.get().max(end));
         Ok(Buffer {
             owner: self.owner.clone(),
             ptr: arena.storage.ptr + start as u64,
@@ -872,7 +904,147 @@ impl Cuda {
             storage: self.allocate(bytes)?,
             next: std::cell::Cell::new(0),
             high_water: std::cell::Cell::new(0),
+            profile_high: std::cell::Cell::new(0),
         }))
+    }
+    /// Run `build` (one sequential wide profile's construction) as a padded-input share scope when `on`
+    /// (config::shared_padded_inputs): inside it, Cuda::shared_padded_input lends each padded-K operand's backing once.
+    pub(crate) fn with_padded_share_scope<R>(&self, on: bool, build: impl FnOnce() -> Result<R>) -> Result<R> {
+        if !on { return build(); }
+        ensure!(self.owner.padded_scope.get().is_none(), "padded input share scopes do not nest");
+        let id = self.owner.padded_next.get();
+        self.owner.padded_next.set(id + 1);
+        self.owner.padded_scope.set(Some(id));
+        let result = build();
+        self.owner.padded_scope.set(None);
+        result
+    }
+    /// config::shared_padded_inputs (Nov 19 2026): the first `len` bytes of padded-K operand `key`'s zeroed backing
+    /// (Matrix::canonical_source plus a buffer kind), created at its first taker's size. Sequential wide profiles are
+    /// built widest first and run one at a time on one ordered stream, and only that operand's producers write it (the
+    /// k columns of each row), so its pad columns stay zero for every taker. None outside a share scope, when the
+    /// backing is smaller than `len`, or when this scope already took it: the caller keeps its own buffer then.
+    #[track_caller]
+    pub(crate) fn shared_padded_input(&self, key: (u64, u64, u8), len: usize) -> Result<Option<Buffer<u8>>> {
+        let Some(scope) = self.owner.padded_scope.get() else { return Ok(None) };
+        let existing = self.owner.padded_inputs.borrow().get(&key).and_then(|(weak, taken)| Some((weak.upgrade()?, *taken)));
+        let arena = match existing {
+            Some((arena, taken)) => {
+                if arena.bytes() < len || taken == scope { return Ok(None); }
+                arena
+            }
+            None => {
+                let arena = self.row_arena(len)?;
+                let mut whole = unsafe { arena.storage.view(0, arena.storage.len)? };
+                whole.zero()?;
+                arena
+            }
+        };
+        self.owner.padded_inputs.borrow_mut().insert(key, (Rc::downgrade(&arena), scope));
+        arena.next.set(0);
+        self.carve(arena, len).map(Some)
+    }
+    /// config::shared_slot_tables (Nov 19 2026): an immutable device copy of `data`. With the flag on, every caller with
+    /// the same contents gets the same allocation (no caller may write it); otherwise a fresh upload.
+    #[track_caller]
+    pub(crate) fn shared_immutable_i32(&self, data: &[i32]) -> Result<Rc<Buffer<i32>>> {
+        if !crate::config::shared_slot_tables() {
+            let mut b = self.allocate(data.len())?; b.upload(data)?; return Ok(Rc::new(b));
+        }
+        use sha2::Digest;
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), std::mem::size_of_val(data)) };
+        let key = (data.len(), <[u8; 32]>::from(sha2::Sha256::digest(bytes)));
+        if let Some(b) = self.owner.immutable_i32.borrow().get(&key).and_then(Weak::upgrade) { return Ok(b); }
+        let mut b = self.allocate(data.len())?; b.upload(data)?;
+        let b = Rc::new(b);
+        let mut map = self.owner.immutable_i32.borrow_mut();
+        map.retain(|_, w| w.strong_count() > 0);
+        map.insert(key, Rc::downgrade(&b));
+        Ok(b)
+    }
+    /// A row arena on an elastic range (config::wide16_elastic, Nov 19 2026): `resident` bytes have memory now; the
+    /// rest is registered as part of the 16K extension and has memory only while Cuda::wide16_map lends it pool chunks.
+    /// Carving is unchanged (addresses never move, so captured graphs stay valid); no kernel may run on a carve beyond
+    /// the resident prefix while the extension is unmapped (the prefill planner offers 16,384 rows only while mapped).
+    pub(crate) fn row_arena_wide16(&self, bytes: usize, resident: usize, label: &str) -> Result<Rc<RowArena>> {
+        let storage = self.allocate_elastic(bytes, resident, label)?;
+        let resident = storage.elastic_resident().context("elastic arena")?;
+        let arena = Rc::new(RowArena {storage, next: std::cell::Cell::new(0), high_water: std::cell::Cell::new(0),
+            profile_high: std::cell::Cell::new(0)});
+        if resident < arena.storage.len {
+            self.owner.wide16.borrow_mut().push((Rc::downgrade(&arena), resident));
+        }
+        Ok(arena)
+    }
+    fn wide16_arenas(&self) -> Vec<(Rc<RowArena>, usize)> {
+        self.owner.wide16.borrow().iter().filter_map(|(w, r)| w.upgrade().map(|a| (a, *r))).collect()
+    }
+    /// Whether this process has a 16K extension (an elastic widest profile).
+    pub(crate) fn wide16_configured(&self) -> bool { !self.wide16_arenas().is_empty() }
+    pub(crate) fn wide16_mapped(&self) -> bool { self.owner.wide16_mapped.get() }
+    /// Bytes of the extension (the spans above the resident prefixes).
+    pub(crate) fn wide16_bytes(&self) -> usize { self.wide16_arenas().iter().map(|(a, r)| a.storage.len - r).sum() }
+    /// The resident prefix every arena of the extension has (for the narrower profiles' carve check).
+    pub(crate) fn wide16_resident_prefixes(&self) -> Vec<(Rc<RowArena>, usize)> { self.wide16_arenas() }
+    /// Pool chunks wide16_map would take now.
+    pub(crate) fn wide16_missing_chunks(&self) -> Result<usize> {
+        if self.wide16_mapped() { return Ok(0); }
+        self.wide16_arenas().iter().map(|(a, r)| a.storage.elastic_missing(*r, a.storage.len - r)).sum()
+    }
+    /// Map every arena's extension from the image pool's free chunks (zeroed), all or nothing. Ok(false), changing
+    /// nothing, when the pool has too few free chunks.
+    pub(crate) fn wide16_map(&self) -> Result<bool> {
+        if self.wide16_mapped() { return Ok(true); }
+        let arenas = self.wide16_arenas();
+        ensure!(!arenas.is_empty(), "no 16K extension to map");
+        let mut done: Vec<&(Rc<RowArena>, usize)> = Vec::new();
+        for entry in &arenas {
+            let (a, r) = entry;
+            match a.storage.elastic_map(*r, a.storage.len - r) {
+                Ok(true) => done.push(entry),
+                outcome => {
+                    for (b, s) in done { b.storage.elastic_unmap(*s, b.storage.len - s)?; }
+                    return outcome.map(|_| false);
+                }
+            }
+        }
+        self.owner.wide16_mapped.set(true);
+        Ok(true)
+    }
+    /// Return the extension's chunks to the pool (after draining the context, as every VMM unmap here does).
+    pub(crate) fn wide16_unmap(&self) -> Result<()> {
+        if !self.wide16_mapped() { return Ok(()); }
+        for (a, r) in self.wide16_arenas() { a.storage.elastic_unmap(r, a.storage.len - r)?; }
+        self.owner.wide16_mapped.set(false);
+        Ok(())
+    }
+    /// Map the extension before the real image pool exists (the widest profile's construction, startup warm-ups): a
+    /// temporary pool of exactly the missing chunks backs it until wide16_end_temporary releases it, every chunk
+    /// returned (the batched warm-up's pattern for its regions). With a pool present, it maps from that pool.
+    pub(crate) fn wide16_begin_temporary(&self) -> Result<()> {
+        if !self.wide16_configured() || self.wide16_mapped() { return Ok(()); }
+        if self.owner.image_pool.borrow().is_none() {
+            let chunks = self.wide16_missing_chunks()?;
+            self.create_image_pool(chunks.max(1) * self.image_pool_chunk_bytes()?)?;
+            self.owner.wide16_temporary_pool.set(true);
+        }
+        ensure!(self.wide16_map()?, "16K extension: no room to map it for construction / warm-up");
+        Ok(())
+    }
+    pub(crate) fn wide16_end_temporary(&self) -> Result<()> {
+        self.wide16_unmap()?;
+        if self.owner.wide16_temporary_pool.replace(false) { self.release_image_pool()?; }
+        Ok(())
+    }
+    /// Run `build` between wide16_begin_temporary and wide16_end_temporary (the end runs on failure too).
+    pub(crate) fn with_wide16_temporarily<R>(&self, build: impl FnOnce() -> Result<R>) -> Result<R> {
+        if !self.wide16_configured() || self.wide16_mapped() { return build(); }
+        self.wide16_begin_temporary()?;
+        let result = build();
+        let ended = self.wide16_end_temporary();
+        let value = result?;
+        ended?;
+        Ok(value)
     }
     /// Dynamic callers must admit a complete workspace above the same floor
     /// that individual allocations enforce. Otherwise a successful preflight
@@ -1446,6 +1618,8 @@ pub struct RowArena {
     storage: Buffer<u8>,
     next: std::cell::Cell<usize>,
     high_water: std::cell::Cell<usize>,
+    /// The largest extent carved since reset_profile_high (one profile's construction).
+    profile_high: std::cell::Cell<usize>,
 }
 impl RowArena {
     pub fn bytes(&self) -> usize {
@@ -1458,6 +1632,10 @@ impl RowArena {
     pub(crate) fn rewind(&self) {
         self.next.set(0);
     }
+    pub(crate) fn reset_profile_high(&self) { self.profile_high.set(0); }
+    pub(crate) fn profile_high(&self) -> usize { self.profile_high.get() }
+    /// The prefix that always has memory (the whole arena unless it is elastic).
+    pub(crate) fn resident_bytes(&self) -> usize { self.storage.elastic_resident().unwrap_or(self.storage.len) }
 }
 impl Buffer<u8> {
     pub fn upload_part(&mut self, offset: usize, data: &[u8]) -> Result<()> {
@@ -1527,6 +1705,10 @@ impl<T: DeviceElement> Buffer<T> {
     }
     /// Whether this is an elastic range (Cuda::allocate_elastic): only its resident prefix and mapped spans exist.
     pub(crate) fn is_elastic(&self) -> bool { matches!(self.storage, Storage::Elastic(_)) }
+    /// An elastic range's resident prefix (bytes, a whole number of pool chunks), None for other storage.
+    pub(crate) fn elastic_resident(&self) -> Option<usize> {
+        match &self.storage { Storage::Elastic(e) => Some(e.resident.min(self.len)), _ => None }
+    }
     /// Pool chunks elastic_map(offset, len) would take now (0 for a span already mapped or resident).
     pub(crate) fn elastic_missing(&self, offset: usize, len: usize) -> Result<usize> {
         let Storage::Elastic(e) = &self.storage else { anyhow::bail!("not an elastic range") };

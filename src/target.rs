@@ -490,6 +490,8 @@ struct Plan {
     /// Rows per verify compressor block: all rows for one session; a batched
     /// step gives each session its own block of rows / sessions rows.
     block: usize,
+    /// Sessions of a batched step (1 for a single sequence): parts of `block` rows each.
+    sessions: usize,
 }
 impl Plan {
     #[cfg(test)]
@@ -551,7 +553,8 @@ impl Plan {
         let mut o = Self { swa_layout, positions: vec![0; rows], locations: vec![-1; rows],
             raw_pair: vec![0; rows], raw_single: vec![0; rows], pair_lengths: vec![0; rows],
             single_lengths: vec![0; rows], swa_ids: vec![-1; rows * 128], swa_lengths: vec![0; rows],
-            requests: vec![0; rows], pair_starts: vec![0; rows], single_starts: vec![0; rows], block };
+            requests: vec![0; rows], pair_starts: vec![0; rows], single_starts: vec![0; rows], block,
+            sessions: parts.len() };
         for (k, &(base, position, live)) in parts.iter().enumerate() {
             let p = Self::append_session(position, live, rows, context, swa_layout, base)?;
             for row in 0..block {
@@ -570,6 +573,16 @@ impl Plan {
                 o.swa_ids[d * 128..(d + 1) * 128].copy_from_slice(&p.swa_ids[row * 128..(row + 1) * 128]);
                 o.swa_lengths[d] = p.swa_lengths[row]; o.requests[d] = p.requests[row];
                 o.pair_starts[d] = p.pair_starts[row]; o.single_starts[d] = p.single_starts[row];
+            }
+        }
+        // Rows past the last block (three sessions on 16 rows: row 15) are never executed, but the index scorers still
+        // score every row: an empty range at key 0 widened the last scorer block (four query rows, bounded by the union
+        // of their ranges) from the last session's region down to region 0, reading every region between (Nov 19 2026).
+        // An empty range at the last session's own base keeps that block inside its region.
+        if let Some(last) = parts.len().checked_sub(1) {
+            let (pair, single) = (o.pair_starts[last * block], o.single_starts[last * block]);
+            for d in parts.len() * block..rows {
+                o.pair_starts[d] = pair; o.single_starts[d] = single;
             }
         }
         Ok(o)
@@ -620,6 +633,7 @@ impl Plan {
             pair_starts: vec![0; rows],
             single_starts: vec![0; rows],
             block: rows,
+            sessions: 1,
         };
         for row in 0..live {
             let pos = position + row;
@@ -820,6 +834,8 @@ impl Step {
             for m in [&mut self.m2, &mut self.m8, &mut self.m14] { m.set_gather_starts(pair)?; }
             self.m20.set_gather_starts(single)?;
         }
+        let parts: Vec<(usize, usize)> = if p.sessions > 1 { (0..p.sessions).map(|k| (k * p.block, p.block)).collect() } else { Vec::new() };
+        for m in [&mut self.m2, &mut self.m8, &mut self.m14, &mut self.m20] { m.set_parts(&parts)?; }
         if let Some(staging)=&self.staged_metadata {
             unsafe {staging.flush(Some(stream))?;}
         }
@@ -1278,11 +1294,12 @@ impl Target {
             atlas_bytes.extend_from_slice(bytes);
             source_hashes.extend_from_slice(hashes);
         }
+        let quarter = crate::config::engram_quarter(plan.rank)?;
         let row_store1 = Rc::new(RowStore::new(
             PackedShard::open(
-                &backing.join(format!("engram-l1-r{}of4.bin", plan.rank)),
+                &backing.join(format!("engram-l1-r{quarter}of4.bin")),
                 1,
-                plan.rank,
+                quarter,
                 4,
                 384006168,
             )?,
@@ -1618,8 +1635,25 @@ impl Target {
         if shared { widths.sort_unstable_by(|a, b| b.cmp(a)); }
         let mut bank = Vec::with_capacity(widths.len());
         for rows in widths {
+            // config::wide16_elastic: the 16,384-row profile's arenas keep only their 8,192-row halves resident, so every
+            // narrower profile must carve inside those halves (it would fault on an unmapped chunk otherwise).
+            let prefixes = self.cuda.wide16_resident_prefixes();
+            for (arena, _) in &prefixes { arena.reset_profile_high(); }
             let target = self.fork_wide_with_arenas(core, core_bytes, stream, kernels,
                 rows, sequence_parallel, if shared {bank.first()} else {None})?;
+            if rows == 16384 && self.cuda.wide16_configured() {
+                // Its construction ran with the extension mapped from a temporary pool (decoder::WideBuild::new).
+                self.cuda.wide16_end_temporary()?;
+                eprintln!("wide16 extension {}", serde_json::json!({"rank":self.rank,"bytes":self.cuda.wide16_bytes(),
+                    "arenas":self.cuda.wide16_resident_prefixes().iter().map(|(a,r)|serde_json::json!({"bytes":a.bytes(),
+                        "resident":r,"carved":a.profile_high()})).collect::<Vec<_>>()}));
+            } else {
+                for (arena, resident) in &prefixes {
+                    ensure!(arena.profile_high() <= *resident,
+                        "16K extension: the {rows}-row profile carves {} bytes of an arena whose resident half is {resident}",
+                        arena.profile_high());
+                }
+            }
             bank.push(target);
         }
         Ok(bank)
@@ -1634,7 +1668,9 @@ impl Target {
         rows: usize, sequence_parallel: bool, share: Option<&Self>,
     ) -> Result<Self> {
         // The profile's rows decide which family its width-named bundles belong to (config::building_wide_profile).
-        crate::config::building_wide_profile(rows,||self.fork_wide_with_arenas_in(core,core_bytes,stream,kernels,rows,sequence_parallel,share,false))
+        // config::shared_padded_inputs: a sequential profile (never a peer bank) is one padded-input share scope.
+        crate::config::building_wide_profile(rows,||self.cuda.with_padded_share_scope(crate::config::shared_padded_inputs(),
+            ||self.fork_wide_with_arenas_in(core,core_bytes,stream,kernels,rows,sequence_parallel,share,false)))
     }
     /// Two private causal owners still prefill sequentially. Lend only the
     /// existing transient parity/candidate arenas, with one ordered stream;
@@ -2812,23 +2848,50 @@ impl Target {
         for q in self.index_queries().into_iter().flatten() { q.unmap_region_keys(k)?; }
         Ok(())
     }
+    /// Keys by reach (config::region_keys_by_reach): the same for region `k`'s key rows of positions [from, to).
+    pub(crate) fn region_keys_span_missing_chunks(&self, k: usize, from: usize, to: usize) -> Result<usize> {
+        let mut chunks = 0;
+        for q in self.index_queries().into_iter().flatten() { chunks += q.region_key_span_missing_chunks(k, from, to)?; }
+        Ok(chunks)
+    }
+    pub(crate) fn map_region_keys_span(&self, k: usize, from: usize, to: usize) -> Result<bool> {
+        let queries: Vec<_> = self.index_queries().into_iter().flatten().collect();
+        for (i, q) in queries.iter().enumerate() {
+            if !q.map_region_key_span(k, from, to)? {
+                for done in &queries[..i] { done.unmap_region_key_span(k, from, to)?; }
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    pub(crate) fn unmap_region_keys_span(&self, k: usize, from: usize, to: usize) -> Result<()> {
+        for q in self.index_queries().into_iter().flatten() { q.unmap_region_key_span(k, from, to)?; }
+        Ok(())
+    }
     /// Pages [first, last) that serving region `k` of whole conversations (full regions) occupies in a cache of
     /// `ratio` with `page_tokens` slots a page: its slots are k x context / ratio + 32 onward, one conversation long.
-    fn serving_region_pages(k: usize, ratio: usize, page_tokens: usize) -> (usize, usize) {
+    /// Pages of serving region `k` (one source of compression `ratio`, pages of `page_tokens` rows) that hold its
+    /// conversation's positions [from, to). The whole region is [0, MODEL_CONTEXT).
+    fn serving_region_span_pages(k: usize, ratio: usize, page_tokens: usize, from: usize, to: usize) -> (usize, usize) {
         let context = crate::config::MODEL_CONTEXT;
         let first = k * context / ratio + COMPRESSED_OFFSET;
-        let last = first + context / ratio;
-        (first / page_tokens, last.div_ceil(page_tokens))
+        let (a, b) = (first + from / ratio, first + to.min(context).div_ceil(ratio));
+        (a / page_tokens, b.div_ceil(page_tokens))
     }
     /// Elastic regions (config::elastic_regions): image-pool chunks that mapping serving region `k` would take now.
     pub(crate) fn serving_region_missing_chunks(&self, k: usize) -> Result<usize> {
-        ensure!(k >= 1 && crate::config::elastic_regions()?, "elastic serving region");
+        self.serving_region_span_missing_chunks(k, 0, crate::config::MODEL_CONTEXT)
+    }
+    /// As serving_region_missing_chunks, for the positions [from, to) of the region's conversation only (map by reach,
+    /// config::region_map_by_reach).
+    pub(crate) fn serving_region_span_missing_chunks(&self, k: usize, from: usize, to: usize) -> Result<usize> {
+        ensure!(k >= 1 && crate::config::elastic_regions()? && from < to, "elastic serving region");
         let mut chunks = 0;
         for source in [&self.source2, self.group8.source(), self.group14.source(), self.late.source()] {
             let ratio = if source.layer_id() == 20 { 1 } else { 2 };
-            let (a, b) = Self::serving_region_pages(k, ratio, source.cache().page_tokens());
+            let (a, b) = Self::serving_region_span_pages(k, ratio, source.cache().page_tokens(), from, to);
             chunks += source.cache().missing_chunks(a, b)?;
-            let (a, b) = Self::serving_region_pages(k, ratio, 64);
+            let (a, b) = Self::serving_region_span_pages(k, ratio, 64, from, to);
             chunks += source.keys().missing_chunks(a, b)?;
         }
         Ok(chunks)
@@ -2840,24 +2903,34 @@ impl Target {
     /// Map serving region `k`'s spans of the four sources' compressed and key caches from the image pool, all or
     /// nothing: Ok(false), with nothing mapped, without room. Call before anything is copied into the region.
     pub(crate) fn map_serving_region(&self, k: usize) -> Result<bool> {
-        if !self.serving_region_room(k)? { return Ok(false); }
+        self.map_serving_region_span(k, 0, crate::config::MODEL_CONTEXT)
+    }
+    /// As map_serving_region, for the positions [from, to) of the region's conversation. Every span mapped must later
+    /// be released with unmap_serving_region_span over the same positions (chunks are reference counted).
+    pub(crate) fn map_serving_region_span(&self, k: usize, from: usize, to: usize) -> Result<bool> {
+        if self.serving_region_span_missing_chunks(k, from, to)? > self.cuda.image_pool_free_chunks().unwrap_or(0) {
+            return Ok(false);
+        }
         for source in [&self.source2, self.group8.source(), self.group14.source(), self.late.source()] {
             let ratio = if source.layer_id() == 20 { 1 } else { 2 };
-            let (a, b) = Self::serving_region_pages(k, ratio, source.cache().page_tokens());
+            let (a, b) = Self::serving_region_span_pages(k, ratio, source.cache().page_tokens(), from, to);
             ensure!(source.cache().map_pages(a, b)?, "elastic region map lost its room");
-            let (a, b) = Self::serving_region_pages(k, ratio, 64);
+            let (a, b) = Self::serving_region_span_pages(k, ratio, 64, from, to);
             ensure!(source.keys().map_pages(a, b)?, "elastic region map lost its room");
         }
         Ok(true)
     }
     /// Release serving region `k`'s spans (after its conversation left; the unmap drains the context first).
     pub(crate) fn unmap_serving_region(&self, k: usize) -> Result<()> {
-        ensure!(k >= 1 && crate::config::elastic_regions()?, "elastic serving region");
+        self.unmap_serving_region_span(k, 0, crate::config::MODEL_CONTEXT)
+    }
+    pub(crate) fn unmap_serving_region_span(&self, k: usize, from: usize, to: usize) -> Result<()> {
+        ensure!(k >= 1 && crate::config::elastic_regions()? && from < to, "elastic serving region");
         for source in [&self.source2, self.group8.source(), self.group14.source(), self.late.source()] {
             let ratio = if source.layer_id() == 20 { 1 } else { 2 };
-            let (a, b) = Self::serving_region_pages(k, ratio, source.cache().page_tokens());
+            let (a, b) = Self::serving_region_span_pages(k, ratio, source.cache().page_tokens(), from, to);
             source.cache().unmap_pages(a, b)?;
-            let (a, b) = Self::serving_region_pages(k, ratio, 64);
+            let (a, b) = Self::serving_region_span_pages(k, ratio, 64, from, to);
             source.keys().unmap_pages(a, b)?;
         }
         Ok(())
@@ -3182,6 +3255,13 @@ impl Target {
     pub(crate) fn encoder_checkpoint_image_bytes(&self,position:usize)->Result<usize> {
         ensure!(encoder_checkpoint_enabled()&&self.lease.is_current()&&self.pending.is_none(),
             "encoder checkpoint size requires a healthy admitted owner");
+        self.encoder_checkpoint_image_bytes_by_layout(position)
+    }
+    /// The same size from the owner's storage layout alone (state_image_regions_for_layers_mode reads only buffer
+    /// geometry, never history). For room reservations made before this profile adopts the history: k16b (Nov 20),
+    /// config::wide16_elastic's borrow ran before the prefill owner's handoff and refused every 16K request.
+    pub(crate) fn encoder_checkpoint_image_bytes_by_layout(&self,position:usize)->Result<usize> {
+        ensure!(encoder_checkpoint_enabled(),"encoder checkpoint size requires encoder checkpoints");
         Ok(self.state_image_regions_for_layers_mode(position,true,true,
             crate::config::bank_encoder_checkpoint_requested())?.iter().map(|r|r.bytes()).sum())
     }
@@ -5757,6 +5837,14 @@ impl Target {
             Some(self.region_gather_starts(&p, parts)?)
         } else { None };
         self.step.update_with(&p, gathers.as_ref().map(|(a, b)| (a.as_slice(), b.as_slice())), stream)?;
+        // The two-row case benefits from both smaller launches on the held verifier.
+        // Wider ordinary graphs, shared-region graphs and append use the usual kernels.
+        if verification && self.source_phase == Phase::Verify && self.rows == 6 && !region && ids.len() == 2 {
+            self.tokens.use_live_gate_rows();
+            for metadata in [&mut self.step.m2, &mut self.step.m8, &mut self.step.m14] {
+                metadata.select_two_row_solo_index();
+            }
+        }
         if let Some(step) = &mut self.cached_decoder {
             let mut decoder = Plan::append_with_layout(
                 self.history.position,
@@ -6950,9 +7038,13 @@ impl Target {
         // Captured encoder graphs always contain the whole layer 20.
         let layer20_defer=layer20_defer_enabled()? && !encoder_graph;
         let mut layer20_deferred=0usize;
-        let record_stalls=std::env::var("CANADA_SCRATCH_PREFILL_STALL_COUNTERS").as_deref()==Ok("1");
+        let stall_mode = std::env::var("CANADA_SCRATCH_PREFILL_STALL_COUNTERS").ok();
+        let profile_first_wide = stall_mode.as_deref() == Some("profile-first-wide")
+            && crate::cuda::SERVING_STARTED.load(std::sync::atomic::Ordering::Relaxed);
+        let trace_phases = matches!(stall_mode.as_deref(), Some("phases" | "profile-first-wide"));
+        let record_stalls = trace_phases || stall_mode.as_deref() == Some("1");
         let mut stall_counters=Vec::new();
-        let available: Vec<usize> = std::iter::once(128).chain(wides.iter().map(|w| w.rows)).collect();
+        let available: Vec<usize> = self.prefill_widths(wides);
         let lookahead=if lookahead {
             ensure!(std::env::var("CANADA_SCRATCH_ENGRAM_URING").as_deref() == Ok("1"),
                 "Engram lookahead requires the bounded io_uring reader");
@@ -6992,6 +7084,8 @@ impl Target {
             crate::config::plan_encoder_append(ids.len(),&available,merge)
         };
         for (chunk_index, &rows) in chunks.iter().enumerate() {
+            ensure!(rows != 16384 || !self.cuda.wide16_configured() || self.cuda.wide16_mapped(),
+                "a 16,384-row chunk needs its elastic extension mapped");
             let profile = wides.iter().position(|w| w.rows == rows);
             let remaining = ids.len() - done;
             let chunk = &ids[done..done + remaining.min(rows)];
@@ -7023,9 +7117,13 @@ impl Target {
                 None => &mut *self,
                 Some(i) => &mut wides[i],
             };
-            let profile_this_chunk=profile_start==Some(previous+done);
+            let bounded_8k = profile_start == Some(previous + done);
+            let first_wide = profile_first_wide && previous + done == 0 && rows == 16384
+                && chunk.len() == rows && !encoder_graph;
+            let profile_this_chunk = bounded_8k || first_wide;
             if profile_this_chunk {
-                ensure!(rows==8192 && chunk.len()==8192,"bounded profile must contain one full8K encoder chunk");
+                ensure!(!bounded_8k || (rows == 8192 && chunk.len() == 8192),
+                    "bounded profile must contain one full8K encoder chunk");
                 stream.synchronize()?;target.cuda.profiler_start()?;
             }
             let chunk_graph=encoder_graph || (tiny_encoder_graph && rows==128 && chunk.len()==128);
@@ -7038,7 +7136,7 @@ impl Target {
             let counters=record_stalls.then(crate::prefill_stall::Snapshot::read);
             let chunk_start=Instant::now();
             let history_before=checkpoint.as_ref().map(|_|target.history.clone());
-            let chunk_result=target.encoder_chunk(chunk, next.as_deref(), &cache, comm, stream, chunk_graph);
+            let chunk_result=target.encoder_chunk(chunk, next.as_deref(), &cache, comm, stream, chunk_graph, trace_phases);
             target.layer20_projection_only=false;
             if let Some(counters)=counters {
                 stall_counters.push(counters.finish(previous+done,chunk.len(),rows,chunk_start.elapsed().as_secs_f64()*1000.));
@@ -7248,7 +7346,10 @@ impl Target {
         comm: &Roce,
         stream: &Stream,
         graph: bool,
+        trace_phases: bool,
     ) -> Result<(Instant, bool, Option<LookaheadMetrics>)> {
+        use crate::prefill_stall::PhaseTrace;
+        let mut trace = trace_phases.then(PhaseTrace::new);
         let rows = self.rows;
         ensure!(
             crate::config::extend_rows(rows) && !chunk.is_empty() && chunk.len() <= rows
@@ -7281,9 +7382,12 @@ impl Target {
         let behind_l0 = engram_behind_l0_enabled() && !(graph && !captured);
         let mut batch = None;
         let host_started=Instant::now();
+        PhaseTrace::mark(&mut trace, "plan");
         if !behind_l0 {
             let prepared_batch = self.history.prepare_padded(&padded, chunk.len(), &self.hashes)?;
+            PhaseTrace::mark(&mut trace, "history");
             self.prepare_engram_rows(&prepared_batch.rows)?;
+            PhaseTrace::mark(&mut trace, "engram_both");
             batch = Some(prepared_batch);
         }
         let host_engram=Instant::now();
@@ -7316,6 +7420,7 @@ impl Target {
             chunk.len(),rows,stream,self.prefill_mhc_live_norm&&rows==512
                 ||self.prefill_wide_mhc_norm&&[1024,2048].contains(&rows))?;
         let prepared = Instant::now();
+        PhaseTrace::mark(&mut trace, "setup_and_upload");
         let mut behind_ms = 0.0;
         #[cfg(feature="storage-fault-injection")]
         let layer0_trace=end==16896&&std::env::var("CANADA_SCRATCH_PREFILL_LAYER0_TRACE").as_deref()==Ok("1");
@@ -7340,11 +7445,14 @@ impl Target {
             // Embedding and layer 0 read no Engram input; the host stages this chunk's rows
             // (mapped inputs, published before any consumer launch) while they execute.
             self.enqueue_initial(comm, stream)?;
+            PhaseTrace::mark(&mut trace, "enqueue_initial");
             let behind_started = Instant::now();
             let prepared_batch = self.history.prepare_padded(&padded, chunk.len(), &self.hashes)?;
+            PhaseTrace::mark(&mut trace, "history");
             if engram_split14_enabled() && !self.engram_projection_active {
                 // Layer-14 rows have no consumer before layer 14: stage them behind layers 1-13.
                 self.prepare_engram_rows1(&prepared_batch.rows)?;
+                PhaseTrace::mark(&mut trace, "engram1");
                 behind_ms = behind_started.elapsed().as_secs_f64()*1000.;
                 if host_timing_mode>=2 {
                     let waiting=Instant::now();
@@ -7352,13 +7460,16 @@ impl Target {
                     layer0_wait_ms=waiting.elapsed().as_secs_f64()*1000.;
                 }
                 self.enqueue_before_engram14(comm, stream)?;
+                PhaseTrace::mark(&mut trace, "enqueue_before_14");
                 let rows14_started=Instant::now();
                 self.prepare_engram_rows14(&prepared_batch.rows)?;
+                PhaseTrace::mark(&mut trace, "engram14");
                 rows14_ms=rows14_started.elapsed().as_secs_f64()*1000.;
                 batch = Some(prepared_batch);
                 self.enqueue_encoder_from_engram14(comm, stream)?;
             } else {
                 self.prepare_engram_rows(&prepared_batch.rows)?;
+                PhaseTrace::mark(&mut trace, "engram_both");
                 batch = Some(prepared_batch);
                 behind_ms = behind_started.elapsed().as_secs_f64()*1000.;
                 self.enqueue_encoder_after_initial(comm, stream)?;
@@ -7367,6 +7478,7 @@ impl Target {
             self.enqueue_encoder(comm, stream)?;
         }
         let batch = batch.context("encoder chunk Engram batch")?;
+        PhaseTrace::mark(&mut trace, "enqueue_remaining");
         if host_timing {
             eprintln!("claude host rank{} rows={rows} live={} serial_engram_ms={:.3} rest_ms={:.3} behind_l0_engram_ms={:.3} rows14_ms={:.3} layer0_wait_ms={:.3} misses1={} misses14={}",
                 self.rank, chunk.len(), host_engram.duration_since(host_started).as_secs_f64()*1000.,
@@ -7400,26 +7512,31 @@ impl Target {
                 });
                 let executed = (|| -> Result<()> {
                     self.wait_encoder_chunk(stream)?;
+                    PhaseTrace::mark(&mut trace, "wait_stream");
                     comm.health()?;
                     self.check_candidates()?;
                     ensure!(cache.error()? == 0, "prefill encoder publication fault");
                     Ok(())
                 })();
+                PhaseTrace::mark(&mut trace, "check_gpu");
                 // Drain the bounded I/O task even if the GPU failed. Neither
                 // path may leave background work behind a released writer.
                 let gpu_wait_ms=started.elapsed().as_secs_f64()*1000.;
                 let join_started=Instant::now();
                 let warmed = worker.join().map_err(|_| anyhow::anyhow!("Engram prefetch panicked"));
                 let join_wait_ms=join_started.elapsed().as_secs_f64()*1000.;
+                PhaseTrace::mark(&mut trace, "join_lookahead");
                 executed?;
                 let worker_ms=warmed??;
                 Ok(LookaheadMetrics {next_rows:next.len(),worker_ms,gpu_wait_ms,join_wait_ms})
             })?)
         } else {
             self.wait_encoder_chunk(stream)?;
+            PhaseTrace::mark(&mut trace, "wait_stream");
             comm.health()?;
             self.check_candidates()?;
             ensure!(cache.error()? == 0, "prefill encoder publication fault");
+            PhaseTrace::mark(&mut trace, "check_gpu");
             None
         };
         self.io.audit_input_images(&self.tokens, previous, chunk, stream)?;
@@ -7436,6 +7553,10 @@ impl Target {
         cache.commit(end)?;
         self.lease.finish_write()?;
         self.trace_prefill_boundary_for_probe("encoder_chunk")?;
+        PhaseTrace::mark(&mut trace, "commit");
+        if let Some(trace) = trace {
+            trace.emit(self.rank, previous, chunk.len(), rows);
+        }
         Ok((prepared, captured, lookahead_metrics))
     }
     /// Diagnostic copy of the last prompt row's full FP32 vocabulary logits.
@@ -8181,6 +8302,12 @@ impl Target {
         Ok(self.inline_checkpoint_plan_at(wides, prefix, total - prefix, None, retained)?
             .is_some_and(|plan| extra >= plan[..plan.len() - 1].iter().sum::<usize>() + 128))
     }
+    /// The chunk widths a prefill may plan with: 128 and every wide profile, except the 16,384-row profile while its
+    /// elastic extension is unmapped (config::wide16_elastic; its upper arena halves have no memory then).
+    fn prefill_widths(&self, wides: &[Self]) -> Vec<usize> {
+        let lent = !self.cuda.wide16_configured() || self.cuda.wide16_mapped();
+        std::iter::once(128).chain(wides.iter().map(|w| w.rows).filter(|&r| r != 16384 || lent)).collect()
+    }
     fn inline_checkpoint_plan_at(&self, wides: &[Self], prefix: usize, suffix: usize,
         forced: Option<Vec<usize>>, retained: bool) -> Result<Option<Vec<usize>>> {
         let requested = match self.checkpoint_inline_for_probe {
@@ -8191,7 +8318,7 @@ impl Target {
             return Ok(None);
         }
         let total = prefix + suffix;
-        let available: Vec<usize> = std::iter::once(128).chain(wides.iter().map(|w| w.rows)).collect();
+        let available: Vec<usize> = self.prefill_widths(wides);
         let plan = match forced {
             Some(plan) => { crate::config::validate_encoder_chunks(total, &plan, &available)?; plan }
             None => {
@@ -9154,6 +9281,51 @@ mod tests {
         assert_eq!(Plan::batched(&[(b, 9, 5)], 6, 262144, layout).unwrap().block, 6);
         assert!(Plan::batched(&[(a, 1, 1), (b, 9, 1), (SessionBase::region(2, 65536, window).unwrap(), 5, 1),
             (SessionBase::region(3, 65536, window).unwrap(), 5, 1)], 6, 262144, layout).is_err());
+    }
+    #[test]
+    fn region_cache_granules_tile_the_whole_region() {
+        let g = crate::config::REGION_MAP_GRANULE;
+        let context = crate::config::MODEL_CONTEXT;
+        for k in 1..4 {
+            for (ratio, page) in [(1usize, 64usize), (2, 64), (2, 128), (1, 256)] {
+                let whole = Target::serving_region_span_pages(k, ratio, page, 0, context);
+                let mut at = 0;
+                let mut last_end = whole.0;
+                while at < context {
+                    let (a, b) = Target::serving_region_span_pages(k, ratio, page, at, at + g);
+                    // Consecutive granules meet or share one page, never leave a gap.
+                    assert!(a <= last_end && a + 1 >= last_end && b > a, "k {k} ratio {ratio} page {page} at {at}");
+                    last_end = b;
+                    at += g;
+                }
+                assert_eq!(last_end, whole.1);
+                // A granule's pages hold every position in it.
+                let (a, b) = Target::serving_region_span_pages(k, ratio, page, g, 2 * g);
+                let first = k * context / ratio + COMPRESSED_OFFSET;
+                assert!(a * page <= first + g / ratio && (first + (2 * g) / ratio) <= b * page);
+            }
+        }
+    }
+    #[test]
+    fn rows_past_the_last_block_keep_the_scorer_inside_the_last_region() {
+        use crate::swa_layout::Layout;
+        let layout = Layout::Ring;
+        let window = crate::swa_layout::OFFSET + layout.ring().unwrap();
+        let base = |k| SessionBase::region(k, 65536, window).unwrap();
+        // Three sessions on 16 rows: blocks of five, row 15 past the last block.
+        let p = Plan::batched(&[(base(0), 300, 5), (base(1), 4000, 3), (base(2), 900, 4)], 16, 262144, layout).unwrap();
+        assert_eq!(p.block, 5);
+        let (pair2, single2) = (p.pair_starts[10], p.single_starts[10]);
+        assert!(pair2 > 0 && single2 > 0);
+        assert_eq!((p.pair_starts[15], p.single_starts[15], p.pair_lengths[15], p.single_lengths[15]), (pair2, single2, 0, 0));
+        // The MQA scorer's last block of four query rows (12-15) now spans only the third session's keys.
+        let lo = (12..16).map(|r| p.pair_starts[r]).min().unwrap();
+        let hi = (12..16).map(|r| p.pair_starts[r] + p.pair_lengths[r]).max().unwrap();
+        assert_eq!(lo, pair2);
+        assert_eq!(hi - lo, 452); // positions 900-903: (903 + 1) / 2 pair keys at most
+        // Two sessions on 16 rows: blocks of six; rows 12-15 are all past the last block and stay empty.
+        let q = Plan::batched(&[(base(0), 300, 6), (base(1), 4000, 6)], 16, 262144, layout).unwrap();
+        assert!((12..16).all(|r| q.pair_starts[r] == q.pair_starts[6] && q.pair_lengths[r] == 0));
     }
     #[test]
     fn compact_state_pages_cover_wraps_and_padding_without_aliases() {

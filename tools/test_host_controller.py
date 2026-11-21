@@ -42,11 +42,15 @@ class HostControllerTests(unittest.TestCase):
     def fake_run(self, args, rank=0, **kwargs):
         self.assertEqual(args[0], 'python3')
         kind = Path(args[1]).stem
-        action = args[4]
+        action = args[2] if kind == 'host_memory' else args[4]
         call = (rank, kind, action)
         self.calls.append(call)
         if call in self.fail:
             raise subprocess.TimeoutExpired('node management', 90)
+        if kind == 'host_memory':
+            if action == 'arm':
+                self.assertEqual(args[4:], [f'titanic-{args[3]}-r{rank}', f'/state/rank{rank}.json', '--zero-swappiness'])
+            return subprocess.CompletedProcess(args, 0, '', '')
         return subprocess.CompletedProcess(args, 0, json.dumps(dict(
             action={'arm':'armed', 'ensure':'renewed', 'restore':'restored'}[action],
             cap_mhz=2350)), '')
@@ -72,6 +76,57 @@ class HostControllerTests(unittest.TestCase):
         self.assertEqual([c[0] for c in self.calls if c[1:] == ('host_clock', 'restore')], [0, 1, 2, 3])
         self.assertTrue(self.fleet.state()['stopped'])
 
+    def test_memory_arm_failure_retires_generation_without_touching_gpu_or_nvme(self):
+        self.policy['memory'] = True
+        self.state['stopped'] = True
+        fleet.atomic(self.fleet.state_file, self.state)
+        self.fail.add((1, 'host_memory', 'arm'))
+        with patch.object(self.fleet, 'preflight', return_value='image-id'), \
+             patch.object(self.fleet, 'prepare_host_policy', return_value=self.policy):
+            with self.assertRaisesRegex(RuntimeError, 'memory policy arm incomplete'):
+                self.fleet.launch()
+        self.assertEqual(self.calls, [(0, 'host_memory', 'arm'), (1, 'host_memory', 'arm')]
+                         + [(r, 'host_memory', 'retire') for r in range(4)])
+        self.assertTrue(self.fleet.state()['stopped'])
+
+    def test_portable_launch_binds_local_cache_and_uses_the_rank_inventory(self):
+        self.state['stopped'] = True
+        fleet.atomic(self.fleet.state_file, self.state)
+        self.policy['memory'] = True
+        commands = {}
+        cache_dirs = {}
+        def run(args, rank=0, **kwargs):
+            if args[0] == 'python3':
+                return self.fake_run(args, rank, **kwargs)
+            if args[:2] == ['docker', 'run']:
+                commands[rank] = list(map(str, args))
+            elif args[0] == 'install':
+                cache_dirs[rank] = list(map(str, args[1:]))
+            else:
+                self.assertIn(args[0], ['mkdir', 'chmod'])
+            return subprocess.CompletedProcess(args, 0, '', '')
+        self.fleet.run.side_effect = run
+        self.fleet.inspect.return_value = {'State': {'Running': True}}
+        with patch.object(self.fleet, 'preflight', return_value='image-id'), \
+             patch.object(self.fleet, 'prepare_host_policy', return_value=self.policy), \
+             patch.object(self.fleet, 'health', return_value={'status':'ready'}), \
+             patch.object(fleet.subprocess, 'run') as copy:
+            state = self.fleet.launch()
+        self.assertEqual(copy.call_count, 3)
+        self.assertEqual(self.calls[:4], [(r, 'host_memory', 'arm') for r in range(4)])
+        cache = str(self.fleet.state_dir/'disk-tier')
+        self.assertEqual(set(commands), set(range(4)))
+        for rank, cmd in commands.items():
+            self.assertEqual(cache_dirs[rank], ['-d', '-m', '0700', cache])
+            self.assertIn(cache+':/cache', cmd)
+            self.assertIn('CANADA_SCRATCH_DISK_TIER_DIR=/cache', cmd)
+            self.assertIn('NCCL_IB_HCA='+','.join(self.fleet.cfg['nodes'][rank]['hcas']), cmd)
+            self.assertEqual(cmd[-3:], ['image-id', 'resident-http-peer', f'/state/rank{rank}.json'])
+            conf = json.loads((self.fleet.state_dir/state['generation']/f'rank{rank}.json').read_bytes())
+            self.assertEqual(conf['rank'], rank)
+            flex = set(map(int, self.fleet.profile['CANADA_SCRATCH_FLEX_WIDTHS'].split(',')))
+            self.assertEqual(set(conf['wide_widths']), flex | {512, 1024, 2048, 4096, 8192, 16384})
+
     def test_transient_renewal_failure_keeps_model_and_recovers_without_repeated_disk_writes(self):
         self.fail.add((1, 'host_clock', 'ensure'))
         with patch.object(self.fleet, 'stop') as stop:
@@ -88,6 +143,7 @@ class HostControllerTests(unittest.TestCase):
             write.assert_not_called()
 
     def test_explicit_stock_and_no_nvme_policy_make_no_host_changes(self):
+        self.fleet.cfg['serving_memory_policy'] = False
         self.fleet.cfg['gpu_clock_cap_mhz'] = 0
         for node in self.fleet.cfg['nodes']:
             node['disable_nvme0_apst'] = False

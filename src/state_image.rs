@@ -30,11 +30,17 @@ impl std::ops::Deref for ImageBuffer {
 impl ImageBuffer {
     fn buffer_mut(&mut self) -> &mut Buffer<u8> { &mut self.buffer }
 }
+/// The allocator takes the whole buffer from one source. Even a fully pooled
+/// image must leave the ordinary host reserve intact.
+pub(crate) fn image_storage_fits(available: usize, reserve: usize, bytes: usize, pooled: bool) -> bool {
+    available.checked_sub(reserve).is_some_and(|spare| pooled || bytes <= spare)
+}
+
 /// Image storage under the allocator's admission line (see Image::try_allocate); None: no room now.
 fn allocate_storage(cuda: &Cuda, total: usize) -> Result<Option<ImageBuffer>> {
     let reserve = crate::memory::floor_bytes().max(cuda.allocation_reserve_bytes());
-    let host_bytes = if cuda.image_pool_fits(total) { 0 } else { total };
-    if cuda.admission_memory()?.admitted_available < reserve + host_bytes { return Ok(None); }
+    let available = cuda.admission_memory()?.admitted_available;
+    if !image_storage_fits(available, reserve, total, cuda.image_pool_fits(total)) { return Ok(None); }
     let storage = match ImageBuffer::allocate(cuda, total) {
         Ok(storage) => storage,
         Err(error) if crate::cuda::allocation_floor_refused(&error) => return Ok(None),
@@ -532,6 +538,16 @@ impl Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn displaced_checkpoint_respects_the_host_floor_and_whole_buffer_pool_fit() {
+        let bytes = 471_345_156;
+        let reserve = 4usize << 30;
+        assert!(image_storage_fits(reserve, reserve, bytes, true));
+        assert!(!image_storage_fits(reserve - 1, reserve, bytes, true));
+        assert!(!image_storage_fits(reserve + bytes - 1, reserve, bytes, false));
+        assert!(image_storage_fits(reserve + bytes, reserve, bytes, false));
+    }
+
     fn r(name: &str, pointer: u64, bytes: usize) -> Descriptor {
         Descriptor {
             name: name.into(),

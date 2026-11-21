@@ -65,6 +65,7 @@ struct Case {
   int rows, columns, kmax;
   std::vector<int> starts, lengths, offsets;
   bool equal_keys = false;  // every key identical: one threshold bin holds every key
+  int stride = 0;           // score row stride in u16 keys (0: columns rounded up to 16)
 };
 
 // The reference key of (row r, column c): per lane t, heads nt*8+2t and +1 over nt = 0..3, then (a0+a1)+(a2+a3).
@@ -109,7 +110,7 @@ static int run_case(const Case& cs, std::mt19937& rng, int scale_spread, bool ve
   // Ties: copy some keys so equal scores occur (the cut's tie rule is then exercised).
   for (int c = 64; c < C; c += 97) memcpy(&k[(size_t)c * 64], &k[(size_t)(c - 64) * 64], 64), ks[c] = ks[c - 64];
 
-  const int stride = (C + 15) / 16 * 16;
+  const int stride = cs.stride ? cs.stride : (C + 15) / 16 * 16;
   uint8_t *dq, *dk;
   uint32_t *dqs, *dks;
   float* dw;
@@ -189,23 +190,31 @@ static int run_case(const Case& cs, std::mt19937& rng, int scale_spread, bool ve
       ++bad_rows;
     }
   }
-  // The fused launch (ca_idx16_dense, up to kDenseRows rows) must write the same keys and the same selection.
+  // Both fused launches must write the same scores and selections as the separate passes.
   int dense_bad = -1;
-  if (R <= kDenseRows) {
+  if (R <= 2 * kDenseRows) {
+    const int groups = (R + kDenseRows - 1) / kDenseRows;
+    const size_t scratch_words = groups * (2 + kDenseRows * 2048);
     uint16_t* dkeys2;
     int* dout2;
     uint32_t* dscr;
     CK(cudaMalloc(&dkeys2, (size_t)R * stride * 2));
     CK(cudaMalloc(&dout2, (size_t)R * kmax * 4));
-    CK(cudaMalloc(&dscr, (2 + (size_t)R * 2048) * 4));
-    CK(cudaMemset(dkeys2, 0xAB, (size_t)R * stride * 2));
-    CK(cudaMemset(dout2, 0x5A, (size_t)R * kmax * 4));
-    CK(cudaMemset(dscr, 0, (2 + (size_t)R * 2048) * 4));
+    CK(cudaMalloc(&dscr, scratch_words * 4));
+    CK(cudaMemset(dscr, 0, scratch_words * 4));
     CK(cudaFuncSetAttribute(ca_idx16_dense, cudaFuncAttributeMaxDynamicSharedMemorySize, kDenseSmem));
+    CK(cudaFuncSetAttribute(ca_idx16_dense_pair, cudaFuncAttributeMaxDynamicSharedMemorySize, kDenseSmem));
     dense_bad = 0;
     for (int rep = 0; rep < 2; ++rep) {  // twice: the scratch must be left zero for the next launch
-      ca_idx16_dense<<<48, 1024, kDenseSmem>>>(dq, dqs, dw, dk, dks, dst, dlen, doff, R, C, dkeys2, stride, kmax, dout2,
-                                               kmax, dscr);
+      CK(cudaMemset(dkeys2, rep ? 0x39 : 0xAB, (size_t)R * stride * 2));
+      CK(cudaMemset(dout2, rep ? 0xC5 : 0x5A, (size_t)R * kmax * 4));
+      if (groups == 1) {
+        ca_idx16_dense<<<48, 1024, kDenseSmem>>>(dq, dqs, dw, dk, dks, dst, dlen, doff, R, C,
+                                                dkeys2, stride, kmax, dout2, kmax, dscr);
+      } else {
+        ca_idx16_dense_pair<<<dim3(24,2), 1024, kDenseSmem>>>(dq, dqs, dw, dk, dks, dst, dlen, doff, R, C,
+                                                             dkeys2, stride, kmax, dout2, kmax, dscr);
+      }
       CK(cudaGetLastError());
       CK(cudaDeviceSynchronize());
       std::vector<uint16_t> keys2((size_t)R * stride);
@@ -223,7 +232,7 @@ static int run_case(const Case& cs, std::mt19937& rng, int scale_spread, bool ve
         }
       }
     }
-    std::vector<uint32_t> scr(2 + (size_t)R * 2048);
+    std::vector<uint32_t> scr(scratch_words);
     CK(cudaMemcpy(scr.data(), dscr, scr.size() * 4, cudaMemcpyDeviceToHost));
     for (auto v : scr) dense_bad += v != 0;  // left zero
     cudaFree(dkeys2), cudaFree(dout2), cudaFree(dscr);
@@ -349,6 +358,54 @@ int main(int argc, char** argv) {
     bad += run_case(e, rng, 2, true);
   }
   bad += run_case(causal(8, 131072, 512), rng, 3, true);  // a full group of eight rows at 131K
+  bad += run_case(causal(9, 1536, 512), rng, 2, true);
+  bad += run_case(causal(13, 4096, 512), rng, 2, true);
+  {  // Actual pair-index geometry: the first 3 dense layers span half a million keys per region.
+    const int region_keys = 1048576 / 2;
+    Case f{16, 4 * region_keys, 512, {}, {}, {}, false, 2 * region_keys};
+    for (int r = 0; r < 16; ++r) {
+      f.starts.push_back((r / 4) * region_keys);
+      f.lengths.push_back(r % 4 == 3 ? 0 : 6800 + 51 * r);
+      f.offsets.push_back(f.starts.back());
+    }
+    bad += run_case(f, rng, 2, true);
+  }
+  {  // Additional stress case with a million-key gap and four rows of padding.
+    Case m{16, 1048576 + 8192, 512, {}, {}, {}, false, 1048576};
+    for (int r = 0; r < 16; ++r) {
+      const bool second = r >= 6 && r < 12, pad = r >= 12;
+      m.starts.push_back(second ? 1048576 : 0);
+      m.lengths.push_back(pad ? 0 : 3000 + 37 * r);
+      m.offsets.push_back(second ? 1048576 : 0);
+    }
+    bad += run_case(m, rng, 2, true);
+  }
+  {  // four conversations in four regions, four rows each (two groups, each spanning two regions)
+    Case f{16, 3 * 1048576 + 8192, 512, {}, {}, {}, false, 1048576};
+    for (int r = 0; r < 16; ++r) {
+      f.starts.push_back((r / 4) * 1048576);
+      f.lengths.push_back(2000 + 53 * r);
+      f.offsets.push_back((r / 4) * 1048576);
+    }
+    bad += run_case(f, rng, 2, true);
+  }
+  {  // the fused launch on one 8-row group of the batched step: conversation 1 (rows 0-5, keys from 0) and
+     // conversation 2 (rows 6-7, keys from 1,048,576); then a group spanning regions 2 and 3
+    Case g{8, 1048576 + 8192, 512, {}, {}, {}, false, 1048576};
+    for (int r = 0; r < 8; ++r) {
+      g.starts.push_back(r >= 6 ? 1048576 : 0);
+      g.lengths.push_back(2500 + 41 * r);
+      g.offsets.push_back(r >= 6 ? 1048576 : 0);
+    }
+    bad += run_case(g, rng, 2, true);
+    Case h{8, 3 * 1048576 + 8192, 512, {}, {}, {}, false, 1048576};
+    for (int r = 0; r < 8; ++r) {
+      h.starts.push_back(r >= 4 ? 3 * 1048576 : 2 * 1048576);
+      h.lengths.push_back(r == 7 ? 0 : 1800 + 61 * r);
+      h.offsets.push_back(r >= 4 ? 3 * 1048576 : 2 * 1048576);
+    }
+    bad += run_case(h, rng, 2, true);
+  }
   printf("{\"correctness_failures\": %d}\n", bad);
   if (argc > 1 && !strcmp(argv[1], "--no-timing")) return bad ? 1 : 0;
   for (int rows : {1, 2, 6, 16})

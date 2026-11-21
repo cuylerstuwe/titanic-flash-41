@@ -53,6 +53,14 @@ impl Layout {
             }
     }
     pub(crate) fn pages(self, context: usize) -> Result<usize> {
+        self.pages_with(context, crate::config::swa_exact_pages())
+    }
+    /// `exact` (config::swa_exact_pages, Nov 19 2026): a ring layout allocates the pages its slots reach,
+    /// OFFSET + ring slots, instead of rounding that page count up to a power of two. Slots never change (slot() is
+    /// OFFSET + position % ring slots either way) and every consumer takes physical slot indices from the host, so
+    /// values are identical; the rounding only wasted memory (wide8192: 512 pages for the 257 its slots reach, about
+    /// 0.4 GB a box over the window caches of 40 layers). The absolute layout keeps its power of two.
+    pub(crate) fn pages_with(self, context: usize, exact: bool) -> Result<usize> {
         ensure!(
             (1..=1048576).contains(&context),
             "SWA logical context capacity"
@@ -64,7 +72,8 @@ impl Layout {
             Self::WideRing8192 => context.min(LARGE_RING_SLOTS),
             Self::WideRing16384 => context.min(XL_RING_SLOTS),
         };
-        Ok((OFFSET + rows).div_ceil(64).next_power_of_two())
+        let pages = (OFFSET + rows).div_ceil(64);
+        Ok(if exact && self != Self::Absolute { pages } else { pages.next_power_of_two() })
     }
     pub(crate) fn retained(self, position: usize, frontier: usize) -> bool {
         position < frontier && (self == Self::Absolute || frontier - position <= WINDOW)
@@ -181,9 +190,29 @@ mod tests {
             }
         }
         assert_eq!(Layout::WideRing16384.max_rows(),16384);
-        assert_eq!(Layout::WideRing16384.pages(1048576).unwrap(),1024);
+        assert_eq!(Layout::WideRing16384.pages_with(1048576,false).unwrap(),1024);
         // Existing8K allocations and addresses remain unchanged.
-        assert_eq!(Layout::WideRing8192.pages(1048576).unwrap(),512);
+        assert_eq!(Layout::WideRing8192.pages_with(1048576,false).unwrap(),512);
+    }
+    #[test]
+    fn exact_ring_pages_cover_every_slot_and_keep_the_absolute_layout() {
+        for layout in [Layout::Ring, Layout::WideRing, Layout::WideRing8192, Layout::WideRing16384] {
+            for context in [256usize, 4096, 65536, 1048576] {
+                let exact = layout.pages_with(context, true).unwrap();
+                let rounded = layout.pages_with(context, false).unwrap();
+                assert!(exact <= rounded && rounded == exact.next_power_of_two());
+                // Every slot a position of this context can take lies inside the exact allocation.
+                let ring = layout.ring().unwrap();
+                let top = (0..context.min(ring)).map(|p| layout.slot(p)).max().unwrap();
+                assert!(top < exact * 64, "{layout:?} {context}");
+                assert!(exact * 64 - top <= 64, "no page beyond the last slot's");
+            }
+        }
+        assert_eq!(Layout::WideRing8192.pages_with(1048576, true).unwrap(), 257);
+        assert_eq!(Layout::WideRing16384.pages_with(1048576, true).unwrap(), 513);
+        assert_eq!(Layout::Ring.pages_with(1048576, true).unwrap(), 5);
+        assert_eq!(Layout::Absolute.pages_with(4096, true).unwrap(), 128);
+        assert_eq!(Layout::Absolute.pages_with(4000, true).unwrap(), Layout::Absolute.pages_with(4000, false).unwrap());
     }
 
 }

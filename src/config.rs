@@ -980,6 +980,19 @@ mod flex_width_tests {
         }
     }
     #[test]
+    fn engram_quarters_are_a_permutation() {
+        // SAFETY of the env var: this test owns CANADA_SCRATCH_ENGRAM_QUARTERS for its duration.
+        unsafe { std::env::remove_var("CANADA_SCRATCH_ENGRAM_QUARTERS"); }
+        assert_eq!((0..4).map(|r| crate::config::engram_quarter(r).unwrap()).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        unsafe { std::env::set_var("CANADA_SCRATCH_ENGRAM_QUARTERS", "1,3,2,0"); }
+        assert_eq!((0..4).map(|r| crate::config::engram_quarter(r).unwrap()).collect::<Vec<_>>(), [1, 3, 2, 0]);
+        for bad in ["1,1,2,0", "0,1,2", "0,1,2,4", "a,b,c,d"] {
+            unsafe { std::env::set_var("CANADA_SCRATCH_ENGRAM_QUARTERS", bad); }
+            assert!(crate::config::engram_quarter(0).is_err(), "{bad}");
+        }
+        unsafe { std::env::remove_var("CANADA_SCRATCH_ENGRAM_QUARTERS"); }
+    }
+    #[test]
     fn flex_widths_parse_strictly() {
         assert_eq!(parse_flex_widths(None).unwrap(), Vec::<usize>::new());
         assert_eq!(parse_flex_widths(Some("")).unwrap(), Vec::<usize>::new());
@@ -1166,6 +1179,39 @@ pub(crate) fn fused_boundary_poll() -> Result<bool> {
         Err(e) => Err(e.into()),
     }
 }
+/// CANADA_SCRATCH_INDEX_BF16_PLAIN_ONLY=1 (Nov 19 2026, with config::index_bf16; default off): the bf16 route only in index
+/// layers without a candidate publisher or consumer (2, 8, 14 ...); layers 20 and 24-36 keep the regular scores. Their bf16
+/// f32-score path diverged on rows past region 0 (floor bxh: 78-80 % shared picks against 99.6 % on the plain layers).
+pub(crate) fn index_bf16_plain_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_INDEX_BF16_PLAIN_ONLY").as_deref() == Ok("1"))
+}
+/// CANADA_SCRATCH_INDEX_BF16_PUBLISH_FP32=1 (Nov 19 2026, with config::index_bf16; default off): source20's candidate
+/// blocks (the 2048-block mask later index layers apply beyond 16,384 keys) come from the regular fp32 scores; the bf16
+/// scores still choose every layer's keys. bf16 block maxima tie at the cut and the cut keeps the older block.
+pub(crate) fn index_bf16_publish_fp32() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_INDEX_BF16_PUBLISH_FP32").as_deref() == Ok("1"))
+}
+/// CANADA_SCRATCH_INDEX_BF16_SCOPE=decode|prefill (Nov 19 2026 diagnostic; unset: every owner the bf16 route admits):
+/// with config::index_bf16, only owners of at most 32 rows (decode, verify, batched, copy steps) or only wider ones
+/// (the 128-row extend owner and the wide prefill profiles) take the bf16 index route.
+pub(crate) fn index_bf16_scope_admits(rows: usize) -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_INDEX_BF16_SCOPE") {
+        Ok(v) => match v.as_str() { "decode" => Ok(rows <= 32), "prefill" => Ok(rows > 32),
+            _ => anyhow::bail!("invalid bf16 index scope (decode or prefill)") },
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_INDEX_BF16_CHECK=1 (Nov 19 2026 diagnostic; steps not being captured, i.e. batched steps with
+/// CANADA_SCRATCH_BATCHED_GRAPHS=0): every bf16 selection there is preceded by the
+/// regular dense selection of the same rows, and rows where they differ are logged (query_index::bf16_check_compare).
+/// The bf16 route gave runaway answers in batched decode of 3-4 conversations (floor idx bfm1 / bfl1).
+pub(crate) fn index_bf16_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_INDEX_BF16_CHECK").as_deref() == Ok("1"))
+}
 /// CANADA_SCRATCH_INDEX_BF16_DENSE=1 (Nov 18 2026, bf16 index route step 2): with config::index_bf16, groups of up to
 /// eight rows score and select in one persistent launch (index_bf16.cu ca_idx16_dense; the same keys and selection as
 /// the two launches, checked by the probe). Default off.
@@ -1265,6 +1311,10 @@ pub(crate) struct DiskTierConfig {
     /// ~25-30 ms of all-rank agreement and allocation plus a read at ~2.2 GB/s (digests and upload a few ms).
     pub read_bytes_per_s: f64,
     pub read_fixed_s: f64,
+    /// Save on evict (CANADA_SCRATCH_DISK_TIER_SAVE_ON_EVICT, tokens, default 0 = off; Nov 19 2026): a cache entry of at
+    /// least this many tokens without a disk copy is written to disk when cache pressure evicts it, so it parks instead
+    /// of being dropped (Worker::save_before_evict).
+    pub save_on_evict_tokens: usize,
 }
 pub(crate) fn disk_tier() -> Result<Option<DiskTierConfig>> {
     match std::env::var("CANADA_SCRATCH_DISK_TIER") {
@@ -1290,6 +1340,7 @@ pub(crate) fn disk_tier() -> Result<Option<DiskTierConfig>> {
         max_parked: number("CANADA_SCRATCH_DISK_TIER_MAX_PARKED", 64)? as usize,
         read_bytes_per_s: number("CANADA_SCRATCH_DISK_TIER_READ_MBPS", 2200)? as f64 * 1e6,
         read_fixed_s: number("CANADA_SCRATCH_DISK_TIER_READ_FIXED_MS", 30)? as f64 / 1e3,
+        save_on_evict_tokens: number("CANADA_SCRATCH_DISK_TIER_SAVE_ON_EVICT", 0)? as usize,
     };
     ensure!(config.cap_bytes > 0 && config.max_parked > 0 && config.dir.is_absolute() && config.read_bytes_per_s > 0.0,
         "disk tier budgets");
@@ -1383,6 +1434,159 @@ pub(crate) fn elastic_regions() -> Result<bool> {
         "elastic regions need full regions and the image pool");
     Ok(on)
 }
+/// CANADA_SCRATCH_ENGRAM_QUARTERS=q0,q1,q2,q3 (default 0,1,2,3; Nov 19 2026): rank r reads Engram quarter q[r], the
+/// rows [rows x q / 4, rows x (q + 1) / 4) of each table, from engram-l{layer}-r{q}of4.bin in its backing directory.
+/// Quarters are contiguous row ranges, so quarter 0 holds the 2-gram heads and quarter 3 the 4-gram heads, whose rows
+/// miss the row cache 4-6x as often (offline screen, Nov 19: 7.7 / 21 / 33 / 44 % of new code and prose); a step waits
+/// for the slowest rank's row reads, and rank 3's drive (the Spark) is the slowest. Each row still has exactly one
+/// owning rank, so the cross-rank sums stay exact: only which machine reads which rows changes.
+/// CANADA_SCRATCH_CACHE_KEEP_LATEST=1 (default off): before a request's saves and evictions the session cache is ordered as every earlier
+/// checkpoint first (entries another cached entry extends), then each conversation's latest image, each group oldest /
+/// least recently used first. Every eviction planner takes the oldest eligible entry, so a conversation's continuation
+/// image gives way only when no earlier checkpoint is left (r2b, Nov 19: a fourth conversation's only checkpoint was
+/// the oldest entry and went, while three others still held older checkpoints of their own).
+pub(crate) fn cache_keep_latest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_CACHE_KEEP_LATEST").as_deref() == Ok("1"))
+}
+pub(crate) fn validate_cache_keep_latest() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_CACHE_KEEP_LATEST") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid cache keep-latest policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_SWA_EXACT_PAGES=1 (Nov 19 2026, default off): window caches of the ring layouts allocate exactly the
+/// pages their slots reach (swa_layout::Layout::pages_with). Same slots and values; ~0.4 GB a box less with wide8192,
+/// and the 16,384-row ring (wide16384) then needs 513 pages a layer, one more than wide8192 takes today.
+pub(crate) fn swa_exact_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_SWA_EXACT_PAGES").as_deref() == Ok("1"))
+}
+pub(crate) fn validate_swa_exact_pages() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_SWA_EXACT_PAGES") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid exact window pages policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+/// Profile dedup (Nov 19 2026, RAM round item 3: the dropped widths; all default off). Each wide profile held its own
+/// copy of buffers that are immutable (slot tables, MMA scales) or written by one operand at a time (padded-K inputs),
+/// plus a WO-A scratch the WO-A cache never reads: 53-186 MiB a width (allocation sites, floor wds).
+///   CANADA_SCRATCH_WOA_DECODED_ON_DEMAND=1: a medium WO-A scratch allocates its 16 MiB decoded operand only when no
+///     immutable decoded operand serves it (CANADA_SCRATCH_WOA_CACHE=0, or a probe turning the cache off);
+///   CANADA_SCRATCH_SHARED_PADDED_INPUTS=1: sequential wide profiles take their padded-K FP8 inputs from one zeroed
+///     backing per operand, sized by the widest profile (Cuda::shared_padded_input);
+///   CANADA_SCRATCH_SHARED_SLOT_TABLES=1: identical immutable slot tables (candidate map, index key slots) are uploaded
+///     once and shared (Cuda::shared_immutable_i32).
+/// CANADA_SCRATCH_SHARED_MATRIX_ENCODING_SCREEN=1 (Oct 31, blockscaled::Matrix::prepare) shares the MMA scales.
+fn dedup_flag(name: &str) -> Result<bool> {
+    match std::env::var(name) {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid {name} policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+pub(crate) fn woa_decoded_on_demand() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_WOA_DECODED_ON_DEMAND").as_deref() == Ok("1"))
+}
+pub(crate) fn shared_padded_inputs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_SHARED_PADDED_INPUTS").as_deref() == Ok("1"))
+}
+pub(crate) fn shared_slot_tables() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_SHARED_SLOT_TABLES").as_deref() == Ok("1"))
+}
+/// The dedup settings as a mask (1 WO-A on demand, 2 padded inputs, 4 slot tables, 8 matrix encodings), validated.
+pub(crate) fn validate_profile_dedup() -> Result<u8> {
+    let encodings = std::env::var("CANADA_SCRATCH_SHARED_MATRIX_ENCODING_SCREEN").as_deref() == Ok("1");
+    Ok(u8::from(dedup_flag("CANADA_SCRATCH_WOA_DECODED_ON_DEMAND")?)
+        | u8::from(dedup_flag("CANADA_SCRATCH_SHARED_PADDED_INPUTS")?) << 1
+        | u8::from(dedup_flag("CANADA_SCRATCH_SHARED_SLOT_TABLES")?) << 2
+        | u8::from(encodings) << 3)
+}
+/// CANADA_SCRATCH_WIDE16_ELASTIC=1|2 (default 0):
+/// with a 16,384-row wide profile, its shared arenas (two layer-parity arenas, the source scratch, the wide input and
+/// gather IO) keep only their 8,192-row sizes resident; the rest (~5.6 GB a box) is mapped from the image pool only
+/// while a prefill that can use 16,384-row chunks runs, and the planner offers 16,384 rows only while it is mapped.
+/// The pool lends free chunks first; then 1 = the approved policy (Nov 18): optional and superseded snapshots give way
+/// (parked when they already have a disk copy, else dropped), never a conversation's only image; 2 = also parks
+/// snapshots that already have a disk copy (nothing is lost: they reload from the tier). Without the room, 8,192-row
+/// chunks as today. Needs the image pool.
+pub(crate) fn wide16_elastic() -> Result<u8> {
+    match std::env::var("CANADA_SCRATCH_WIDE16_ELASTIC") {
+        Ok(v) => { ensure!(v == "0" || v == "1" || v == "2", "invalid 16K extension policy");
+            ensure!(v == "0" || std::env::var_os("CANADA_SCRATCH_IMAGE_POOL_MIB").is_some(),
+                "the 16K extension borrows from the image pool (CANADA_SCRATCH_IMAGE_POOL_MIB)");
+            Ok(v.parse()?) }
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+pub(crate) fn engram_quarter(rank: usize) -> Result<usize> {
+    let quarters: Vec<usize> = match std::env::var("CANADA_SCRATCH_ENGRAM_QUARTERS") {
+        Ok(v) => v.split(',').map(|x| x.trim().parse::<usize>()).collect::<std::result::Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!("CANADA_SCRATCH_ENGRAM_QUARTERS: {e}"))?,
+        Err(std::env::VarError::NotPresent) => vec![0, 1, 2, 3],
+        Err(e) => return Err(e.into()),
+    };
+    let mut sorted = quarters.clone(); sorted.sort_unstable();
+    ensure!(sorted == [0, 1, 2, 3] && rank < 4, "Engram quarters must be a permutation of 0,1,2,3");
+    Ok(quarters[rank])
+}
+/// CANADA_SCRATCH_REGION_SCORER_PARTS=1 (default off; Nov 19 2026): in a batched step of several conversations the
+/// dense index scorers (the 16- and 32-row owners' MQA logits) run one launch per conversation's block of rows
+/// (mqa::Dense::run_parts) instead of one over every row. The kernel bounds each block of four query rows by the
+/// union of its rows' key ranges, so blocks of 5 or 6 rows (2-3 conversations) straddle two conversations and read
+/// every key between their regions. Each row's logits are its own dot products: the values are unchanged.
+/// CANADA_SCRATCH_REGION_SCORER_PARTS_CHECK=1 (diagnostic, eager steps): each per-conversation scoring is compared with
+/// the whole launch inside every row's own range and must be identical.
+pub(crate) fn region_scorer_parts_check() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_REGION_SCORER_PARTS_CHECK").as_deref() == Ok("1"))
+}
+pub(crate) fn region_scorer_parts() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_REGION_SCORER_PARTS") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid region scorer parts policy"); Ok(v == "1") }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_REGION_MAP_BY_REACH=1 (default off; Nov 19 2026, the RAM round): with elastic regions, a serving
+/// region's compressed and key caches are mapped only for the positions its conversation can reach, in granules of
+/// REGION_MAP_GRANULE positions, and grow before a step would pass them (Worker::extend_region_maps), instead of for a
+/// whole 1M context (~0.93 GB a region a box). Those caches are only read inside each row's own key range (sparse
+/// attention, the per-query gather of CANADA_SCRATCH_REGION_GATHER_BY_QUERY=1, image and relocation copies), so the
+/// unmapped rest is never touched. The owners' gathered key matrices keep whole regions: an index scorer bounds each
+/// block of query rows by the union of its rows' ranges and may read across a region's unused rows.
+pub(crate) fn region_map_by_reach() -> Result<bool> {
+    let on = match std::env::var("CANADA_SCRATCH_REGION_MAP_BY_REACH") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid region map-by-reach policy"); v == "1" }
+        Err(std::env::VarError::NotPresent) => false,
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(!on || (elastic_regions()? && region_gather_by_query()),
+        "region map by reach needs elastic regions and the per-query region gather");
+    Ok(on)
+}
+/// CANADA_SCRATCH_REGION_KEYS_BY_REACH=1 (needs map by reach AND per-conversation scoring, region_scorer_parts): the
+/// owners' key matrices map by reach too, granule by granule with the caches. Nov 19 (r2f / r2h): this was implied by
+/// the two flags and faulted (Xid 31, FAULT_PDE in "mqa-region rows": a region's second key chunk unmapped while its
+/// conversation was short) because some launch still scores across regions: the _PARTS_CHECK comparison's whole
+/// launch by design, and in r2f most likely batched graphs captured at warm-up. It is now its own opt-in (default off);
+/// per-conversation scoring alone keeps whole-region keys.
+pub(crate) fn region_keys_by_reach() -> Result<bool> {
+    let on = match std::env::var("CANADA_SCRATCH_REGION_KEYS_BY_REACH") {
+        Ok(v) => { ensure!(v == "0" || v == "1", "invalid region keys by reach policy"); v == "1" }
+        Err(std::env::VarError::NotPresent) => false,
+        Err(e) => return Err(e.into()),
+    };
+    Ok(on && region_map_by_reach()? && region_scorer_parts()? && !region_scorer_parts_check())
+}
+/// Positions a region's caches are mapped in with config::region_map_by_reach (a multiple of every page's positions).
+pub(crate) const REGION_MAP_GRANULE: usize = 65536;
 /// Slots of a compressed or key cache of `ratio` that region 0 uses (slot 0 sentinel, 32 offset, one whole conversation):
 /// the resident span of an elastic cache, or None without elastic regions.
 pub(crate) fn elastic_resident_slots(ratio: usize) -> Result<Option<usize>> {

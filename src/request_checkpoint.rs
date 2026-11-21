@@ -53,7 +53,7 @@ pub(super) fn try_checkpoint(w: &mut Worker, other_charge: usize,
 }
 
 pub(super) fn try_checkpoint_protected(w: &mut Worker, other_charge: usize,
-    other_count: usize, protected: u16) -> Result<Option<(RequestCheckpoint, Value)>> {
+    other_count: usize, protected: u32) -> Result<Option<(RequestCheckpoint, Value)>> {
     checkpoint(w, other_charge, other_count, Some(protected))
 }
 
@@ -62,7 +62,7 @@ pub(super) fn try_checkpoint_protected(w: &mut Worker, other_charge: usize,
 const PAUSE_SLACK_BYTES: usize = 64 * 1024 * 1024;
 
 fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
-    protected: Option<u16>) -> Result<Option<(RequestCheckpoint, Value)>> {
+    protected: Option<u32>) -> Result<Option<(RequestCheckpoint, Value)>> {
     w.state_pressure_trim=None;w.park_refusal=None;
     ensure!(w.current.is_some() && other_count<=1 && w.verify.profile_is_current()
         && w.verify.position() == w.history.frontier() as u64,
@@ -80,7 +80,7 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
         else {w.session_cache_slots.saturating_sub(other_count)};
     let mut evictions = if let Some(mask) = protected {
         ensure!(cache_protection_mask_valid(mask,entries.len()), "park protection mask extent");
-        let protected = (0..entries.len()).map(|i| mask & (1 << i) != 0).collect::<Vec<_>>();
+        let protected = (0..entries.len()).map(|i| mask & (1u32 << i) != 0).collect::<Vec<_>>();
         completed_cache_evictions(&entries, &vec![false; entries.len()], &protected,
             (usize::MAX, charge), budget, true, slots)
     } else {
@@ -120,7 +120,7 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
                 continue;
             }
             let candidate=(0..entries.len()).filter(|i|!indices.contains(i))
-                .min_by_key(|&i|usize::from(protected.unwrap_or(0)&(1<<i)!=0));
+                .min_by_key(|&i|usize::from(protected.unwrap_or(0)&(1u32<<i)!=0));
             let Some(i)=candidate else{
                 w.park_refusal=Some(json!({"stage":"every cached entry planned","available_bytes":available,"required_bytes":reserve+charge,"entries":entries.len()}));
                 return Ok(None);
@@ -138,10 +138,10 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
     }
     let within_budget=evictions.is_some();
     let mut evicted=0;
-    let evicted_protected=evictions.as_ref().map_or(0,|v|v.iter().filter(|&&i|protected.unwrap_or(0)&(1<<i)!=0).count());
+    let evicted_protected=evictions.as_ref().map_or(0,|v|v.iter().filter(|&&i|protected.unwrap_or(0)&(1u32<<i)!=0).count());
     if let Some(mut indices)=evictions {
         indices.sort_unstable();evicted=indices.len();
-        for i in indices.into_iter().rev(){w.evict_cached(i);}
+        for i in indices.into_iter().rev(){w.evict_cached_saving(i)?;}
     }
     // The plan counts every evicted entry's whole charge. Cached images that share ancestor pages with an entry
     // that stays give back less than that, and the save below must still leave the cache reserve, so the plan can
@@ -233,7 +233,7 @@ pub(super) fn try_exchange(w:&mut Worker,saved:&mut RequestCheckpoint)->Result<O
     }
     evictions.sort_unstable();
     let evicted=evictions.len();
-    for i in evictions.into_iter().rev(){w.evict_cached(i);}
+    for i in evictions.into_iter().rev(){w.evict_cached_saving(i)?;}
     if !w.control.all_admit(w.cuda.image_admission_memory()?.admitted_available>=reserve+extra)?{return Ok(None);}
     w.cuda.synchronize_all()?;let began=Instant::now();
     let prepared=w.session.as_mut().unwrap().prepare_exchange(&w.verify,&saved.image,w.shared_image_budget,&w.comm,&w.stream)?;

@@ -24,7 +24,7 @@ TOOLS=[
 def sandbox(case,deps,command,label,seconds=12):
     deps=deps.resolve()
     name='canada-scratch-agent-eval-'+label
-    args=['docker','run','--rm','--name',name,'--label','owner=canada-scratch-20261022',
+    args=['docker','run','--rm','--name',name,'--label','owner=titanic-flash-fixture',
           '--network','none','--cpus','1','--memory','512m','--memory-swap','512m','--pids-limit','64',
           '--read-only','--cap-drop','ALL','--security-opt','no-new-privileges','--user','65534:65534',
           '--tmpfs','/tmp:rw,nosuid,nodev,noexec,size=64m','-v',str(case)+':/case:ro',

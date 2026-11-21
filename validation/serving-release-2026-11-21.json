@@ -1,0 +1,85 @@
+{
+  "release": "s1682",
+  "date": "2026-11-21",
+  "native_baseline": "s1621",
+  "native_hardware": "4 × GB10",
+  "gpu_clock_cap_mhz": 2350,
+  "single_stream": {
+    "temperature": 1,
+    "top_p": 1,
+    "append_tokens": [
+      [
+        500,
+        588
+      ],
+      [
+        2073,
+        2290
+      ]
+    ],
+    "median_ttft_ms": {
+      "s1621": [
+        285,
+        447
+      ],
+      "s1682": [
+        267,
+        445
+      ]
+    },
+    "cold_prompt_tokens": 129553,
+    "cold_prefill_seconds": {
+      "s1621": 14.1,
+      "s1682": 13.65
+    },
+    "code_131k": {
+      "paired_seeds": 6,
+      "generated_tokens_per_seed": 384,
+      "s1682_faster_pairs": 4,
+      "pooled_decode_tokens_per_second": {
+        "s1621": 85.6,
+        "s1682": 90.0
+      }
+    }
+  },
+  "native_cache": {
+    "long_conversations": 4,
+    "final_context_range": [
+      997425,
+      997477
+    ],
+    "correct_answers": 16,
+    "answer_checks": 16,
+    "intervening_short_requests": 17,
+    "return_cached_tokens": 997422,
+    "return_ttft_seconds": 0.27,
+    "disk_return_prompt_tokens": 19388,
+    "disk_return_cold_ttft_seconds": 2.4,
+    "disk_return_warm_ttft_seconds": 0.039
+  },
+  "native_image_checks": {
+    "rewind_prompt_tokens_reused": 974056,
+    "new_image_prefix_tokens_reused": 974038,
+    "new_image_prefill_tokens": 980,
+    "new_image_prefill_ms": 354,
+    "routed_initial_screenshots": 34
+  },
+  "native_lifecycle": {
+    "clean_boot_loads_per_rank": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "failed_start_fallback_rehearsed": "s1621",
+    "hardware_policy_recovery": [
+      "worker exit",
+      "guard termination",
+      "abandoned startup"
+    ]
+  },
+  "portable_validation": {
+    "scope": "Source, launcher, profile, artifact hashes, and CPU checks.",
+    "fresh_four_gpu_install_tested_for_this_publication": false
+  }
+}

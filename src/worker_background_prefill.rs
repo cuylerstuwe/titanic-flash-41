@@ -83,7 +83,7 @@ impl Worker {
         queue:Option<&crate::http_server::Queue>,job:Option<&crate::http_server::Job>)->Result<Value> {
         let background=self.pending_prefill.as_ref().context("missing resumable prefill")?.background;
         let peers=self.peer_prefill_enabled;let slice=self.peer_prefill_slice;let began=Instant::now();
-        self.continue_prefill(&mut |control,remaining,cached| {
+        let result=self.continue_prefill(&mut |control,remaining,cached| {
             let stop=queue.map(|q|->Result<bool>{
                 let priority=background&&(q.foreground_can_join()?||q.router_hold());
                 let peer=peers&&q.prefill_peer_should_yield(background,remaining,q.prefill_slice_due(began.elapsed(),slice),
@@ -93,7 +93,10 @@ impl Worker {
             let head=stop.map(|v|[u8::from(v)]);
             let wire=control.command(head.as_ref().map(|v|v.as_slice()))?;
             ensure!(wire.len()==1&&wire[0]<=1,"resumable encoder yield command");Ok(wire[0]==1)
-        })
+        });
+        // config::wide16_elastic: a finished background prefill returns the 16K extension (a paused one keeps it).
+        if result.is_ok() {self.release_wide16_if_idle()?;}
+        result
     }
     pub(super) fn continue_prefill(&mut self,
         should_yield:&mut impl FnMut(&mut ControlChannel,usize,&[CachedSession])->Result<bool>)->Result<Value> {
@@ -105,10 +108,19 @@ impl Worker {
             if !self.large.profile_is_current() {self.large.handoff_from(&self.verify)?;}
             let end=pending.checkpoints.front().copied().unwrap_or(pending.plan.prompt.len());
             if end>pending.cursor {
-                let control=&mut self.control;
-                let pre=Instant::now();
                 let chunks=if pending.remaining_chunks.is_empty(){None}
                     else{Some(std::mem::take(&mut pending.remaining_chunks))};
+                // config::wide16_elastic: a plan made while the 16K extension was lent needs it again (another request
+                // may have run since and returned it); without the room, the rest is planned afresh at 8,192 rows.
+                let chunks=match chunks {
+                    Some(c) if c.contains(&16384)&&self.cuda.wide16_configured()&&!self.cuda.wide16_mapped() => {
+                        let report=self.borrow_wide16(pending.plan.prompt.len()-pending.cursor,pending.plan.prompt.len())?;
+                        if report["lent"]==true {Some(c)} else {None}
+                    }
+                    other => other,
+                };
+                let control=&mut self.control;
+                let pre=Instant::now();
                 let progress=self.large.prefill_wide_interruptible(&mut self.wides,
                     &pending.plan.prompt[pending.cursor..end],&self.comm,&self.stream,chunks,&mut |done|
                         should_yield(control,pending.plan.prompt.len()-pending.cursor-done,&self.cached_sessions))?;

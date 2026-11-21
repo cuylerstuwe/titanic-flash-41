@@ -221,6 +221,30 @@ impl KeyMatrix {
         ensure!(k >= 1 && k < self.regions() && self.payload.is_elastic(), "elastic key matrix region");
         Ok((k * self.region_rows * 64, self.region_rows * 64))
     }
+    /// Byte span of region k's key rows for its conversation's positions [from, to) (map by reach with scorer parts):
+    /// this matrix holds region_rows keys for the model context, so positions scale by region_rows / context.
+    fn region_span_positions(&self, k: usize, from: usize, to: usize) -> Result<(usize, usize)> {
+        ensure!(k >= 1 && k < self.regions() && self.payload.is_elastic() && from < to, "elastic key matrix region span");
+        let context = crate::config::MODEL_CONTEXT;
+        let a = (from * self.region_rows / context).min(self.region_rows);
+        let b = (to.min(context) * self.region_rows).div_ceil(context).saturating_add(64).min(self.region_rows);
+        Ok(((k * self.region_rows + a) * 64, (b - a).max(1) * 64))
+    }
+    pub(crate) fn region_span_missing_chunks(&self, k: usize, from: usize, to: usize) -> Result<usize> {
+        if self.regions() == 1 || !self.payload.is_elastic() { return Ok(0); }
+        let (offset, len) = self.region_span_positions(k, from, to)?;
+        self.payload.elastic_missing(offset, len)
+    }
+    pub(crate) fn map_region_span(&self, k: usize, from: usize, to: usize) -> Result<bool> {
+        if self.regions() == 1 || !self.payload.is_elastic() { return Ok(true); }
+        let (offset, len) = self.region_span_positions(k, from, to)?;
+        self.payload.elastic_map(offset, len)
+    }
+    pub(crate) fn unmap_region_span(&self, k: usize, from: usize, to: usize) -> Result<()> {
+        if self.regions() == 1 || !self.payload.is_elastic() { return Ok(()); }
+        let (offset, len) = self.region_span_positions(k, from, to)?;
+        self.payload.elastic_unmap(offset, len)
+    }
     /// Elastic region matrices: image-pool chunks mapping region k would take now (0 for any other matrix).
     pub(crate) fn region_missing_chunks(&self, k: usize) -> Result<usize> {
         if self.regions() == 1 || !self.payload.is_elastic() { return Ok(0); }
@@ -333,8 +357,73 @@ pub struct Dense {
     // A view must be dropped before the optional same-owner scratch backing.
     score_owner: Option<Rc<Buffer<f32>>>,
     stream: Cell<usize>,
+    /// config::region_scorer_parts: descriptors for scoring rows [row0, row0 + n) alone, keyed by (row0, n).
+    part_maps: Vec<((usize, usize), Box<Descriptors>)>,
 }
 impl Dense {
+    /// Region steps (config::region_scorer_parts, Nov 19 2026): encode a descriptor set for every block of rows a batched
+    /// step can give one conversation (2-4 sessions, blocks of 2-8 rows), so each conversation's rows are scored by a
+    /// launch of their own. The kernel bounds each block of four query rows by the union of its rows' key ranges and
+    /// clamps rows past `rows` to the last one, so a launch per conversation never reads another region's keys.
+    pub(crate) fn prepare_parts(&mut self) -> Result<()> {
+        self.part_maps.clear();
+        if ![16, 32].contains(&self.rows) { return Ok(()); }
+        let mut want = std::collections::BTreeSet::new();
+        for sessions in 2..=4usize {
+            for block in 2..=8usize.min(self.rows / sessions) {
+                for k in 0..sessions { want.insert((k * block, block)); }
+            }
+        }
+        for (row0, n) in want { let maps = self.encode_part(row0, n)?; self.part_maps.push(((row0, n), maps)); }
+        Ok(())
+    }
+    fn encode_part(&self, row0: usize, n: usize) -> Result<Box<Descriptors>> {
+        ensure!(n >= 1 && row0 + n <= self.rows, "MQA part rows");
+        let mut maps = Box::new(Descriptors([0; 640]));
+        let status = unsafe {
+            self.native.encode_maps(n as i32, self.keys.rows as i32,
+                (self.queries.payload.ptr() + (row0 * 32 * 64) as u64) as _,
+                (self.queries.scales.ptr() + (row0 * 32 * 4) as u64) as _,
+                self.keys.payload.ptr() as _, self.keys.scales.ptr() as _,
+                (self.queries.weights.ptr() + (row0 * 32 * 4) as u64) as _, maps.0.as_mut_ptr() as _)
+        };
+        ensure!(status == 0, "MQA part TMA preparation failed: {status}");
+        Ok(maps)
+    }
+    /// Diagnostic: the first `len` logits of output row `row` as bytes (config::region_scorer_parts_check).
+    pub(crate) fn read_output_row(&self, row: usize, len: usize) -> Result<Vec<u8>> {
+        ensure!(row < self.rows.div_ceil(4) * 4 && len <= self.stride, "MQA output row read");
+        unsafe { self.cuda.read_device(self.output.ptr() + (row * self.stride * 4) as u64, len * 4) }
+    }
+    pub(crate) fn has_parts(&self) -> bool { !self.part_maps.is_empty() && self.native.key_splits(self.rows) == 0 }
+    /// Score each part [row0, row0 + n) of the rows with its own launch (prepare_parts). Rows outside every part are
+    /// not scored (a batched step's rows past its last block). Every row's logits are its own dot products, so the
+    /// values equal a whole launch's; only the keys read outside a row's own range go.
+    pub(crate) fn run_parts(&self, ranges: &Ranges, parts: &[(usize, usize)], stream: &Stream) -> Result<()> {
+        ensure!(self.has_parts()
+                && self.queries.ready.get() && self.keys.ready.get()
+                && ranges.rows == self.rows && ranges.keys == self.keys.rows && ranges.columns == self.columns
+                && self.cuda.owns_buffer(&ranges.starts) && self.cuda.owns_buffer(&ranges.ends)
+                && self.cuda.owns_stream(stream),
+            "MQA part inputs/ranges/context");
+        self.queries.bind(stream)?;
+        let p = stream.raw() as usize;
+        ensure!([self.stream.get(), self.keys.stream.get()].iter().all(|v| *v == 0 || *v == p),
+            "MQA state requires one ordered stream");
+        self.stream.set(p);
+        self.keys.stream.set(p);
+        for &(row0, n) in parts {
+            let maps = &self.part_maps.iter().find(|(key, _)| *key == (row0, n))
+                .ok_or_else(|| anyhow::anyhow!("MQA part ({row0}, {n}) has no descriptors"))?.1;
+            let status = unsafe {
+                (self.native.launch)(n as u32, self.keys.rows as u32, self.columns as u32, self.stride as u32,
+                    (ranges.starts.ptr() + (row0 * 4) as u64) as _, (ranges.ends.ptr() + (row0 * 4) as u64) as _,
+                    (self.output.ptr() + (row0 * self.stride * 4) as u64) as _, maps.0.as_ptr() as _, stream.raw())
+            };
+            ensure!(status == 0, "MQA part launch: {status}");
+        }
+        Ok(())
+    }
     pub fn new(
         cuda: &Cuda,
         native: Rc<Native>,
@@ -389,8 +478,11 @@ impl Dense {
             output,
             score_owner: None,
             stream: Cell::new(0),
+            part_maps: Vec::new(),
         })
     }
+    /// The context of this scorer (config::index_bf16_check's read-backs).
+    pub(crate) fn cuda(&self) -> &Cuda { &self.cuda }
     pub fn run(&self, ranges: &Ranges, stream: &Stream) -> Result<()> {
         ensure!(
             self.queries.ready.get()
@@ -441,6 +533,7 @@ impl Dense {
         };
         ensure!(status == 0, "MQA TMA/attribute preparation failed: {status}");
         self.keys = keys;
+        if !self.part_maps.is_empty() { self.prepare_parts()?; }
         Ok(())
     }
     /// Construction-only scratch reuse. Q/K descriptors do not contain the

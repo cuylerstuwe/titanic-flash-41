@@ -34,6 +34,12 @@ pub(crate) fn fits_one_region_with(extent: usize, capacity: usize, full: bool) -
 /// sixteen keeps a margin): with lookahead admission (config::region_lookahead) a conversation closer than this to
 /// its region's end sits out.
 const BOUNDARY_STEP: usize = 16;
+/// Map by reach: positions past a step mapped beyond a conversation's reach (a step's rows and the page they share).
+const REACH_MARGIN: usize = 256;
+/// Map by reach: a region conversation's caches grow once its frontier comes this close to their mapped end.
+const EXTEND_AHEAD: usize = 8192;
+/// Map by reach: positions a region conversation advances before growth its caches were refused is tried again.
+const GROW_RETRY: usize = 512;
 /// A generating conversation at `position` with `remaining` tokens to produce cannot take another batched step
 /// inside a region of `capacity` positions (only reachable with lookahead admission).
 pub(crate) fn at_region_end(position: usize, remaining: usize, capacity: usize) -> bool {
@@ -60,8 +66,11 @@ fn pair_rows() -> Result<usize> {
 pub(crate) fn validate() -> Result<()> {
     if !enabled()? {
         ensure!(!crate::config::full_regions()?, "full serving regions need batched decode");
+        ensure!(!crate::config::region_map_by_reach()?, "region map by reach needs batched decode");
         return Ok(());
     }
+    // Map by reach checks its own prerequisites (elastic regions, the per-query region gather) here, at startup.
+    crate::config::region_map_by_reach()?;
     ensure!(crate::config::batched_regions()? >= 2 && crate::config::reset_keeps_caches()?
         && crate::config::batch_screen_sessions()? == 1,
         "batched decode needs CANADA_SCRATCH_BATCHED_REGIONS >= 2 and the kept-cache reset");
@@ -115,7 +124,10 @@ impl Timing {
             format!("; batched-body draft head forms since the last report: whole {} subset {} (pooled passes {})", take(0), take(1),
                 crate::dspark::BATCHED_HEAD_POOLED.swap(0, std::sync::atomic::Ordering::Relaxed))
         } else { String::new() };
-        eprintln!("batched decode timing: {}; owner graph captures {captures}{forms}{phases}", parts.join("; "));
+        let checked = if crate::config::region_scorer_parts_check() {
+            format!("; scorer parts checked {}", crate::query_index::REGION_SCORER_PARTS_CHECKED.load(std::sync::atomic::Ordering::Relaxed))
+        } else { String::new() };
+        eprintln!("batched decode timing: {}; owner graph captures {captures}{forms}{phases}{checked}", parts.join("; "));
         // CANADA_SCRATCH_BATCHED_TRACE=1: the steps' gate trace since the last report (diagnostic).
         let trace = crate::dspark_generation::take_batched_trace();
         if !trace.is_empty() { eprintln!("batched trace {}", serde_json::Value::Array(trace)); }
@@ -173,12 +185,12 @@ impl Worker {
     pub(crate) fn boundary_peer(&self) -> Result<Option<u64>> {
         let capacity = self.region_capacity()?;
         Ok(self.peers.iter().filter(|p| p.finished.is_none()
-            && at_region_end(p.position(), p.limit.saturating_sub(p.emitted), capacity)).map(|p| p.id).min())
+            && at_region_end(p.position(), p.limit.saturating_sub(p.emitted), self.peer_capacity(p, capacity))).map(|p| p.id).min())
     }
     pub(crate) fn peer_at_boundary(&self, id: u64) -> Result<bool> {
         let capacity = self.region_capacity()?;
         let peer = self.peers.iter().find(|p| p.id == id).context("unknown region conversation")?;
-        Ok(peer.finished.is_none() && at_region_end(peer.position(), peer.limit.saturating_sub(peer.emitted), capacity))
+        Ok(peer.finished.is_none() && at_region_end(peer.position(), peer.limit.saturating_sub(peer.emitted), self.peer_capacity(peer, capacity)))
     }
     /// Region 0's generating conversation has reached the first region's rows while regions are occupied: it sits out
     /// until they are empty (lookahead admission).
@@ -284,39 +296,89 @@ impl Worker {
             "kept_images":kept,"peers":self.peers.len(),"elastic":elastic,"evicted_images":evicted,
             "seconds":began.elapsed().as_secs_f64()}))
     }
-    /// Elastic regions: evict cached images in the cache's pressure order (as the displaced reclaim does), one at a
-    /// time, until every rank's image pool can map serving region `region`. Ranks agree on each victim, so all evict
-    /// the same entries. Returns (room, images evicted); no room once nothing evictable is left.
-    /// Elastic regions: whether the image pool's free chunks can map `region`'s cache spans and, with full regions, the
-    /// 16-row owner's key rows of that region.
-    /// Elastic regions: the regions mapping `region` needs, 1..=region minus those already mapped. Every region up to the
-    /// highest occupied one stays mapped (release_regions): an index scorer bounds each block of query rows by the union
-    /// of its rows' key ranges, so a block holding rows of region 0 and region 3 also reads regions 1 and 2 (Nov 18,
-    /// fqa4: an MMU read fault in region 1's index key rows after its conversation left while region 3's stayed).
+    /// Elastic regions: the regions whose owners' key matrices mapping `region` needs, 1..=region minus those already
+    /// mapped. Every region up to the highest occupied one keeps its key rows mapped (release_regions): an index scorer
+    /// bounds each block of query rows by the union of its rows' key ranges, so a block holding rows of region 0 and
+    /// region 3 also reads regions 1 and 2 (Nov 18, fqa4: an MMU read fault in region 1's index key rows after its
+    /// conversation left while region 3's stayed). Without map by reach the regions' caches follow the same rule.
     fn regions_to_map(&self, region: usize) -> Vec<usize> {
+        // Keys by reach (map by reach + per-conversation scoring): no whole-region key maps; keys grow with the caches.
+        if crate::config::region_keys_by_reach().unwrap_or(false) { return Vec::new(); }
         (1..=region).filter(|&j| self.elastic_mapped & (1u8 << j) == 0).collect()
     }
+    /// Map by reach (config::region_map_by_reach): the cache positions a conversation at `position` with `remaining`
+    /// tokens to produce needs mapped: one lookahead (at least a step) and a margin past its frontier, rounded up to the
+    /// granule.
+    pub(crate) fn cache_reach_target(position: usize, remaining: usize) -> Result<usize> {
+        let ahead = crate::config::region_lookahead()?.max(BOUNDARY_STEP);
+        let reach = position.saturating_add(remaining.min(ahead)).saturating_add(BOUNDARY_STEP + REACH_MARGIN);
+        let g = crate::config::REGION_MAP_GRANULE;
+        Ok(reach.div_ceil(g).saturating_mul(g).min(crate::config::MODEL_CONTEXT))
+    }
+    /// Map by reach: the cache positions the decoding region-0 conversation needs in the region it detaches to.
+    fn detach_cache_target(&self) -> Result<usize> {
+        Self::cache_reach_target(self.verify.position() as usize, self.limit.saturating_sub(self.emitted))
+    }
+    /// Elastic regions: whether the image pool's free chunks can map what a detach into `region` needs: the owners' key
+    /// rows of every region up to it and `region`'s cache spans (all of them, or by reach the detaching conversation's).
     fn region_room(&self, region: usize) -> Result<bool> {
+        let by_reach = crate::config::region_map_by_reach()?;
         let mut need = 0;
         for j in self.regions_to_map(region) {
-            need += self.verify.serving_region_missing_chunks(j)?;
+            if !by_reach { need += self.verify.serving_region_missing_chunks(j)?; }
             for owner in self.region_key_owners() { need += owner.region_keys_missing_chunks(j)?; }
         }
+        if by_reach {
+            let (from, to) = (self.region_cache_reach[region], self.detach_cache_target()?);
+            if to > from { need += self.span_missing_chunks(region, from, to)?; }
+        }
         Ok(need <= self.cuda.image_pool_free_chunks().unwrap_or(0))
+    }
+    /// Map by reach: pool chunks that mapping region `region`'s positions [from, to) would take: the caches, and with keys
+    /// by reach every owner's key rows of those positions.
+    fn span_missing_chunks(&self, region: usize, from: usize, to: usize) -> Result<usize> {
+        let mut need = self.verify.serving_region_span_missing_chunks(region, from, to)?;
+        if crate::config::region_keys_by_reach()? {
+            for owner in self.region_key_owners() { need += owner.region_keys_span_missing_chunks(region, from, to)?; }
+        }
+        Ok(need)
+    }
+    /// Map by reach: map (all or nothing) or unmap one granule of a region: caches, and with keys by reach the owners' keys.
+    fn map_granule(&self, region: usize, from: usize, to: usize) -> Result<bool> {
+        if !self.verify.map_serving_region_span(region, from, to)? { return Ok(false); }
+        if crate::config::region_keys_by_reach()? {
+            let owners = self.region_key_owners();
+            for (i, owner) in owners.iter().enumerate() {
+                if !owner.map_region_keys_span(region, from, to)? {
+                    for done in &owners[..i] { done.unmap_region_keys_span(region, from, to)?; }
+                    self.verify.unmap_serving_region_span(region, from, to)?;
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+    fn unmap_granule(&self, region: usize, from: usize, to: usize) -> Result<()> {
+        if crate::config::region_keys_by_reach()? {
+            for owner in self.region_key_owners() { owner.unmap_region_keys_span(region, from, to)?; }
+        }
+        self.verify.unmap_serving_region_span(region, from, to)
     }
     /// Every owner whose index key matrices may span the regions: the 6-row, 16-row and 32-row owners (an owner without
     /// region matrices maps nothing).
     fn region_key_owners(&self) -> Vec<&crate::target::Target> {
         [Some(&self.verify), self.long_verify.as_ref(), self.copy32_verify.as_ref()].into_iter().flatten().collect()
     }
-    /// Map one region's cache spans and every owner's region key rows, all or nothing (Ok(false) without room).
+    /// Map one region's cache spans (unless they map by reach) and every owner's region key rows, all or nothing
+    /// (Ok(false) without room).
     fn map_one_region(&self, region: usize) -> Result<bool> {
-        if !self.verify.map_serving_region(region)? { return Ok(false); }
+        let caches = !crate::config::region_map_by_reach()?;
+        if caches && !self.verify.map_serving_region(region)? { return Ok(false); }
         let owners = self.region_key_owners();
         for (i, owner) in owners.iter().enumerate() {
             if !owner.map_region_keys(region)? {
                 for done in &owners[..i] { done.unmap_region_keys(region)?; }
-                self.verify.unmap_serving_region(region)?;
+                if caches { self.verify.unmap_serving_region(region)?; }
                 return Ok(false);
             }
         }
@@ -324,7 +386,32 @@ impl Worker {
     }
     fn unmap_one_region(&self, region: usize) -> Result<()> {
         for owner in self.region_key_owners() { owner.unmap_region_keys(region)?; }
-        self.verify.unmap_serving_region(region)
+        if crate::config::region_map_by_reach()? { Ok(()) } else { self.verify.unmap_serving_region(region) }
+    }
+    /// Map by reach: grow region `region`'s cache spans to `to` positions one granule at a time (each granule is
+    /// unmapped on its own later: chunks are reference counted). Ok(false), nothing changed, without room.
+    fn grow_region_caches(&mut self, region: usize, to: usize) -> Result<bool> {
+        let g = crate::config::REGION_MAP_GRANULE;
+        let from = self.region_cache_reach[region];
+        ensure!(from % g == 0 && to % g == 0 && to <= crate::config::MODEL_CONTEXT, "region cache granules");
+        let mut at = from;
+        while at < to {
+            if !self.map_granule(region, at, at + g)? {
+                while at > from { at -= g; self.unmap_granule(region, at, at + g)?; }
+                return Ok(false);
+            }
+            at += g;
+        }
+        self.region_cache_reach[region] = self.region_cache_reach[region].max(to);
+        Ok(true)
+    }
+    /// Map by reach: release every cache granule of a vacated region (nothing reads a vacated region's caches).
+    fn release_region_caches(&mut self, region: usize) -> Result<()> {
+        let g = crate::config::REGION_MAP_GRANULE;
+        let mut at = self.region_cache_reach[region];
+        while at > 0 { at -= g; self.unmap_granule(region, at, at + g)?; }
+        self.region_cache_reach[region] = 0;
+        Ok(())
     }
     /// Map `region` and every unmapped region below it, all or nothing (Ok(false), nothing changed, without room).
     fn map_region(&mut self, region: usize) -> Result<bool> {
@@ -338,11 +425,25 @@ impl Worker {
             self.elastic_mapped |= 1u8 << j;
             done.push(j);
         }
+        if crate::config::region_map_by_reach()? {
+            let to = self.detach_cache_target()?;
+            if to > self.region_cache_reach[region] && !self.grow_region_caches(region, to)? {
+                for &d in done.iter().rev() { self.unmap_one_region(d)?; self.elastic_mapped &= !(1u8 << d); }
+                return Ok(false);
+            }
+        }
         Ok(true)
     }
     /// After a region conversation left (its peer already removed): unmap every mapped region above the highest region
-    /// still occupied, highest first. A vacated region below an occupied one stays mapped (see regions_to_map).
+    /// still occupied, highest first. A vacated region below an occupied one keeps its key rows mapped (see
+    /// regions_to_map); with map by reach its caches go at once.
     fn release_regions(&mut self) -> Result<()> {
+        if crate::config::region_map_by_reach()? {
+            for j in 1..crate::config::batched_regions()? {
+                if self.region_cache_reach[j] > 0 && !self.peers.iter().any(|p| p.region == j) { self.release_region_caches(j)?; }
+            }
+            self.region_grow_retry = [0; 4];
+        }
         let high = self.peers.iter().map(|p| p.region).max().unwrap_or(0);
         for j in (high + 1..crate::config::batched_regions()?).rev() {
             if self.elastic_mapped & (1u8 << j) != 0 {
@@ -352,23 +453,64 @@ impl Worker {
         }
         Ok(())
     }
-    fn reclaim_for_region(&mut self, region: usize) -> Result<(bool, usize)> {
+    /// Elastic regions: evict cached images in the cache's pressure order (as the displaced reclaim does), one at a
+    /// time, until every rank's image pool has room (`room` on every rank). Ranks agree on each victim, so all evict
+    /// the same entries. Returns (room, images evicted); no room once nothing evictable is left.
+    fn reclaim_until(&mut self, label: &str, region: usize, room: impl Fn(&Self) -> Result<bool>) -> Result<(bool, usize)> {
         let tokens = self.verify.position() as usize;
         let mut evicted = 0;
         loop {
-            let room = self.region_room(region)?;
-            if self.control.all_admit(room)? { return Ok((true, evicted)); }
+            let ok = room(self)?;
+            if self.control.all_admit(ok)? { return Ok((true, evicted)); }
             let entries = self.cached_sessions.iter().map(|c| (c.prefix.len(), c.charge)).collect::<Vec<_>>();
             let optional = self.optional_entries(tokens);
             let superseded = vec![false; entries.len()];
             let victim = pressure_cache_victim(&entries, &optional, &superseded, tokens, self.image_entry_limit(),
                 self.pressure_long_first(tokens), &[]);
-            self.control.agree(&serde_json::to_vec(&("region-reclaim-v1", region, victim, &entries))?)?;
+            self.control.agree(&serde_json::to_vec(&(label, region, victim, &entries))?)?;
             let Some(victim) = victim else { return Ok((false, evicted)) };
             self.stream.synchronize()?;
-            self.evict_cached(victim);
+            self.evict_cached_saving(victim)?;
             evicted += 1;
         }
+    }
+    fn reclaim_for_region(&mut self, region: usize) -> Result<(bool, usize)> {
+        self.reclaim_until("region-reclaim-v1", region, |w| w.region_room(region))
+    }
+    /// The positions region conversation `p` may reach in its region: the region's capacity, or with map by reach the
+    /// positions its caches are mapped for (a conversation that could not grow them sits out there, as at a region's end).
+    fn peer_capacity(&self, p: &Peer, capacity: usize) -> usize {
+        match self.region_cache_reach[p.region] { 0 => capacity, mapped => capacity.min(mapped) }
+    }
+    /// Map by reach: before a batched step, grow the cache spans of every generating region conversation within
+    /// EXTEND_AHEAD positions of its mapped end, evicting cached images in pressure order when the pool is short (as a
+    /// detach does). A region whose spans cannot grow is retried after its conversation advanced GROW_RETRY positions,
+    /// or once a region is released; if it never can, the conversation sits out at its mapped end (peer_capacity) and
+    /// moves back to region 0 when that is free (attach_peer), as at a region's end.
+    fn extend_region_maps(&mut self) -> Result<Value> {
+        if !crate::config::region_map_by_reach()? { return Ok(Value::Null); }
+        let wants: Vec<(usize, usize)> = self.peers.iter()
+            .filter(|p| p.finished.is_none() && p.position() >= self.region_grow_retry[p.region])
+            .filter(|p| p.position().saturating_add(BOUNDARY_STEP + EXTEND_AHEAD) > self.region_cache_reach[p.region]
+                && self.region_cache_reach[p.region] < crate::config::MODEL_CONTEXT)
+            .map(|p| Ok((p.region, Self::cache_reach_target(p.position().saturating_add(EXTEND_AHEAD),
+                p.limit.saturating_sub(p.emitted).saturating_sub(EXTEND_AHEAD))?)))
+            .collect::<Result<_>>()?;
+        let mut events = Vec::new();
+        for (region, to) in wants {
+            let from = self.region_cache_reach[region];
+            if to <= from { continue; }
+            let began = Instant::now();
+            let (room, evicted) = self.reclaim_until("region-grow-v1", region,
+                |w| Ok(w.span_missing_chunks(region, from, to)? <= w.cuda.image_pool_free_chunks().unwrap_or(0)))?;
+            let grown = room && self.grow_region_caches(region, to)?;
+            ensure!(grown == room, "region cache growth lost its room");
+            self.region_grow_retry[region] = if grown { 0 } else {
+                self.peers.iter().find(|p| p.region == region).map_or(0, |p| p.position()) + GROW_RETRY };
+            events.push(json!({"region":region,"from":from,"to":to,"grown":grown,"evicted_images":evicted,
+                "seconds":began.elapsed().as_secs_f64()}));
+        }
+        Ok(if events.is_empty() { Value::Null } else { json!(events) })
     }
     /// The oldest finished region conversation waiting for region 0.
     pub(crate) fn finished_peer(&self) -> Option<u64> {
@@ -513,14 +655,18 @@ impl Worker {
                 "batched step needs a generating region-0 conversation");
         }
         self.peers.sort_by_key(|p| p.region);
+        // Map by reach: grow the caches of region conversations near their mapped ends first.
+        let grown = self.extend_region_maps()?;
         // Lookahead admission: a conversation at its region's end never takes a step (the scheduler also leaves it out).
         let capacity = self.region_capacity()?;
+        let reach = self.region_cache_reach;
         if include_active {
             ensure!(self.peers.is_empty() || !at_region_end(self.verify.position() as usize,
                 self.limit.saturating_sub(self.emitted), capacity), "region-0 conversation at the regions' rows");
         }
         let stepping = |p: &Peer| p.finished.is_none() && skip & (1u8 << p.region) == 0
-            && !at_region_end(p.position(), p.limit.saturating_sub(p.emitted), capacity);
+            && !at_region_end(p.position(), p.limit.saturating_sub(p.emitted),
+                match reach[p.region] { 0 => capacity, mapped => capacity.min(mapped) });
         let decoding = self.peers.iter().filter(|p| stepping(p)).count();
         ensure!(include_active || decoding > 0, "batched step without decoding conversations");
         let parts_n = decoding + usize::from(include_active);
@@ -626,7 +772,32 @@ impl Worker {
             let captures = self.long_verify.as_ref().map_or(0, |t| t.graph_capture_count()) + self.verify.graph_capture_count();
             self.batched_timing.report(captures);
         }
-        Ok(json!({"type":"batched_tokens","conversations":conversations,"owner_rows":rows,
-            "rows_per_conversation":per,"region0":include_active,"seconds":began.elapsed().as_secs_f64()}))
+        let mut out = json!({"type":"batched_tokens","conversations":conversations,"owner_rows":rows,
+            "rows_per_conversation":per,"region0":include_active,"seconds":began.elapsed().as_secs_f64()});
+        if !grown.is_null() { out["region_caches_grown"] = grown; }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod map_by_reach_tests {
+    use super::*;
+    #[test]
+    fn cache_reach_targets_cover_a_lookahead_in_whole_granules() {
+        let g = crate::config::REGION_MAP_GRANULE;
+        // SAFETY of the env var: this test owns CANADA_SCRATCH_REGION_LOOKAHEAD for its duration.
+        unsafe { std::env::set_var("CANADA_SCRATCH_REGION_LOOKAHEAD", "16384"); }
+        // A 16K conversation with the harness's 262,144-token limit: one granule (16,384 + 16,384 + margin < 65,536).
+        assert_eq!(Worker::cache_reach_target(16_000, 262_144).unwrap(), g);
+        // A short remaining output maps only what it can reach.
+        assert_eq!(Worker::cache_reach_target(100, 10).unwrap(), g);
+        // 256K positions: through the next lookahead, rounded up to granules.
+        let t = Worker::cache_reach_target(256_000, 262_144).unwrap();
+        assert!(t % g == 0 && t >= 256_000 + 16_384 + BOUNDARY_STEP + REACH_MARGIN && t - g < 256_000 + 16_384 + BOUNDARY_STEP + REACH_MARGIN);
+        // Never past the model context.
+        assert_eq!(Worker::cache_reach_target(1_040_000, 262_144).unwrap(), crate::config::MODEL_CONTEXT);
+        // Growth starts EXTEND_AHEAD before the mapped end, well before a step could pass it.
+        assert!(EXTEND_AHEAD > BOUNDARY_STEP + REACH_MARGIN && g % 128 == 0 && crate::config::MODEL_CONTEXT % g == 0);
+        unsafe { std::env::remove_var("CANADA_SCRATCH_REGION_LOOKAHEAD"); }
     }
 }

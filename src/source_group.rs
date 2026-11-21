@@ -205,11 +205,12 @@ impl Group {
             caches.push(PagedKv::new_layout(cuda, swa_pages, 64, crate::attention::kv_format()?.window)?);
         }
         let row_store = if start == 14 {
+            let quarter = crate::config::engram_quarter(plan.rank)?;
             Some(Rc::new(RowStore::new(
                 PackedShard::open(
-                    &backing.join(format!("engram-l14-r{}of4.bin", plan.rank)),
+                    &backing.join(format!("engram-l14-r{quarter}of4.bin")),
                     14,
-                    plan.rank,
+                    quarter,
                     4,
                     384016682,
                 )?,

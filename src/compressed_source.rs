@@ -96,6 +96,13 @@ impl Metadata {
         self.keys.update(positions, &key_locations)?;
         self.query.update(positions, starts, lengths)
     }
+    /// Batched steps: the conversations' row blocks for the dense index scorer (config::region_scorer_parts).
+    pub(crate) fn set_parts(&mut self, parts: &[(usize, usize)]) -> Result<()> {
+        self.query.set_parts(parts)
+    }
+    pub(crate) fn select_two_row_solo_index(&mut self) {
+        self.query.two_row_solo_verify = true;
+    }
     /// Region steps: each row's first index key row to gather (CANADA_SCRATCH_REGION_GATHER_CACHE=1).
     pub(crate) fn set_gather_starts(&mut self, starts: &[i32]) -> Result<()> {
         self.query.set_gather_starts(starts)

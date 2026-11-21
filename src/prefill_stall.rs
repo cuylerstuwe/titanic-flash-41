@@ -4,6 +4,55 @@
 //! scope. Missing counters stay missing, rather than being reported as zero.
 use std::{collections::BTreeMap, fs, time::Instant};
 
+/// Collect only on a diagnostic run. Each mark describes the time *since* its predecessor on
+/// the calling model thread. GPU work and work on other ranks can overlap these intervals.
+pub(crate) struct PhaseTrace {
+    last: Instant,
+    counts: Option<[i64; 6]>,
+    phases: Vec<serde_json::Value>,
+}
+
+#[cfg(target_os = "linux")]
+fn thread_counts() -> Option<[i64; 6]> {
+    let mut value = std::mem::MaybeUninit::uninit();
+    // getrusage initializes value on success. RUSAGE_THREAD excludes the Engram lookahead worker.
+    if unsafe { libc::getrusage(libc::RUSAGE_THREAD, value.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let value = unsafe { value.assume_init() };
+    let micros = |t: libc::timeval| t.tv_sec * 1_000_000 + t.tv_usec;
+    Some([micros(value.ru_utime), micros(value.ru_stime), value.ru_nvcsw,
+          value.ru_nivcsw, value.ru_minflt, value.ru_majflt])
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_counts() -> Option<[i64; 6]> { None }
+
+impl PhaseTrace {
+    pub(crate) fn new() -> Self {
+        Self { last: Instant::now(), counts: thread_counts(), phases: Vec::with_capacity(14) }
+    }
+
+    #[inline]
+    pub(crate) fn mark(trace: &mut Option<Self>, stage: &'static str) {
+        let Some(trace) = trace else { return };
+        let now = Instant::now();
+        let current = thread_counts();
+        let delta = current.zip(trace.counts).map(|(a, b)| std::array::from_fn::<_, 6, _>(|i| a[i] - b[i]));
+        trace.phases.push(serde_json::json!([stage, (now - trace.last).as_micros(), delta]));
+        trace.last = now;
+        trace.counts = current;
+    }
+
+    pub(crate) fn emit(self, rank: usize, start: usize, live: usize, capacity: usize) {
+        eprintln!("prefill host phases {}", serde_json::json!({
+            "rank": rank, "start": start, "live": live, "capacity": capacity, "phases": self.phases,
+            "columns": ["stage", "wall_us", ["user_us", "system_us", "voluntary_switches",
+                                             "involuntary_switches", "minor_faults", "major_faults"]]
+        }));
+    }
+}
+
 pub(crate) struct Snapshot {
     values: BTreeMap<String,u64>,
     unavailable: Vec<String>,

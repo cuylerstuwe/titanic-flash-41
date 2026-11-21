@@ -478,6 +478,7 @@ pub(crate) struct Consumer {
     module: Module,
     rows: usize,
     mask_stride: usize,
+    fused_score_mask: bool,
     bounded_mask: std::cell::Cell<bool>,
 }
 /// CANADA_SCRATCH_BOUNDED_CANDIDATE_MASK_DECODE=1 (default off): the six- and 16-row verify owners' candidate
@@ -502,15 +503,32 @@ impl Consumer {
             Err(std::env::VarError::NotPresent)=>true,
             Err(error)=>return Err(error.into()),
         };
+        let fused_score_mask = match std::env::var("CANADA_SCRATCH_INDEX_BF16_MASK") {
+            Ok(value) => {
+                ensure!(matches!(value.as_str(), "0" | "1"), "invalid bf16 consumer mask policy");
+                value == "1" && matches!(rows, 6 | 16)
+            }
+            Err(std::env::VarError::NotPresent) => false,
+            Err(error) => return Err(error.into()),
+        };
         Ok(Self {
             cuda: cuda.clone(),
             module: cuda.module(core)?,
             rows,
+            fused_score_mask,
             mask_stride: columns.div_ceil(BLOCK),
             bounded_mask: std::cell::Cell::new(enabled && columns==1048576
                 && (rows==128 || (matches!(rows, 6 | 16) && bounded_mask_decode()))),
         })
     }
+    /// One mask byte covers eight consecutive scores, relative to the beginning of its row.
+    pub(crate) fn score_mask<'a>(&self, mask: &'a Buffer<u8>) -> Result<Option<(&'a Buffer<u8>, usize)>> {
+        if !self.fused_score_mask { return Ok(None); }
+        ensure!(self.cuda.owns_buffer(mask) && mask.len() == self.rows * self.mask_stride,
+            "bf16 consumer mask geometry");
+        Ok(Some((mask, self.mask_stride)))
+    }
+
     pub(crate) fn apply(
         &self,
         scores: &mut Buffer<f32>,

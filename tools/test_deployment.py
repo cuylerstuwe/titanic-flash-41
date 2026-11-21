@@ -74,6 +74,19 @@ class DeploymentChecks(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'missing default MoE artifact'):
             prepare.validate_fenced_bundles(inventory)
 
+    def test_s1682_profile_requires_its_compiled_index_attention_and_wide_regions(self):
+        inventory = json.loads((ROOT/'runtime/artifacts.json').read_bytes())
+        profile = json.loads((ROOT/'deploy/profile.json').read_bytes())
+        paths = ['index-bf16-b1c069d36287a577/index16.cubin',
+                 'attention-dsv41-decode-prefetch-v2/libcanada_decode.so',
+                 'mqa-v2/libcanada_mqa.so', 'mqa-keysplit-v2/libcanada_mqa_keysplit.so']
+        for path in paths:
+            with self.subTest(path=path):
+                files = inventory['files'].copy()
+                del files['kernels/'+path]
+                with self.assertRaisesRegex(AssertionError, 'serving kernel digest mismatch'):
+                    prepare.validate_serving_kernels({'files':files}, profile)
+
     def test_runtime_matches_loader_pins_and_enabled_overlays(self):
         inventory = json.loads((ROOT/'runtime/artifacts.json').read_text())
         wrong = copy.deepcopy(inventory)

@@ -92,6 +92,8 @@ pub struct TokenRows {
     image_owner: Option<Rc<crate::prompt_media::Bindings>>,
     rows: usize,
     active_rows: usize,
+    // Native gate GEMV launch extent. The top-k always sees the entire row owner.
+    gate_rows: usize,
     /// Batched verification with padding routes: each row's source row (-1: its own routing).
     padding_sources: Buffer<i32>,
     padding_active: bool,
@@ -106,6 +108,7 @@ impl TokenRows {
             image_owner: None,
             rows: ids.len(),
             active_rows: 0,
+            gate_rows: ids.len(),
             padding_sources: cuda.allocate(ids.len())?,
             padding_active: false,
         };
@@ -125,6 +128,7 @@ impl TokenRows {
         self.live.upload(&[live as i32])?;
         self.clear_images()?;
         self.active_rows = live;
+        self.gate_rows = self.rows;
         // Every step starts without padding routes; a batched step sets them after this update.
         self.padding_active = false;
         Ok(())
@@ -164,6 +168,7 @@ impl TokenRows {
         &self.live
     }
     pub(crate) fn active_rows(&self) -> usize { self.active_rows }
+    pub(crate) fn use_live_gate_rows(&mut self) { self.gate_rows = self.active_rows; }
 }
 pub struct Router {
     cuda: Cuda,
@@ -343,11 +348,11 @@ impl Router {
               // The native primitive's arithmetic and <=16-row admission stay
               // unchanged; only the finite M32 profile issues a second call.
               let experts=output.len()/self.rows;
-              for offset in (0..self.rows).step_by(16) {
+              for offset in (0..tokens.gate_rows).step_by(16) {
                 ensure!(
                 unsafe {
                     (self.native.logits)(
-                        (self.rows-offset).min(16) as i32,
+                        (tokens.gate_rows-offset).min(16) as i32,
                         (input.ptr()+(offset*5120*2)as u64) as *const c_void,
                         *weight as *const c_void,
                         (output.ptr()+(offset*experts*4)as u64) as *mut c_void,
@@ -834,6 +839,7 @@ impl LayerFfn {
             image_pointers: unsafe {tokens.image_pointers.view(rank*(self.rows/4),self.rows/4)}?,
             image_owner: tokens.image_owner.clone(),
             live: unsafe {t.live.view(0,1)}?, rows:(self.rows/4),
+            gate_rows: self.rows/4,
             active_rows:tokens.active_rows.saturating_sub(rank*(self.rows/4)).min(self.rows/4),
             padding_sources: unsafe {tokens.padding_sources.view(rank*(self.rows/4),self.rows/4)}?,
             padding_active: false,
@@ -1373,7 +1379,7 @@ impl LayerFfn {
         ensure!(t.pack_bf16.is_some()&&t.intermediates.is_none(),"pipeline requires fused dual-row input contract");
         let local=TokenRows{ids:unsafe{tokens.ids.view(rank*2048,2048)}?,live:unsafe{t.live.view(0,1)}?,
             image_pointers:unsafe{tokens.image_pointers.view(rank*2048,2048)}?,image_owner:tokens.image_owner.clone(),
-            rows:2048,active_rows:tokens.active_rows.saturating_sub(rank*2048).min(2048),
+            rows:2048,active_rows:tokens.active_rows.saturating_sub(rank*2048).min(2048),gate_rows:2048,
             padding_sources:unsafe{tokens.padding_sources.view(rank*2048,2048)}?,padding_active:false};
         ensure!(unsafe{(t.local_live)(tokens.live.ptr()as *const c_void,t.live.ptr()as *mut c_void,
             2048,rank as i32,stream.raw())}==0,"pipeline local metadata launch");

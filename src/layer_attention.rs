@@ -609,8 +609,21 @@ impl Layer {
         let dsv41_prefill=|rows:usize,extra:usize|->Result<Execution>{Ok(Execution::Prefill(
             crate::attention::Prefill::new_dsv41(cuda,&kernels.join(if pico {"attention-pico-prefill-v1"}
                 else {"attention-dsv41-prefill-v1"}),rows,extra)?))};
-        let dsv41_split=|rows:usize,extra:usize,splits:usize|->Result<Execution>{Ok(Execution::Prefill(
-            crate::attention::Prefill::new_dsv41_split(cuda,&kernels.join("attention-dsv41-decode-v1"),rows,extra,splits)?))};
+        let dsv41_split = |rows, extra, splits| -> Result<Execution> {
+            // Select once during construction so graph replay has no additional branch.
+            let bundle = match (rows, extra, splits) {
+                (6, 512, 8) => match std::env::var("CANADA_SCRATCH_PREFETCH_SPARSE_PAGES").as_deref() {
+                    Ok("1") => "attention-dsv41-decode-prefetch-v1",
+                    Ok("2") => "attention-dsv41-decode-prefetch-v2",
+                    Ok("0") | Err(std::env::VarError::NotPresent) => "attention-dsv41-decode-v1",
+                    _ => anyhow::bail!("CANADA_SCRATCH_PREFETCH_SPARSE_PAGES must be 0, 1 or 2"),
+                },
+                _ => "attention-dsv41-decode-v1",
+            };
+            Ok(Execution::Prefill(crate::attention::Prefill::new_dsv41_split(
+                cuda, &kernels.join(bundle), rows, extra, splits,
+            )?))
+        };
         let decode = if kv_v41 {
             // V4.1 caches: FlashInfer v0.7.3's DSv4.1 kernels in the roles of today's primitives. Layers 0-1 read the
             // window only; split decode keeps today's split counts and fp32 partials.

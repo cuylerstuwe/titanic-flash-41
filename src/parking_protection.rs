@@ -47,37 +47,37 @@ impl Protection {
         if !self.epoch { self.parent = self.recent.clone(); self.epoch = true; }
     }
     pub(super) fn end_epoch(&mut self) { self.parent = Parent::None; self.epoch = false; }
-    fn identity_mask(parent: &Parent, entries: &[(&[u32], &Identity)]) -> u16 {
+    fn identity_mask(parent: &Parent, entries: &[(&[u32], &Identity)]) -> u32 {
         match parent {
             Parent::None => 0,
-            Parent::Unknown => ((1u32 << entries.len()) - 1) as u16,
+            Parent::Unknown => ((1u64 << entries.len()) - 1) as u32,
             Parent::Known(parent) => entries.iter().enumerate()
                 .filter(|(_, (tokens, media))| parent.covers(tokens, media))
                 .max_by_key(|(_, (tokens, _))| tokens.len())
-                .map_or(0, |(i, _)| 1 << i),
+                .map_or(0, |(i, _)| 1u32 << i),
         }
     }
-    fn parent_mask(&self, entries: &[(&[u32], &Identity)]) -> u16 {
+    fn parent_mask(&self, entries: &[(&[u32], &Identity)]) -> u32 {
         // Keep the fan-out ancestor even when a foreground child completes.
         // Also keep the latest foreground turn: a long-lived background owner
         // may prevent this admission epoch from becoming completely idle.
         Self::identity_mask(&self.parent, entries) | Self::identity_mask(&self.recent, entries)
     }
     pub(super) fn mask(&self, w: &Worker, queue: &Queue,
-        ready: &VecDeque<(Option<u64>, Job)>, images: &[ParkedRequest]) -> Result<u16> {
+        ready: &VecDeque<(Option<u64>, Job)>, images: &[ParkedRequest]) -> Result<u32> {
         ensure!(w.cached_sessions.len()<=w.session_cache_slots
             &&w.cached_sessions.len()<=MAX_SESSION_CACHE_SLOTS,"park protection cache bound");
         let entries = w.cached_sessions.iter().map(|c| (c.prefix.as_slice(), &c.media)).collect::<Vec<_>>();
         let mut protected = self.parent_mask(&entries);
         for (i, (tokens, media)) in entries.into_iter().enumerate() {
-            if protected & (1 << i) != 0 { continue; }
+            if protected & (1u32 << i) != 0 { continue; }
             let mut peer_needs=false;
             for image in images {peer_needs|=image.needs_prefix(w,tokens,media)?;}
             if w.history.needs_prefix(tokens, media)
                 || peer_needs
                 || ready.iter().any(|(_, job)| job.needs_cached_prefix(tokens, media))
                 || queue.pending_needs_prefix(tokens, media)? {
-                protected |= 1 << i;
+                protected |= 1u32 << i;
             }
         }
         Ok(protected)
@@ -126,9 +126,16 @@ mod tests {
         let sixteen=(1..=16).map(|n|vec![10;n]).collect::<Vec<_>>();
         let entries=sixteen.iter().map(|t|(t.as_slice(),&empty)).collect::<Vec<_>>();
         protection.parent=Parent::Unknown;
-        assert_eq!(protection.parent_mask(&entries),u16::MAX,"unknown parent protects all sixteen slots");
+        assert_eq!(protection.parent_mask(&entries),0xffff,"unknown parent protects all sixteen slots");
         protection.parent=Parent::None;
         remember(&mut protection,&[10;16],&empty);
-        assert_eq!(protection.parent_mask(&entries),1<<15,"longest parent can occupy the high bit");
+        assert_eq!(protection.parent_mask(&entries),1<<15,"longest parent can occupy the sixteenth bit");
+        let wide=(1..=32).map(|n|vec![10;n]).collect::<Vec<_>>();
+        let entries=wide.iter().map(|t|(t.as_slice(),&empty)).collect::<Vec<_>>();
+        protection.parent=Parent::Unknown;
+        assert_eq!(protection.parent_mask(&entries),u32::MAX,"unknown parent protects all thirty-two slots");
+        protection.parent=Parent::None;
+        remember(&mut protection,&[10;32],&empty);
+        assert_eq!(protection.parent_mask(&entries),1<<31,"longest parent can occupy the high bit");
     }
 }

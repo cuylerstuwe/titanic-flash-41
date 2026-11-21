@@ -1,0 +1,116 @@
+--- a/decode.cu
++++ b/decode.cu
+@@ -4,6 +4,7 @@
+ // the V4.1 store kernels. Numerics: both caches dequantized exactly to bf16; bf16 QK and PV MMAs with fp32
+ // accumulation; fp32 normalized partials and a log2 LSE per split; the merge folds in the attention sink and
+ // writes bf16 output and the final log2 LSE (sink included), the convention the prefill entry point also uses.
++#include <type_traits>
+ #include <cuda_runtime.h>
+ #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/decode.cuh>
+ #include <flashinfer/attention/sparse_mla_sm120/execution/merge.cuh>
+@@ -11,7 +12,7 @@
+ namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16 {
+ template <int NUM_HEADS, bool EXTRA_FP4, ModelType MT = ModelType::DSV4_1>
+ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
+-    titanic_dsv41_decode_fp32_kernel(
++    prefetched_dsv41_decode_kernel(
+         const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
+         const int32_t* __restrict__ indices, float* __restrict__ mid_out,
+         float* __restrict__ mid_lse, const int* __restrict__ topk_length_ptr,
+@@ -56,14 +57,15 @@
+     const bool extra = chunk >= main_chunks;
+     const bool fp4 = EXTRA_FP4 && extra;
+     const int start = (extra ? chunk - main_chunks : chunk) * R::CANDIDATES;
+-    const int n = extra ? elen : len, pbs = extra ? pbs_extra : main_page_block_size;
++    const int n = extra ? elen : len;
+     const size_t stride = extra ? extra_page_stride_bytes : page_stride_bytes;
+     const uint8_t* cache = extra ? extra_KV_cache : KV_cache;
+     const int32_t* ix = extra ? extra_indices + (size_t)t * extra_indices_stride_elems
+                               : indices + (size_t)t * indices_stride_elems;
+     if (tidx < R::CANDIDATES) sm.valid[tidx] = start + tidx < n ? ix[start + tidx] : -1;
+     __syncthreads();
+-    auto gather = [&](bool power_of_two) __attribute__((always_inline)) {
++    auto gather = [&](auto format) __attribute__((always_inline)) {
++      constexpr bool fixed_fp4 = decltype(format)::value;
+       for (int task = tidx; task < R::CANDIDATES * R::QK_VECTORS; task += R::BLOCK_THREADS) {
+         const int row = task / R::QK_VECTORS, d = task % R::QK_VECTORS * R::VECTOR_ELEMS;
+         const int index = sm.valid[row];
+@@ -71,28 +73,55 @@
+         __nv_bfloat162 scale = __floats2bfloat162_rn(0.f, 0.f);
+         if (index >= 0) {
+           size_t slot;
+-          const uint8_t* base = Cache::locate(cache, index, pbs, stride, power_of_two, slot);
+-          const uint8_t* src = base + Cache::data_offset(fp4, slot) + (fp4 ? d / 2 : d);
+-          raw = fp4 ? uint64_t(*reinterpret_cast<const uint32_t*>(src))
++          const uint8_t* base = Cache::locate(cache, index, 64, stride, true, slot);
++          const uint8_t* src = base + Cache::data_offset(fixed_fp4, slot) + (fixed_fp4 ? d / 2 : d);
++          raw = fixed_fp4 ? uint64_t(*reinterpret_cast<const uint32_t*>(src))
+                     : *reinterpret_cast<const uint64_t*>(src);
+           const uint8_t sc =
+-              base[Cache::scale_offset(fp4, pbs, slot) +
+-                   d / (fp4 ? Dsv41Fp4Layout::SCALE_GROUP : Dsv41Fp8Layout::QUANT_TILE)];
+-          scale = decode_e4m3_or_ue8m0_scale_bf16(sc, fp4);
++              base[Cache::scale_offset(fixed_fp4, 64, slot) +
++                   d / (fixed_fp4 ? Dsv41Fp4Layout::SCALE_GROUP : Dsv41Fp8Layout::QUANT_TILE)];
++          scale = decode_e4m3_or_ue8m0_scale_bf16(sc, fixed_fp4);
+         }
+         __nv_bfloat162 pairs[4];
+ #pragma unroll
+         for (int j = 0; j < 4; ++j)
+           pairs[j] = __hmul2(
+-              decode_e2m1_or_e4m3_pair_bf16(uint32_t(raw >> (j * (fp4 ? 8 : 16))), fp4), scale);
++              decode_e2m1_or_e4m3_pair_bf16(uint32_t(raw >> (j * (fixed_fp4 ? 8 : 16))), fixed_fp4), scale);
+         *reinterpret_cast<uint4*>(&sm.kv[row][d]) = *reinterpret_cast<uint4*>(pairs);
+       }
+     };
+-    if (Cache::INLINE || (pbs & (pbs - 1)) == 0)
+-      gather(true);
+-    else
+-      gather(false);
+-    __syncthreads();
++    if (fp4) {
++      gather(std::true_type{});
++    } else {
++      gather(std::false_type{});
++    }
++    __syncthreads();
++    // Warm the next chunk of this split while QK and PV consume the current one.
++    // Up to four disjoint 128-byte offsets cover one packed candidate row.
++    static_assert(R::CANDIDATES == 64 && R::BLOCK_THREADS == 256);
++    if (chunk + 1 < hi) {
++      const int following = chunk + 1;
++      const bool next_extra = following >= main_chunks;
++      const bool next_fp4 = EXTRA_FP4 && next_extra;
++      const int offset = (next_extra ? following - main_chunks : following) * R::CANDIDATES + tidx / 4;
++      const int limit = next_extra ? elen : len, segment = tidx % 4;
++      if (offset < limit && (!next_fp4 || segment < 2)) {
++        const int32_t* candidates = next_extra ? extra_indices + (size_t)t * extra_indices_stride_elems
++                                              : indices + (size_t)t * indices_stride_elems;
++        const int candidate = candidates[offset];
++        if (candidate >= 0) {
++          size_t slot;
++          const auto page = Cache::locate(next_extra ? extra_KV_cache : KV_cache, candidate, 64,
++                                          next_extra ? extra_page_stride_bytes : page_stride_bytes, true, slot);
++          const auto data = page + Cache::data_offset(next_fp4, slot) + 128 * segment;
++          asm volatile("prefetch.global.L2 [%0];" :: "l"(data));
++          if (segment == 0) {
++            const auto scales = page + Cache::scale_offset(next_fp4, 64, slot);
++            asm volatile("prefetch.global.L2 [%0];" :: "l"(scales));
++          }
++        }
++      }
++    }
+     float qk[4] = {};
+ #pragma unroll
+     for (int k = 0; k < Geometry::D_QK; k += R::MMA_K) {
+@@ -356,8 +385,8 @@
+         kPage);
+     return (int)cudaGetLastError();
+   };
+-  int r = extra ? launch(fi::kernels::dsv41_bf16::titanic_dsv41_decode_fp32_kernel<kHeads, true, ::ModelType::DSV4_1>)
+-                : launch(fi::kernels::dsv41_bf16::titanic_dsv41_decode_fp32_kernel<kHeads, false, ::ModelType::DSV4_1>);
++  int r = extra ? launch(fi::kernels::dsv41_bf16::prefetched_dsv41_decode_kernel<kHeads, true, ::ModelType::DSV4_1>)
++                : launch(fi::kernels::dsv41_bf16::prefetched_dsv41_decode_kernel<kHeads, false, ::ModelType::DSV4_1>);
+   if (r) return r;
+   constexpr int kMergeThreads = 64;
+   fi::titanic_dsv41_merge_fp32_kernel<kHeads, 512, kMergeThreads, 512 / kMergeThreads>

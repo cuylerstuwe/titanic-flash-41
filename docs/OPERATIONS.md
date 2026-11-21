@@ -205,10 +205,18 @@ available on every rank.
 All memory-floor checks now use one function, with the same 8 GiB default.
 `CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB` overrides the floor and is for tests only.
 
+## November 21 serving profile
+
+The checked-in deployment profile selects s1682. During startup the worker verifies the BF16 index against the CUDA source embedded in the engine. Six-row sparse verification uses version 2 of the staged-read attention kernel. The launcher supplies 27 prefill widths from 256 through 16,384 rows. The 3,072 MiB runtime allocation floor, bounded snapshot pool and incremental mapping of long conversations apply independently on each rank.
+
+With `serving_memory_policy` enabled, a node-local systemd service records the boot and original values of `vm.compaction_proactiveness` and `vm.swappiness` in private tmpfs before setting both to zero. It follows the generation's exact container process. Its stop hook restores the saved values on worker exit, guard death or abandoned startup and respects intervening operator changes. Setting `serving_memory_policy` to `false` leaves those settings under host control. This policy changes no boot configuration.
+
+The deployment supplies RoCE device names, addresses and GID indices from each node's inventory. It creates a private `state/disk-tier/` on each node's local SSD for optional parked snapshots. Only this dedicated directory is mounted at `/cache` in the worker. Snapshots can contain conversation data. The worker removes orphan `.img` files on startup. [Setup](SETUP.md) · [Qualification](VALIDATION.md#november-21-serving-release-s1682)
+
 ## November 19 disk-tier and regions release settings
 
 Native production (s1621) keeps every November 18 setting and adds four: one for the disk tier and three for decoding
-several conversations together. They are runtime settings read at startup; the portable profile is unchanged.
+several conversations together. They are runtime settings read at startup; these settings first shipped in the native profile.
 
 - `CANADA_SCRATCH_DISK_TIER=1`: byte-exact copies of conversation snapshots on the device's local NVMe. When no request
   has arrived for `CANADA_SCRATCH_DISK_TIER_IDLE_SECS` (3), the coldest resident snapshots are copied, prompt-end
@@ -223,7 +231,7 @@ several conversations together. They are runtime settings read at startup; the p
   slot and byte limits, and all four devices agree on it before it runs. Budgets: `CANADA_SCRATCH_DISK_TIER_GIB` (64),
   `CANADA_SCRATCH_DISK_TIER_WRITE_GIB_DAY` (200), `CANADA_SCRATCH_DISK_TIER_FREE_FLOOR_GIB` (free space kept on the
   filesystem, 40) and `CANADA_SCRATCH_DISK_TIER_MAX_PARKED` (64). The directory is `CANADA_SCRATCH_DISK_TIER_DIR`
-  (`/scratch/disk-tier` in the container: bind-mount a directory on local NVMe there that the container can write).
+  (the portable launcher sets it to `/cache` on local NVMe).
   The engine empties it at startup, so a copy never outlives the process that made it.
 - `CANADA_SCRATCH_FULL_REGIONS=1`: every serving region of batched decode holds a whole conversation (the full model
   context), so the compressed caches and their index-key caches span four model contexts of address space. Before,
@@ -249,7 +257,7 @@ end-to-end gain, so its export is not published.
 ## November 18 cache release settings
 
 Native production (s1599) keeps every November 17 setting and adds two, both about which conversation snapshot a turn
-saves or keeps. They are runtime settings read at startup; the portable profile is unchanged.
+saves or keeps. They are runtime settings read at startup; these settings first shipped in the native profile.
 
 - `CANADA_SCRATCH_NEAR_END_AFTER_RESTORE=1`: a turn whose prefix is restored from a snapshot inside the cache lookup
   saves its next checkpoint one token before its prompt end (`CANADA_SCRATCH_ENCODER_NEAR_END`), captured inside the
@@ -272,7 +280,7 @@ prefix lengths and byte counts only, for diagnosis), `CANADA_SCRATCH_CACHE_LADDE
 ## November 17 memory release settings
 
 Native production (s1595) keeps every November 15 setting and changes four, all about memory. They are runtime
-settings read at startup; the portable profile is unchanged.
+settings read at startup; these settings first shipped in the native profile.
 
 - `CANADA_SCRATCH_IMAGE_POOL_MIB=8192`: the snapshot chunk pool. After the startup warm-up every device creates a fixed
   pool of 16 MiB physical chunks (about 0.2 s for 8 GiB). A conversation snapshot (a cached conversation or a paused
@@ -301,7 +309,7 @@ could take it and the engine stopped).
 ## November 15 release settings
 
 Native production (s1586; the settings are s1585's) runs the s1399 profile with five settings changed and 58 added, and twelve encoder
-widths instead of five. Every one is a runtime setting read at startup; the portable profile is unchanged. They
+widths instead of five. Every one is a runtime setting read at startup; these settings first shipped in the native profile. They
 are grouped here by what they do. Settings that change which rows a kernel reads, in what order, or when work is
 launched leave results bit-identical; the ones that change a summation order or the drafter are named as such,
 and the release as a whole is judged by the reference comparison in [validation](VALIDATION.md).
