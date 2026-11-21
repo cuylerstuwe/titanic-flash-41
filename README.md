@@ -8,7 +8,7 @@ The engine includes GPU model execution, speculative decoding, SSD-backed Engram
 
 **Current release: s1682 (November 21).** This release adds source-verified BF16 attention indexing, staged reads during sparse attention verification, and additional prefill chunk sizes. It reserves memory for forward continuations and maps the other conversation regions as they grow. A temporary Linux memory policy reduces background page movement while each worker serves.
 
-On four GB10s, a cold 129,553-token prompt took **13.65 s** in s1682 and **14.10 s** in s1621. At roughly 131K context, six paired coding samples with the same output length decoded at **90.0 vs 85.6 tok/s** pooled. All four long chats in a separate test reached about 997K tokens and finished, and a return after 17 unrelated requests reused 997,422 tokens. The measurements below against SGLang and TensorFold are from the dated s1387 benchmark. [Release validation](docs/VALIDATION.md#november-21-serving-release-s1682) · [Four-Spark setup](docs/SETUP.md)
+On four GB10s, a cold 129,553-token prompt took **13.65 s** in s1682 and **14.10 s** in s1621. At roughly 131K context, six paired coding samples with the same output length decoded at **90.0 vs 85.6 tok/s** pooled. All four long chats in a separate test reached about 997K tokens and finished, and a return after 17 unrelated requests reused 997,422 tokens. [Release validation](docs/VALIDATION.md#november-21-serving-release-s1682) · [Four-Spark setup](docs/SETUP.md)
 
 The November 19 release (s1621) introduced the local NVMe snapshot tier and full-length serving regions for concurrent conversations. The November 18 release (s1599) improved short tool continuations and retained useful snapshots under cache pressure. [Earlier release measurements](docs/VALIDATION.md#november-19-disk-tier-and-regions-release-s1621)
 
@@ -24,34 +24,28 @@ At the recommended temperature 1 / top-p 1 settings on fresh boots, a 129,955-to
 
 ## Performance
 
-Single-stream measurements from **November 8, 2026 (s1387)**, using the published comparison's prompts, context file, request settings and timing function. The installed native production service ran **on the head GB10 against its head-local endpoint**, bypassing any external router or physical HTTP network hop. All 24 requests completed in one pass on the first model load after a four-device reboot; six short installed-service checks preceded it, none with a long prompt. Only Titanic was measured again; competitor results below are the author's existing published numbers.
+**November 21, 2026 · installed s1682 · single stream.** The benchmark client ran on the head GB10 and connected to the server over loopback. All 24 requests completed in one pass at the 2350 MHz cap. SGLang and TensorFold figures come from the original four-Spark comparison. Titanic used three ASUS GX10s and one DGX Spark with two switched 100 Gb/s fabrics. Differences in hardware, networking and prior traffic also affect cross-system comparisons.
 
-For s1387, a separate portable installation reproduced all 24 benchmark outputs from that release’s native run. See the dated run records for the hardware, sampler and timing method. [Benchmark details](docs/BENCHMARKS.md)
+Speeds are in **tokens per second**. Each Titanic score is the median of three 512-token decode trials.
 
-Median generation speed in **tokens/second**, three repetitions with a 512-token output budget:
-
-| Starting context | Workload | SGLang stock, published | SGLang tuned, published | TensorFold, published | Titanic s1387 |
+| Starting context | Workload | SGLang stock, published | SGLang tuned, published | TensorFold, published | Titanic s1682 |
 |---|---|---:|---:|---:|---:|
-| Clean | Code | 71.6 | 103.1 | 110.9 | 120.3 |
-| Clean | Prose | 32.9 | 46.3 | 57.7 | 65.2 |
-| Clean | Prose 2 | 26.8 | 43.7 | 56.3 | 62.0 |
-| ~131K tokens | Code | 57.4 | 86.0 | 94.7 | 111.0 |
-| ~131K tokens | Prose | 32.0 | 45.8 | 57.7 | 62.1 |
-| ~131K tokens | Prose 2 | 28.1 | 44.1 | 53.7 | 61.4 |
+| Clean | Code | 71.6 | 103.1 | 110.9 | 137.9 |
+| Clean | Prose | 32.9 | 46.3 | 57.7 | 76.7 |
+| Clean | Prose 2 | 26.8 | 43.7 | 56.3 | 65.9 |
+| ~131K tokens | Code | 57.4 | 86.0 | 94.7 | 125.2 |
+| ~131K tokens | Prose | 32.0 | 45.8 | 57.7 | 73.5 |
+| ~131K tokens | Prose 2 | 28.1 | 44.1 | 53.7 | 70.8 |
 
-| Uncached ~131K prompt, time to first generated content | SGLang tuned, published | TensorFold, published | Titanic s1387 |
+| First uncached long prompt | SGLang tuned, published | TensorFold, published | Titanic s1682 |
 |---|---:|---:|---:|
-| First long-context request | 32.45 s | 56.02 s | 16.31 s |
+| Time to first generated content | 32.45 s | 56.02 s | **13.97 s** |
 
-The comparison uses **temperature 0, top-p 1, thinking disabled**. These are benchmark settings, not the server's recommended-use defaults. “Prose 2” is the published fishing-village story workload, not the separate sampled-chat workload. Uncached timing means no reusable prompt state; it does not mean an empty operating-system file cache. Generation trials follow warmups and can reuse prompt state.
+The server reported **0 cached tokens out of 131,064** on the first long request. The previous native s1387 run took 16.31 s on that prompt. Each of the nine measured long-context decode trials then reused all but one prompt token.
 
-These are **cross-system comparisons**: Titanic ran on three ASUS GX10s and one DGX Spark, with two switched 100 Gb/s fabrics. The published runs used four DGX Sparks and a different network arrangement. These short throughput measurements do not establish completed-task quality or which system solves arbitrary agentic tasks fastest. Multi-stream results are deliberately omitted.
+All six Titanic decode medians were higher than on s1387, by 6.3–18.3%. The releases generated different continuations on the same prompts, which can change speculative decode speed. This benchmark uses temperature 0, top-p 1 and thinking disabled. “Prose 2” is the fishing-village story. Separate qualification covers the recommended sampler and completed agentic tasks. [s1682 qualification](docs/VALIDATION.md#november-21-serving-release-s1682)
 
-Boot and allocation history can also affect GB10 memory bandwidth. Those conditions were not normalized against the published competitor runs; the table reports observed results, not an isolated measure of engine efficiency.
-
-Titanic used the 2350 MHz cap. Every row comes from the complete s1387 pass, including lower results, rather than historical best scores. Decode rows are within about 1% of the earlier s1329 pass (prose 2 at ~131K is 4.7% higher); the first long-context request is 22% faster (20.99 s for s1329). [Historical comparisons and run accounting](docs/BENCHMARKS.md) retain earlier results separately.
-
-Source: [published comparison and benchmark client](https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa), pinned revision `7ae39b401e4e0887b2b7d5e4c4412cf60aa694f2`. [Full results](benchmarks/results-2026-11-08-s1387.json) include ranges, timing details, hardware and measured-build identity; [individual samples](benchmarks/samples-2026-11-08-s1387.json) omit generated text. [Reproduction instructions](docs/BENCHMARKS.md) use the original external timing function.
+[Published comparison and client](https://gist.github.com/kevintheo-ai/60eb093a5b4c54c4ac9a0b6b678408fa) · [Full results](benchmarks/results-2026-11-21-s1682.json) · [All 24 samples](benchmarks/samples-2026-11-21-s1682.json) · [Method and previous releases](docs/BENCHMARKS.md)
 
 ## Model and quality
 

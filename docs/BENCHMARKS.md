@@ -1,9 +1,8 @@
 # Reproducing the published single-stream comparison
 
-The README benchmark measures native production s1387 (November 8) with the [prefill and vision options](PREFILL.md) enabled.
-The portable profile in this repository enables the same options; a portable s1387 pass reproduced the native outputs exactly. Historical s1329, s1291, s1173 and s986 measurements remain separately labeled below.
+The README reports the November 21 native production **s1682** pass. Earlier native and portable measurements are dated below.
 
-Run on the **head node**, against its direct loopback endpoint, with no other requests. Use a freshly started model process if measuring the first uncached long prompt. Do not route through a remote client or proxy.
+Run on the **head node**, against its direct loopback endpoint, with no other requests. For the first uncached long prompt, verify that the server processed the full prompt with zero cache hits. Record the model load and prior traffic. A fresh process with an unused benchmark prefix also provides a cold-prompt start. Do not route through a remote client or proxy.
 
 ```sh
 cd /srv/titanic-flash-41/source
@@ -23,7 +22,26 @@ The original decode formula is `(completion_tokens - 1) / (last_content_delta_ti
 
 The README's first-long-prompt TTFT is the initial 131K prose warmup, not the median of later cached requests. The later trials benefit from prefix reuse. Uncached TTFT includes work outside GPU prefill; report it separately from server prefill timing.
 
-## Current s1387 native production pass — November 8
+## Current s1682 native production pass — November 21
+
+All 24 requests ran against the installed head-local endpoint with one stream. The same four s1682 workers served the entire pass on their first model load after boot. Production traffic had used this generation earlier. Server usage counted 131,064 uncached tokens on the first long request, and the native request counter advanced by exactly 24. The 2350 MHz cap was active throughout. No node recorded swap I/O during the run.
+
+The table compares median decode throughput in tokens per second across the two native releases.
+
+| Context | Workload | s1387 | s1682 | Change |
+|---|---|---:|---:|---:|
+| Clean | Code | 120.3 | 137.9 | +14.6% |
+| Clean | Prose | 65.2 | 76.7 | +17.6% |
+| Clean | Prose 2 | 62.0 | 65.9 | +6.3% |
+| ~131K tokens | Code | 111.0 | 125.2 | +12.8% |
+| ~131K tokens | Prose | 62.1 | 73.5 | +18.3% |
+| ~131K tokens | Prose 2 | 61.4 | 70.8 | +15.3% |
+
+Time to first generated content on the cold 131K prose warmup fell from **16.31 s to 13.97 s** (14.3% shorter). The first-token time includes request and server overhead. The other long-context samples report how much of the prefix the server reused on each turn.
+
+All 18 measured continuations had different output hashes from their corresponding s1387 trials. Within the s1682 run, the three repetitions produced the same text for each clean workload and three distinct outputs for each long-context workload. Both releases used the same prompt lengths, output budgets and sampler. Boot history, prior requests and the generated tokens can affect the observed decode rates. The pinned client recorded timing as published. A return hook collected each request's cache counts after timing ended. [Full results](../benchmarks/results-2026-11-21-s1682.json) · [Individual samples](../benchmarks/samples-2026-11-21-s1682.json)
+
+## Historical s1387 native production pass — November 8
 
 All 24 requests completed on the first production model load after a four-device reboot, against the head's local endpoint (route via `lo`). The 2350 MHz cap and production APST policy remained active. Five installed head-local checks and one routed synthetic image request preceded the benchmark; none populated its long prompt.
 
