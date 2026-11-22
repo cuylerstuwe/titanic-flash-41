@@ -136,6 +136,30 @@ impl WorkspacePlan {
     }
 }
 
+/// Buffers every participating rank must secure before the first split-attention gather.
+struct SplitWorkspace {
+    x: Buffer<bf16>,
+    norm: Buffer<bf16>,
+    qkv: Buffer<bf16>,
+    q: Buffer<bf16>,
+    k: Buffer<bf16>,
+    v: Buffer<bf16>,
+    kf: Buffer<bf16>,
+    vf: Buffer<bf16>,
+    attn: Buffer<bf16>,
+    delta: Buffer<bf16>,
+    gate_up: Buffer<bf16>,
+    gated: Buffer<bf16>,
+    vit: Buffer<bf16>,
+    scratch: Buffer<f32>,
+    co: Buffer<f32>,
+    si: Buffer<f32>,
+    starts: Buffer<i32>,
+    lengths: Buffer<i32>,
+    span: Buffer<bf16>,
+    root_buffers: Option<[Buffer<bf16>; 4]>,
+}
+
 pub struct Vision {
     cuda: Cuda,
     weights: Weights,
@@ -384,7 +408,8 @@ impl Vision {
     /// arithmetic matches vision_full_attention. Only `root` forms the aligned span; the
     /// caller broadcasts it exactly as for single-rank encoding.
     pub(crate) fn encode_split(&self, patches: &Buffer<bf16>, geometry: Geometry, comm: &crate::roce::Roce,
-        rank: usize, root: usize, stream: &Stream) -> Result<ImageSpan> {
+        rank: usize, root: usize, stream: &Stream, control: &mut crate::control_channel::ControlChannel,
+        #[cfg(feature="storage-fault-injection")] capacity_fault: Option<&crate::worker_media::ImageCapacityFault>) -> Result<ImageSpan> {
         let split = self.split_attention.as_ref().context("vision split attention artifact absent")?;
         let g = geometry.validate()?;
         let n = g.rows(); let m = g.feature_rows();
@@ -395,26 +420,38 @@ impl Vision {
         ensure!(nl > 0 && nl <= pad && (r0 * 588 * 2) % 16 == 0, "vision split partition");
         let needed = Self::split_admission_bytes(g, rank == root)?;
         let reserve = self.cuda.allocation_reserve_bytes();
-        let memory_before = self.cuda.admission_memory()?;
-        ensure!(needed + reserve < memory_before.admitted_available,
-            crate::memory::InputCapacityError("vision split workspace exceeds available UMA above reserve", needed + reserve));
-        let a = |len: usize| -> Result<Buffer<bf16>> { self.cuda.allocate_input::<bf16>(len) };
-        let (x, norm, qkv) = (a(pad*1024)?, a(pad*1024)?, a(pad*3072)?);
-        let (q, k, v) = (a(pad*1024)?, a(pad*1024)?, a(pad*1024)?);
-        let (mut kf, mut vf) = (a(4*pad*1024)?, a(4*pad*1024)?);
-        let (attn, delta) = (a(pad*1024)?, a(pad*1024)?);
-        let (gate_up, gated) = (a(pad*5632)?, a(pad*2816)?);
-        let mut vit = a(4*pad*1024)?;
-        let scratch = self.cuda.allocate_input::<f32>((pad*3072).max(if rank == root { m*5120 } else { 0 }))?;
-        let co = self.cuda.allocate_input::<f32>(n*32)?;
-        let si = self.cuda.allocate_input::<f32>(n*32)?;
-        let mut starts = self.cuda.allocate_input::<i32>(1)?;
-        let mut lengths = self.cuda.allocate_input::<i32>(2)?;
-        starts.upload(&[0])?;
-        lengths.upload(&[n as i32, nl as i32])?;
-        let span = self.cuda.allocate_input::<bf16>(g.tokens()*5120)?;
-        let root_buffers = if rank == root { Some((a(m*9216)?, a(m*5120)?, a(m*5120)?, a(m*5120)?)) } else { None };
-        stream.join_default()?;
+        // A local refusal must reach every participant before any peer joins a K/V gather.
+        // Host conversion and other ranks' allocations can change supply since admission.
+        let workspace = (|| -> Result<_> {
+            #[cfg(feature="storage-fault-injection")]
+            if let Some(fault) = capacity_fault { fault.check(rank,"split_workspace",needed + reserve)?; }
+            let memory_before = self.cuda.admission_memory()?;
+            ensure!(needed + reserve < memory_before.admitted_available,
+                crate::memory::InputCapacityError("vision split workspace exceeds available UMA above reserve", needed + reserve));
+            let a = |len: usize| -> Result<Buffer<bf16>> { self.cuda.allocate_input::<bf16>(len) };
+            let (x, norm, qkv) = (a(pad*1024)?, a(pad*1024)?, a(pad*3072)?);
+            let (q, k, v) = (a(pad*1024)?, a(pad*1024)?, a(pad*1024)?);
+            let (kf, vf) = (a(4*pad*1024)?, a(4*pad*1024)?);
+            let (attn, delta) = (a(pad*1024)?, a(pad*1024)?);
+            let (gate_up, gated) = (a(pad*5632)?, a(pad*2816)?);
+            let vit = a(4*pad*1024)?;
+            let scratch = self.cuda.allocate_input::<f32>((pad*3072).max(if rank == root { m*5120 } else { 0 }))?;
+            let co = self.cuda.allocate_input::<f32>(n*32)?;
+            let si = self.cuda.allocate_input::<f32>(n*32)?;
+            let mut starts = self.cuda.allocate_input::<i32>(1)?;
+            let mut lengths = self.cuda.allocate_input::<i32>(2)?;
+            starts.upload(&[0])?;
+            lengths.upload(&[n as i32, nl as i32])?;
+            let span = self.cuda.allocate_input::<bf16>(g.tokens()*5120)?;
+            let root_buffers = if rank == root { Some([a(m*9216)?, a(m*5120)?, a(m*5120)?, a(m*5120)?]) } else { None };
+            stream.join_default()?;
+            Ok(SplitWorkspace { x, norm, qkv, q, k, v, kf, vf, attn, delta, gate_up, gated,
+                vit, scratch, co, si, starts, lengths, span, root_buffers })
+        })();
+        let SplitWorkspace { x, norm, qkv, q, k, v, mut kf, mut vf, attn, delta, gate_up, gated,
+            mut vit, scratch, co, si, starts, lengths, span, root_buffers } =
+            crate::worker_media::coordinate_input_stage(workspace, needed + reserve,
+                "split vision workspace unavailable", &mut |ok| control.all_admit(ok))?;
         let decode_selected = comm.decode_reduction_selected();
         comm.select_decode_reduction(false, stream)?;
         let run = (|| -> Result<()> {
@@ -459,7 +496,7 @@ impl Vision {
                 self.norm(&x, &norm, "vision.norm.weight", nl, stream)?;
             }
             unsafe { comm.gather_rows(&norm, &mut vit, stream)?; }
-            if let Some((unfolded, align1, gelu, features)) = &root_buffers {
+            if let Some([unfolded, align1, gelu, features]) = &root_buffers {
                 self.elementwise("vision_unfold", m * 9216,
                     &[vit.ptr(), unfolded.ptr(), g.height as u64, g.width as u64, (m * 9216) as u64], stream)?;
                 self.linear(unfolded, align1, &scratch, "aligner.w1", m, 5120, 9216, true, stream)?;

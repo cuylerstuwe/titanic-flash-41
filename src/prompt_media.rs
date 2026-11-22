@@ -46,6 +46,11 @@ impl Identity {
         Ok(Self { placements })
     }
     pub fn placements(&self) -> &[Placement] { &self.placements }
+
+    /// The sorted spans fit wholly in the materialized target prefix.
+    pub(crate) fn fully_prefilled(&self, frontier: usize) -> bool {
+        self.placements.last().is_none_or(|p| p.start + p.tokens <= frontier)
+    }
     pub fn is_empty(&self) -> bool { self.placements.is_empty() }
     pub fn metadata_bytes(&self) -> usize { self.placements.capacity() * std::mem::size_of::<Placement>() }
     pub fn validate_prompt(&self, prompt: &[u32]) -> Result<()> {
@@ -117,7 +122,8 @@ impl Bindings {
             let span = span.as_ref().ok_or_else(|| anyhow::anyhow!("attempt to re-embed a skipped cached image"))?;
             for position in start.max(placement.start)..end.min(placement.start + placement.tokens) {
                 let row = position - start;
-                ensure!(ids[row] == i64::from(IMAGE_TOKEN), "image binding overlaps a text token");
+                ensure!(ids[row] == i64::from(IMAGE_TOKEN),
+                    "image binding overlaps a text token at position {position} in input rows {start}..{end}");
                 pointers[row] = span.data.ptr() + ((position - placement.start) * 5120 * 2) as u64;
             }
         }
@@ -129,6 +135,19 @@ impl Bindings {
 mod tests {
     use super::*;
     fn key(n: u8) -> ImageKey { ImageKey { input: [n; 32], encoder: [7; 32] } }
+    #[test]
+    fn only_completed_image_spans_can_move_to_a_decode_region() {
+        let prompt = [3, IMAGE_TOKEN, IMAGE_TOKEN, 4, IMAGE_TOKEN, IMAGE_TOKEN, 5];
+        let media = Identity::new(vec![
+            Placement {start: 1, tokens: 2, key: key(1)},
+            Placement {start: 4, tokens: 2, key: key(2)},
+        ], &prompt).unwrap();
+        assert!(Identity::default().fully_prefilled(0));
+        assert!(!media.fully_prefilled(3));
+        assert!(!media.fully_prefilled(5));
+        assert!(media.fully_prefilled(6));
+        assert!(media.fully_prefilled(prompt.len()));
+    }
     #[test]
     fn prefix_identity_covers_content_detail_encoder_and_partial_images() {
         let tokens = [3, IMAGE_TOKEN, IMAGE_TOKEN, 4, IMAGE_TOKEN, IMAGE_TOKEN, 5];

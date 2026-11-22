@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
 libloading = "0.8"
 libc = "0.2"
 half = { version = "2", features = ["serde"] }

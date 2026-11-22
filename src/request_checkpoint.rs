@@ -307,7 +307,7 @@ pub(super) fn keep_displaced(w: &mut Worker, loaded_is_parked: bool) -> Result<V
             kept = w.retain_cached_prefix_reserved(&prefix, pending, media, 0, 0, w.displaced_snapshot)?;
         }
     }
-    let checkpoints = w.materialize_displaced_checkpoint(&[], &prefix, None)?;
+    let checkpoints = w.materialize_displaced_checkpoint(None, &prefix, None)?;
     if !checkpoints.is_null() { kept["kept_images"] = checkpoints; }
     Ok(kept)
 }

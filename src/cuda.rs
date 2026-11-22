@@ -1705,6 +1705,10 @@ impl<T: DeviceElement> Buffer<T> {
     }
     /// Whether this is an elastic range (Cuda::allocate_elastic): only its resident prefix and mapped spans exist.
     pub(crate) fn is_elastic(&self) -> bool { matches!(self.storage, Storage::Elastic(_)) }
+
+    pub(crate) fn owned_pool_chunks(&self) -> usize {
+        match &self.storage { Storage::Pooled(allocation) => allocation.handles.len(), _ => 0 }
+    }
     /// An elastic range's resident prefix (bytes, a whole number of pool chunks), None for other storage.
     pub(crate) fn elastic_resident(&self) -> Option<usize> {
         match &self.storage { Storage::Elastic(e) => Some(e.resident.min(self.len)), _ => None }

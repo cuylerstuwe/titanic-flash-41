@@ -11,6 +11,8 @@ mod admission;
 mod raw_input;
 #[path = "http_context.rs"]
 mod context;
+#[path = "http_input_budget.rs"]
+mod input_budget;
 #[path = "input_reclaim_ack.rs"]
 mod reclaim_ack;
 use timing::{PrefillTiming, WithTimings};
@@ -158,6 +160,7 @@ struct Shared {
     // On with two-owner admission and with batched decode; the two-slot gate above is two-owner only.
     execution_timing: AtomicBool,
     execution_admission: Arc<Semaphore>,
+    large_conversion: Arc<Semaphore>,
     waiting_inputs: AtomicUsize,
     waiting_image_budget: AtomicUsize,
     waiting_raw_pool: Mutex<Option<Arc<raw_input::Pool>>>,
@@ -1014,17 +1017,31 @@ async fn finish_chat(shared: Arc<Shared>, body: context::Input, permit: OwnedSem
     if shared.health.load(Ordering::Acquire) != READY || shared.shutdown.load(Ordering::Acquire) {
         return error(StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready", "native worker is stopping");
     }
-    // Conversion can simultaneously own the raw body, parsed/normalized
-    // request, canonical conversation, rendering and tokenizer buffers. Hold
-    // this conservative size-based allowance through the blocking task, even
-    // if its HTTP caller disconnects. Decoder scratch has its own reservation.
+    // Upload has finished. Its resident bytes are already in MemAvailable.
+    // Waiting raw requests retain their upload guards until they reach this point.
+    drop(upload_workspace);
+    let expanded = body.expanded_len();
+    let large = shared.body_limit == MAX_BODY && expanded >= input_budget::LARGE_BODY;
+    // Up to four owners may generate concurrently. Stage their largest HTTP
+    // conversions one at a time so they can use the same transient headroom.
+    let conversion_lane = if large {
+        Some(shared.large_conversion.clone().acquire_owned().await.expect("input lane stays open"))
+    } else { None };
+    let (body, conversion_bytes) = if large {
+        match tokio::task::spawn_blocking(move || {
+            let bytes = input_budget::workspace(expanded, body.image_payload_bytes());
+            (body, bytes)
+        }).await {
+            Ok(result) => result,
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR,"protocol_failure","input accounting failed"),
+        }
+    } else { (body, input_budget::workspace(expanded, 0)) };
     let conversion_workspace = if shared.body_limit == MAX_BODY {
-        match reserve_input_workspace(&shared, body.expanded_len()*16+(64<<20)).await {
-            Ok(reservation) => Some(reservation),
+        match reserve_input_workspace(&shared, conversion_bytes).await {
+            Ok(guard) => Some(guard),
             Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "input_capacity", "input conversion cannot retain the memory reserve"),
         }
     } else { None };
-    drop(upload_workspace);
     let frontend = shared.frontend.clone();
     let capacity = shared.capacity;
     let cancellation = registration.cancellation.clone();
@@ -1037,6 +1054,7 @@ async fn finish_chat(shared: Arc<Shared>, body: context::Input, permit: OwnedSem
         match tokio::task::spawn_blocking(move || {
             let cancelled = || preprocessing_cancel.load(Ordering::Acquire)
                 || preprocessing_shared.shutdown.load(Ordering::Acquire);
+            let _conversion_lane = conversion_lane;
             let prepared = body.with_bytes(conversion_workspace, &preprocessing_shared, |body, references| {
                 let convert = || match references {
                     None => frontend.prepare_chat_cancellable(body, capacity, &cancelled),
@@ -1268,6 +1286,7 @@ pub(crate) fn start(config: &ServerConfig, capacity: usize, images: bool) -> Res
         execution_activity: AtomicBool::new(false),
         execution_timing: AtomicBool::new(false),
         execution_admission: Arc::new(Semaphore::new(2)),
+        large_conversion: Arc::new(Semaphore::new(1)),
         waiting_inputs: AtomicUsize::new(0),
         waiting_image_budget: AtomicUsize::new(0),
         waiting_raw_pool: Mutex::new(None),
@@ -1590,6 +1609,7 @@ mod tests {
             execution_activity: AtomicBool::new(false),
             execution_timing: AtomicBool::new(false),
             execution_admission: Arc::new(Semaphore::new(2)),
+            large_conversion: Arc::new(Semaphore::new(1)),
             waiting_inputs: AtomicUsize::new(0),
             waiting_image_budget: AtomicUsize::new(0),
             waiting_raw_pool: Mutex::new(None),

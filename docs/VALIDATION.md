@@ -1,5 +1,19 @@
 # Validation status
 
+## November 21 screenshot serving repair (s1690)
+
+Four GB10s ran the serving binary at 2350 MHz with the canonical target, temperature 1 and top-p 1. All 46 requests in the native panel completed. Four images with identical dimensions and different colors yielded the correct two quadrant colors alone and concurrently. The worker trace confirmed four distinct decode regions sharing an actual GPU step. Shared visual state was also exercised while a different region processed a new prompt.
+
+| Check | Result |
+|---|---|
+| One cold conversation with 70 screenshots | 621,049 prompt tokens, 67.79 s server prefill |
+| Text extension of the same conversation | 620,800 of 621,060 tokens restored, 0.76 s to first token |
+| Four independent histories with 70 screenshots each | 1,010,178–1,012,783 prompt tokens, 36/36 naturally completed receipt and image checks |
+| Eight further turns per conversation | All 32 extensions reused at least 1,010,048 tokens. The largest gap from the preceding prompt length was 201 tokens. |
+| Time to first token for those concurrent extensions | Median 2.23 s, 95th percentile 2.68 s |
+
+The client resent the full input each time and timed the first streamed token over a forwarded connection. The single-chat cold and warm probes capped generation at one and sixteen tokens. The four conversations answered to a natural stop, and each follow-up checked both its own receipt and screenshot. The separate single-stream comparison table reports the release on which those scores were measured. A separate four-device diagnostic injected allocation failures before distributed image encoding and checked exact recovery against the canonical image embeddings on all four ranks. Fault injection is excluded from the release binary. Independent deployments can exercise their own image histories using the [concurrent screenshot check](../tools/smoke_image_sessions.py).
+
 ## November 21 serving release (s1682)
 
 The native qualification used four GB10s, the canonical 1017 weights, and a 2350 MHz cap. The following s1621 and s1682 measurements use the same head-local client at temperature 1 and top-p 1. Time to first token includes serving the request. Cold prefill measures server processing.

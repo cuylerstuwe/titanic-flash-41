@@ -15,7 +15,7 @@
 //! current) and becomes region 0's resident finished conversation, exactly as if it had finished
 //! there: its next turn continues from the live state, or the next prompt saves its cache image.
 //! When a region is needed and only finished conversations hold them, the oldest is dropped
-//! without an image. A conversation with media inputs does not move.
+//! without an image. Completed media spans move with the KV and their identities with the resident history.
 use super::*;
 use crate::dspark_generation::BatchedSession;
 use crate::target::SessionBase;
@@ -215,16 +215,16 @@ impl Worker {
         let regions = crate::config::batched_regions()?;
         Ok((1..regions).find(|&r| !self.peers.iter().any(|p| p.region == r)))
     }
-    /// The decoding region-0 conversation can move: past its prefill, generating, no media, room
+    /// The decoding region-0 conversation can move after prefill, with room
     /// for the rest of its output in a region, and a spare drafter for region 0.
     pub(crate) fn can_detach(&self) -> Result<bool> {
         let Some(_) = self.current else { return Ok(false) };
-        // Media: the bindings of a prefill still running (active_media), and any image in the conversation's
-        // history. The bindings end with the prefill (publish_begin), so until Nov 14 2026 a conversation with
-        // images moved once it was decoding, against this module's rule and untested; it now stays in region 0
-        // and takes turns there.
+        // Only completed image spans can move. The binding owns resources while the encoder
+        // runs. After prefill the relocated target state contains their contribution, and the
+        // exact image identities travel with ResidentHistory through detach, attach and save.
         if self.pending_prefill.is_some() || self.prefill_cancelled || self.active_media.is_some()
-            || !self.history.media().is_empty() || self.spare_sessions.is_empty() || self.free_region()?.is_none() || self.emitted >= self.limit
+            || !self.history.media().fully_prefilled(self.verify.position() as usize)
+            || self.spare_sessions.is_empty() || self.free_region()?.is_none() || self.emitted >= self.limit
             || self.history.pending().is_none_or(|a| a == self.cfg.eos_token_id)
             || !self.verify.profile_is_current() {
             return Ok(false);
@@ -245,9 +245,18 @@ impl Worker {
         ensure!(enabled()? && self.can_detach()? && self.free_region()? .is_some()
             && !self.peers.iter().any(|p| p.region == region)
             && (1..crate::config::batched_regions()?).contains(&region), "batched detach eligibility");
-        // Elastic regions: map the region's cache spans first (the kept images below also take pool chunks). Every
-        // rank must have the room rank 0 saw; a rank that does not fails all of them alike instead of diverging.
         let elastic = crate::config::elastic_regions()?;
+        // Preserve the prompt while its source bank still exists and before lending
+        // pool pages to the new region. Only an independent snapshot survives the move.
+        let kept = if crate::config::batched_detach_keeps_images()? {
+            let current = self.history.committed().to_vec();
+            self.materialize_displaced_checkpoint(None, &current, None)?
+        } else { Value::Null };
+        if elastic && kept["candidate"] == true && kept["materialized"] == false {
+            self.elastic_declined = self.current;
+            return Ok(json!({"type":"detach_declined","request_id":self.current,"region":region,
+                "kept_images":kept,"seconds":began.elapsed().as_secs_f64()}));
+        }
         let mut evicted = 0;
         if elastic {
             let (room, gave_way) = self.reclaim_for_region(region)?;
@@ -261,15 +270,6 @@ impl Worker {
             ensure!(self.map_region(region)?, "elastic region map lost its room");
         }
         let id = self.current.unwrap();
-        // Cached images of this conversation are sparse: their prefix lives in region 0's bank, on the lineage the
-        // reset below ends. Copy out the newest one (the conversation's next turn restores it) and every
-        // shared-prefix image (other conversations restore those), as a newcomer's prompt does for a conversation
-        // it displaces in region 0. Without this a turn that follows a batched one started from an older
-        // standalone image (s1503 mi3: 276-343 fresh rows a join where pico prefilled 31).
-        let kept = if crate::config::batched_detach_keeps_images()? {
-            let current = self.history.committed().to_vec();
-            self.materialize_displaced_checkpoint(&[], &current, None)?
-        } else { Value::Null };
         let regions = crate::config::batched_regions()?;
         let context = self.verify.context_capacity();
         let base = SessionBase::serving_region(region, regions, context, self.verify.swa_layout_for_probe())?;
@@ -321,7 +321,7 @@ impl Worker {
     }
     /// Elastic regions: whether the image pool's free chunks can map what a detach into `region` needs: the owners' key
     /// rows of every region up to it and `region`'s cache spans (all of them, or by reach the detaching conversation's).
-    fn region_room(&self, region: usize) -> Result<bool> {
+    fn region_chunks_needed(&self, region: usize) -> Result<usize> {
         let by_reach = crate::config::region_map_by_reach()?;
         let mut need = 0;
         for j in self.regions_to_map(region) {
@@ -332,7 +332,7 @@ impl Worker {
             let (from, to) = (self.region_cache_reach[region], self.detach_cache_target()?);
             if to > from { need += self.span_missing_chunks(region, from, to)?; }
         }
-        Ok(need <= self.cuda.image_pool_free_chunks().unwrap_or(0))
+        Ok(need)
     }
     /// Map by reach: pool chunks that mapping region `region`'s positions [from, to) would take: the caches, and with keys
     /// by reach every owner's key rows of those positions.
@@ -415,7 +415,7 @@ impl Worker {
     }
     /// Map `region` and every unmapped region below it, all or nothing (Ok(false), nothing changed, without room).
     fn map_region(&mut self, region: usize) -> Result<bool> {
-        if !self.region_room(region)? { return Ok(false); }
+        if self.region_chunks_needed(region)? > self.cuda.image_pool_free_chunks().unwrap_or(0) { return Ok(false); }
         let mut done = Vec::new();
         for j in self.regions_to_map(region) {
             if !self.map_one_region(j)? {
@@ -453,29 +453,42 @@ impl Worker {
         }
         Ok(())
     }
-    /// Elastic regions: evict cached images in the cache's pressure order (as the displaced reclaim does), one at a
-    /// time, until every rank's image pool has room (`room` on every rank). Ranks agree on each victim, so all evict
-    /// the same entries. Returns (room, images evicted); no room once nothing evictable is left.
-    fn reclaim_until(&mut self, label: &str, region: usize, room: impl Fn(&Self) -> Result<bool>) -> Result<(bool, usize)> {
-        let tokens = self.verify.position() as usize;
-        let mut evicted = 0;
+    /// Reclaim pool chunks for a region without discarding a different conversation's
+    /// only useful input prefix to keep its less useful generated-answer snapshot.
+    fn reclaim_for_chunks(&mut self, label: &str, region: usize, need: usize) -> Result<(bool, usize)> {
+        let mut free = self.cuda.image_pool_free_chunks().unwrap_or(0);
+        if self.control.all_admit(free >= need)? { return Ok((true, 0)); }
+
+        let entries = &self.cached_sessions;
+        let alternatives = CheckpointAlternatives::new(entries);
+        let mut plan: Vec<(usize, usize)> = Vec::new();
+        let mut removed = vec![false; entries.len()];
         loop {
-            let ok = room(self)?;
-            if self.control.all_admit(ok)? { return Ok((true, evicted)); }
-            let entries = self.cached_sessions.iter().map(|c| (c.prefix.len(), c.charge)).collect::<Vec<_>>();
-            let optional = self.optional_entries(tokens);
-            let superseded = vec![false; entries.len()];
-            let victim = pressure_cache_victim(&entries, &optional, &superseded, tokens, self.image_entry_limit(),
-                self.pressure_long_first(tokens), &[]);
-            self.control.agree(&serde_json::to_vec(&(label, region, victim, &entries))?)?;
-            let Some(victim) = victim else { return Ok((false, evicted)) };
-            self.stream.synchronize()?;
-            self.evict_cached_saving(victim)?;
-            evicted += 1;
+            let victim = alternatives.victim(&removed, &[]);
+            self.control.agree(&serde_json::to_vec(&(label, region, victim, &alternatives.lengths))?)?;
+            let Some((i, lost)) = victim else { return Ok((false, 0)); };
+            removed[i] = true;
+            plan.push((i, lost));
+            free += entries[i].images().iter().map(|img| img.owned_pool_chunks()).sum::<usize>();
+            if self.control.all_admit(free >= need)? { break; }
         }
+
+        // Acquire a durable copy before any destruction when the only useful forward
+        // checkpoint must give way and the projected saved prefill pays for both I/Os.
+        // All ordinary disk budgets, free-space limits, and digest checks still apply.
+        if !self.preserve_forward_victims(&plan, &alternatives)? {
+            return Ok((false, 0));
+        }
+        cache_trace(|| json!({"path":label,"region":region,"chunks_needed":need,
+            "victims":plan.iter().map(|&(i,lost)|(self.cached_sessions[i].trace(),lost)).collect::<Vec<_>>()}));
+        self.stream.synchronize()?;
+        plan.sort_unstable_by_key(|&(i, _)| i);
+        for &(i, _) in plan.iter().rev() { self.evict_cached_saving(i)?; }
+        let ready = self.control.all_admit(self.cuda.image_pool_free_chunks().unwrap_or(0) >= need)?;
+        Ok((ready, plan.len()))
     }
     fn reclaim_for_region(&mut self, region: usize) -> Result<(bool, usize)> {
-        self.reclaim_until("region-reclaim-v1", region, |w| w.region_room(region))
+        self.reclaim_for_chunks("region-reclaim-v2", region, self.region_chunks_needed(region)?)
     }
     /// The positions region conversation `p` may reach in its region: the region's capacity, or with map by reach the
     /// positions its caches are mapped for (a conversation that could not grow them sits out there, as at a region's end).
@@ -501,8 +514,8 @@ impl Worker {
             let from = self.region_cache_reach[region];
             if to <= from { continue; }
             let began = Instant::now();
-            let (room, evicted) = self.reclaim_until("region-grow-v1", region,
-                |w| Ok(w.span_missing_chunks(region, from, to)? <= w.cuda.image_pool_free_chunks().unwrap_or(0)))?;
+            let need = self.span_missing_chunks(region, from, to)?;
+            let (room, evicted) = self.reclaim_for_chunks("region-grow-v2", region, need)?;
             let grown = room && self.grow_region_caches(region, to)?;
             ensure!(grown == room, "region cache growth lost its room");
             self.region_grow_retry[region] = if grown { 0 } else {
@@ -573,7 +586,7 @@ impl Worker {
             displaced = self.retain_cached_prefix_reserved(&prefix, pending, media, 0, 0, self.displaced_snapshot)?;
             // The resident conversation's sparse images end with region 0's lineage below, as in detach_active.
             if crate::config::batched_detach_keeps_images()? {
-                let kept = self.materialize_displaced_checkpoint(&[], &prefix, None)?;
+                let kept = self.materialize_displaced_checkpoint(None, &prefix, None)?;
                 if !kept.is_null() && displaced.is_object() { displaced["kept_images"] = kept; }
             }
         }
@@ -612,7 +625,7 @@ impl Worker {
             let media = self.history.media().through(prefix.len());
             displaced = self.retain_cached_prefix_reserved(&prefix, pending, media, 0, 0, self.displaced_snapshot)?;
             if crate::config::batched_detach_keeps_images()? {
-                let kept = self.materialize_displaced_checkpoint(&[], &prefix, None)?;
+                let kept = self.materialize_displaced_checkpoint(None, &prefix, None)?;
                 if !kept.is_null() && displaced.is_object() { displaced["kept_images"] = kept; }
             }
         }

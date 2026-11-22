@@ -22,7 +22,7 @@ The original decode formula is `(completion_tokens - 1) / (last_content_delta_ti
 
 The README's first-long-prompt TTFT is the initial 131K prose warmup, not the median of later cached requests. The later trials benefit from prefix reuse. Uncached TTFT includes work outside GPU prefill; report it separately from server prefill timing.
 
-## Current s1682 native production pass — November 21
+## Published s1682 native benchmark — November 21
 
 All 24 requests ran against the installed head-local endpoint with one stream. The same four s1682 workers served the entire pass on their first model load after boot. Production traffic had used this generation earlier. Server usage counted 131,064 uncached tokens on the first long request, and the native request counter advanced by exactly 24. The 2350 MHz cap was active throughout. No node recorded swap I/O during the run.
 

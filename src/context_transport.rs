@@ -163,6 +163,10 @@ impl Prepared {
     pub fn expanded_bytes(&self) -> usize {
         self.expanded_bytes
     }
+    pub(crate) fn message_json(&self) -> impl Iterator<Item = &str> {
+        self.prefix.as_ref().map_or(&[][..], |s| &s.entries[..self.keep]).iter()
+            .map(|entry| entry.blob.raw.as_ref()).chain(self.tail.iter().map(String::as_str))
+    }
     pub fn image_keys(&self) -> Vec<Hash> {
         self.prefix.as_ref().map_or(&[][..], |s| &s.entries[..self.keep])
             .iter().flat_map(|e| e.blob.images.iter().copied()).collect()
@@ -193,16 +197,7 @@ impl Prepared {
         let _reservation = reserve(self.expanded_bytes)?;
         let mut body = String::with_capacity(self.expanded_bytes);
         body.push_str(&self.head);
-        let old = self
-            .prefix
-            .as_ref()
-            .map_or(&[][..], |s| &s.entries[..self.keep]);
-        for (i, raw) in old
-            .iter()
-            .map(|e| e.blob.raw.as_ref())
-            .chain(self.tail.iter().map(String::as_str))
-            .enumerate()
-        {
+        for (i, raw) in self.message_json().enumerate() {
             if i != 0 {
                 body.push(',');
             }

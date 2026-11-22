@@ -65,11 +65,14 @@ full messages through the ordinary endpoint, or retry a full envelope with
 generated output. References are scoped to the bearer principal and namespace;
 restarts and memory pressure can invalidate them.
 
-Image-bearing inputs retain compact references to processed images instead of
-repeated base64 bodies. If the corresponding image is evicted, the same explicit
-resynchronization is required. Clients and forwarding proxies must preserve the
-extension endpoint and confirmation headers; an unmodified OpenAI client does
-not acquire incremental transport automatically.
+Image-bearing inputs retain compact references. A bounded store of encoded
+image sources can reconstruct processed images when needed. If both copies
+have expired, resend the full conversation once. Keep the missing reference
+scoped to its backend and affected prefix. A sibling conversation can still
+have a valid reference even when it starts with identical system messages.
+Record a new base only after the backend acknowledges both the applied input
+and storage. Forwarding proxies must preserve the extension endpoint and
+confirmation headers for incremental transport.
 
 The small [protocol smoke](../tools/smoke_context.py) exercises full input,
 extension, rewind and a refused missing reference. Run it against an idle test

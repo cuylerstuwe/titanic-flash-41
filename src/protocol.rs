@@ -377,6 +377,10 @@ impl Frontend {
         #[cfg(not(feature = "vision-protocol"))]
         { Ok(None) }
     }
+    #[cfg(feature = "serving")]
+    pub(crate) fn release_optional_images(&self, encoded: bool) -> bool {
+        self.image_cache.as_ref().is_some_and(|cache| cache.release_optional(encoded))
+    }
     #[cfg(feature = "vision-protocol")]
     pub(crate) fn pin_context_images(&self, keys: &[[u8;32]]) -> Result<Vec<ImageReference>> {
         if keys.is_empty() { return Ok(Vec::new()); }
@@ -473,7 +477,7 @@ impl Frontend {
                     let planned = cache.plan_cancellable(tokens, &rendered.image_sources, context_capacity, cancelled)?;
                     deferred_image_inputs = planned.deferred;
                     (planned.tokens, planned.images, planned.inputs, planned.aliases)
-                } else if let Some(references) = _references.filter(|r| self.defer_image_pixels && r.iter().any(|r| r.input.is_none())) {
+                } else if let Some(references) = _references.filter(|r| self.defer_image_pixels && (rendered.image_sources.len() > 8 || r.iter().any(|r| r.input.is_none()))) {
                     let planned = cache.plan_referenced(tokens, &rendered.image_sources, context_capacity, cancelled, references)?;
                     deferred_image_inputs = planned.deferred;
                     (planned.tokens, planned.images, planned.inputs, planned.aliases)

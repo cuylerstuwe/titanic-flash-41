@@ -5814,10 +5814,15 @@ impl Target {
             self.submit_engram_rows(&batch.rows, split_engram14)?;
             marks.push(("engram_submit", Instant::now()));
         }
-        self.io.update_tokens(&mut self.tokens, self.history.position as usize,
-            &padded.iter().copied().map(i64::from).collect::<Vec<_>>(),
-            ids.len(),
-        )?;
+        let token_ids: Vec<_> = padded.iter().copied().map(i64::from).collect();
+        if region && verification {
+            // Each region supplies generated anchors and proposals. A concurrent prefill
+            // can own the shared prompt's images at these same numerical positions.
+            // Updating ordinary token rows also clears image pointers from prior use.
+            self.tokens.update(&token_ids, ids.len())?;
+        } else {
+            self.io.update_tokens(&mut self.tokens, self.history.position as usize, &token_ids, ids.len())?;
+        }
         if padded_routes {
             // Rows between a session's live rows and the next block take that session's last live
             // row's experts with zero weights: they read no expert of their own.

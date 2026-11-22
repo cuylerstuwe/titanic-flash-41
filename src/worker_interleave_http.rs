@@ -54,6 +54,9 @@ enum Scheduled {
     AttachPeer(u64),
 }
 impl Scheduled {
+    // Native commands pass through this decoder too. Keep exchange outside
+    // the native opcode range, including the nine-byte input-reclaim frame.
+    const EXCHANGE: u8 = 0x80;
     fn follows_progress(&self,paused_ids:&[u64],remaining:usize)->bool {
         match self {
             Self::Native(Command::Step|Command::Finish(_)|Command::ReclaimInputs{..})=>true,
@@ -91,7 +94,7 @@ impl Scheduled {
             Self::AttachPeer(id)=>{ensure!(*id>0,"invalid region conversation identity");let mut bytes=vec![24];bytes.extend(id.to_le_bytes());Ok(bytes)},
             Self::Park(None)=>Ok(vec![7]),
             Self::Park(Some(mask))=>{let mut bytes=vec![7];bytes.extend(mask.to_le_bytes());Ok(bytes)},
-            Self::Exchange(id)=>{ensure!(*id>0,"invalid exchange request identity");let mut bytes=vec![17];bytes.extend(id.to_le_bytes());Ok(bytes)},
+            Self::Exchange(id)=>{ensure!(*id>0,"invalid exchange request identity");let mut bytes=vec![Self::EXCHANGE];bytes.extend(id.to_le_bytes());Ok(bytes)},
             Self::PairStep(id)=>{ensure!(*id>0,"invalid paired request identity");let mut bytes=vec![18];bytes.extend(id.to_le_bytes());Ok(bytes)},
             Self::Resume(id)|Self::Discard(id)=>{
                 let mut bytes=vec![if matches!(self,Self::Resume(_)){8}else{9}];
@@ -123,7 +126,7 @@ impl Scheduled {
                 let id=u64::from_le_bytes(bytes[1..].try_into().unwrap());
                 ensure!(id>0,"invalid region conversation identity");Ok(Self::AttachPeer(id))
             },
-            [17,..]if bytes.len()==9=>{
+            [Self::EXCHANGE,..]if bytes.len()==9=>{
                 let id=u64::from_le_bytes(bytes[1..].try_into().unwrap());ensure!(id>0,"invalid exchange request identity");Ok(Self::Exchange(id))
             },
             [18,..]if bytes.len()==9=>{
@@ -689,6 +692,18 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reclamation_and_exchange_roundtrip_to_their_original_operations() {
+        // Same payload tests the operation, not merely byte-for-byte re-encoding.
+        let headroom = crate::memory::floor_bytes() + (64 << 20);
+        let raw = Command::ReclaimInputs { headroom }.encode().unwrap();
+        let exchange = Scheduled::Exchange(headroom as u64).encode().unwrap();
+        assert!(matches!(Scheduled::decode(&raw).unwrap(),
+            Scheduled::Native(Command::ReclaimInputs { headroom: n }) if n == headroom));
+        assert!(matches!(Scheduled::decode(&exchange).unwrap(),
+            Scheduled::Exchange(id) if id == headroom as u64));
+        assert_ne!(raw, exchange);
+    }
     #[test]
     fn batched_decode_commands_roundtrip_and_reject_invalid_frames() {
         for command in [Scheduled::Detach(1),Scheduled::Detach(3),Scheduled::Batched(false,0),Scheduled::Batched(true,0b1010),

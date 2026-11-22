@@ -15,6 +15,12 @@ impl Input {
     pub(super) fn expanded_len(&self) -> usize {
         match self { Self::Raw(raw)=>raw.len(),Self::Incremental(p)=>p.prepared.expanded_bytes() }
     }
+    pub(super) fn image_payload_bytes(&self) -> usize {
+        match self {
+            Self::Raw(bytes) => input_budget::request_images(bytes),
+            Self::Incremental(input) => input.prepared.message_json().map(input_budget::message_images).sum(),
+        }
+    }
     pub(super) fn streaming(&self) -> Result<bool> {
         #[derive(Deserialize)]
         struct Mode { #[serde(default)] stream:Option<bool> }
@@ -84,17 +90,19 @@ pub(super) fn reserve_after_reclaim<T>(
     shared: &Shared,
     mut reserve: impl FnMut() -> Result<T>,
 ) -> Result<T> {
-    match reserve() {
-        Err(error)
-            if error
-                .downcast_ref::<crate::memory::InputCapacityError>()
-                .is_some()
-                && reclaim(shared) =>
-        {
-            reserve()
-        }
-        result => result,
+    let capacity = |error: &anyhow::Error| error.is::<crate::memory::InputCapacityError>();
+    let mut result = reserve();
+    if result.as_ref().is_err_and(&capacity) && crate::memory::trim_free_host_pages() {
+        result = reserve();
     }
+    for encoded in [false, true] {
+        if result.as_ref().is_err_and(&capacity) && shared.frontend.release_optional_images(encoded) {
+            crate::memory::trim_free_host_pages();
+            result = reserve();
+        }
+    }
+    if result.as_ref().is_err_and(capacity) && reclaim(shared) { result = reserve(); }
+    result
 }
 
 pub(super) fn capacity_error(incremental: bool, message: &str) -> Response {

@@ -692,6 +692,9 @@ pub(crate) struct StateImage {
     acceptance_temperature_frontiers: usize,
 }
 impl StateImage {
+    pub(crate) fn restore_host_workspace_bytes(&self) -> usize {
+        self.history_lookup.as_ref().map_or(0, HistoryLookup::reserved_workspace_bytes)
+    }
     pub(crate) fn exchangeable(&self)->bool {self.target.exchangeable()}
     pub(crate) fn device_bytes(&self)->usize {self.target.bytes()+self.draft.bytes()}
     /// Disk tier: every copied image of the session (target, then drafter).
@@ -1593,7 +1596,7 @@ impl GreedySession {
         ensure!(!self.poisoned && Rc::ptr_eq(&self.image_owner, &saved.owner)
             && target.profile_is_current() && target.position() == self.draft.position()?,
             "session image restore owner/frontier");
-        let cpu_bytes = saved.history_lookup.as_ref().map_or(0, HistoryLookup::reserved_workspace_bytes);
+        let cpu_bytes = saved.restore_host_workspace_bytes();
         ensure!(self.cuda.admission_memory()?.admitted_available >= crate::memory::floor_bytes() + cpu_bytes,
             "restored lookup exceeds reserved UMA headroom");
         let lookup = saved.history_lookup.as_ref().map(HistoryLookup::clone_reserved);

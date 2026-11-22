@@ -194,7 +194,7 @@ impl Worker {
                 &mut |fits|control.all_admit(fits))? {
                 ensure!(image.bytes()==device&&image.position()==prefix.len(),"resumed encoder image extent");
                 fused_copy=image.fused_copy();
-                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,charge,
+                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec().into(),media,charge,
                     prompt_logits:None,speculative:only_free_capacity,shared:false,image:CachedState::Encoder{image,history,policy},
                     kind:"bank_resume",born:std::time::Instant::now(),used:std::time::Instant::now(),serial:self.cache_serial,restored_serial:0});
                 saved=true;

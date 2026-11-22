@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 static HOST_WORKSPACE_RESERVED: AtomicUsize = AtomicUsize::new(0);
 
-/// Test-only override of the physical memory floor, in MiB. Unset in production, where every
-/// admission keeps [`DEFAULT_FLOOR`] of MemAvailable (see [`Available::gb10`]) free. The
+/// Test-only override of the physical memory floor, in MiB. Production can select its own
+/// floor when the snapshot pool is preallocated (see [`SERVING_FLOOR_ENV`]). The
 /// memory-floor test sets it to measure how far below 8 GiB the GB10s stay healthy.
 pub(crate) const FLOOR_OVERRIDE_ENV: &str = "CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB";
 pub(crate) const DEFAULT_FLOOR: usize = 8 << 30;
@@ -107,8 +107,8 @@ pub(crate) fn release_file_cache(root: &Path) -> Result<(usize, usize, usize)> {
     Ok((files, before, after))
 }
 
-/// The physical memory floor every admission keeps free: 8 GiB unless the test-only override
-/// is set. An invalid override is refused by [`validate_floor`] at startup.
+/// The physical memory floor selected at startup, taking the preallocated pool into account.
+/// Invalid settings are refused by [`validate_floor`].
 pub(crate) fn floor_bytes() -> usize {
     floor_setting().as_ref().copied().unwrap_or(DEFAULT_FLOOR)
 }

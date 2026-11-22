@@ -126,6 +126,11 @@ impl State {
         self.oldest.clear();
         self.retained = 0;
     }
+    fn clear_stored(&mut self) {
+        self.stored.clear();
+        self.stored_oldest.clear();
+        self.stored_bytes = 0;
+    }
     fn retain(&mut self, input: Arc<PatchInput>) {
         self.oldest.retain(|k| *k != input.identity);
         if self.warm.contains_key(&input.identity) {
@@ -226,6 +231,17 @@ impl ImageInputCache {
             reserve_workspace: |_|Ok(None),
             ..Self::new()
         }
+    }
+    /// Release cache ownership only. Requests already using an image retain
+    /// their own Arc. Never wait behind an active image decoder on the HTTP lane.
+    pub(crate) fn release_optional(&self, encoded: bool) -> bool {
+        let Ok(mut state) = self.state.try_lock() else { return false; };
+        if encoded && state.stored_bytes != 0 {
+            state.clear_stored();
+        } else if !encoded && state.retained != 0 {
+            state.clear_warm();
+        } else { return false; }
+        true
     }
     fn resolve(&self, source: &ImageSource) -> Result<(Vec<u8>, Detail)> {
         let (bytes, detail) = match source {
@@ -371,6 +387,11 @@ impl ImageInputCache {
             };
             if !enough()? {
                 state.clear_warm();
+                crate::memory::trim_free_host_pages();
+                if !enough()? && state.stored_bytes != 0 {
+                    state.clear_stored();
+                    crate::memory::trim_free_host_pages();
+                }
             }
             ensure!(
                 enough()?,
@@ -412,7 +433,10 @@ impl ImageInputCache {
             if result.iter().any(|r:&crate::protocol::ImageReference|r.identity==*key){continue;}
             let hex=key.iter().map(|b|format!("{b:02x}")).collect::<String>();
             let source=format!("http://titanic-context.invalid/{hex}");
-            let live=state.live.get(key).and_then(Weak::upgrade);
+            // A long prefix should pin compact immutable sources where possible.
+            // Warm patches remain available to materialize() if the model needs them.
+            let use_stored = allow_stored && keys.len() > 8 && state.stored.contains_key(key);
+            let live=if use_stored { None } else { state.live.get(key).and_then(Weak::upgrade) };
             if let (Some(input),Some(&(detail,encoded_bytes)))=(live,state.source_info.get(key)) {
                 state.retain(input.clone());
                 state.touch_stored(key);
@@ -491,6 +515,7 @@ impl ImageInputCache {
         let mut images = Vec::new();
         let mut inputs = Vec::new();
         let mut deferred = Vec::new();
+        let mut pinned_patch_bytes = 0usize;
         let mut aliases = Vec::new();
         let mut sources = sources.iter().zip(source_keys);
         let mut encoded_bytes = 0usize;
@@ -504,12 +529,15 @@ impl ImageInputCache {
                 // geometry. Metadata does not bypass encoded or token budgets.
                 // Keep already-live patches on the ordinary fast path.
                 if let (Some(cache), Some(key)) = (deferred_cache, source_key) {
-                    let memo = {
+                    let saved = {
                         let state = self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?;
-                        state.sources.get(&key).copied().filter(|memo|
-                            state.live.get(&memo.identity).and_then(Weak::upgrade).is_none())
+                        state.sources.get(&key).copied()
+                            .filter(|memo| state.live.get(&memo.identity).and_then(Weak::upgrade).is_none())
+                            .map(|memo| (memo, state.stored.get(&memo.identity).cloned()))
                     };
-                    if let Some(memo) = memo {
+                    // A compact envelope needs an alias with a recoverable source.
+                    // Re-prepare an evicted source below when seeding that transport.
+                    if let Some((memo, stored)) = saved.filter(|(_,s)| references.is_none() || s.is_some()) {
                         ensure!((1..=MAX_ENCODED_BYTES).contains(&memo.encoded_bytes), "invalid deferred image byte count");
                         encoded_bytes = encoded_bytes.checked_add(memo.encoded_bytes)
                             .ok_or_else(|| anyhow::anyhow!("request encoded image byte capacity exceeded"))?;
@@ -519,8 +547,12 @@ impl ImageInputCache {
                         images.push(Descriptor { start: output.len(), geometry: memo.geometry, input: memo.identity });
                         output.extend(std::iter::repeat_n(IMAGE_TOKEN, count));
                         self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?.touch_stored(&memo.identity);
+                        if references.is_some() {
+                            aliases.push(crate::protocol::ImageAlias { source_hash: key, identity: memo.identity });
+                        }
                         deferred.push(DeferredInput { identity: memo.identity, geometry: memo.geometry,
-                            source: DeferredSource::Request(source.clone()), cache: cache.clone() });
+                            source: stored.map_or_else(|| DeferredSource::Request(source.clone()), DeferredSource::Stored),
+                            cache: cache.clone() });
                         continue;
                     }
                 }
@@ -605,7 +637,22 @@ impl ImageInputCache {
                             source_hash,identity:input.identity});
                     }
                 }
-                inputs.push(input);
+                // Cold uploads still validate each image canonically. Beyond this
+                // small set of pinned patches retain its exact immutable source.
+                // Large screenshot histories then need one decoder workspace,
+                // independent of how many histories are admitted to generation.
+                let pin = pinned_patch_bytes.saturating_add(input.bytes());
+                if let (Some(cache), Some(_)) = (deferred_cache, source_key)
+                    && pin > 32 << 20 {
+                    let state = self.state.lock().map_err(|_| anyhow::anyhow!("image input cache poisoned"))?;
+                    let stored = state.stored.get(&input.identity).cloned();
+                    deferred.push(DeferredInput { identity: input.identity, geometry: input.geometry,
+                        source: stored.map_or_else(|| DeferredSource::Request(source.clone()), DeferredSource::Stored),
+                        cache: cache.clone() });
+                } else {
+                    pinned_patch_bytes = pin;
+                    inputs.push(input);
+                }
             }
             ensure!(
                 output.len() <= capacity,
@@ -805,6 +852,28 @@ mod tests {
         // A live reference keeps its patches (no deferral).
         let refs = cache.pin_references(&[identity], true).unwrap();
         assert!(refs[0].input.is_some() && refs[0].stored.is_none());
+    }
+    #[test]
+    fn deferred_history_keeps_its_aliases_and_survives_optional_reclamation() {
+        let mut cache = ImageInputCache::for_test();
+        cache.store_budget = 8 << 20;
+        let cache = Arc::new(cache);
+        let images: Vec<_> = (0..10).map(|i| data_source(&png(i), ImageDetail::Auto, "")).collect();
+        let cold = cache.expand(vec![IMAGE_TOKEN;10], &images, 8192).unwrap();
+        let expected: Vec<_> = cold.inputs.iter().map(|input| input.patches.clone()).collect();
+        let keys: Vec<_> = cold.images.iter().map(|image| image.input).collect();
+        drop(cold);
+        let refs = cache.pin_references(&keys, true).unwrap();
+        assert!(refs.iter().all(|r| r.stored.is_some() && r.input.is_none()));
+        assert!(cache.release_optional(false));
+        let plan = cache.plan_referenced(vec![IMAGE_TOKEN;10], &images, 8192, &||false, &[]).unwrap();
+        assert_eq!(plan.aliases.len(),10);
+        assert_eq!(plan.deferred.len(),10);
+        assert!(cache.release_optional(true));
+        assert!(cache.pin_references(&keys, true).is_err());
+        for (lazy, pixels) in plan.deferred.iter().zip(expected) {
+            assert_eq!(lazy.materialize(&||false).unwrap().patches,pixels);
+        }
     }
     #[test]
     fn source_store_is_off_by_default_and_bounded_oldest_out() {

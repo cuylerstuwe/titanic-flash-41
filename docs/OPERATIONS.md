@@ -18,11 +18,23 @@ The Rust server exposes authenticated `GET /health`, `GET /v1/models` and `POST 
 }
 ```
 
-Use a smaller output budget where appropriate, and respect the total 1,048,576-token context limit. The output budget also decides whether a conversation can decode in the same steps as others: the whole `max_tokens` counts, not the answer's real length (see [Several conversations at once](#several-conversations-at-once)). Reasoning tokens count toward the output budget. `top_k: -1` means no top-k truncation. Supported temperatures are exactly 0 and 1; top-p must be 1. Unsupported sampling options fail explicitly rather than silently changing the target distribution.
+Choose the output budget for the task and keep prompt plus generated tokens within 1,048,576. The default profile makes room for the next 16,384 positions as a stream grows. A caller can use a large output budget and still share decode steps. [Concurrent requests](#foreground-and-background). Reasoning tokens count toward the output budget. `top_k: -1` means no top-k truncation. Supported temperatures are exactly 0 and 1; top-p must be 1. Unsupported sampling options fail explicitly rather than silently changing the target distribution.
 
 The protocol supports ordinary OpenAI-style tool definitions, tool calls and tool-result messages, along with DeepSeek thinking controls. Images use supported `image_url` message content and the canonical image encoder/processor. The server validates URLs, image dimensions and resource limits. This release is not a complete replacement for every OpenAI API feature: arbitrary temperatures, nucleus cutoffs, penalties and constrained JSON/grammar decoding are not implemented. A requested schema must not be confused with a constrained-decoding guarantee.
 
 Streaming uses SSE and ends with `[DONE]`. One delta may contain multiple speculative tokens. Clients should use reported usage for token counts, not count SSE chunks. Closing an active stream requests cancellation; bounded native work already in flight may finish before it is observed. Output backpressure pauses/resumes native generation, with a bounded stall timeout.
+
+### Long screenshot histories
+
+The serving profile reserves model-state capacity for four conversations. The coordinator also needs host memory to read HTTP bodies, render messages and prepare images. A text-only tool result can still arrive with every previous screenshot when a client resends a full history.
+
+Upload and conversion have separate lifetimes. Conversions of bodies at least 16 MiB share one host preparation slot. Decode may overlap across all four requests. The conversion estimate treats inline image data separately from text and tool schemas. Each image still passes canonical decoding and the vision workspace checks. Cold histories limit how many decoded patch buffers one request keeps in memory at once.
+
+The profile allows up to 384 MiB for reusable encoded image sources. It allocates entries on demand and can drop optional image data under pressure. The client can resend a full history when a retained reference has expired. Genuine input-capacity refusals are request-local. A later request can use the same workers. When temporary host allocations leave too little room to restore a checkpoint, the worker rechecks available memory across all devices. It preserves checkpoints held in the preallocated GPU pool during host reclamation.
+
+When a concurrent decode region needs more pool pages, the server checks that the entire allocation fits across all devices. Before reusing the primary bank, it copies any dependent prompt checkpoint that must survive the move. The planner counts physical pool pages and host headroom separately. It estimates how many tokens each independent checkpoint could restore using both the token history and image identities. A completed answer can include reasoning that the client omits on the next turn. If the last reusable input checkpoint must give way, the configured disk tier can park it within its write and free-space budgets when reloading saves more time than writing and reading the snapshot.
+
+To exercise concurrent screenshots, run `python3 tools/smoke_image_sessions.py --base-url http://127.0.0.1:8000 --key-file /srv/titanic-flash-41/state/keys/http.key` against an idle instance. Four conversations must identify different colors in the same image positions on successive turns. The `--screenshots`, `--padding-lines`, and `--rounds` options extend the workload. The check reports the actual prompt and cached token counts for each conversation.
 
 ## Prompt processing and Pi timing
 
@@ -46,9 +58,9 @@ The numbers above are illustrative. `prompt_n` counts uncached prompt tokens; `c
 
 Requests default to foreground. Set `X-LocalAI-Mode: background` for background work, or explicitly use `foreground`. Background requests are peers with each other; foreground requests are peers with each other. Among admitted requests, foreground work pauses background work at safe boundaries; background work resumes with its accepted state intact. This transition can take a few seconds and is not a hard real-time preemption promise.
 
-Up to **four requests are admitted** (two before the November 15 release), each retaining the full 1,048,576-token context capacity. Additional requests wait FIFO. Admitted requests decode in the same steps or take turns, as described under [Several conversations at once](#several-conversations-at-once). An admitted request keeps its slot until its final response, terminal error, client cancellation/disconnection or terminal stall timeout. A temporary output stall, priority hold or pause does not release the slot. A queued foreground request does not displace admitted background requests. A completed tool-call response ends that request; submitting tool results creates a new request. Model state is retained in memory, without SSD parking.
+Up to **four requests are admitted** (two before the November 15 release), each retaining the full 1,048,576-token context capacity. Additional requests wait FIFO. Admitted requests decode in the same steps or take turns, as described under [Several conversations at once](#several-conversations-at-once). An admitted request keeps its slot until its final response, terminal error, client cancellation/disconnection or terminal stall timeout. A temporary output stall, priority hold or pause does not release the slot. A queued foreground request does not displace admitted background requests. A completed tool-call response ends that request; submitting tool results creates a new request. The workers retain recent state in RAM and can park eligible snapshots in the bounded disk tier.
 
-The default has **one physical execution bank**, not two permanently allocated banks. Overlap uses complete, lossless state snapshots at committed boundaries. Solo forward reuse stays in the active bank and does not require a request snapshot. The shared snapshot/cache ceiling is allocated only as needed, and optional completed conversation checkpoints yield to unfinished requests (sizes under [Resident conversations](#resident-conversations)). The 8 GiB operating margin and 8.5 GiB allocation floor remain enforced on the limiting rank. Large same-priority peers may run serially if switching cannot retain both snapshots safely; their lifetime admissions and progress are preserved. With the two-owner scheduler, a foreground newcomer that cannot safely pause an existing background request gets an explicit capacity error rather than silently canceling that owner or waiting indefinitely behind a hold. The batched scheduler of the November 15 release (`CANADA_SCRATCH_BATCHED_DECODE=1`, the supplied profile) does not return that error yet: the newcomer waits for the background request. Overlap throughput and switching latency can be worse than the former permanently allocated two-bank layout.
+Solo generation uses the main execution bank. With full regions enabled, three additional regions can each hold a complete conversation. As streams grow, the workers map physical storage from the preallocated pool. Under pressure, admitted requests can take turns at committed boundaries. The supplied profile uses a 9 GiB pool and a 3 GiB operating reserve per rank. Some GPU allocations also require 512 MiB of headroom. Cold, immutable snapshots may be parked in the configured local disk tier. A foreground request waiting behind four existing admissions waits for a slot; priority applies to admitted work.
 
 `CANADA_SCRATCH_SINGLE_BANK=1` selects the qualified layout. Its paired execution, cross-bank prefix import and shared paired-drafter flags are disabled in the supplied profile. Primary append/decode graph variants are fully warmed and retained (`CANADA_SCRATCH_GRAPH_CACHE_ROWS=0`). A nonzero row budget is an optional bounded-retention control, with recapture latency on misses; it is not the release default. Do not independently re-enable conflicting paired flags.
 
@@ -202,12 +214,12 @@ in about 110 s. With the November 15 release's budgets all four stay resident: o
 turns were served from the cache, with a median time to first token of 0.38 s, and at least 10.6 GiB stayed
 available on every rank.
 
-All memory-floor checks now use one function, with the same 8 GiB default.
+The historical release used an 8 GiB default. The current pooled-memory profile selects its serving floor explicitly.
 `CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB` overrides the floor and is for tests only.
 
 ## November 21 serving profile
 
-The checked-in deployment profile selects s1682. During startup the worker verifies the BF16 index against the CUDA source embedded in the engine. Six-row sparse verification uses version 2 of the staged-read attention kernel. The launcher supplies 27 prefill widths from 256 through 16,384 rows. The 3,072 MiB runtime allocation floor, bounded snapshot pool and incremental mapping of long conversations apply independently on each rank.
+The checked-in deployment profile retains the s1682 compute settings. During startup the worker verifies the BF16 index against the CUDA source embedded in the engine. Six-row sparse verification uses version 2 of the staged-read attention kernel. The launcher supplies 27 prefill widths from 256 through 16,384 rows. The 3,072 MiB operating reserve, bounded snapshot pool and incremental mapping of long conversations apply independently on each rank.
 
 With `serving_memory_policy` enabled, a node-local systemd service records the boot and original values of `vm.compaction_proactiveness` and `vm.swappiness` in private tmpfs before setting both to zero. It follows the generation's exact container process. Its stop hook restores the saved values on worker exit, guard death or abandoned startup and respects intervening operator changes. Setting `serving_memory_policy` to `false` leaves those settings under host control. This policy changes no boot configuration.
 
@@ -390,23 +402,9 @@ image if it had finished), so its next turn still starts from its prompt; the `r
 
 ### Several conversations at once
 
-`CANADA_SCRATCH_BATCHED_DECODE=1` with `CANADA_SCRATCH_BATCHED_REGIONS=4`: up to four conversations decode in the
-same steps (one verification over every conversation's rows), each in a serving region of 262,144 positions.
+The November 15 implementation divided the address space into four 262,144-position regions. It counted the requested output budget in full and kept image histories in the main bank. These historical limits explain the measurements in that release.
 
-**Which conversations share steps.** One whose prompt plus its token limit (`max_tokens`; 262,144 when the request
-gives none) fits a region, with 64 positions of margin, and which has no image in its history. The limit counts
-in full, whatever the answer turns out to be: a client that sends a large `max_tokens` on every request (many
-agent harnesses send the model's maximum) gets no shared steps. Everything else takes turns in region 0 through
-paused images, 64 tokens at a time, and all of them stay resident. A conversation in its first run yields after
-16 tokens to one that has not started, so a newcomer's prefill starts at once, as it did with the two-owner
-scheduler. At most two conversations are paused at once:
-two such conversations alternate, and when a third or a fourth arrives while two are paused, it runs to its end
-before a paused one resumes (the two-owner scheduler of earlier releases ran them as FIFO pairs: two alternate,
-the others wait for their first token). Total time is the same or shorter; an early conversation can finish later.
-While a region is occupied, a waiting conversation that does not fit waits, first in line, until the regions are
-empty: region 0 has no upper bound of its own in the address space it shares with the regions, so a longer
-conversation beside them would write over their rows. To get shared steps, send a `max_tokens` that leaves the
-prompt room inside a region (prompt + `max_tokens` + 64 <= 262,144).
+The current four-region profile provides up to 1,048,576 positions per conversation. The regions grow on demand. Once the image spans have been processed and committed, the scheduler can include that conversation in batched decode. Image preparation and partially committed prefills finish at a safe boundary before the worker moves the conversation. The supplied profile uses 16,384 positions of lookahead and preserves each admitted request through completion, cancellation or terminal failure.
 
 A conversation that moves to a region takes region 0's drafter along, and a spare takes its place; a paused or
 cached conversation's drafter state restores into whichever drafter region 0 holds. The related settings (`CANADA_SCRATCH_BATCHED_GRAPHS`, `..._GRAPH_WARMUP`, `..._DRAFT_BODY`,

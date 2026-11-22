@@ -6,7 +6,7 @@ use super::interleave_http::idle_anchor_policy::{Mode,Policy};
 
 fn entries(w:&Worker)->Vec<Value> {
     w.cached_sessions.iter().map(|c|json!({"owner":c.owner,"tokens":c.prefix.len(),
-        "prefix_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(&c.prefix).unwrap())),
+        "prefix_sha256":format!("{:x}",Sha256::digest(serde_json::to_vec(c.prefix.as_slice()).unwrap())),
         "bytes":c.charge,"speculative":c.speculative})).collect()
 }
 

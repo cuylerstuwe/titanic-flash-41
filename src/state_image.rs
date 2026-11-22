@@ -470,6 +470,9 @@ impl Image {
     }
     /// Disk tier (crate::disk_tier): whether the device copy is present (false: parked on disk).
     pub(crate) fn resident(&self) -> bool { self.device.is_some() }
+    pub(crate) fn owned_pool_chunks(&self) -> usize {
+        self.device.as_ref().map_or(0, |storage| storage.owned_pool_chunks())
+    }
     pub(crate) fn has_disk_copy(&self) -> bool { self.disk.is_some() }
     /// Bytes the device copy holds now (0 while parked).
     pub(crate) fn device_bytes(&self) -> usize { if self.device.is_some() { self.total } else { 0 } }

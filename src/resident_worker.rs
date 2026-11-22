@@ -462,7 +462,7 @@ struct DraftTail {
 }
 struct CachedSession {
     owner: u8,
-    prefix:Vec<u32>,
+    prefix:CachedPrefix,
     media:crate::prompt_media::Identity,
     image:CachedState,
     charge:usize,
@@ -528,6 +528,58 @@ impl CachedSession {
     fn opportunistic_logits(&self)->bool {
         self.speculative || (self.prompt_logits.is_some() && self.media.placements().is_empty())
     }
+}
+
+/// Eviction cost at a bank handoff. The replacement must survive the reset
+/// and match both the full token prefix and its image identities.
+struct CheckpointAlternatives {
+    lengths: Vec<usize>,
+    coverage: Vec<Vec<usize>>,
+    independent: Vec<bool>,
+    cheap: Vec<bool>,
+}
+
+impl CheckpointAlternatives {
+    fn new(entries: &[CachedSession]) -> Self {
+        let lengths: Vec<_> = entries.iter().map(|e| e.prefix.len()).collect();
+        let independent: Vec<_> = entries.iter().map(|e| !e.speculative && e.prompt_logits.is_none()
+            && matches!(&e.image, CachedState::Encoder { image, .. } if !image.bank_retained())).collect();
+        let cheap = entries.iter().map(|e| e.speculative || (e.parkable() && e.disk_clean())).collect();
+        let coverage = entries.iter().enumerate().map(|(i, candidate)| {
+            entries.iter().enumerate().map(|(j, other)| {
+                let through = lengths[i].min(lengths[j]);
+                if i == j || !independent[j] || !candidate.media.matches_prefix(&other.media, through) { return 0; }
+                let covered = match lengths[i].cmp(&lengths[j]) {
+                    std::cmp::Ordering::Greater => candidate.prefix.extends(&other.prefix),
+                    std::cmp::Ordering::Equal => candidate.prefix[..] == other.prefix[..],
+                    std::cmp::Ordering::Less => !candidate.shared && other.prefix.extends(&candidate.prefix),
+                };
+                if covered { through } else { 0 }
+            }).collect()
+        }).collect();
+        Self { lengths, coverage, independent, cheap }
+    }
+
+    fn victim(&self, removed: &[bool], protected: &[usize]) -> Option<(usize, usize)> {
+        (0..self.lengths.len()).filter(|i| !removed[*i] && !protected.contains(i)).map(|i| {
+            let covered = self.coverage[i].iter().zip(removed)
+                .filter_map(|(&n, &gone)| (!gone).then_some(n)).max().unwrap_or(0);
+            (i, self.lengths[i].saturating_sub(covered))
+        }).min_by_key(|&(i, lost)| (!self.cheap[i], self.independent[i] && lost == self.lengths[i], lost, i))
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn bank_handoff_keeps_independent_inputs_even_when_a_generated_answer_is_longer() {
+    let alternatives = CheckpointAlternatives {
+        lengths: vec![1_010_048, 1_010_416, 1_012_224, 1_012_524],
+        // The fourth snapshot requires the bank about to be reset. It cannot cover the third.
+        coverage: vec![vec![0; 4], vec![1_010_048,0,0,0], vec![0; 4], vec![0,0,1_012_224,0]],
+        independent: vec![true,false,true,false], cheap:vec![false;4],
+    };
+    assert_eq!(alternatives.victim(&[false;4], &[3]), Some((1,368)));
+    assert_eq!(alternatives.victim(&[false,true,false,false], &[3]), Some((0,1_010_048)));
 }
 
 /// Cache slots kept for checkpoints under 8,192 tokens (CANADA_SCRATCH_SESSION_CACHE_SHORT_RESERVE=R, at most
@@ -1031,7 +1083,7 @@ impl Worker {
     fn keep_latest_earlier(&self) -> Vec<bool> {
         let c = &self.cached_sessions;
         let n = c.len();
-        let ext: Vec<Vec<bool>> = (0..n).map(|j| (0..n).map(|i| j != i && prefix_extends(&c[j].prefix, &c[i].prefix)
+        let ext: Vec<Vec<bool>> = (0..n).map(|j| (0..n).map(|i| j != i && c[j].prefix.extends(&c[i].prefix)
             && c[j].media.matches_prefix(&c[i].media, c[i].prefix.len())).collect()).collect();
         let facts: Vec<EntryFacts> = c.iter().map(|e| EntryFacts { serial: e.serial, restored: e.restored_serial,
             shared: e.shared || e.kind == "shared_prefix" }).collect();
@@ -1064,15 +1116,15 @@ impl Worker {
     /// 256K-token snapshot is ~0.23 GiB a box, a fraction of a second to write. Every rank writes its own shard; the
     /// choice uses only state every rank shares and every outcome goes through an all-rank vote, so all ranks keep the
     /// same entries. A failed copy leaves the entry as it was (the eviction drops it).
-    pub(crate) fn save_before_evict(&mut self, i: usize) -> Result<Option<Value>> {
+    pub(crate) fn save_before_evict(&mut self, i: usize, last_forward: bool) -> Result<Option<Value>> {
         let Some(tier) = self.disk_tier.clone() else { return Ok(None) };
-        if tier.save_on_evict_tokens == 0 || i >= self.cached_sessions.len() { return Ok(None); }
+        if (!last_forward && tier.save_on_evict_tokens == 0) || i >= self.cached_sessions.len() { return Ok(None); }
         let began = Instant::now();
         {
             let c = &self.cached_sessions[i];
             // Nov 19 (r2b): optional entries (prompt-end images with exact logits) are not worth a write in the request
             // path: ten such saves cost 0.09-0.11 s each to keep images that only serve an exact retry.
-            if c.prefix.len() < tier.save_on_evict_tokens || !c.parkable() || !c.resident_now() || c.disk_clean()
+            if (!last_forward && c.prefix.len() < tier.save_on_evict_tokens) || !c.parkable() || !c.resident_now() || c.disk_clean()
                 || c.speculative || c.opportunistic_logits() { return Ok(None); }
         }
         // A copy the idle-time writer has in progress for this entry is abandoned: the loop below writes every missing
@@ -1116,14 +1168,27 @@ impl Worker {
         eprintln!("disk tier {event}");
         Ok(Some(event))
     }
+    /// Obtain any indispensable durable copies before a planned eviction changes RAM.
+    fn preserve_forward_victims(&mut self, plan: &[(usize, usize)], alternatives: &CheckpointAlternatives) -> Result<bool> {
+        for &(i, lost) in plan {
+            if !alternatives.independent[i] || alternatives.cheap[i] || lost == 0 || lost != alternatives.lengths[i] { continue; }
+            let Some(tier) = self.disk_tier.as_ref() else { continue; };
+            let entry = &self.cached_sessions[i];
+            let worth_saving = entry.parkable() && crate::disk_tier::reload_pays(
+                entry.logical_bytes().saturating_mul(2), lost, false, tier.read_bytes_per_s,
+                2. * tier.read_fixed_s, crate::config::encoder_chunk_costs());
+            if !self.control.all_admit(worth_saving)? { continue; }
+            self.save_before_evict(i, true)?;
+            if !self.control.all_admit(self.cached_sessions[i].disk_clean())? { return Ok(false); }
+        }
+        Ok(true)
+    }
+
     /// evict_cached after save_before_evict: what cache pressure (not policy parking) uses.
     pub(crate) fn evict_cached_saving(&mut self, i: usize) -> Result<()> {
-        self.save_before_evict(i)?;
+        self.save_before_evict(i, false)?;
         self.evict_cached(i);
         Ok(())
-    }
-    fn evict_all_cached(&mut self) {
-        while !self.cached_sessions.is_empty() { self.evict_cached(0); }
     }
     /// config::wide16_elastic (Nov 19 2026): before a prefill of `uncached` new tokens (a prompt of `total`), lend the
     /// 16,384-row profile its extension from the image pool, so the planner can offer 16,384-row chunks. Free chunks
@@ -1147,15 +1212,16 @@ impl Worker {
         self.control.agree(&proof)?;
         let free_before = self.cuda.image_pool_free_chunks().unwrap_or(0);
         let mut gave_way = Vec::new();
-        let lent = loop {
-            let free = self.cuda.image_pool_free_chunks().unwrap_or(0);
-            if self.control.all_admit(free >= need + reserve)? { break true; }
-            let Some(i) = self.wide16_victim(policy, total) else { break false };
-            let c = &self.cached_sessions[i];
-            gave_way.push(json!({"tokens":c.prefix.len(),"parked":self.disk_tier.is_some()&&c.parkable()&&c.disk_clean(),
-                "optional":self.optional_entries(total)[i],"bytes":c.logical_bytes()}));
-            self.evict_cached(i);
-        };
+        let plan = self.wide16_eviction_plan(policy, total, need + reserve)?;
+        let lent = plan.is_some();
+        if let Some(indices) = plan {
+            for i in indices {
+                let c = &self.cached_sessions[i];
+                gave_way.push(json!({"tokens":c.prefix.len(),"parked":self.disk_tier.is_some()&&c.parkable()&&c.disk_clean(),
+                    "optional":self.optional_entries(total)[i],"bytes":c.logical_bytes()}));
+                self.evict_cached(i);
+            }
+        }
         let mapped = lent && self.cuda.wide16_map()?;
         let agreed = lent && self.control.all_admit(mapped)?;
         if mapped && !agreed { self.cuda.wide16_unmap()?; }
@@ -1166,6 +1232,28 @@ impl Worker {
         eprintln!("wide16 borrow {report}");
         Ok(report)
     }
+    /// Stage potential evictions without freeing GPU storage. Each selection sees the same
+    /// remaining entries it would see after a real eviction. Put every entry back in its
+    /// original position before returning, including when a rank declines the loan.
+    fn wide16_eviction_plan(&mut self, policy: u8, total: usize, required: usize) -> Result<Option<Vec<usize>>> {
+        let mut available = self.cuda.image_pool_free_chunks().unwrap_or(0);
+        let mut held = Vec::new();
+        let fits = loop {
+            match self.control.all_admit(available >= required) {
+                Ok(true) => break Ok(true),
+                Err(error) => break Err(error),
+                Ok(false) => {}
+            }
+            let Some(index) = self.wide16_victim(policy, total) else { break Ok(false) };
+            let entry = self.cached_sessions.remove(index);
+            available += entry.images().iter().map(|image| image.owned_pool_chunks()).sum::<usize>();
+            held.push((index, entry));
+        };
+        let indices = held.iter().map(|(index, _)| *index).collect();
+        for (index, entry) in held.into_iter().rev() { self.cached_sessions.insert(index, entry); }
+        Ok(fits?.then_some(indices))
+    }
+
     /// The next snapshot that gives way to the 16K extension (identical on every rank: it reads only the shared cache
     /// list), or None. Policy 1 (approved Nov 18): optional and superseded snapshots only, those with a disk copy first
     /// (they park, nothing is lost), oldest first; policy 2 then parks any resident snapshot that has a disk copy.
@@ -1366,14 +1454,38 @@ impl Worker {
     }
 }
 
-/// Whether the cached prefix `longer` extends `shorter` (config::cache_keep_latest). Only the eviction order depends on
-/// it, never a restore, so it compares the lengths, the first 1,024 tokens and the 1,024 tokens ending where `shorter`
-/// ends instead of whole prefixes (up to 1M tokens each); every rank holds the same prefixes and decides alike.
-fn prefix_extends(longer: &[u32], shorter: &[u32]) -> bool {
-    if longer.len() <= shorter.len() { return false; }
-    let head = shorter.len().min(1024);
-    let tail = shorter.len().saturating_sub(1024);
-    longer[..head] == shorter[..head] && longer[tail..shorter.len()] == shorter[tail..]
+/// A checkpoint's token sequence is immutable for its lifetime. Compare a pair
+/// exactly once while both checkpoints exist. A weak reference keeps only the
+/// Vec header's identity after eviction; dropping the last owner frees its tokens.
+struct CachedPrefix {
+    ids: std::rc::Rc<Vec<u32>>,
+    comparisons: std::cell::RefCell<Vec<(std::rc::Weak<Vec<u32>>, bool)>>,
+}
+impl From<Vec<u32>> for CachedPrefix {
+    fn from(ids: Vec<u32>) -> Self {
+        Self { ids: std::rc::Rc::new(ids), comparisons: Default::default() }
+    }
+}
+impl std::ops::Deref for CachedPrefix {
+    type Target = Vec<u32>;
+    fn deref(&self) -> &Vec<u32> { &self.ids }
+}
+impl<T: AsRef<[u32]> + ?Sized> PartialEq<T> for CachedPrefix {
+    fn eq(&self, other: &T) -> bool { self.ids.as_slice() == other.as_ref() }
+}
+impl CachedPrefix {
+    fn extends(&self, shorter: &Self) -> bool {
+        if self.len() <= shorter.len() { return false; }
+        let key = std::rc::Rc::as_ptr(&shorter.ids);
+        let mut comparisons = self.comparisons.borrow_mut();
+        if let Some((_, result)) = comparisons.iter().find(|(other, _)| other.as_ptr() == key) {
+            return *result;
+        }
+        let matches = self.starts_with(shorter);
+        comparisons.retain(|(other, _)| other.strong_count() != 0);
+        comparisons.push((std::rc::Rc::downgrade(&shorter.ids), matches));
+        matches
+    }
 }
 /// config::cache_keep_latest: what the earlier-checkpoint rule reads of an entry: the Begin that saved it, the Begin that
 /// last restored it (0: never) and whether it is a prefix several conversations share.
@@ -1420,6 +1532,24 @@ fn pressure_cache_victim(entries:&[(usize,usize)], optional:&[bool], superseded:
         &&(optional[*i]||superseded[*i]||!protected.contains(i)))
         .min_by_key(|&i|if optional[i] {(0,entries[i].0,i)}
             else if superseded[i] {(1,usize::MAX-entries[i].0,i)}else{(2,0,i)})
+}
+
+fn displaced_storage_fits(host: usize, reserve: usize, bytes: usize, pool: usize) -> bool {
+    crate::state_image::image_storage_fits(host, reserve, bytes,
+        bytes >= crate::cuda::POOLED_IMAGE_MIN && pool >= bytes)
+}
+
+#[cfg(test)]
+#[test]
+fn a_displaced_copy_needs_a_whole_allocation_from_one_memory_source() {
+    let mib = 1 << 20;
+    let reserve = 3584 * mib;
+    let host = reserve + 849 * mib;
+    let size = 886 * mib;
+    assert!(!displaced_storage_fits(host, reserve, size, 112 * mib + 48 * mib));
+    assert!(displaced_storage_fits(host, reserve, size, 112 * mib + 784 * mib));
+    assert!(displaced_storage_fits(host + 48 * mib, reserve, size, 112 * mib));
+    assert!(!displaced_storage_fits(reserve - 1, reserve, size, 896 * mib));
 }
 
 struct CacheSaveAdmission {
@@ -2791,6 +2921,32 @@ impl Worker {
         Ok(event)
     }
 
+    /// A concurrent HTTP conversion can temporarily occupy another request's working room.
+    /// Its buffers are independent of the model checkpoints. Only a rank under pressure waits.
+    /// Keep this off the HTTP reclaim-command path, since that command can unblock a conversion.
+    fn recover_request_headroom(&mut self, required: usize) -> Result<Value> {
+        let before = self.cuda.admission_memory()?;
+        let trimmed = before.admitted_available <= required && crate::memory::trim_free_host_pages();
+        let mut available = self.cuda.admission_memory()?;
+        let began = Instant::now();
+        while available.admitted_available <= required && available.host_workspace_reserved > 0
+            && began.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+            available = self.cuda.admission_memory()?;
+        }
+        let wait_ms = began.elapsed().as_secs_f64() * 1000.;
+        let mut event = if self.control.all_admit(available.admitted_available > required)? {
+            json!({"evicted":[]})
+        } else {
+            self.reclaim_input_space(required)?
+        };
+        event["trimmed_free_host_pages"] = json!(trimmed);
+        event["input_wait_ms"] = json!(wait_ms);
+        event["before_input_recovery"] = json!(before);
+        event["after_input_recovery"] = json!(self.cuda.admission_memory()?);
+        Ok(event)
+    }
+
     /// Admission at the committed request boundary, before resetting a live
     /// owner or appending any tokens. Optional caches may have accumulated, or
     /// host/driver memory may have grown since the preceding request. All ranks
@@ -2805,9 +2961,7 @@ impl Worker {
         if self.control.all_admit(fits)? {return Ok(None);}
         // Return allocator-free host pages before sacrificing reusable model
         // images. This is pressure-only work, never a decode-loop operation.
-        let trimmed=crate::memory::trim_free_host_pages();
-        let mut reclaimed=self.reclaim_input_space(required)?;
-        reclaimed["trimmed_free_host_pages"]=json!(trimmed);
+        let reclaimed=self.recover_request_headroom(required)?;
         let fits=self.cuda.admission_memory()?.admitted_available>required;
         #[cfg(feature = "storage-fault-injection")]
         let fits=self.cache_save_fault.apply(cache_admission_fault::Point::PrefillAfterReclaim,self.comm.rank(),fits);
@@ -2823,23 +2977,26 @@ impl Worker {
     /// is not resent), so only such a checkpoint can serve it; a bank-retained one dies with the
     /// bank. Budget, entry and memory admission are those of an ordinary cache save, agreed by all
     /// ranks; a refusal leaves the ordinary behavior. No arithmetic changes.
-    fn materialize_displaced_checkpoint(&mut self,incoming:&[u32],current:&[u32],wanted:Option<&CachedSession>)->Result<Value> {
+    fn materialize_displaced_checkpoint(&mut self,incoming:Option<(&[u32], &crate::prompt_media::Identity)>,current:&[u32],wanted:Option<&CachedSession>)->Result<Value> {
         if !self.displaced_checkpoint_enabled||self.session.is_none()||current.is_empty() {return Ok(Value::Null);}
+        let continued = |entry: &CachedSession| incoming.is_some_and(|(tokens, media)|
+            tokens.starts_with(&entry.prefix) && media.matches_prefix(&entry.media, entry.prefix.len()));
         let live=|worker:&Self,c:&CachedSession|c.owner==worker.bank_id&&current.starts_with(&c.prefix)
+            &&worker.history.media().matches_prefix(&c.media,c.prefix.len())
             &&matches!(&c.image,CachedState::Encoder{image,..}if image.bank_retained()&&worker.verify.encoder_prefix_reusable_from(image));
         let found=self.cached_sessions.iter().enumerate().filter(|(_,c)|live(self,c))
             .max_by_key(|(_,c)|c.prefix.len()).map(|(i,_)|i);
         // Shared-prefix images serve other conversations: every sparse one on this bank that the incoming prompt
         // does not continue is kept too (the newest image alone is the displaced conversation's own).
         let shared=(0..self.cached_sessions.len()).filter(|&i|Some(i)!=found&&self.cached_sessions[i].shared
-            &&live(self,&self.cached_sessions[i])&&!incoming.starts_with(&self.cached_sessions[i].prefix)).collect::<Vec<_>>();
+            &&live(self,&self.cached_sessions[i])&&!continued(&self.cached_sessions[i])).collect::<Vec<_>>();
         // Entries that give way for one copy (CANADA_SCRATCH_DISPLACED_RECLAIM) are removed from the vector, so
         // the indices still to be copied are kept in step.
         let mut shared=shared;
         let mut report=match found {
             None=>json!({"materialized":false,"candidate":false}),
             // The incoming request continues this checkpoint's lineage; the bank keeps serving it.
-            Some(index) if incoming.starts_with(&self.cached_sessions[index].prefix)=>
+            Some(index) if continued(&self.cached_sessions[index])=>
                 json!({"materialized":false,"candidate":true,"continued":true}),
             Some(index)=>{
                 let (report,removed)=self.materialize_bank_image(index,wanted,&shared)?;
@@ -2887,29 +3044,37 @@ impl Worker {
             let refused=|evicted:usize|json!({"materialized":false,"candidate":true,"refused":true,"bytes":full,
                 "charged":charged,"budget":budget,"gave_way":evicted});
             if !(self.displaced_reclaim&&self.cache_pressure_reclaim&&full<=2*1024usize.pow(3)) {return Ok((refused(0),removed));}
-            // The displaced conversation is the most recently used one: older inactive images give way for it, in
-            // the cache's pressure order (optional entries, then this conversation's own older rungs, then the
-            // oldest; the two longest entries longer than this image stay). Every rank holds the same entries and
-            // agrees on each step, so all ranks choose the same victims.
-            let entries=self.cached_sessions.iter().map(|c|(c.prefix.len(),c.charge)).collect::<Vec<_>>();
-            let tokens=entries[index].0;
-            let optional=self.optional_entries(tokens);
-            let own=&self.cached_sessions[index];
-            let superseded=self.cached_sessions.iter().enumerate().map(|(i,c)|i!=index&&c.owner==own.owner
-                &&c.prefix.len()<own.prefix.len()&&own.prefix.starts_with(&c.prefix)
-                &&own.media.matches_prefix(&c.media,c.prefix.len())).collect::<Vec<_>>();
-            // Per-rank byte counts stay out of the agreement (each rank votes on its own room below).
-            self.control.agree(&serde_json::to_vec(&("displaced-reclaim-v1",index,&entries,&optional,&superseded,keep))?)?;
+            // A pooled image releases pool pages. Its logical charge does not become free
+            // host memory. Only count actual backing for the proposed destination.
+            let alternatives = CheckpointAlternatives::new(&self.cached_sessions);
+            let tokens = alternatives.lengths[index];
+            let mut protected = keep.to_vec();
+            protected.push(index);
+            let mut gone = vec![false; self.cached_sessions.len()];
+            let mut plan = Vec::new();
+            let mut projected_charge = charged;
+            let mut projected_host = available;
+            let mut projected_pool = self.cuda.image_pool_free_bytes().unwrap_or(0);
+            let chunk_bytes = self.cuda.image_pool_chunk_bytes()?;
             loop {
-                let reclaim=removed.iter().map(|&i|entries[i].1).sum::<usize>();
-                let local=charged.saturating_sub(reclaim).saturating_add(delta)<=budget
-                    &&crate::state_image::image_storage_fits(available.saturating_add(reclaim),reserve,full,pooled);
-                if self.control.all_admit(local)? {break;}
-                let excluded=removed.iter().chain(keep).copied().chain(std::iter::once(index)).collect::<Vec<_>>();
-                let Some(next)=pressure_cache_victim(&entries,&optional,&superseded,tokens,self.image_entry_limit(),
-                    self.pressure_long_first(tokens),&excluded) else {return Ok((refused(0),Vec::new()));};
-                removed.push(next);
+                let local = projected_charge.saturating_add(delta) <= budget
+                    && displaced_storage_fits(projected_host, reserve, full, projected_pool);
+                if self.control.all_admit(local)? { break; }
+                let victim = alternatives.victim(&gone, &protected);
+                self.control.agree(&serde_json::to_vec(&("displaced-reclaim-v2", index, victim, &protected))?)?;
+                let Some((i, lost)) = victim else { return Ok((refused(0), Vec::new())); };
+                let entry = &self.cached_sessions[i];
+                gone[i] = true;
+                projected_charge = projected_charge.saturating_sub(entry.charge);
+                for image in entry.images() {
+                    let chunks = image.owned_pool_chunks();
+                    if chunks > 0 { projected_pool += chunks * chunk_bytes; }
+                    else if image.resident() { projected_host += image.bytes(); }
+                }
+                plan.push((i, lost));
+                removed.push(i);
             }
+            if !self.preserve_forward_victims(&plan, &alternatives)? { return Ok((refused(0), Vec::new())); }
             removed.sort_unstable();
             if !removed.is_empty() {
                 cache_trace(||json!({"path":"displaced_reclaim","incoming_tokens":tokens,"available":available,
@@ -2975,7 +3140,7 @@ impl Worker {
             let began=Instant::now();
             if let Some(image)=self.try_save_cached_session_image(pending,device_bytes)? {
                 ensure!(image.device_bytes()==device_bytes,"cached image estimate differs from allocation");
-                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,image:CachedState::Complete{image,pending},charge,prompt_logits:None,kind:"completed",born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0,speculative:false,shared:false});
+                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec().into(),media,image:CachedState::Complete{image,pending},charge,prompt_logits:None,kind:"completed",born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0,speculative:false,shared:false});
                 saved=true;
             }
             saved_seconds=began.elapsed().as_secs_f64();
@@ -3130,7 +3295,7 @@ impl Worker {
         };
         // Before the incoming request touches the bank: keep the displaced conversation's newest
         // bank-retained checkpoint as a standalone image (CANADA_SCRATCH_DISPLACED_CHECKPOINT).
-        let displaced=self.materialize_displaced_checkpoint(&plan.prompt,&current_prefix,wanted.as_ref())?;
+        let displaced=self.materialize_displaced_checkpoint(Some((&plan.prompt,&plan.media)),&current_prefix,wanted.as_ref())?;
         let transient_image_bytes=self.suspended_image_bytes
             +self.cached_sessions.iter().map(|c|c.charge).sum::<usize>()
             +wanted.as_ref().map_or(0,|c|c.charge);
@@ -3152,17 +3317,16 @@ impl Worker {
                 self.peer_bank.as_ref().unwrap().encoder_import_source(&cached)?;
                 imported_owner=Some(cached.owner);
             }
-            let extra_history=match &cached.image {CachedState::Encoder{history,..}=>
-                history.as_ref().map_or(0,crate::history_lookup::HistoryLookup::workspace_bytes),_=>0};
+            let extra_history=match &cached.image {
+                CachedState::Encoder{history,..}=>history.as_ref().map_or(0,crate::history_lookup::HistoryLookup::reserved_workspace_bytes),
+                CachedState::Complete{image,..}=>image.session.restore_host_workspace_bytes(),
+            };
             let mut admitted=self.control.all_admit(self.cuda.admission_memory()?.admitted_available>=reserve+extra_history)?;
             if !admitted {
-                let dropped=self.cached_sessions.iter().map(|c|json!([c.prefix.len(),c.charge])).collect::<Vec<_>>();
-                let available=self.cuda.admission_memory()?.admitted_available;
-                cache_trace(||json!({"path":"restore_admission_clear","restoring_tokens":cached.prefix.len(),
-                    "required":reserve+extra_history,"available":available,"dropped":dropped}));
-                self.evict_all_cached();
+                let recovery=self.recover_request_headroom(reserve+extra_history)?;
                 admitted=self.control.all_admit(self.cuda.admission_memory()?.admitted_available>=reserve+extra_history)?;
-                cache_trace(||json!({"path":"restore_admission_retry","restoring_tokens":cached.prefix.len(),"admitted":admitted}));
+                cache_trace(||json!({"path":"restore_admission_retry","restoring_tokens":cached.prefix.len(),
+                    "required":reserve+extra_history,"recovery":recovery,"admitted":admitted}));
             }
             if admitted {
                 let prior=if imported {let CachedState::Encoder{image,..}=&cached.image else{unreachable!()};
@@ -3331,7 +3495,10 @@ impl Worker {
                 }
             }else{
                 restore_refused=true;
-                if imported {retained_image=self.return_encoder_parent(Some(cached))?;}
+                // The checked-out checkpoint still owns its reserved slot and bytes. A
+                // transient refusal has made no changes to its contents or its bank.
+                self.cached_sessions.push(cached);
+                retained_image=true;
             }
         }
         Ok((json!({"enabled":true,"hit":restored_tokens>0,"restored_tokens":restored_tokens,
@@ -3895,7 +4062,7 @@ impl Worker {
         let checkpoint_saved=image.is_some();
         if let Some(image)=image {
             ensure!(image.bytes()==device_bytes&&image.position()==checkpoint,"encoder cache saved extent");
-            self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec(),media,charge,prompt_logits:None,speculative:false,shared:shared_image,
+            self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:prefix.to_vec().into(),media,charge,prompt_logits:None,speculative:false,shared:shared_image,
                 kind:if shared_image {"shared_prefix"} else {"prompt_checkpoint"},born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0,
                 image:CachedState::Encoder{image,history:checkpoint_history.unwrap(),
                     policy:self.session.as_ref().unwrap().proposal_policy_image()?}});
@@ -3904,7 +4071,7 @@ impl Worker {
         let extra_saved=extra_image.is_some();
         if let (Some(image),Some((at,device2,charge2,media2)),Some(history))=(extra_image,extra,extra_history) {
             ensure!(image.bytes()==device2&&image.position()==at,"extra encoder cache saved extent");
-            self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt[..at].to_vec(),media:media2,
+            self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt[..at].to_vec().into(),media:media2,
                 charge:charge2,prompt_logits:None,speculative:false,shared:false,
                 kind:"near_end",born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0,
                 image:CachedState::Encoder{image,history,policy:self.session.as_ref().unwrap().proposal_policy_image()?}});
@@ -3935,7 +4102,7 @@ impl Worker {
             let save_at=Instant::now();
             if let Some(image)=self.try_save_cached_session_image(anchor,device)? {
                 ensure!(image.device_bytes()==device,"encoder final prompt image estimate differs");
-                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt.clone(),media:plan.media.clone(),charge,prompt_logits:Some(logits),speculative:false,shared:false,
+                self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt.clone().into(),media:plan.media.clone(),charge,prompt_logits:Some(logits),speculative:false,shared:false,
                     kind:"prompt_end_logits",born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0,
                     image:CachedState::Complete{image,pending:anchor}});
                 prompt_logit_cache["saved"]=json!(true);
@@ -4242,7 +4409,7 @@ impl Worker {
                     let save_at=Instant::now();
                     if let Some(image)=self.try_save_cached_session_image(anchor,device)? {
                         ensure!(image.device_bytes()==device,"exact prompt image estimate disagrees");
-                        self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt.clone(),media:plan.media.clone(),
+                        self.cached_sessions.push(CachedSession{owner:self.bank_id,prefix:plan.prompt.clone().into(),media:plan.media.clone(),
                             image:CachedState::Complete{image,pending:anchor},charge,prompt_logits:Some(logits),speculative:false,shared:false,
                             kind:"prompt_end_logits",born:Instant::now(),used:Instant::now(),serial:self.cache_serial,restored_serial:0});
                         prompt_logit_cache["saved"]=json!(true);
@@ -7088,9 +7255,10 @@ mod wide_warmup_tests {
 
 #[cfg(test)]
 mod keep_latest_tests {
-    use super::{cache_evictions, keep_latest_earlier_flags, keep_latest_order, prefix_extends, EntryFacts};
+    use super::{cache_evictions, keep_latest_earlier_flags, keep_latest_order, CachedPrefix, EntryFacts};
     fn ext_of(list: &[&Vec<u32>]) -> Vec<Vec<bool>> {
-        (0..list.len()).map(|j| (0..list.len()).map(|i| j != i && prefix_extends(list[j], list[i])).collect()).collect()
+        let prefixes: Vec<CachedPrefix> = list.iter().map(|v| (*v).clone().into()).collect();
+        prefixes.iter().map(|longer| prefixes.iter().map(|shorter| longer.extends(shorter)).collect()).collect()
     }
     fn f(serial: u64, restored: u64) -> EntryFacts { EntryFacts { serial, restored, shared: false } }
     #[test]
@@ -7148,15 +7316,34 @@ mod keep_latest_tests {
         assert_eq!(keep_latest_earlier_flags(&facts, &ext_of(&list)), vec![false; 5]);
     }
     #[test]
-    fn prefix_extension_compares_the_head_and_the_tail_window() {
-        let a: Vec<u32> = (0..3_000).collect();
-        let mut b = a.clone(); b.extend(9_000..9_500u32);
-        assert!(prefix_extends(&b, &a) && !prefix_extends(&a, &b) && !prefix_extends(&a, &a));
-        let mut head = b.clone(); head[5] = 1;
-        assert!(!prefix_extends(&head, &a));
-        let mut tail = b.clone(); tail[2_999] = 1;
-        assert!(!prefix_extends(&tail, &a));
-        let short: Vec<u32> = vec![4, 5];
-        assert!(prefix_extends(&[4, 5, 6], &short) && !prefix_extends(&[4, 6, 6], &short));
+    fn edited_conversations_keep_their_independent_checkpoints() {
+        let unrelated = vec![77; 40_000];
+        let original: Vec<u32> = (0..65_536).collect();
+        let mut edited = original.clone();
+        edited[32_768] += 1;
+        edited.push(77);
+        let list = [&unrelated, &original, &edited];
+        let facts = [f(1, 0), f(2, 0), f(3, 4)];
+        let earlier = keep_latest_earlier_flags(&facts, &ext_of(&list));
+        assert_eq!(earlier, [false; 3]);
+        let order = keep_latest_order(&earlier);
+        let entries = order.iter().map(|&i| (list[i].len(), 10)).collect::<Vec<_>>();
+        let victim = cache_evictions(&entries, (70_000, 10), 30, true, 16).unwrap();
+        assert_eq!(order[victim[0]], 0);
+
+        let prefix: CachedPrefix = original.into();
+        let mut extended = prefix.to_vec();
+        extended.push(77);
+        let longer: CachedPrefix = extended.into();
+        let fork: CachedPrefix = edited[..65_536].to_vec().into();
+        for _ in 0..2 {
+            assert!(longer.extends(&prefix));
+            assert!(!longer.extends(&fork));
+            assert!(!prefix.extends(&longer) && !prefix.extends(&prefix));
+        }
+        assert_eq!(longer.comparisons.borrow().len(), 2);
+        drop(fork);
+        assert!(longer.extends(&prefix[..127].to_vec().into()));
+        assert_eq!(longer.comparisons.borrow().len(), 2);
     }
 }

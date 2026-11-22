@@ -13,7 +13,7 @@ use std::{collections::HashMap, path::PathBuf, rc::Rc, sync::Arc, time::Instant}
 /// All peers vote before entering the next GPU collective. Allocation refusal
 /// must not strand receivers in a broadcast, while execution/identity errors
 /// must never be reported as retryable capacity failures.
-fn coordinate_input_stage<T>(local:Result<T>, required:usize, phase:&'static str,
+pub(crate) fn coordinate_input_stage<T>(local:Result<T>, required:usize, phase:&'static str,
     vote:&mut impl FnMut(bool)->Result<bool>)->Result<T> {
     let recoverable=local.as_ref().err().is_none_or(|e|
         e.downcast_ref::<crate::memory::InputCapacityError>().is_some());
@@ -37,7 +37,7 @@ fn coordinate_input_stage<T>(local:Result<T>, required:usize, phase:&'static str
 }
 
 #[cfg(feature="storage-fault-injection")]
-struct ImageCapacityFault {
+pub(crate) struct ImageCapacityFault {
     rank:usize,
     phase:String,
     remaining:std::cell::Cell<usize>,
@@ -46,13 +46,13 @@ struct ImageCapacityFault {
 impl ImageCapacityFault {
     fn parse(value:&str)->Result<Self> {
         let parts=value.split(':').collect::<Vec<_>>();
-        ensure!(parts.len()==3,"image capacity fault must be rank:patches|span:count");
+        ensure!(parts.len()==3,"image capacity fault must be rank:phase:count");
         let rank=parts[0].parse()?;let count=parts[2].parse()?;
-        ensure!(rank<4 && ["patches","span"].contains(&parts[1]) && (1..=2).contains(&count),
+        ensure!(rank<4 && ["patches","span","split_workspace","parallel_patches"].contains(&parts[1]) && (1..=2).contains(&count),
             "bounded image capacity fault");
         Ok(Self{rank,phase:parts[1].into(),remaining:std::cell::Cell::new(count)})
     }
-    fn check(&self,rank:usize,phase:&str,required:usize)->Result<()> {
+    pub(crate) fn check(&self,rank:usize,phase:&str,required:usize)->Result<()> {
         if self.rank==rank && self.phase==phase && self.remaining.get()>0 {
             self.remaining.set(self.remaining.get()-1);
             return Err(crate::memory::InputCapacityError("injected image allocation refusal",required).into());
@@ -293,13 +293,30 @@ impl Media {
                     let local_ok=(self.rank!=0||inputs.is_some())
                         &&self.cuda.admission_memory()?.admitted_available>self.cuda.allocation_reserve_bytes()+need;
                     if !control.all_admit(local_ok)? {break;}
-                    let mut patches=Vec::with_capacity(group.len());
-                    for (j,(image,_)) in group.iter().enumerate() {
-                        let mut buffer=self.cuda.allocate_input::<bf16>(image.geometry.rows()*588)?;
-                        if let Some(inputs)=&inputs {buffer.upload(inputs[j].patches.reinterpret_cast())?;}
+                    // Allocate the whole group's inputs locally, then let all ranks vote before
+                    // the first broadcast. A falling reserve must not strand a peer in NCCL.
+                    let patches = (|| -> Result<Vec<_>> {
+                        #[cfg(feature="storage-fault-injection")]
+                        if let Some(fault) = &self.capacity_fault {
+                            fault.check(self.rank, "parallel_patches", need + self.cuda.allocation_reserve_bytes())?;
+                        }
+                        let mut patches = Vec::with_capacity(group.len());
+                        for (j, (image, _)) in group.iter().enumerate() {
+                            let mut buffer = self.cuda.allocate_input::<bf16>(image.geometry.rows() * 588)?;
+                            if let Some(inputs) = &inputs { buffer.upload(inputs[j].patches.reinterpret_cast())?; }
+                            patches.push(buffer);
+                        }
                         stream.join_default()?;
-                        unsafe {comm.broadcast_image_patches(&buffer,0,stream)?;}
-                        patches.push(buffer);
+                        Ok(patches)
+                    })();
+                    let patches = match coordinate_input_stage(patches, need + self.cuda.allocation_reserve_bytes(),
+                        "parallel image patch workspace unavailable", &mut |ok| control.all_admit(ok)) {
+                        Ok(patches) => patches,
+                        Err(error) if error.is::<crate::memory::InputCapacityError>() => break,
+                        Err(error) => return Err(error),
+                    };
+                    for patch in &patches {
+                        unsafe { comm.broadcast_image_patches(patch, 0, stream)?; }
                     }
                     stream.synchronize()?;comm.health()?;
                     let mut spans:Vec<ImageSpan>=Vec::with_capacity(group.len());
@@ -351,15 +368,25 @@ impl Media {
             }else{
                 let g=image.geometry;
                 let patch_bytes=g.rows()*588*2;
-                let split_image=self.split&&Vision::split_rows(g).is_some();
-                let needed=if split_image {
-                    Vision::split_admission_bytes(g,self.rank==self.encoder_rank)?+patch_bytes.next_multiple_of(2<<20)
-                }else if self.rank==self.encoder_rank {
-                    if self.scratch_for(g)?.is_some(){g.arena_admission_bytes(true)?}else{g.workspace_bytes(true,self.compact_workspace)?}
-                }else{g.tokens()*5120*2+(16<<20)
-                    +if self.encoder_rank!=0{patch_bytes.next_multiple_of(2<<20)}else{0}};
-                let base_required=self.cuda.allocation_reserve_bytes()+needed;
-                let mut retry_required=base_required;
+                let reserve = self.cuda.allocation_reserve_bytes();
+                let whole_required = reserve + if self.rank == self.encoder_rank {
+                    if self.scratch_for(g)?.is_some() { g.arena_admission_bytes(true)? }
+                    else { g.workspace_bytes(true,self.compact_workspace)? }
+                } else {
+                    g.tokens()*5120*2 + (16<<20) + if self.encoder_rank!=0 { patch_bytes.next_multiple_of(2<<20) } else { 0 }
+                };
+                let mut split_image = self.split && Vision::split_rows(g).is_some();
+                let mut retry_required = whole_required;
+                if split_image {
+                    retry_required = reserve + Vision::split_admission_bytes(g, self.rank==self.encoder_rank)?
+                        + patch_bytes.next_multiple_of(2<<20);
+                    // Under local pressure, use the already-loaded whole-image encoder and its
+                    // shared scratch. The owner and receivers still run the canonical image path.
+                    if !control.all_admit(self.cuda.admission_memory()?.admitted_available > retry_required)? {
+                        split_image = false;
+                        retry_required = whole_required;
+                    }
+                }
                 let mut attempt=0;
                 let span=loop {
                     // One bounded retry can reclaim optional completed caches;
@@ -395,16 +422,21 @@ impl Media {
                         }
                         if !control.all_admit(enough(&self.cuda)?)? {
                             eprintln!("image admission refused: {}",json!({"rank":self.rank,
-                                "needed_bytes":needed,"required_available_bytes":required,"reclamations":reclamations,
+                                "needed_bytes":required.saturating_sub(reserve),"required_available_bytes":required,"reclamations":reclamations,
                                 "memory":self.cuda.admission_memory()?,"percpu_free_bytes":crate::memory::percpu_free_bytes()}));
                             return Err(crate::memory::InputCapacityError(
                                 "image encoding cannot retain the UMA reserve",required).into());
                         }
                     }
-                    match self.encode_attempt(image,required,control,comm,stream) {
+                    match self.encode_attempt(image,required,split_image,control,comm,stream) {
                         Ok(span)=>break span,
                         Err(error) if attempt==0 && error.downcast_ref::<crate::memory::InputCapacityError>().is_some()=>{
-                            retry_required=retry_required.max(error.downcast_ref::<crate::memory::InputCapacityError>().unwrap().1);
+                            if split_image {
+                                split_image = false;
+                                retry_required = whole_required;
+                            } else {
+                                retry_required = retry_required.max(error.downcast_ref::<crate::memory::InputCapacityError>().unwrap().1);
+                            }
                             eprintln!("image allocation retry: {}",json!({"rank":self.rank,
                                 "geometry":g,"reason":error.to_string(),"memory":self.cuda.admission_memory()?,
                                 "percpu_free_bytes":crate::memory::percpu_free_bytes()}));
@@ -442,7 +474,7 @@ impl Media {
             "cache_reclamations":reclamations,"host_allocator_trims":host_trims,"prefill_scratch_bytes":self.scratch_arena.as_ref().map_or(0,|a|a.bytes()),"diagnostic_span_hashes":hashes});
         Ok((bindings,receipt))
     }
-    fn encode_attempt(&self,image:&Descriptor,required:usize,control:&mut ControlChannel,
+    fn encode_attempt(&self,image:&Descriptor,required:usize,split_image:bool,control:&mut ControlChannel,
         comm:&Roce,stream:&Stream)->Result<ImageSpan> {
         let g=image.geometry;
         let patches=(||->Result<_>{
@@ -450,7 +482,7 @@ impl Media {
             // in the same two all-rank votes, then the bounded cache reclaim
             // and retry above. Rank zero must never leave peers in a broadcast.
             let input=if self.rank==0 {Some(self.resolve_input(image)?)}else{None};
-            let patches=if self.split || self.encoder_rank!=0 || self.rank==0 {
+            let patches=if split_image || self.encoder_rank!=0 || self.rank==0 {
                 let mut patches=self.cuda.allocate_input::<bf16>(g.rows()*588)?;
                 if let Some(input)=input {
                     patches.upload(input.patches.reinterpret_cast())?;
@@ -466,16 +498,17 @@ impl Media {
         })();
         let patches=coordinate_input_stage(patches,required,"image patch allocation unavailable",
             &mut |v|control.all_admit(v))?;
-        if self.split || self.encoder_rank!=0 {
+        if split_image || self.encoder_rank!=0 {
             unsafe {comm.broadcast_image_patches(patches.as_ref().unwrap(),0,stream)?;}
         }
         // Complete transport before any rank can free input after a refusal.
         stream.synchronize()?;comm.health()?;
         let span=(||->Result<_>{
-            let span=if self.split&&Vision::split_rows(g).is_some() {
+            let span=if split_image {
                 // Every rank computes its row slice; only the root's span is complete
                 // and the caller's ordinary broadcast distributes it.
-                self.encoder.as_ref().unwrap().encode_split(patches.as_ref().unwrap(),g,comm,self.rank,self.encoder_rank,stream)?
+                self.encoder.as_ref().unwrap().encode_split(patches.as_ref().unwrap(),g,comm,self.rank,self.encoder_rank,stream,control,
+                    #[cfg(feature="storage-fault-injection")] self.capacity_fault.as_ref())?
             }else if self.rank==self.encoder_rank {
                 self.encoder.as_ref().unwrap().encode_with_arena(patches.as_ref().unwrap(),g,stream,self.compact_workspace,self.scratch_for(g)?)?
             }else{ImageSpan {data:self.cuda.allocate_input(g.tokens()*5120)?,geometry:g}};
@@ -571,7 +604,12 @@ pub fn placement_probe(path:&std::path::Path)->Result<Value> {
         }
         #[cfg(feature="storage-fault-injection")]
         if p.capacity_checks && location==3 && (!p.workspace_compare || compact) {
-            for fault_spec in ["3:span:1","3:span:2","1:patches:1","1:span:2"] {
+            let mut faults=vec!["3:span:1","3:span:2","1:patches:1","1:span:2"];
+            if split && Vision::split_rows(p.fixtures[0].descriptor.geometry).is_some() {
+                faults.push("0:split_workspace:1");
+                faults.push("3:split_workspace:1");
+            }
+            for fault_spec in faults {
                 media.release_warm();media.capacity_fault=Some(ImageCapacityFault::parse(fault_spec)?);
                 let f=&p.fixtures[0];let descriptor=Descriptor{start:1,..f.descriptor.clone()};
                 let mut tokens=vec![crate::prompt_media::IMAGE_TOKEN;descriptor.geometry.tokens()+2];
@@ -588,6 +626,9 @@ pub fn placement_probe(path:&std::path::Path)->Result<Value> {
                     let (_,receipt)=result?;
                     ensure!(receipt["diagnostic_span_hashes"]==reference[0],"retried image changed canonical span");
                 }
+                if let Some(fault)=&media.capacity_fault {
+                    if p.rank==fault.rank { ensure!(fault.remaining.get()==0,"configured capacity fault did not fire"); }
+                }
                 control.agree(fault_spec.as_bytes())?;
                 media.capacity_fault=None;media.release_warm();
                 if p.rank==0 {media.set_inputs(&[f.load()?])?;}
@@ -597,6 +638,35 @@ pub fn placement_probe(path:&std::path::Path)->Result<Value> {
                 control.agree(&serde_json::to_vec(&receipt["diagnostic_span_hashes"])?)?;
                 capacity_records.push(json!({"fault":fault_spec,"refused":refused,"recovery_exact":true}));
             }
+        }
+        #[cfg(feature="storage-fault-injection")]
+        if p.capacity_checks && split {
+            // A single remote rank refuses the optional group after the initial admission vote.
+            // Each image must still be encoded through the ordinary path with the identical span.
+            media.release_warm();
+            media.capacity_fault=Some(ImageCapacityFault::parse("1:parallel_patches:1")?);
+            let mut tokens=vec![2];
+            let mut descriptors=Vec::new();
+            for f in &p.fixtures {
+                descriptors.push(Descriptor{start:tokens.len(),..f.descriptor.clone()});
+                tokens.extend(std::iter::repeat_n(crate::prompt_media::IMAGE_TOKEN, f.descriptor.geometry.tokens()));
+                tokens.push(2);
+            }
+            if p.rank==0 {media.set_inputs(&p.fixtures.iter().map(Fixture::load).collect::<Result<Vec<_>>>()?)?;}
+            let (_, receipt)=media.prepare(media.identity(&descriptors,&tokens)?,&descriptors,0,
+                &mut control,&comm,&stream,&mut |_,_|anyhow::bail!("parallel fallback unexpectedly needed reclamation"))?;
+            let got=receipt["diagnostic_span_hashes"].as_array().ok_or_else(|| anyhow::anyhow!("parallel fallback span hashes"))?;
+            ensure!(got.len()==descriptors.len(), "parallel fallback lost an image");
+            for (i,(actual,descriptor)) in got.iter().zip(&descriptors).enumerate() {
+                ensure!(actual["start"].as_u64()==Some(descriptor.start as u64),
+                    "parallel fallback misplaced image {i}");
+                let expected=reference[i][0]["sha256"].as_str()
+                    .ok_or_else(||anyhow::anyhow!("missing reference digest for image {i}"))?;
+                ensure!(actual["sha256"].as_str()==Some(expected), "parallel fallback changed image {i}");
+            }
+            if p.rank==1 {ensure!(media.capacity_fault.as_ref().unwrap().remaining.get()==0,"fault did not fire");}
+            control.agree(b"parallel-image-fallback-complete")?;
+            capacity_records.push(json!({"fault":"1:parallel_patches:1","refused":false,"recovery_exact":true}));
         }
         if p.workspace_compare && location==3 && compact {
             // Synthetic BF16 input patterns use public fixture bytes, not CPU
