@@ -83,6 +83,26 @@ impl Native {
         })
     }
 }
+thread_local! {
+    /// config::gate_sep_screen: the empty kernel's module, and whether graphs captured from now on launch it after
+    /// the router's top-k in steps of 2-4 live rows.
+    static GATE_SEP: std::cell::RefCell<Option<crate::cuda::Module>> = const { std::cell::RefCell::new(None) };
+    static GATE_SEP_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Plan screen (config::gate_sep_screen): the empty kernel between routing and the experts on or off for graphs
+/// captured from now on (the caller drops its graphs).
+pub(crate) fn set_gate_sep_for_probe(cuda: &Cuda, on: bool) -> Result<()> {
+    ensure!(crate::config::gate_sep_screen(), "gate separation screen admission");
+    if on && GATE_SEP.with(|g| g.borrow().is_none()) {
+        let module = cuda.module(include_bytes!("../kernels/gate_sep_noop.ptx"))?;
+        GATE_SEP.with(|g| *g.borrow_mut() = Some(module));
+    }
+    GATE_SEP_ON.with(|flag| flag.set(on));
+    Ok(())
+}
+/// Captures (screen arm) that launched the empty kernel since the last call.
+pub(crate) fn gate_sep_launched() -> usize { GATE_SEP_COUNT.with(|n| n.replace(0)) }
+thread_local! { static GATE_SEP_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 /// Validated scheduler metadata. The image token uses the stored VL correction
 /// bias; padded rows return id=-1 and weight=0 from the GPU router.
 pub struct TokenRows {
@@ -408,6 +428,14 @@ impl Router {
             }?;
         }
         self.census(tokens, stream)?;
+        if GATE_SEP_ON.with(std::cell::Cell::get) && crate::cuda::capturing() && (2..=4).contains(&tokens.active_rows) {
+            GATE_SEP.with(|g| -> Result<()> {
+                let g = g.borrow();
+                let module = g.as_ref().ok_or_else(|| anyhow::anyhow!("gate separation kernel absent"))?;
+                unsafe { module.function("ca_gate_sep")?.launch([tokens.active_rows as u32, 1, 1], [128, 1, 1], 0, stream, &mut []) }
+            })?;
+            GATE_SEP_COUNT.with(|n| n.set(n.get() + 1));
+        }
         crate::mhc::stats_point(crate::mhc::StatsPoint::AfterRouting, stream)?;
         Ok(())
     }

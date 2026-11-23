@@ -396,6 +396,9 @@ pub(crate) struct GreedySession {
     prelaunched: Option<(u64, u32)>,
     stop_token: Option<u32>,
     history_lookup: Option<HistoryLookup>,
+    /// config::copy_hints: the current request's file-hint copy source (worker-owned; set before each of its steps,
+    /// never part of a session image). Exact point-mass proposals like the history's own.
+    copy_hints: Option<Rc<crate::history_lookup::HintIndex>>,
     /// config::batched_proposal_launch: this step's proposals, already drawn by the batched step's shared launch.
     batched_proposals: Option<[u32; 5]>,
     /// Guarded draft-head subset: the worker's verdict on this step's context (config::draft_head_subset_guard).
@@ -623,7 +626,7 @@ impl PreparedSession {
             poisoned: false, target_seed: None, stochastic_prefix_schedule,
             causal_three_threshold: None, causal_two_threshold: None, causal_full_threshold: None,
             causal_short_rows: 3, causal_ladder: None, prelaunched: None, stop_token: None, history_lookup: None,
-            batched_proposals: None,
+            copy_hints: None, batched_proposals: None,
             head_subset_ok: false, head_subset_guarded: crate::config::draft_head_subset()? == 1,
             draft_warmed: false,
             skip_unused_draft: match std::env::var("CANADA_SCRATCH_SKIP_UNUSED_DRAFT") {
@@ -784,6 +787,21 @@ pub(crate) struct Step {
     pub acceptance_temperature_probe: Option<serde_json::Value>,
 }
 impl GreedySession {
+    /// config::copy_hints: the worker hands the current request's hint source to its own steps (None otherwise).
+    pub(crate) fn use_copy_hints(&mut self, hints: Option<Rc<crate::history_lookup::HintIndex>>) { self.copy_hints = hints; }
+    /// The short copy proposal: the committed history's, or the file hints' when theirs is a longer match. Both are
+    /// exact tokens from committed or harness-known bytes, verified like any proposal.
+    fn copy_proposal(&self, start: u64, anchor: u32) -> Result<Option<crate::history_lookup::Proposal>> {
+        let Some(history) = self.history_lookup.as_ref() else { return Ok(None) };
+        let own = history.propose(start, anchor)?;
+        let Some(hints) = self.copy_hints.as_ref() else { return Ok(own) };
+        let hinted = hints.propose(history.tokens(), anchor)?;
+        Ok(match (own, hinted) {
+            (Some(a), Some(b)) if b.matched > a.matched => Some(b),
+            (None, Some(b)) => Some(b),
+            (a, _) => a,
+        })
+    }
     /// Explicit saved post-thinking frontier; this does not change serving policy.
     pub(crate) fn probe_post_thinking_temperatures(&mut self,target:&mut Target,anchor:u32,seed:u64,
         comm:&Roce,stream:&Stream)->Result<serde_json::Value> {
@@ -1755,8 +1773,13 @@ impl GreedySession {
         if limit<ROWS || self.target_seed.is_none()
             || !(self.draft_warmed || self.draft.sampled_graphs_ready()) {return Ok(None)}
         let begin=Instant::now();let start=target.position();
-        let Some((source,inputs))=self.history_lookup.as_ref()
-            .map(|h|h.propose_block_minimum::<ROWS>(start,anchor,buffers.minimum_match)).transpose()?.flatten() else{return Ok(None)};
+        let mut found=self.history_lookup.as_ref()
+            .map(|h|h.propose_block_minimum::<ROWS>(start,anchor,buffers.minimum_match)).transpose()?.flatten();
+        // config::copy_hints: the same block rule over the file hints when the history has no block here.
+        if found.is_none() && let (Some(history),Some(hints))=(self.history_lookup.as_ref(),self.copy_hints.as_ref()) {
+            found=hints.propose_block::<ROWS>(history.tokens(),anchor,buffers.minimum_match)?;
+        }
+        let Some((source,inputs))=found else{return Ok(None)};
         let proposals=&inputs[1..];
         self.poisoned=true;
         let result=(|| {
@@ -1890,9 +1913,7 @@ impl GreedySession {
         let target_only = context_tail || (self.skip_unused_draft && limit==1);
         if target_only { return Ok(false); }
         let fallback_warm=self.draft_warmed || (self.target_seed.is_some() && self.draft.sampled_graphs_ready());
-        let lookup = if fallback_warm {
-            self.history_lookup.as_ref().map(|history| history.propose(start, anchor)).transpose()?.flatten()
-        } else { None };
+        let lookup = if fallback_warm { self.copy_proposal(start, anchor)? } else { None };
         Ok(lookup.is_none() && self.reasoning_temperature_probe.is_none())
     }
     fn draft_phase(
@@ -1940,8 +1961,7 @@ impl GreedySession {
                 || (self.target_seed.is_some() && self.draft.sampled_graphs_ready());
             // A pooled pass already chose the neural drafter (neural_draft_needed); keep that choice.
             let lookup = if fallback_warm && !target_only && !ran {
-                self.history_lookup.as_ref()
-                    .map(|history| history.propose(start, anchor)).transpose()?.flatten()
+                self.copy_proposal(start, anchor)?
             } else { None };
             let mut acceptance_temperature_probe=None;
             let (draft_tokens, draft_confidence, scheduled_rows, produced_proposals) = if target_only {
@@ -2725,6 +2745,7 @@ impl GreedySession {
             "DSpark EXTEND-after-restore window");
         self.poisoned = true;
         self.history_lookup = None;
+        self.copy_hints = None;
         self.draft.reset(stream)?;
         self.prefill_features.run(target, stream)?;
         let (values, live) = self.prefill_features.values()?;
@@ -2757,6 +2778,7 @@ impl GreedySession {
         );
         self.poisoned = true;
         self.history_lookup = None;
+        self.copy_hints = None;
         self.draft.reset(stream)?;
         // Retain stable feature storage across requests instead of allocating
         // another CUDA module and buffer on every fresh request.
@@ -2796,7 +2818,7 @@ impl GreedySession {
         ensure!(!self.poisoned, "startup reset requires a healthy session");
         self.poisoned=true;
         self.draft.reset(stream)?;
-        self.history_lookup=None;
+        self.history_lookup=None;self.copy_hints=None;
         self.draft_warmed=false;
         self.target_seed=None;
         self.stop_token=None;
@@ -2817,6 +2839,7 @@ impl GreedySession {
         self.poisoned=true;
         self.draft.reset(stream)?;
         self.history_lookup=None;
+        self.copy_hints=None;
         self.draft_warmed=false;
         self.target_seed=None;
         self.stop_token=None;

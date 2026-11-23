@@ -1,0 +1,38 @@
+.version 7.0
+.target sm_80
+.address_size 64
+
+// CANADA_SCRATCH_HEAD_COMPACT_EXCEPTIONS (src/lossless_head.rs): one warp copies an escaped 32-weight group of the
+// canonical BF16 head into the compact table and writes the relative byte offset of each of its four eight-weight
+// slices into that group's unused payload bytes, where target-head-lossless-compact-v1 reads it (Nov 22).
+.visible .entry gather_escapes(
+    .param .u64 canonical, .param .u64 payload, .param .u64 indices, .param .u64 compact
+) {
+    .reg .u64 w, hi, list, table, addr, weight_offset, group_addr, relative;
+    .reg .u32 id, lane, group, index, destination, slice;
+    .reg .u16 value;
+    .reg .pred done;
+    ld.param.u64 w,[canonical];
+    ld.param.u64 hi,[payload];
+    ld.param.u64 list,[indices];
+    ld.param.u64 table,[compact];
+    mov.u32 id,%ctaid.x;
+    mov.u32 lane,%tid.x;
+    mad.wide.u32 addr,id,4,list;
+    ld.global.u32 group,[addr];
+    mad.lo.u32 index,group,32,lane;
+    mad.wide.u32 addr,index,2,w;
+    ld.global.u16 value,[addr];
+    mad.lo.u32 destination,id,32,lane;
+    mad.wide.u32 addr,destination,2,table;
+    st.global.u16 [addr],value;
+    setp.ge.u32 done,lane,4;
+    @done bra end;
+    mad.wide.u32 group_addr,group,32,hi;
+    mad.wide.u32 addr,lane,8,group_addr;
+    mad.lo.u32 slice,id,4,lane;
+    mul.wide.u32 relative,slice,16;
+    st.global.u64 [addr],relative;
+end:
+    ret;
+}

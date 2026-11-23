@@ -283,7 +283,9 @@ impl Worker {
         let mut spare = self.spare_sessions.pop().context("spare drafter")?;
         // Region 0's next conversation may arrive as an image (a paused one resuming, a cached one's turn).
         spare.clear_for_region0(&self.stream)?;
-        let session = self.session.replace(spare).context("active drafter")?;
+        let mut session = self.session.replace(spare).context("active drafter")?;
+        // config::copy_hints: the conversation's hint source moves into its region with its drafter.
+        session.use_copy_hints(self.copy_hints.iter().find(|(known, _)| *known == id).map(|(_, hints)| hints.clone()));
         self.peers.push(Peer { id, region, base, session, history, resident, emitted: self.emitted, limit: self.limit, finished: None });
         self.current = None;
         self.emitted = 0;
@@ -543,6 +545,8 @@ impl Worker {
     /// its region, releases the region now without a cache image.
     pub(crate) fn finish_peer(&mut self, id: u64, reason: Finish) -> Result<Value> {
         let index = self.peers.iter().position(|p| p.id == id).context("unknown region conversation")?;
+        // config::copy_hints: the conversation generates no more; its drafter drops its hints when it is reused.
+        self.copy_hints.retain(|(known, _)| *known != id);
         self.stream.synchronize()?;
         let label = match reason { Finish::Stop => "stop", Finish::Length => "length", Finish::Cancelled => "cancelled" };
         let (region, emitted, frontier) = { let p = &self.peers[index]; (p.region, p.emitted, p.position()) };

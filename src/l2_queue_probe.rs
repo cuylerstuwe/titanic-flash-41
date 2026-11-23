@@ -316,6 +316,15 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
     // CANADA_SCRATCH_MOE_FC_PDL_M3=0, …_COOPERATIVE_EPILOGUE=0 and …_MOE_CACHE_CA=0 so both arms take those two
     // plans at every live count. After everything else.
     let scale_codes = owner == 6 && std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE_SCREEN").as_deref() == Ok("1");
+    // An empty kernel between the router's top-k and the experts at 2-4 live rows (CANADA_SCRATCH_GATE_SEP_SCREEN=1;
+    // pico's DSGB10_GATE_SEP, checklist step 8): after everything else.
+    let gate_sep = crate::config::gate_sep_screen();
+    // The six-row head on its compact exception table against the canonical backing (CANADA_SCRATCH_HEAD_COMPACT_SCREEN=1
+    // with CANADA_SCRATCH_HEAD_COMPACT_EXCEPTIONS=1; checklist step 3): six-row owner, very last.
+    let head_compact = owner == 6 && crate::config::head_compact_screen();
+    // The six-row head's bit-plane layout on that table against the compact head (CANADA_SCRATCH_HEAD_PLANES_SCREEN=1
+    // with CANADA_SCRATCH_HEAD_COMPACT_EXCEPTIONS=1; checklist step 5): six-row owner, after that one.
+    let head_planes = owner == 6 && crate::config::head_planes_screen();
     let live_variants: &[(&str, usize, usize, bool)] = if owner == 6
         && std::env::var("CANADA_SCRATCH_MOE_LIVE_VARIANTS_SCREEN").as_deref() == Ok("1") {
         &[("cache-ca plan from two live rows", 2, 6, false), ("fused FFN sum from two live rows", 6, 2, false),
@@ -334,7 +343,7 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
         // plan 0 or (…_SCREEN_ALL=1) on every plan; other arithmetic, so a difference is recorded, not fatal.
         let direct_plans = if !(owner == 6 && (crate::config::wqb_direct_screen() || crate::config::qkva_direct_screen())) { 0 }
             else if crate::config::wqb_direct_screen_all() { plans.len().max(1) } else { 1 };
-        let direct_base = plans.len() + woa_plans + grids.len() + lates.len() + usize::from(early) + phases.len() + usize::from(bounded) + live_variants.len() + usize::from(keys_fork) + usize::from(index_lead) + usize::from(engram_lead) + usize::from(native_front) + usize::from(union_share) + usize::from(index_fork) + usize::from(qkv_narrow) + usize::from(route_front) + usize::from(scale_codes);
+        let direct_base = plans.len() + woa_plans + grids.len() + lates.len() + usize::from(early) + phases.len() + usize::from(bounded) + live_variants.len() + usize::from(keys_fork) + usize::from(index_lead) + usize::from(engram_lead) + usize::from(native_front) + usize::from(union_share) + usize::from(index_fork) + usize::from(qkv_narrow) + usize::from(route_front) + usize::from(scale_codes) + usize::from(gate_sep) + usize::from(head_compact) + usize::from(head_planes);
         // The attention boundaries' statistics by rank quarter (CANADA_SCRATCH_MHC_QUARTER_STATS_SCREEN=1; six-row
         // owner): one more variant after those, on plan 0 in both arms. Bit-identical by construction: the
         // screen's logit and sample comparison is its check.
@@ -384,6 +393,15 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
             let scale_variant = scale_codes && index == first_live_variant + live_variants.len() + usize::from(keys_fork)
                 + usize::from(index_lead) + usize::from(engram_lead) + usize::from(native_front) + usize::from(union_share) + usize::from(index_fork)
                 + usize::from(qkv_narrow) + usize::from(route_front);
+            let sep_variant = gate_sep && index == first_live_variant + live_variants.len() + usize::from(keys_fork)
+                + usize::from(index_lead) + usize::from(engram_lead) + usize::from(native_front) + usize::from(union_share) + usize::from(index_fork)
+                + usize::from(qkv_narrow) + usize::from(route_front) + usize::from(scale_codes);
+            let compact_variant = head_compact && index == first_live_variant + live_variants.len() + usize::from(keys_fork)
+                + usize::from(index_lead) + usize::from(engram_lead) + usize::from(native_front) + usize::from(union_share) + usize::from(index_fork)
+                + usize::from(qkv_narrow) + usize::from(route_front) + usize::from(scale_codes) + usize::from(gate_sep);
+            let planes_variant = head_planes && index == first_live_variant + live_variants.len() + usize::from(keys_fork)
+                + usize::from(index_lead) + usize::from(engram_lead) + usize::from(native_front) + usize::from(union_share) + usize::from(index_fork)
+                + usize::from(qkv_narrow) + usize::from(route_front) + usize::from(scale_codes) + usize::from(gate_sep) + usize::from(head_compact);
             let direct_plan = (index >= direct_base && index < direct_base + direct_plans).then(|| index - direct_base);
             let quarter_variant = quarter && index == direct_base + direct_plans;
             let head4_variant = head4 && index == direct_base + direct_plans + usize::from(quarter);
@@ -419,6 +437,17 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
                     target.set_l2_queue_for_probe((!plans.is_empty()).then_some(0), stream)?;
                     target.set_moe_route_front_for_probe(on, stream)?;
                     crate::moe::route_placed();
+                } else if compact_variant {
+                    target.set_l2_queue_for_probe((!plans.is_empty()).then_some(0), stream)?;
+                    target.set_head_compact_for_probe(on, stream)?;
+                } else if planes_variant {
+                    target.set_l2_queue_for_probe((!plans.is_empty()).then_some(0), stream)?;
+                    target.set_head_variant_for_probe(if on { crate::lossless_head::PLANES } else { crate::lossless_head::COMPACT }, stream)?;
+                    crate::lossless_head::planes_launched();
+                } else if sep_variant {
+                    target.set_l2_queue_for_probe((!plans.is_empty()).then_some(0), stream)?;
+                    target.set_gate_sep_for_probe(on, stream)?;
+                    crate::ffn::gate_sep_launched();
                 } else if union_variant {
                     target.set_l2_queue_for_probe((!plans.is_empty()).then_some(0), stream)?;
                     ensure!(target.set_sparse_union_share_for_probe(on, stream)?, "candidate union screen on an unlinked owner");
@@ -534,12 +563,17 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
                 ensure!(checks[0]["logits_sha256"] != checks[1]["logits_sha256"],
                     "changed L2 queue inputs did not change logits");
                 if let Some(reference) = &expected {
-                    if direct_plan.is_some() || native || grid.is_some() || late.is_some() || index_early || phase.is_some() || bounded_mask || live_variant.is_some() || fork_variant || lead_variant || engram_variant || front_variant || union_variant || ifork_variant || qkv_variant || route_variant || scale_variant || head4_variant { exact &= reference == &checks; }
+                    if direct_plan.is_some() || native || grid.is_some() || late.is_some() || index_early || phase.is_some() || bounded_mask || live_variant.is_some() || fork_variant || lead_variant || engram_variant || front_variant || union_variant || ifork_variant || qkv_variant || route_variant || scale_variant || sep_variant || compact_variant || planes_variant || head4_variant { exact &= reference == &checks; }
                     else { ensure!(reference == &checks, "an L2 queue plan changed full logits or target T1 samples"); }
                 } else { expected = Some(checks.clone()); }
                 let mean = samples.iter().sum::<f64>() / samples.len() as f64;
                 if front_variant && on { swapped = target.moe_swapped(); }
                 if route_variant && on { regridded = crate::moe::route_placed(); ensure!(regridded > 0, "fused routing screen placed no router"); }
+                // The receipt that this arm's captures ran the plane operator and the compact arm's did not.
+                if planes_variant { let launched = crate::lossless_head::planes_launched(); if on { regridded = launched; }
+                    ensure!(on == (launched > 0), "the bit-plane head launched {launched} times with the planes {}", if on { "on" } else { "off" }); }
+                if sep_variant { let launched = crate::ffn::gate_sep_launched(); if on { regridded = launched; }
+                    ensure!(on == (launched > 0) || !(2..=4).contains(&live), "gate separation launched {launched} kernels"); }
                 means[usize::from(arm.is_some())] += mean / 2.;
                 records.push(json!({"owner_rows":owner,"live":live,"plan":index,"queue":arm.is_some(),"trial":trial,
                     "mean_ms":mean,"samples_ms":samples,"roce_counter_deltas":moved,"clock":clocks}));
@@ -554,6 +588,52 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
                     means[0], means[1], 100.*(means[1]/means[0]-1.));
                 summary.push(json!({"owner_rows":owner,"live":live,"plan":index,"variant":"four-bit code for the FC1 expert scales (half of 3.9 % of an expert's bytes) against the input-address plan",
                     "exact":exact,"control_ms":means[0],"queue_ms":means[1],
+                    "delta_ms":means[1]-means[0],"delta_percent":100.*(means[1]/means[0]-1.),
+                    "control_floor_ms":floor0,"queue_floor_ms":floor1,"delta_floor_ms":floor1-floor0}));
+                continue;
+            }
+            if compact_variant {
+                target.set_head_compact_for_probe(true, stream)?;
+                let floor = |queue: bool| records.iter().rev().take(4).filter(|r| r["queue"] == queue)
+                    .flat_map(|r| r["samples_ms"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()))
+                    .fold(f64::INFINITY, f64::min);
+                let (floor0, floor1) = (floor(false), floor(true));
+                ensure!(exact, "the compact head changed logits or samples in the plan screen");
+                eprintln!("rank{rank} compact head M{owner} live{live}: canonical {:.3} ms, compact {:.3} ms ({:+.2}%), floors {floor0:.3} / {floor1:.3}, logits and samples exact {exact}",
+                    means[0], means[1], 100.*(means[1]/means[0]-1.));
+                summary.push(json!({"owner_rows":owner,"live":live,"plan":index,"variant":"six-row head: compact exception table against the canonical backing",
+                    "exact":exact,"control_ms":means[0],"queue_ms":means[1],
+                    "delta_ms":means[1]-means[0],"delta_percent":100.*(means[1]/means[0]-1.),
+                    "control_floor_ms":floor0,"queue_floor_ms":floor1,"delta_floor_ms":floor1-floor0}));
+                continue;
+            }
+            if planes_variant {
+                target.set_head_variant_for_probe(crate::lossless_head::COMPACT, stream)?;
+                // Floors and medians over both trials of an arm; the means carry the outliers.
+                let arm = |queue: bool| { let mut all = records.iter().rev().take(4).filter(|r| r["queue"] == queue)
+                    .flat_map(|r| r["samples_ms"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap())).collect::<Vec<_>>();
+                    all.sort_by(f64::total_cmp); (all[0], all[all.len() / 2]) };
+                let ((floor0, median0), (floor1, median1)) = (arm(false), arm(true));
+                ensure!(exact, "the bit-plane head changed logits or samples in the plan screen");
+                eprintln!("rank{rank} plane head M{owner} live{live}: compact {:.3} ms, planes {:.3} ms ({:+.2}%), floors {floor0:.3} / {floor1:.3}, medians {median0:.3} / {median1:.3}, plane launches captured {regridded}, logits and samples exact {exact}",
+                    means[0], means[1], 100.*(means[1]/means[0]-1.));
+                summary.push(json!({"owner_rows":owner,"live":live,"plan":index,"variant":"six-row head: bit-plane weight layout (compact + planes) against the compact head",
+                    "captured_launches":regridded,"exact":exact,"control_ms":means[0],"queue_ms":means[1],
+                    "delta_ms":means[1]-means[0],"delta_percent":100.*(means[1]/means[0]-1.),
+                    "control_floor_ms":floor0,"queue_floor_ms":floor1,"delta_floor_ms":floor1-floor0,
+                    "control_median_ms":median0,"queue_median_ms":median1,"delta_median_ms":median1-median0}));
+                continue;
+            }
+            if sep_variant {
+                target.set_gate_sep_for_probe(false, stream)?;
+                let floor = |queue: bool| records.iter().rev().take(4).filter(|r| r["queue"] == queue)
+                    .flat_map(|r| r["samples_ms"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()))
+                    .fold(f64::INFINITY, f64::min);
+                let (floor0, floor1) = (floor(false), floor(true));
+                eprintln!("rank{rank} gate separation M{owner} live{live}: control {:.3} ms, separated {:.3} ms ({:+.2}%), floors {floor0:.3} / {floor1:.3}, captured launches {regridded}, logits and samples exact {exact}",
+                    means[0], means[1], 100.*(means[1]/means[0]-1.));
+                summary.push(json!({"owner_rows":owner,"live":live,"plan":index,"variant":"empty kernel (no PDL) between the router's top-k and the routed experts at 2-4 live rows (pico's DSGB10_GATE_SEP)",
+                    "captured_launches":regridded,"exact":exact,"control_ms":means[0],"queue_ms":means[1],
                     "delta_ms":means[1]-means[0],"delta_percent":100.*(means[1]/means[0]-1.),
                     "control_floor_ms":floor0,"queue_floor_ms":floor1,"delta_floor_ms":floor1-floor0}));
                 continue;

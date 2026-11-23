@@ -272,6 +272,9 @@ fn with_execution_activity(
 pub(crate) struct Job {
     pub id: String,
     pub tokens: Vec<u32>,
+    /// config::copy_hints: the prompt's file-hint tokens (protocol::PreparedChat::copy_hints), sent to every rank in
+    /// a CopyHints frame immediately before this job's Begin (worker_interleave_http::run).
+    pub copy_hints: Vec<u32>,
     pub images: Vec<crate::image_cache::Descriptor>,
     pub image_inputs: Vec<Arc<crate::worker_media::PatchInput>>,
     #[cfg(feature = "vision-protocol")]
@@ -1137,6 +1140,7 @@ async fn finish_chat(shared: Arc<Shared>, body: context::Input, permit: OwnedSem
     let job = Job {
         id: id.clone(),
         tokens: prepared.tokens.clone(),
+        copy_hints: std::mem::take(&mut prepared.copy_hints),
         images: std::mem::take(&mut prepared.images),
         image_inputs: std::mem::take(&mut prepared.image_inputs),
         #[cfg(feature = "vision-protocol")]

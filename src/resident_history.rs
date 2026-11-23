@@ -285,6 +285,9 @@ impl ResidentHistory {
     pub fn retire(&mut self) {
         self.phase = Phase::Poisoned;
     }
+    pub(crate) fn next_request_id(&self) -> Result<u64> {
+        self.last_id.checked_add(1).ok_or_else(|| anyhow::anyhow!("request ID space exhausted"))
+    }
     /// Physical owners keep their phase and token buffers in place. Switching
     /// the selected owner must still preserve the group-wide request-ID floor.
     pub(crate) fn synchronize_request_ids(&mut self,other:&mut Self)->Result<()> {
@@ -346,6 +349,17 @@ impl ResidentHistory {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fresh_http_owner_continues_after_a_startup_request() {
+        let mut history = ResidentHistory::new(128, 1).unwrap();
+        assert_eq!(history.next_request_id().unwrap(), 1);
+        history.prepare(45_770_011, vec![2, 3], 3, 7).unwrap();
+        history.prefilled(2, 10).unwrap();
+        history.finish(Finish::Cancelled).unwrap();
+        let next = history.next_request_id().unwrap();
+        assert_eq!(next, 45_770_012);
+        history.prepare(next, vec![4], 3, 8).unwrap();
+    }
     #[test]
     fn only_replaced_naturally_finished_output_is_an_optional_copy_hint() {
         let finished=|reason| {

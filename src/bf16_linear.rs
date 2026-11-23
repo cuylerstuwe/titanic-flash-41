@@ -202,6 +202,10 @@ impl<T: Output> Projection<T> {
             "pooled lossless head geometry/context");
         self.lossless_head.as_ref().unwrap().run_pooled(input.ptr(),output.ptr(),rows,stream)
     }
+    pub(crate) fn set_head_variant_for_probe(&self,variant:u8)->Result<()> {
+        self.lossless_head.as_ref().ok_or_else(||anyhow::anyhow!("head variant screen without the lossless head"))?
+            .set_variant_for_probe(variant)
+    }
     pub(crate) fn set_lossless_for_probe(&self,active:bool)->Result<()> {
         ensure!(self.lossless_head.is_some() && self.rows==6
             && std::env::var("CANADA_SCRATCH_LOSSLESS_HEAD_SCREEN").as_deref()==Ok("1"),

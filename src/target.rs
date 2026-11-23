@@ -2537,6 +2537,35 @@ impl Target {
         self.decoder_graph = None;
         crate::moe::set_route_front_for_probe(on)
     }
+    /// Plan screen (CANADA_SCRATCH_HEAD_COMPACT_SCREEN=1): the six-row head on its compact exception table or on the
+    /// canonical backing (the head is shared, so every owner of it switches).
+    pub(crate) fn set_head_compact_for_probe(&mut self, on: bool, stream: &Stream) -> Result<()> {
+        self.set_head_variant_for_probe(if on { crate::lossless_head::COMPACT } else { crate::lossless_head::CANONICAL }, stream)
+    }
+    /// Plan screens (that one and CANADA_SCRATCH_HEAD_PLANES_SCREEN=1): the six-row head's operator for the graphs
+    /// captured from now on, one of crate::lossless_head's CANONICAL, COMPACT and PLANES (the head is shared, so
+    /// every owner of it switches).
+    pub(crate) fn set_head_variant_for_probe(&mut self, variant: u8, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && self.rows == 6 && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle head variant screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        self.io.set_head_variant_for_probe(variant)
+    }
+    /// Plan screen (CANADA_SCRATCH_GATE_SEP_SCREEN=1): the empty kernel between routing and the experts at 2-4 live rows.
+    pub(crate) fn set_gate_sep_for_probe(&mut self, on: bool, stream: &Stream) -> Result<()> {
+        ensure!(crate::config::l2_queue_screen() && [6, 16].contains(&self.rows) && self.source_phase == Phase::Verify
+            && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
+            && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle gate separation screen");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs) { *graph = None; }
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs) { *graph = None; }
+        self.decoder_graph = None;
+        crate::ffn::set_gate_sep_for_probe(&self.cuda, on)
+    }
     /// Exported front-end nodes the last verification graph capture replaced (screens).
     pub(crate) fn moe_swapped(&self) -> usize { self.moe_swapped }
     /// Plan screen (CANADA_SCRATCH_SPARSE_UNION_SHARE_SCREEN=1): layers 28, 32 and 36 reuse layer 24's candidate
@@ -6153,6 +6182,7 @@ impl Target {
     /// graph or adding an all-gather. The finite screen compares all four ranks.
     pub(crate) fn pending_local_logits_for_probe(&self) -> Result<(&Buffer<f32>, usize)> {
         ensure!(std::env::var("CANADA_SCRATCH_INDEX_SCORE_MODEL_SCREEN").as_deref()==Ok("1")
+            ||std::env::var_os("CANADA_SCRATCH_VERIFIER_NUMERICS_PROBE").is_some()
             ||std::env::var("CANADA_SCRATCH_SHARED_DOWN_FLASH_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_FFN_HINT_MODEL_SCREEN").as_deref()==Ok("1")
             ||std::env::var("CANADA_SCRATCH_FFN_SUM_SHARED_SCREEN").as_deref()==Ok("1")
@@ -7341,6 +7371,15 @@ impl Target {
         stream.synchronize()?;
         self.row_store1.evict_file_pages_for_probe()?;
         self.group14.engram_store()?.evict_file_pages_for_probe()
+    }
+    /// config::engram_media_overlap: the Engram stores' handles and both tables' row ids for `tokens` appended after
+    /// the prefix `before` (hash_history::preview_rows). Reads no model state.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn first_rows_engram_ids(&self, before: &[u32], tokens: &[u32])
+        -> Result<(Rc<RowStore>, Rc<RowStore>, Vec<u64>, Vec<u64>)> {
+        let rows = crate::hash_history::preview_rows(before, tokens, &self.hashes)?;
+        Ok((self.row_store1.clone(), self.group14.engram_store()?,
+            rows.iter().flat_map(|row| row[0]).collect(), rows.iter().flat_map(|row| row[1]).collect()))
     }
     /// Returns when host preparation finished and GPU enqueue began.
     fn encoder_chunk(

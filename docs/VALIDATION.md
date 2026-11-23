@@ -1,5 +1,44 @@
 # Validation status
 
+## November 22 edit and cache release (s1694)
+
+Four GB10s ran the serving binary at 2350 MHz with the canonical target, temperature 1 and top-p 1. Every comparison below uses a head-local client, the same seeds and the s1690 settings on the same hardware as its control.
+
+| Check | s1690 settings | s1694 |
+|---|---:|---:|
+| Edit and rewrite panel, 24 requests in a coding harness's format, pooled decode | 138.0 tok/s | 208.6 tok/s |
+| The same panel, total wall time | 325 s | 217 s |
+| Its 16 edit requests, wall time | 163.5 s | 142.8 s |
+| Its 8 whole-file rewrites, wall time | 161.9 s | 74.3 s |
+| Server prompt processing on that panel, median | 642 ms | 648 ms |
+| Ordinary and long-context decode panel, 65 requests, loaded back to back | 89.9 tok/s | 89.7 tok/s |
+| The same at an interior position of a long context | 84.1 tok/s | 83.8 tok/s |
+
+All 46 tool calls of the edit panel applied to their files, and the eight rewritten files were byte-identical with and without copy hints. The panel was built to exercise file edits; the share of such turns in ordinary use was not measured. Edits of a few lines moved by less than 2 %. The decode panel generated identical tokens in identical steps in both arms. A third load of the candidate placed before the control read 90.0 tok/s, so the two settings are equal within the drift between consecutive loads.
+
+The compact output-head table was compared with the canonical matrix inside one load: logits and samples were identical at two, three and six verification rows, and a step took 0.03 to 0.08 ms less. Teacher-forced logits of the six-, 16- and 32-row verifiers were compared with DeepSeek's reference on 360 rows. Their divergence from the reference (KL 0.0120, 0.0119 and 0.0121) matched the reference's own split-K noise (0.0113) within the paired intervals.
+
+The four-conversation screenshot panel of the s1690 release ran twice, 46 requests each, all completed. The first run used that release's order on a fresh boot: one conversation starts from the single-chat checkpoint. The second reordered the first requests so that no conversation could start from it and all four prefilled a million tokens cold, the order that failed on earlier builds of this release.
+
+| Check | Standard order | All four cold |
+|---|---:|---:|
+| One cold conversation with 70 screenshots, 621,049 prompt tokens, server prefill | 66.96 s | 67.82 s |
+| Text extension of it: 620,800 of 621,060 tokens restored, time to first token | 0.77 s | 0.78 s |
+| Four independent histories, 1,010,178–1,012,783 prompt tokens, completed receipt and image checks | 36/36 | 36/36 |
+| Eight further turns per conversation: extensions that reused at least 1,010,048 tokens | 32/32 | 32/32 |
+| Largest gap from the preceding prompt length | 201 tokens | 191 tokens |
+| Time to first token for those concurrent extensions, median / 95th percentile | 2.27 s / 2.65 s | 2.32 s / 2.81 s |
+| Pages swapped out on the coordinator during the panel | 0 | 46 |
+| Coordinator's lowest available memory | 3.53 GiB | 3.60 GiB |
+
+The engine's own swap use was zero in both runs and no input was refused. The second run was a late load on a 6.5-hour boot. In both, available memory on the coordinator came within 0.1 GiB of the 3.5 GiB reserve for a moment while four 55 MB requests arrived together, closer than the 4.05 GiB of the s1690 qualification. A third run in the standard order on that aged boot, with about 0.5 GiB less free host memory, declined one conversation's checkpoint 74 MB below the reserve and prefilled it again; the fresh-boot run above replaced it.
+
+A separate load checked serving behaviour. A stream cancelled mid-answer left the server ready, and the same prompt then ran to its limit. A follow-up turn reused 12,642 of 12,664 prompt tokens. Three maximum-effort tasks finished naturally with the graded answers. A foreground request completed in 2.2 s beside a running background request. Two overlapping requests each repeated about 75 lines of a numbered listing with copy hints attached, returned every line exactly and decoded together at about 105 tokens per second each. The same load compared the six-row and 16-row verifiers after a 131,000-token prefix, where no reference logits exist: their mutual KL was 0.0017 on 96 rows with identical top tokens, below their difference at short context (0.0034) and well below the reference's own noise.
+
+The installed release passed a clean boot with one model load per host, a head-local completion, the public smoke client twice (12 of 12 requests each, with forward reuse of about 9,250 prompt tokens) and two requests routed through the M4 router by Pi: an image question answered in 0.95 s, and a rewrite of a 366-line file that changed only the requested line, whose 3,584-token write decoded at about 335 tokens per second from the conversation's own copy of the file.
+
+Three earlier builds of this release failed that panel when the conversations' first requests arrived in a different order from the s1690 runs. The first lost a conversation's only restore point to another conversation's save while replaced snapshots were still cached. The second refused an image input for lack of host memory while a replaced snapshot held 0.94 GB outside the snapshot pool. Both paths are unchanged from s1690. The third replaced the wrong victim when a save needed two. The release gives up replaced snapshots and completed-turn snapshots that no request has restored before any restore point, in the save plans and in the host-memory reclaim, and unit tests replay the traced cache states.
+
 ## November 21 screenshot serving repair (s1690)
 
 Four GB10s ran the serving binary at 2350 MHz with the canonical target, temperature 1 and top-p 1. All 46 requests in the native panel completed. Four images with identical dimensions and different colors yielded the correct two quadrant colors alone and concurrently. The worker trace confirmed four distinct decode regions sharing an actual GPU step. Shared visual state was also exercised while a different region processed a new prompt.

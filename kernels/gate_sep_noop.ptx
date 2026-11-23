@@ -1,0 +1,11 @@
+.version 7.0
+.target sm_80
+.address_size 64
+
+// CANADA_SCRATCH_GATE_SEP_SCREEN (src/ffn.rs; plan screen only): an empty kernel launched without PDL between the
+// router's top-k and the routed experts in steps of 2-4 live rows, as pico's DSGB10_GATE_SEP separates its router
+// gate from the MoE. It reads and writes nothing.
+.visible .entry ca_gate_sep()
+{
+	ret;
+}

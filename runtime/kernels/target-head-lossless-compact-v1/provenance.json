@@ -1,0 +1,8 @@
+{
+ "source_manifest_sha256": "d0ff14ca7341e5489a1a252dd8f9e24205fe583118ead1810e501909ba244274",
+ "source_ptx_sha256": "b068d465252caaa40d3e16a627d72c767f1d951afa5d4b126a34219c73d86f4d",
+ "ptxas": "Build cuda_13.0.r13.0/compiler.36424714_0",
+ "patched_load": "@%p2 ld.global.cg.v4.b32 { %r20, %r21, %r22, %r23 }, [ %rd13 + 0 ];",
+ "cubin_sha256": "3dbc4ecf151f1047eda907963bcc1be4e2c6b82d997a2c379b4d914417c47b85",
+ "manifest_sha256": "570bbb8c09e94a84843c325304ce504d977d8f6063348679e9762c11094d2304"
+}

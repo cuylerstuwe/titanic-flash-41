@@ -39,6 +39,8 @@ fn fingerprint(ids: impl IntoIterator<Item = u32>) -> u64 {
     }
     value ^ (value >> 32)
 }
+/// The same fingerprint over a whole token list (config::copy_hints: ranks agree on the hint tokens they hold).
+pub(crate) fn fingerprint_ids(ids: &[u32]) -> u64 { fingerprint(ids.iter().copied()) }
 fn backup_fingerprint(ids:impl IntoIterator<Item=u32>)->usize {
     let mut h=fingerprint(ids);h^=h>>29;h=h.wrapping_mul(0x9e3779b97f4a7c15);h^=h>>32;h as usize
 }
@@ -232,6 +234,8 @@ impl HistoryLookup {
         let inputs=self.tokens[proposal.source_end..proposal.source_end+ROWS].try_into().unwrap();
         Ok(Some((proposal,inputs)))
     }
+    /// The committed tokens: the suffix that a separate copy source (config::copy_hints) is matched against.
+    pub(crate) fn tokens(&self) -> &[u32] { &self.tokens }
     pub(crate) fn propose(&self, start: u64, anchor: u32) -> Result<Option<Proposal>> {
         ensure!(start == self.position() && anchor < 129280, "history lookup query frontier/token");
         let Some(minimum) = self.minimum_match else { return Ok(None); };
@@ -274,10 +278,148 @@ impl HistoryLookup {
     }
 }
 
+/// config::copy_hints: an immutable index over file text the harness has shown the model (protocol::numbered_runs),
+/// queried with a conversation's committed tokens. Same key lengths, longest-key-first rule and five-token proposals
+/// as `HistoryLookup`; the most recent occurrence of a key wins. Built once per request with rolling hashes (a few
+/// milliseconds for the largest hint set), never extended.
+pub(crate) struct HintIndex {
+    tokens: Vec<u32>,
+    tables: [Vec<u32>; 5],
+}
+const HINT_BASE: u64 = 0x9e37_79b9_7f4a_7c15;
+fn hint_hash(ids: impl IntoIterator<Item = u32>) -> u64 {
+    ids.into_iter().fold(0u64, |h, id| h.wrapping_mul(HINT_BASE).wrapping_add(id as u64 + 1))
+}
+fn hint_slot(hash: u64, slots: usize) -> usize {
+    ((hash ^ (hash >> 29)).wrapping_mul(0xbf58_476d_1ce4_e5b9) >> 32) as usize & (slots - 1)
+}
+impl HintIndex {
+    pub(crate) const MAX_TOKENS: usize = 1 << 18;
+    pub(crate) fn new(tokens: &[u32]) -> Result<Self> {
+        ensure!(tokens.len() >= 16 && tokens.len() <= Self::MAX_TOKENS && tokens.iter().all(|&id| id < 129280),
+            "copy hint extent/token domain");
+        // One-way tables at a load of at most 0.25 up to 131K tokens (0.375 at the largest set): a displaced key
+        // usually leaves a shorter key of the same occurrence, so the proposal survives with a shorter match.
+        let slots = (tokens.len() * 4).next_power_of_two().clamp(4096, 1 << 19);
+        let mut tables: [Vec<u32>; 5] = std::array::from_fn(|_| vec![EMPTY; slots]);
+        // A key that ends at `end` proposes tokens end+1..end+6: only keys with five tokens after them are indexed.
+        let last = tokens.len() - 6;
+        for (n, table) in LENGTHS.into_iter().zip(&mut tables) {
+            if last + 1 < n { continue; }
+            let top = (1..n).fold(1u64, |p, _| p.wrapping_mul(HINT_BASE));
+            let mut hash = hint_hash(tokens[..n].iter().copied());
+            table[hint_slot(hash, slots)] = (n - 1) as u32;
+            for end in n..=last {
+                hash = hash.wrapping_sub((tokens[end - n] as u64 + 1).wrapping_mul(top))
+                    .wrapping_mul(HINT_BASE).wrapping_add(tokens[end] as u64 + 1);
+                table[hint_slot(hash, slots)] = end as u32;
+            }
+        }
+        Ok(Self { tokens: tokens.to_vec(), tables })
+    }
+    pub(crate) fn workspace_bytes(&self) -> usize { (self.tokens.len() + 5 * self.tables[0].len()) * 4 }
+    /// The longest key formed by the end of `history` plus `anchor` that occurs in the hints, and the five hint
+    /// tokens after it. Every candidate is compared token for token; a hash collision only loses the proposal.
+    pub(crate) fn propose(&self, history: &[u32], anchor: u32) -> Result<Option<Proposal>> {
+        ensure!(anchor < 129280, "copy hint query token");
+        let slots = self.tables[0].len();
+        for (n, table) in LENGTHS.into_iter().zip(&self.tables).rev() {
+            if history.len() + 1 < n { continue; }
+            let suffix = &history[history.len() + 1 - n..];
+            let end = table[hint_slot(hint_hash(suffix.iter().copied().chain([anchor])), slots)];
+            if end == EMPTY { continue; }
+            let end = end as usize;
+            ensure!(end + 1 >= n && end + 6 <= self.tokens.len(), "copy hint index bounds");
+            if self.tokens[end] == anchor && self.tokens[end + 1 - n..end] == *suffix {
+                return Ok(Some(Proposal { tokens: self.tokens[end + 1..end + 6].try_into().unwrap(), matched: n, source_end: end }));
+            }
+        }
+        Ok(None)
+    }
+    /// As `HistoryLookup::propose_block_minimum`: a whole block from the hints under the same minimum-match rule.
+    pub(crate) fn propose_block<const ROWS:usize>(&self,history:&[u32],anchor:u32,minimum:usize)
+        ->Result<Option<(Proposal,[u32;ROWS])>> {
+        ensure!([16,32].contains(&ROWS)&&[16,24,32,48,64].contains(&minimum),"copy hint block geometry/minimum");
+        let Some(mut proposal)=self.propose(history,anchor)? else{return Ok(None)};
+        if proposal.source_end+ROWS>self.tokens.len() {return Ok(None)}
+        if proposal.matched<minimum {
+            let required_key=match minimum{24=>16,48=>32,_=>return Ok(None)};
+            if proposal.matched<required_key||proposal.source_end+1<minimum||history.len()+1<minimum
+                ||self.tokens[proposal.source_end+1-minimum..proposal.source_end]
+                    !=history[history.len()+1-minimum..] {return Ok(None)}
+            proposal.matched=minimum;
+        }
+        let inputs=self.tokens[proposal.source_end..proposal.source_end+ROWS].try_into().unwrap();
+        Ok(Some((proposal,inputs)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "timing only: cargo test --release -- --ignored hint_index_build_time --nocapture"]
+    fn hint_index_build_time() {
+        let mut x=0x9e3779b97f4a7c15u64;
+        let tokens=(0..196_608).map(|_|{x^=x<<13;x^=x>>7;x^=x<<17;(x%120_000) as u32}).collect::<Vec<_>>();
+        for n in [2_000usize,20_000,196_608] {
+            let began=std::time::Instant::now();
+            let index=HintIndex::new(&tokens[..n]).unwrap();
+            eprintln!("HintIndex {n} tokens: {:.2} ms, {} bytes",began.elapsed().as_secs_f64()*1000.,index.workspace_bytes());
+        }
+    }
+    #[test]
+    fn hints_match_the_history_suffix_and_propose_their_own_tokens() {
+        // History ends with 40 tokens that appear in the hint stream, followed there by 300..340.
+        let shared=(1000..1040).collect::<Vec<u32>>();
+        let mut hint=(5..60).collect::<Vec<u32>>();hint.extend(&shared);hint.extend(300..340);hint.extend(7..30);
+        let hints=HintIndex::new(&hint).unwrap();
+        let mut history=(2000..2100).collect::<Vec<u32>>();history.extend(&shared[..39]);
+        let anchor=shared[39];
+        let lookup=HistoryLookup::with_maximum(4096,&history,SLOTS,64).unwrap();
+        assert!(lookup.propose(lookup.position(),anchor).unwrap().is_none());
+        let p=hints.propose(lookup.tokens(),anchor).unwrap().unwrap();
+        assert_eq!(p.matched,32);assert_eq!(p.tokens,[300,301,302,303,304]);
+        let (b,inputs)=hints.propose_block::<16>(lookup.tokens(),anchor,32).unwrap().unwrap();
+        assert_eq!(b.matched,32);assert_eq!(inputs[0],anchor);assert_eq!(inputs[1..],(300..315).collect::<Vec<_>>()[..]);
+        // 48 needs 47 past tokens equal to the source's; the history shares only 39.
+        assert!(hints.propose_block::<32>(lookup.tokens(),anchor,48).unwrap().is_none());
+        // A different anchor or suffix finds nothing.
+        assert!(hints.propose(lookup.tokens(),anchor+1).unwrap().is_none());
+        assert!(hints.propose(&history[..90],anchor).unwrap().is_none());
+        assert!(HintIndex::new(&[1,2,3]).is_err());
+    }
+    /// Against a direct search: for every query the index returns the longest key length that occurs with five
+    /// tokens after it, at its most recent occurrence, or (rarely, on a slot collision) nothing; never another answer.
+    #[test]
+    fn hint_index_agrees_with_a_direct_search() {
+        let mut x=0x243f6a8885a308d3u64;
+        let mut next=|m:u32|{x^=x<<13;x^=x>>7;x^=x<<17;(x%m as u64) as u32};
+        // A stream with repeated segments: later copies of earlier spans, over a small alphabet.
+        let mut hint:Vec<u32>=(0..600).map(|_|next(50)).collect();
+        for _ in 0..40 {let a=next(500) as usize;let n=20+next(70) as usize;let span=hint[a..(a+n).min(hint.len())].to_vec();hint.extend(span);hint.push(next(50));}
+        let index=HintIndex::new(&hint).unwrap();
+        let (mut found,mut lost)=(0,0);
+        for _ in 0..4000 {
+            let at=70+next(hint.len() as u32-80) as usize;
+            let history=hint[at-70..at].to_vec();let anchor=hint[at];
+            let mut want=None;
+            for n in LENGTHS.into_iter().rev() {
+                let key:Vec<u32>=history[history.len()+1-n..].iter().copied().chain([anchor]).collect();
+                if let Some(end)=(n-1..hint.len()-5).rev().find(|&end|hint[end+1-n..=end]==key[..]) {want=Some((n,end));break;}
+            }
+            let (n,end)=want.expect("the query itself occurs in the stream");
+            match index.propose(&history,anchor).unwrap() {
+                Some(p) if p.matched==n => {assert_eq!((p.source_end,p.tokens.to_vec()),(end,hint[end+1..end+6].to_vec()));found+=1;}
+                // A collision displaced the longest key: a shorter one may answer, with its own most recent occurrence.
+                Some(p) => {assert!(p.matched<n&&hint[p.source_end+1-p.matched..=p.source_end]==[&history[history.len()+1-p.matched..],&[anchor]].concat()[..]);lost+=1;}
+                None => lost+=1,
+            }
+        }
+        eprintln!("hint index against a direct search: {found} longest-key answers, {lost} displaced to a shorter key or lost");
+        assert!(found>=3400,"{found} exact answers, {lost} displaced");
+    }
     #[test]
     fn relaxed_block_gate_keeps_source_committed_and_default_strong() {
         let mut prefix=(100..132).collect::<Vec<_>>();prefix.extend(300..350);prefix.extend(100..131);

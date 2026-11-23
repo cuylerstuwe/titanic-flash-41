@@ -38,6 +38,63 @@ pub struct Frontend {
     image_cache: Option<Arc<crate::image_input_cache::ImageInputCache>>,
     #[cfg(feature = "vision-protocol")]
     defer_image_pixels: bool,
+    /// config::copy_hints: token ids of each numbered listing's text already seen, by the text's SHA-256, with the
+    /// request count at its last use. Bounded: past 2,048 entries or 2,097,152 tokens (8 MiB), entries the current
+    /// request did not use are dropped, least recently used first.
+    hint_cache: std::sync::Mutex<(u64, std::collections::HashMap<[u8; 32], (Arc<Vec<u32>>, u64)>)>,
+}
+/// Most hint tokens a request carries (newest listings first); the worker's hint index accepts up to 2^18.
+const COPY_HINT_TOKENS: usize = 196_608;
+/// The most text one listing contributes to the copy hints (its last lines): about COPY_HINT_TOKENS tokens of code.
+const COPY_HINT_RUN_BYTES: usize = 4 * COPY_HINT_TOKENS;
+/// Listing tokens the front-end keeps between requests (hint_cache).
+const COPY_HINT_CACHE_TOKENS: usize = 2_097_152;
+/// One line of a numbered listing: its number, separator kind, and the text after the separator. Formats seen from
+/// harness file viewers: "12: text" (DSH read), "    12  text" (DSH's string-replace editor), "    12\ttext"
+/// (`cat -n`), "    12→text" and "12|text". Kind 255: a bare number (an empty file line whose separator was trimmed).
+fn numbered_line(line: &str) -> Option<(u64, u8, &str)> {
+    let bytes = line.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() && at < 8 && bytes[at] == b' ' { at += 1; }
+    let digits = at;
+    while at < bytes.len() && at - digits < 9 && bytes[at].is_ascii_digit() { at += 1; }
+    if at == digits { return None; }
+    let number = line[digits..at].parse().ok()?;
+    let rest = &line[at..];
+    let (kind, skip) = if rest.starts_with(": ") { (0, 2) } else if rest.starts_with('\t') { (1, 1) }
+        else if rest.starts_with("  ") { (2, 2) } else if rest.starts_with('→') { (3, '→'.len_utf8()) }
+        else if rest.starts_with('|') { (4, 1) } else if rest == ":" { (0, 1) } else if rest.is_empty() { (255, 0) }
+        else { return None };
+    Some((number, kind, &rest[skip..]))
+}
+/// config::copy_hints: the file text a harness has shown the model with line numbers, oldest listing first, as the
+/// lines of each listing without their numbers. A listing is two or more consecutive lines numbered n, n+1, ...
+/// with one separator style (`numbered_line`). The model writes an edit or write call's string arguments as raw
+/// text (DSML `string="true"` parameters: real newlines, no escapes), so a file's own lines joined by newlines are
+/// what such a call repeats; only the line numbers keep the prompt itself from being that copy source. A line DSH
+/// truncated ends its listing (the suffix is DSH's, not the file's).
+pub(crate) fn numbered_runs(prompt: &str) -> Vec<Vec<&str>> {
+    fn flush<'a>(run: &mut Vec<&'a str>, out: &mut Vec<Vec<&'a str>>) {
+        if run.len() >= 2 { out.push(std::mem::take(run)); } else { run.clear(); }
+    }
+    let mut out: Vec<Vec<&str>> = Vec::new();
+    let mut run: Vec<&str> = Vec::new();
+    let mut expect: Option<(u64, u8)> = None;
+    for line in prompt.split('\n') {
+        match numbered_line(line) {
+            Some((number, kind, text)) => {
+                let continues = expect.is_some_and(|(next, style)| number == next && (kind == style || kind == 255));
+                if !continues { flush(&mut run, &mut out); if kind == 255 { expect = None; continue; } }
+                let style = if continues { expect.unwrap().1 } else { kind };
+                if let Some(cut) = text.find("... (line truncated to ") {
+                    run.push(&text[..cut]); flush(&mut run, &mut out); expect = None;
+                } else { run.push(text); expect = Some((number + 1, style)); }
+            }
+            None => { flush(&mut run, &mut out); expect = None; }
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 /// Already processed immutable image input for the experimental compact-context
 /// path. These handles are supplied by trusted Rust cache ownership, never
@@ -82,6 +139,9 @@ pub struct PreparedChat {
     #[cfg(feature = "vision-protocol")]
     pub deferred_image_inputs: Vec<crate::image_input_cache::DeferredInput>,
     pub image_aliases: Vec<ImageAlias>,
+    /// config::copy_hints: the text of the numbered file listings in this prompt (protocol::numbered_runs), as token ids;
+    /// an extra copy source for the worker, never part of `tokens`.
+    pub copy_hints: Vec<u32>,
 }
 
 #[cfg(feature = "serving")]
@@ -366,7 +426,65 @@ impl Frontend {
                 Err(std::env::VarError::NotPresent) => false,
                 Err(error) => return Err(error.into()),
             },
+            hint_cache: Default::default(),
         })
+    }
+    /// config::copy_hints: the hint tokens of a rendered prompt: its numbered listings (`numbered_runs`), newest
+    /// first up to COPY_HINT_TOKENS, returned oldest first (the hint index keeps the most recent occurrence of a
+    /// phrase). A listing's tokens are cached by its text, so a conversation tokenizes each listing once.
+    /// The work of one request is bounded: a listing contributes its last COPY_HINT_RUN_BYTES at most (a fixed cut,
+    /// so its cache key does not move when other listings come and go), the last listing taken is cut to the tokens
+    /// that still fit, and the cache lock is held for lookups and inserts only, never while tokenizing (requests
+    /// prepare concurrently; Nov 22: the first version tokenized a listing of any size under the lock and then
+    /// dropped it when it was over the budget).
+    fn copy_hint_tokens(&self, prompt: &str) -> Result<Vec<u32>> {
+        let runs = numbered_runs(prompt);
+        let lock = || self.hint_cache.lock().map_err(|_| anyhow::anyhow!("copy hint cache poisoned"));
+        let generation = { let mut guard = lock()?; guard.0 += 1; guard.0 };
+        let mut chosen: Vec<Arc<Vec<u32>>> = Vec::new();
+        let mut cut: Option<Vec<u32>> = None;
+        let mut total = 0usize;
+        for run in runs.iter().rev() {
+            if total >= COPY_HINT_TOKENS { break; }
+            let mut first = run.len();
+            let mut bytes = 0usize;
+            while first > 0 && bytes + run[first - 1].len() + 1 <= COPY_HINT_RUN_BYTES { first -= 1; bytes += run[first].len() + 1; }
+            let text = run[first..].join("\n");
+            if text.len() < 48 { continue; }
+            let key: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+            let cached = lock()?.1.get_mut(&key).map(|(ids, used)| { *used = generation; ids.clone() });
+            let ids = match cached {
+                Some(ids) => ids,
+                None => {
+                    let encoded = self.tokenizer.encode(text.as_str(), false).map_err(|e| anyhow::anyhow!("copy hint tokens: {e}"))?;
+                    let ids = Arc::new(encoded.get_ids().to_vec());
+                    lock()?.1.insert(key, (ids.clone(), generation));
+                    ids
+                }
+            };
+            if total + ids.len() > COPY_HINT_TOKENS {
+                cut = Some(ids[ids.len() - (COPY_HINT_TOKENS - total)..].to_vec());
+                break;
+            }
+            total += ids.len();
+            chosen.push(ids);
+        }
+        {
+            let mut guard = lock()?;
+            let cache = &mut guard.1;
+            let mut held: usize = cache.values().map(|(ids, _)| ids.len()).sum();
+            if cache.len() > 2048 || held > COPY_HINT_CACHE_TOKENS {
+                let mut idle: Vec<([u8; 32], u64, usize)> = cache.iter().filter(|(_, (_, used))| *used != generation)
+                    .map(|(key, (ids, used))| (*key, *used, ids.len())).collect();
+                idle.sort_unstable_by_key(|(_, used, _)| *used);
+                for (key, _, tokens) in idle {
+                    if cache.len() <= 1536 && held <= COPY_HINT_CACHE_TOKENS * 3 / 4 { break; }
+                    cache.remove(&key);
+                    held -= tokens;
+                }
+            }
+        }
+        Ok(cut.iter().flatten().copied().chain(chosen.iter().rev().flat_map(|ids| ids.iter().copied())).collect())
     }
     pub fn prepare_chat(&self, body: &[u8], context_capacity: usize) -> Result<PreparedChat> {
         self.prepare_chat_impl(body, context_capacity, if self.use_region_cache { 2 } else { 1 })
@@ -499,7 +617,9 @@ impl Frontend {
                 && converted.inference_options.top_p == Some(1.),
             "converted request changed admitted target sampling"
         );
+        let copy_hints = if crate::config::copy_hints() { self.copy_hint_tokens(&rendered.prompt)? } else { Vec::new() };
         Ok(PreparedChat {
+            copy_hints,
             converted,
             tokens,
             max_new_tokens,
@@ -704,6 +824,116 @@ mod recipe_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The rendered prompt of a DSH-shaped conversation carries the read result verbatim, the hints are its files'
+    /// JSON-escaped text, and a canonical edit call's argument text tokenizes into a run of the hint tokens.
+    #[test]
+    #[ignore = "requires CANADA_TEST_TOKENIZER pointing to the pinned public1017 tokenizer"]
+    fn copy_hints_cover_a_dsh_read_through_the_canonical_rendering() {
+        let f = Frontend::load(Path::new(&std::env::var("CANADA_TEST_TOKENIZER").unwrap())).unwrap();
+        let file = (0..40).map(|i| format!("    let value_{i} = compute(\"{i}\", {i});")).collect::<Vec<_>>().join("\n");
+        let body: Vec<String> = file.split('\n').enumerate().map(|(i, l)| format!("{}: {l}", i + 1)).collect();
+        let read = format!("<path>src/m.rs</path>\n<type>file</type>\n<content>\n{}\n\n(End of file - total 40 lines)\n</content>", body.join("\n"));
+        let request = json!({"max_tokens":128,"messages":[
+            {"role":"user","content":"Change src/m.rs."},
+            {"role":"assistant","content":"","tool_calls":[{"id":"r1","type":"function","function":{"name":"read","arguments":"{\"file_path\":\"src/m.rs\"}"}}]},
+            {"role":"tool","tool_call_id":"r1","content":read}],
+            "tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"file_path":{"type":"string"}}}}}]});
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let prepared = f.prepare_chat_impl(&bytes, 65536, 1).unwrap();
+        let converted = serde_json::from_value::<ChatCompletionRequest>(normalize_chat_request(&bytes).unwrap()).unwrap()
+            .convert(ConversionOptions::default().with_special_tokens(canonical_special_tokens())
+                .with_model_alias(MODEL_NAME, ModelVersion::DeepseekV41Flash)).unwrap();
+        let rendered = DeepseekV41Encoding::new().with_special_tokens(canonical_special_tokens()).render_conversation(&converted.conversation);
+        // How a later edit call is rendered (the form the model emits): string parameters are raw text in DSML.
+        let mut next = request.clone();
+        next["messages"].as_array_mut().unwrap().push(json!({"role":"assistant","content":"","tool_calls":[{"id":"e1","type":"function",
+            "function":{"name":"edit","arguments":serde_json::to_string(&json!({"file_path":"src/m.rs","old_string":"    let a = \"x\";\n    let b = 1;","new_string":"y","replace_all":false})).unwrap()}}]}));
+        next["messages"].as_array_mut().unwrap().push(json!({"role":"tool","tool_call_id":"e1","content":"ok"}));
+        let next_bytes = serde_json::to_vec(&next).unwrap();
+        let next_converted = serde_json::from_value::<ChatCompletionRequest>(normalize_chat_request(&next_bytes).unwrap()).unwrap()
+            .convert(ConversionOptions::default().with_special_tokens(canonical_special_tokens())
+                .with_model_alias(MODEL_NAME, ModelVersion::DeepseekV41Flash)).unwrap();
+        let next_rendered = DeepseekV41Encoding::new().with_special_tokens(canonical_special_tokens()).render_conversation(&next_converted.conversation);
+        let call_at = next_rendered.prompt.rfind("invoke name=\"edit\"").expect("edit call in the rendered prompt");
+        eprintln!("rendered edit call: {:?}", next_rendered.prompt[call_at..].chars().take(420).collect::<String>());
+        let at = rendered.prompt.find("<type>file</type>").expect("read envelope in the rendered prompt");
+        eprintln!("rendered around the read: {:?}", rendered.prompt[at..].chars().take(160).collect::<String>());
+        let hints = f.copy_hint_tokens(&rendered.prompt).unwrap();
+        assert_eq!(f.decode(&hints).unwrap(), file);
+        // An edit call that repeats lines 10..20, as the model writes it (DSML, raw string parameter): tokenized
+        // canonically, its text is a run of hint tokens except near its two ends.
+        let old = file.split('\n').skip(10).take(10).collect::<Vec<_>>().join("\n");
+        let call = format!("<｜DSML｜ parameter name=\"old_string\" string=\"true\">{old}</｜DSML｜ parameter>");
+        let ids = f.tokenizer.encode(call.as_str(), false).unwrap().get_ids().to_vec();
+        let longest = (0..ids.len()).map(|i| (0..hints.len()).map(|j| {
+            let mut n = 0; while i + n < ids.len() && j + n < hints.len() && ids[i + n] == hints[j + n] { n += 1 } n }).max().unwrap_or(0)).max().unwrap();
+        eprintln!("edit call tokens {} longest run in hints {longest} prompt tokens {}", ids.len(), prepared.tokens.len());
+        assert!(longest * 10 >= ids.len() * 7, "the call's file text should be one run of hint tokens");
+    }
+    /// Front-end cost of the hints on a long conversation: 4 MB of prompt, 200 listings of 200 lines.
+    #[test]
+    #[ignore = "timing only; requires CANADA_TEST_TOKENIZER"]
+    fn copy_hint_front_end_time() {
+        let f = Frontend::load(Path::new(&std::env::var("CANADA_TEST_TOKENIZER").unwrap())).unwrap();
+        let mut prompt = String::new();
+        for file in 0..200 {
+            prompt.push_str("<tool_result><path>src/m.rs</path>\n<type>file</type>\n<content>\n");
+            for line in 0..200 { prompt.push_str(&format!("{}:     let value_{file}_{line} = compute(\"{line}\", {file}) + offset[{line}];\n", line + 1)); }
+            prompt.push_str("\n(End of file - total 200 lines)\n</content>\nSome discussion of the file follows here, with ordinary prose and no numbers.\n");
+        }
+        let scan = std::time::Instant::now();
+        let runs = numbered_runs(&prompt).len();
+        let scan_ms = scan.elapsed().as_secs_f64() * 1000.;
+        let cold = std::time::Instant::now();
+        let first = f.copy_hint_tokens(&prompt).unwrap();
+        let cold_ms = cold.elapsed().as_secs_f64() * 1000.;
+        let warm = std::time::Instant::now();
+        let second = f.copy_hint_tokens(&prompt).unwrap();
+        let warm_ms = warm.elapsed().as_secs_f64() * 1000.;
+        assert_eq!(first, second);
+        eprintln!("copy hint front end: prompt {} bytes, {runs} listings, scan {scan_ms:.2} ms, cold {cold_ms:.1} ms, warm {warm_ms:.2} ms, {} hint tokens",
+            prompt.len(), first.len());
+    }
+    #[test]
+    #[ignore = "requires CANADA_TEST_TOKENIZER"]
+    fn copy_hints_of_an_oversized_listing_are_its_tail() {
+        let f = Frontend::load(Path::new(&std::env::var("CANADA_TEST_TOKENIZER").unwrap())).unwrap();
+        let mut prompt = String::from("<content>\n");
+        for line in 0..60_000 { prompt.push_str(&format!("{}: let value_{line} = compute({line}) + offset[{line}];\n", line + 1)); }
+        prompt.push_str("</content>\nwords\n");
+        assert!(prompt.len() > 2 * COPY_HINT_RUN_BYTES);
+        let started = std::time::Instant::now();
+        let hints = f.copy_hint_tokens(&prompt).unwrap();
+        let cold_ms = started.elapsed().as_secs_f64() * 1000.;
+        assert!(hints.len() > 100_000 && hints.len() <= COPY_HINT_TOKENS, "{}", hints.len());
+        let last = f.tokenizer.encode("let value_59999 = compute(59999) + offset[59999];", false).unwrap();
+        assert!(hints.ends_with(last.get_ids()), "the newest lines are kept");
+        let started = std::time::Instant::now();
+        assert_eq!(f.copy_hint_tokens(&prompt).unwrap(), hints);
+        eprintln!("oversized listing: prompt {} bytes, {} hint tokens, cold {cold_ms:.1} ms, warm {:.2} ms",
+            prompt.len(), hints.len(), started.elapsed().as_secs_f64() * 1000.);
+    }
+    #[test]
+    fn numbered_runs_recover_file_text_from_harness_listings() {
+        let file = "fn main() {\n    let s = \"a\\tb\";\n\n}";
+        let lines: Vec<&str> = file.split('\n').collect();
+        let dsh: Vec<String> = lines.iter().enumerate().map(|(i, l)| format!("{}: {l}", i + 9)).collect();
+        let read = format!("<path>src/m.rs</path>\n<type>file</type>\n<content>\n{}\n\n(End of file - total 12 lines)\n</content>", dsh.join("\n"));
+        let editor: Vec<String> = lines.iter().enumerate().map(|(i, l)| format!("{:>6}  {l}", i + 98)).collect();
+        let cat: Vec<String> = lines.iter().enumerate().map(|(i, l)| format!("{:>6}\t{l}", i + 1)).collect();
+        let prompt = format!("before {read} between\nHere's the result of running `cat -n` on src/m.rs:\n{}\nafter\n{}\nend 7: not a listing",
+            editor.join("\n"), cat.join("\n"));
+        let runs = numbered_runs(&prompt);
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        for run in &runs { assert_eq!(run.join("\n"), file); }
+        // Numbers must be consecutive and one style; a truncated line ends its listing; one line is no listing.
+        assert_eq!(numbered_runs("1: a\n3: b\n4: c\n5\td\n6\te"), vec![vec!["b", "c"], vec!["d", "e"]]);
+        assert_eq!(numbered_runs("1: abc\n2: xyz... (line truncated to 2000 chars)\n3: zzz\n4: yyy"), vec![vec!["abc", "xyz"], vec!["zzz", "yyy"]]);
+        assert!(numbered_runs("<content>\n1: one\n\n(End)\n</content>\n12\n13").is_empty());
+        // An empty file line whose separator was trimmed stays inside its listing.
+        assert_eq!(numbered_runs("7: a\n8:\n9: c"), vec![vec!["a", "", "c"]]);
+        assert_eq!(numbered_runs("     7  a\n     8\n     9  c"), vec![vec!["a", "", "c"]]);
+    }
     #[test]
     fn native_default_uses_remaining_context_and_keeps_explicit_limits() {
         let convert = |extra: Value| {

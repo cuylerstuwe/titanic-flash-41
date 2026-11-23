@@ -28,6 +28,8 @@ use std::{
 
 #[path = "output_projection_probe.rs"]
 mod output_projection_probe;
+#[path = "verifier_numerics_probe.rs"]
+mod verifier_numerics_probe;
 #[path = "woa_mid_native_probe.rs"]
 mod woa_mid_native_probe;
 #[path = "wide_hint_native_probe.rs"]
@@ -353,6 +355,9 @@ enum Command {
     Shutdown,
     Idle,
     ReclaimInputs { headroom: usize },
+    /// config::copy_hints: the next Begin's file-hint tokens, sent in their own frame immediately before it. They
+    /// apply only to a Begin whose prompt has `prompt_len` tokens and ends with `tail`.
+    CopyHints { prompt_len: usize, tail: Vec<u32>, tokens: Vec<u32> },
 }
 
 impl Command {
@@ -397,6 +402,14 @@ impl Command {
                     "input reclamation headroom bounds");
                 out.push(17);out.extend_from_slice(&(*headroom as u64).to_le_bytes());
             }
+            Self::CopyHints { prompt_len, tail, tokens } => {
+                ensure!(*prompt_len <= crate::config::MODEL_CONTEXT && tail.len() <= 64 && tail.len() <= *prompt_len
+                    && tokens.len() <= 1 << 18 && tokens.iter().chain(tail).all(|&id| id < 129280), "copy hint command bounds");
+                out.push(25);out.extend_from_slice(&(*prompt_len as u32).to_le_bytes());out.push(tail.len() as u8);
+                for id in tail { out.extend_from_slice(&id.to_le_bytes()); }
+                out.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+                for id in tokens { out.extend_from_slice(&id.to_le_bytes()); }
+            }
         }
         Ok(out)
     }
@@ -431,6 +444,20 @@ impl Command {
             [3, 2] => Ok(Self::Finish(Finish::Cancelled)),
             [4] => Ok(Self::Shutdown),
             [5] => Ok(Self::Idle),
+            [25, ..] if bytes.len() >= 6 => {
+                let prompt_len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+                let tail_len = bytes[5] as usize;
+                ensure!(tail_len <= 64 && bytes.len() >= 6 + 4 * tail_len + 4, "copy hint command length");
+                let words = |b: &[u8]| b.chunks_exact(4).map(|x| u32::from_le_bytes(x.try_into().unwrap())).collect::<Vec<_>>();
+                let tail = words(&bytes[6..6 + 4 * tail_len]);
+                let at = 6 + 4 * tail_len;
+                let n = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+                ensure!(n <= 1 << 18 && bytes.len() == at + 4 + 4 * n && prompt_len <= crate::config::MODEL_CONTEXT
+                    && tail_len <= prompt_len, "copy hint command length");
+                let tokens = words(&bytes[at + 4..]);
+                ensure!(tokens.iter().chain(&tail).all(|&id| id < 129280), "copy hint token domain");
+                Ok(Self::CopyHints { prompt_len, tail, tokens })
+            }
             [17, ..] if bytes.len() == 9 => {
                 let headroom = usize::try_from(u64::from_le_bytes(bytes[1..].try_into().unwrap()))?;
                 ensure!(headroom > crate::memory::floor_bytes() && headroom <= 12usize << 30,
@@ -703,6 +730,12 @@ struct DecodeSummary {
     phase_ms: [f64; 4],
     wall_ms: f64,
     by_rows: std::collections::BTreeMap<usize, (usize, f64)>,
+    /// By verified rows: proposals accepted, and steps that accepted every proposal (a full block: a wider one
+    /// would have gone on). `merge64`: 32-row steps that directly followed a full 32-row step not already counted,
+    /// i.e. the steps a 64-row copy block would absorb; `open32` is that pairing's state.
+    full_rows: std::collections::BTreeMap<usize, (usize, usize)>,
+    merge64: usize,
+    open32: bool,
     /// The first steps of the request: (ms since the previous event left the worker, rows, drafts, tokens out,
     /// step ms, phases).
     first: Vec<(f64, usize, usize, usize, f64, [f64; 4])>,
@@ -1081,12 +1114,7 @@ struct DiskPending {
 impl Worker {
     /// config::cache_keep_latest: which cache entries are earlier checkpoints (keep_latest_earlier_flags over this list).
     fn keep_latest_earlier(&self) -> Vec<bool> {
-        let c = &self.cached_sessions;
-        let n = c.len();
-        let ext: Vec<Vec<bool>> = (0..n).map(|j| (0..n).map(|i| j != i && c[j].prefix.extends(&c[i].prefix)
-            && c[j].media.matches_prefix(&c[i].media, c[i].prefix.len())).collect()).collect();
-        let facts: Vec<EntryFacts> = c.iter().map(|e| EntryFacts { serial: e.serial, restored: e.restored_serial,
-            shared: e.shared || e.kind == "shared_prefix" }).collect();
+        let (facts, ext) = keep_latest_inputs(&self.cached_sessions);
         keep_latest_earlier_flags(&facts, &ext)
     }
     /// config::cache_keep_latest: put the cache list in keep-latest order (keep_latest_order) before a request's saves and
@@ -1098,6 +1126,31 @@ impl Worker {
         if order.iter().enumerate().all(|(k, &i)| k == i) { return; }
         let mut slots: Vec<Option<CachedSession>> = self.cached_sessions.drain(..).map(Some).collect();
         self.cached_sessions = order.into_iter().map(|i| slots[i].take().expect("each entry once")).collect();
+    }
+    /// config::cache_superseded_first: the eviction plan `victims` (indices into the cache list) of an image whose prefix
+    /// is `prefix`, moved onto the cheapest retained images (prefer_cheaper). The earlier-checkpoint rule is
+    /// read now, so the restore this request made counts. Never taken as a replacement: `protected` entries, shared
+    /// prefixes, and the incoming image's own ancestors (the planners' ladder and reservations decide about those).
+    /// `keep`: victims the planner chose because they are optional stay as they are. Every rank holds the same list and
+    /// serials, so every rank returns the same plan.
+    fn superseded_first(&self, victims: Vec<usize>, prefix: &[u32], protected: &[usize], keep: Option<&[bool]>) -> Vec<usize> {
+        if !crate::config::cache_superseded_first() || victims.is_empty() { return victims; }
+        let class = cache_classes(&self.cached_sessions, &self.keep_latest_earlier());
+        let none = vec![false; self.cached_sessions.len()];
+        let keep = keep.filter(|k| k.len() == none.len()).unwrap_or(&none);
+        if victims.iter().all(|&v| v >= class.len() || class[v] == 0 || keep[v]) { return victims; }
+        let entries: Vec<(usize, usize)> = self.cached_sessions.iter().map(|c| (c.prefix.len(), c.charge)).collect();
+        let excluded: Vec<bool> = self.cached_sessions.iter().enumerate().map(|(i, c)| protected.contains(&i)
+            || c.shared || c.kind == "shared_prefix"
+            || (c.prefix.len() <= prefix.len() && prefix.starts_with(&c.prefix))).collect();
+        let planned = victims.clone();
+        let chosen = prefer_cheaper(&entries, &class, &excluded, keep, victims);
+        if chosen != planned {
+            cache_trace(|| json!({"path":"superseded_first","incoming_tokens":prefix.len(),
+                "planned":planned.iter().map(|&i| self.cached_sessions[i].trace()).collect::<Vec<_>>(),
+                "chosen":chosen.iter().map(|&i| self.cached_sessions[i].trace()).collect::<Vec<_>>()}));
+        }
+        chosen
     }
     /// Disk tier (config::disk_tier): evict cache entry `i`, parking it (RAM freed, kept on disk) when it has a disk copy,
     /// else dropping it as before. Every rank holds the same entries and copies, so every rank does the same.
@@ -1508,6 +1561,75 @@ fn keep_latest_earlier_flags(facts: &[EntryFacts], ext: &[Vec<bool>]) -> Vec<boo
             && (ext[r][i] || (0..n).any(|a| a != i && !facts[a].shared && ext[i][a] && (a == r || ext[r][a])))
     })).collect()
 }
+/// What the keep-latest rule reads of a cache list: each entry's facts, and `ext[j][i]`: entry j extends entry i
+/// (strictly longer, the same tokens and media through i's length).
+fn keep_latest_inputs(c: &[CachedSession]) -> (Vec<EntryFacts>, Vec<Vec<bool>>) {
+    let n = c.len();
+    let ext: Vec<Vec<bool>> = (0..n).map(|j| (0..n).map(|i| j != i && c[j].prefix.extends(&c[i].prefix)
+        && c[j].media.matches_prefix(&c[i].media, c[i].prefix.len())).collect()).collect();
+    let facts: Vec<EntryFacts> = c.iter().map(|e| EntryFacts { serial: e.serial, restored: e.restored_serial,
+        shared: e.shared || e.kind == "shared_prefix" }).collect();
+    (facts, ext)
+}
+/// config::cache_superseded_first, host-memory reclaim (reclaim_optional_cache): the order in which cached images may
+/// give way when an input or a restore lacks host memory. Optional images first, then earlier checkpoints (class 0),
+/// then completed-turn images no request has restored (class 1), then images that a later prompt checkpoint of the
+/// same conversation extends (`extended`: the conversation's prompt has grown past them, though no request has
+/// restored the later checkpoint yet); each group in list order. Shared prefixes never. A conversation's newest
+/// prompt checkpoint is in none of the groups.
+fn host_reclaim_order(optional: &[bool], class: &[u8], extended: &[bool], shared: &[bool]) -> Vec<usize> {
+    let n = optional.len();
+    if class.len() != n || extended.len() != n || shared.len() != n { return Vec::new(); }
+    let pick = |want: &dyn Fn(usize) -> bool| (0..n).filter(|&i| !shared[i] && want(i)).collect::<Vec<_>>();
+    let mut order = pick(&|i| optional[i]);
+    order.extend(pick(&|i| !optional[i] && class[i] == 0));
+    order.extend(pick(&|i| !optional[i] && class[i] == 1));
+    order.extend(pick(&|i| !optional[i] && class[i] == 2 && extended[i]));
+    order
+}
+/// config::cache_superseded_first: `victims` of an eviction plan over `entries` ((prefix tokens, charge) in list order:
+/// among latest images the least recently used first), moved onto the cheapest images the plan retained. `class`:
+/// 0 an earlier checkpoint (the keep-latest rule), 1 a completed-turn image that no request has restored (the next
+/// turn of its conversation normally resumes from the prompt-side checkpoint before it), 2 anything else: a restore
+/// point in use, a prompt-side image, an idle conversation's image. A victim of class 1 or 2 that is not `keep` is
+/// replaced by retained images of a lower class, class 0 before class 1, each in list order, never `excluded`, as
+/// many as free at least the victim's bytes (losing a second cheap image costs nothing a conversation resumes from).
+/// Victims are served most recently used first (highest index), so when the cheap images run out the hottest restore
+/// points stay and the coldest go. A victim without a replacement stays. The plan's slot count and byte budget
+/// still hold: no fewer entries go and no fewer bytes are freed.
+/// Nov 22, third four-conversation run: the plan named an idle conversation's checkpoint and another conversation's
+/// restore point used 4 s before; the first version served victims in plan order, gave the only earlier checkpoint
+/// to the idle one and let the restore point go, with two never-restored completed images of 0.95 GB retained.
+fn prefer_cheaper(entries: &[(usize, usize)], class: &[u8], excluded: &[bool], keep: &[bool], mut victims: Vec<usize>) -> Vec<usize> {
+    let n = entries.len();
+    if class.len() != n || excluded.len() != n || keep.len() != n || victims.iter().any(|&v| v >= n) { return victims; }
+    let mut order: Vec<usize> = (0..victims.len()).collect();
+    order.sort_by_key(|&k| std::cmp::Reverse(victims[k]));
+    for k in order {
+        let v = victims[k];
+        if keep[v] || class[v] == 0 { continue; }
+        let (mut take, mut freed) = (Vec::new(), 0usize);
+        'classes: for cheaper in 0..class[v] {
+            for s in 0..n {
+                if freed >= entries[v].1 { break 'classes; }
+                if class[s] == cheaper && !excluded[s] && !keep[s] && !victims.contains(&s) {
+                    take.push(s);
+                    freed += entries[s].1;
+                }
+            }
+        }
+        if freed >= entries[v].1 && !take.is_empty() {
+            victims[k] = take[0];
+            victims.extend_from_slice(&take[1..]);
+        }
+    }
+    victims
+}
+/// The class prefer_cheaper and host_reclaim_order read of each cached image (0 earlier checkpoint, 1 completed-turn
+/// image never restored, 2 anything else); `earlier` from keep_latest_earlier_flags over the same list.
+fn cache_classes(cached: &[CachedSession], earlier: &[bool]) -> Vec<u8> {
+    cached.iter().zip(earlier).map(|(c, &e)| if e { 0 } else if c.kind == "completed" && c.restored_serial == 0 { 1 } else { 2 }).collect()
+}
 /// The keep-latest order of a cache list (config::cache_keep_latest): every earlier checkpoint first, then every latest
 /// image; each group keeps its existing order (oldest / least recently used first, restores refresh age). Returns the
 /// new order as indices into the old list.
@@ -1589,6 +1711,48 @@ fn reclaim_optional_cache(cuda:&Cuda,control:&mut ControlChannel,
         evicted.push(json!({"prefix_tokens":entry.prefix.len(),"charge_bytes":entry.charge}));
         drop(entry);
         admitted=control.all_admit(room()?.admitted_available > headroom)?;
+    }
+    // config::cache_superseded_first (Nov 22). With a pool, room for host memory was never made from the cache: pooled
+    // snapshots give none back. But a snapshot saved while the pool was full came from general memory and holds it
+    // for as long as it lives; four ~1M-token conversations left the head 150 MB under its reserve that way and an
+    // image input was refused, with a replaced checkpoint of 0.94 GB still resident. Such images give way in
+    // host_reclaim_order, never a conversation's newest prompt-side image. Whether an image sits outside the pool is a
+    // rank's own fact, so each candidate is voted on: it goes everywhere when any rank holds it in general memory.
+    if !admitted && pointless && crate::config::cache_superseded_first() && !cached.is_empty() {
+        let (facts,ext)=keep_latest_inputs(cached);
+        let earlier=keep_latest_earlier_flags(&facts,&ext);
+        let n=cached.len();
+        // A prompt-end image with logits does not count as the later checkpoint: other planners give those up freely,
+        // so the image it extends would be the conversation's only durable restore point.
+        let checkpoint=cached.iter().map(|c|matches!(c.kind,"prompt_checkpoint"|"near_end")).collect::<Vec<_>>();
+        let extended=(0..n).map(|i|(0..n).any(|j|ext[j][i]&&checkpoint[j])).collect::<Vec<_>>();
+        let optional=cached.iter().map(|c|c.opportunistic_logits()).collect::<Vec<_>>();
+        let shared=facts.iter().map(|f|f.shared).collect::<Vec<_>>();
+        let class=cache_classes(cached,&earlier);
+        let order=host_reclaim_order(&optional,&class,&extended,&shared);
+        let mut slots=cached.drain(..).map(Some).collect::<Vec<Option<CachedSession>>>();
+        let outcome=(||->Result<bool>{
+            let mut admitted=false;
+            for i in order {
+                let entry=slots[i].as_ref().expect("each candidate once");
+                let local=entry.images().iter().any(|image|image.resident()&&image.device_bytes()>0&&image.owned_pool_chunks()==0);
+                if control.all_admit(!local)? {continue;}
+                let entry=slots[i].take().unwrap();
+                evicted.push(json!({"prefix_tokens":entry.prefix.len(),"charge_bytes":entry.charge,"kind":entry.kind,
+                    "general_memory":true,"group":if optional[i]{"optional"}else if class[i]==0{"earlier"}else if class[i]==1{"unrestored_completed"}else{"extended"}}));
+                drop(entry);
+                admitted=control.all_admit(room()?.admitted_available > headroom)?;
+                if admitted {break;}
+            }
+            Ok(admitted)
+        })();
+        // The list goes back whatever happened: an error must not empty the cache.
+        cached.extend(slots.into_iter().flatten());
+        admitted=outcome?;
+        if !evicted.is_empty() {
+            cache_trace(||json!({"path":"host_reclaim","headroom":headroom,"admitted":admitted,"evicted":evicted,
+                "entries":cached.iter().map(|c|c.trace()).collect::<Vec<_>>()}));
+        }
     }
     Ok(json!({"headroom_bytes":headroom,"admitted":admitted,"evicted":evicted,"for_image":for_image,
         "remaining_cache_entries":cached.len(),"memory_before":before,
@@ -1687,6 +1851,11 @@ struct Worker {
     /// token already went out.
     #[cfg(feature = "serving")]
     early_emit: Option<crate::http_server::EarlyEmitter>,
+    /// config::copy_hints: hints received for the next Begin (prompt length, prompt tail, hint tokens), and the
+    /// built hint sources of the requests that began with hints and have not finished (request id, lookup; at
+    /// most four, one per serving region, oldest dropped; at most 10.5 MiB each). A request parked and resumed, or stepping after another began, finds its own.
+    pending_copy_hints: Option<(usize, Vec<u32>, Vec<u32>)>,
+    copy_hints: Vec<(u64, std::rc::Rc<crate::history_lookup::HintIndex>)>,
     early_first_emitted: bool,
     current: Option<u64>,
     /// Within-load screens: the arm the current request ran (printed with its decode summary).
@@ -2401,6 +2570,10 @@ impl Worker {
         control.agree(&[0x6d,u8::from(crate::config::validate_swa_exact_pages()?)])?;
         // Nov 19: the keep-latest order decides eviction victims on every rank.
         control.agree(&[0x6c,u8::from(crate::config::validate_cache_keep_latest()?)])?;
+        // Nov 22: validated here so a bad value fails at startup (the overlap itself is rank-local).
+        control.agree(&[0x69,crate::config::validate_engram_media_overlap()?])?;
+        // Nov 22: superseded-first changes eviction victims on every rank.
+        control.agree(&[0x6a,u8::from(crate::config::validate_cache_superseded_first()?)])?;
         // Nov 19: profile dedup (config::validate_profile_dedup) moves profiles' buffers only; every rank runs one layout.
         control.agree(&[0x6b,crate::config::validate_profile_dedup()?])?;
         // Host waits (Nov 12): the control socket's spin budget and the worker thread's timer slack
@@ -2614,6 +2787,8 @@ impl Worker {
             progress_next: false,
             #[cfg(feature = "serving")]
             early_emit: None,
+            pending_copy_hints: None,
+            copy_hints: Vec::new(),
             early_first_emitted: false,
             current: None,
             pending_prefill: None,
@@ -2791,6 +2966,10 @@ impl Worker {
         media:&crate::prompt_media::Identity,required:usize,slots:usize,protected:&[usize],
         recycle_bytes:Option<usize>)->Result<CacheSaveAdmission> {
         let mut removed=if eligible {evictions.expect("eligible cache eviction plan")}else{Vec::new()};
+        if crate::config::cache_superseded_first()&&!removed.is_empty() {
+            let optional=self.optional_entries(prefix.len());
+            removed=self.superseded_first(removed,prefix,protected,Some(&optional));
+        }
         ensure!(protected.iter().all(|&i|i<self.cached_sessions.len()&&!removed.contains(&i)),
             "cache admission would evict a protected parent");
         let budget_evictions=removed.len();
@@ -2828,6 +3007,8 @@ impl Worker {
                 };
                 removed.push(next);
             }
+            // The pressure victims too (every rank ran the same loop over the same list).
+            if removed.len()>budget_evictions {removed=self.superseded_first(removed,prefix,protected,Some(&optional));}
             if !removed.is_empty(){self.stream.synchronize()?;}
         }
         if !removed.is_empty() {
@@ -3189,6 +3370,8 @@ impl Worker {
                     !plan.media.placements().is_empty()||removed.iter().all(|&i|speculative[i]))
         }else{prompt_cache_evictions(&entries,(plan.prompt.len(),charge),budget,
             self.session_cache_long_first,slots,!plan.media.placements().is_empty())};
+        let evictions=if plan.media.placements().is_empty() {evictions}
+            else{evictions.map(|victims|self.superseded_first(victims,&plan.prompt,&[],Some(&speculative)))};
         let eligible=evictions.is_some();
         let reserve=self.cache_reserve()?;
         let admitted=self.control.all_admit(eligible
@@ -4235,6 +4418,19 @@ impl Worker {
                     self.current.is_none(),
                     "cannot replace an active resident request"
                 );
+                // config::copy_hints: hints sent for exactly this prompt become this request's extra copy source.
+                self.copy_hints.retain(|(known, _)| *known != id);
+                match self.pending_copy_hints.take() {
+                    Some((n, tail, hints)) if n == tokens.len() && tokens.ends_with(&tail) && hints.len() >= 16 => {
+                        if self.comm.rank() == 0 { eprintln!("copy hints attached {}", json!({"request_id":id,"hint_tokens":hints.len(),"prompt_tokens":n})); }
+                        if self.copy_hints.len() >= 4 { self.copy_hints.remove(0); }
+                        self.copy_hints.push((id, std::rc::Rc::new(crate::history_lookup::HintIndex::new(&hints)?)));
+                    }
+                    Some((n, _, hints)) => {
+                        if self.comm.rank() == 0 { eprintln!("copy hints dropped {}", json!({"request_id":id,"hint_tokens":hints.len(),"hint_prompt_tokens":n,"prompt_tokens":tokens.len()})); }
+                    }
+                    None => {}
+                }
                 // Batched serving (Worker::region0_admits): the scheduler keeps such a request waiting.
                 ensure!(self.region0_admits(crate::config::region_reach(tokens.len(), limit)?)?,
                     "a conversation that reaches past one serving region needs every region empty");
@@ -4245,7 +4441,43 @@ impl Worker {
                 let mut plan = self.history.prepare_with_media(id, tokens, media, limit, seed)?;
                 let (mut retained_session_cache,deferred_encoder)=self.reuse_cached_session(&mut plan,!greedy,true)?;
                 let media_frontier=deferred_encoder.as_ref().map_or(if plan.reuse{plan.previous}else{0},|c|c.prefix.len());
-                if let Err(error)=self.prepare_media(&images,&plan,media_frontier) {
+                // config::engram_media_overlap: this rank's Engram reads for the first new rows run on a host thread
+                // while the images encode; `stop` ends them between 1,024-id batches once encoding has returned.
+                let warm=if !images.is_empty()&&plan.prompt.len()>media_frontier&&crate::config::engram_media_overlap(id) {
+                    let end=plan.prompt.len().min(media_frontier+2048);
+                    Some(self.large.first_rows_engram_ids(&plan.prompt[..media_frontier],&plan.prompt[media_frontier..end])?)
+                }else{None};
+                let stop=std::sync::atomic::AtomicBool::new(false);
+                let (prepared,warmed)=std::thread::scope(|scope|{
+                    let task=warm.as_ref().map(|(store1,store14,first,second)|{
+                        let (store1,store14,stop)=(&**store1,&**store14,&stop);
+                        scope.spawn(move||->Result<(usize,f64)>{
+                            let began=Instant::now();let mut done=0usize;
+                            for (a,b) in first.chunks(1024).zip(second.chunks(1024)) {
+                                if stop.load(std::sync::atomic::Ordering::Relaxed) {break;}
+                                store1.prefetch(a)?;store14.prefetch(b)?;done+=a.len();
+                            }
+                            Ok((done,began.elapsed().as_secs_f64()*1000.))
+                        })
+                    });
+                    let media_began=Instant::now();
+                    let prepared=self.prepare_media(&images,&plan,media_frontier);
+                    let media_ms=media_began.elapsed().as_secs_f64()*1000.;
+                    stop.store(true,std::sync::atomic::Ordering::Relaxed);
+                    let joined=Instant::now();
+                    let warmed=task.map(|t|(t.join(),media_ms,joined.elapsed().as_secs_f64()*1000.));
+                    (prepared,warmed)
+                });
+                if let (Some((outcome,media_ms,join_ms)),Some((_,_,first,_)))=(warmed,warm.as_ref()) {
+                    // A failed hint read is not the request's failure: the prefill's own lookup reads the row again.
+                    match outcome {
+                        Ok(Ok((done,ms)))=>eprintln!("engram media overlap {}",json!({"rank":self.comm.rank(),"request_id":id,
+                            "row_ids":first.len(),"read_ids":done,"read_ms":ms,"media_ms":media_ms,"join_ms":join_ms})),
+                        Ok(Err(error))=>eprintln!("engram media overlap read failed: {error:#}"),
+                        Err(_)=>eprintln!("engram media overlap thread panicked"),
+                    }
+                }
+                if let Err(error)=prepared {
                     return self.refuse_media_input(id,error);
                 }
                 if let Some(anchor)=retained_session_cache["exact_prompt_anchor"].as_u64() {
@@ -4435,6 +4667,10 @@ impl Worker {
             Command::Step => {
                 ensure!(self.current.is_some(), "decode without resident request");
                 let step_started = Instant::now();
+                if crate::config::copy_hints() && let Some(session) = self.session.as_mut() {
+                    session.use_copy_hints(self.copy_hints.iter().find(|(id, _)| Some(*id) == self.current)
+                        .map(|(_, hints)| hints.clone()));
+                }
                 let limit = if self.copy32_verify.is_some() {self.history.step_limit_for_rows(32)?}
                     else if self.long_verify.is_some() {self.history.step_limit_for_rows(16)?}
                     else {self.history.step_limit()?};
@@ -4528,6 +4764,11 @@ impl Worker {
                     d.emitted += output.len(); d.wall_ms += ms;
                     for (total, phase) in d.phase_ms.iter_mut().zip(step.phase_ms) { *total += phase; }
                     let e = d.by_rows.entry(step.verified_rows).or_insert((0, 0.)); e.0 += 1; e.1 += ms;
+                    let full = !step.draft_tokens.is_empty() && step.matching_proposals == step.draft_tokens.len();
+                    let e = d.full_rows.entry(step.verified_rows).or_insert((0, 0)); e.0 += step.matching_proposals; e.1 += usize::from(full);
+                    if step.verified_rows == 32 {
+                        if d.open32 { d.merge64 += 1; d.open32 = false; } else { d.open32 = full; }
+                    } else { d.open32 = false; }
                     if crate::layer_clock::armed() {
                         if let Some(parts) = crate::layer_clock::read()?.and_then(|marks| crate::layer_clock::parts_us(&marks)) {
                             for (total, value) in d.clock.iter_mut().zip(parts) { *total += value; }
@@ -4565,6 +4806,8 @@ impl Worker {
             }
             Command::Finish(reason) => {
                 ensure!(self.current.is_some(), "finish without resident request");
+                self.copy_hints.retain(|(id, _)| Some(*id) != self.current);
+                if let Some(session) = self.session.as_mut() { session.use_copy_hints(None); }
                 // Surface deferred device errors before acknowledging a final
                 // request boundary. Ordered asynchronous draft/state copies
                 // must complete before HTTP can publish successful completion.
@@ -4601,6 +4844,9 @@ impl Worker {
                         d.steps, d.emitted, d.verified_rows as f64 / n, d.accepted as f64 / n, d.wall_ms / n,
                         d.phase_ms[0] / n, d.phase_ms[1] / n, d.phase_ms[2] / n, d.phase_ms[3] / n,
                         d.by_rows.iter().map(|(r, (c, ms))| (*r, *c, (ms / *c as f64 * 100.).round() / 100.)).collect::<Vec<_>>());
+                    eprintln!("claude decode widths: [rows, steps, proposals accepted, full steps] {:?} merge64 {}",
+                        d.by_rows.iter().map(|(r, (c, _))| { let f = d.full_rows.get(r).copied().unwrap_or((0, 0)); (*r, *c, f.0, f.1) }).collect::<Vec<_>>(),
+                        d.merge64);
                     // The request's begin and its first steps (timing fields only): for the first-token itemisation.
                     if let Some((begin_ms, phases, uncached, early)) = self.begin_record.take() {
                         let ms = |key: &str| phases[key].as_f64().map_or(-1., |s| (s * 1e5).round() / 100.);
@@ -4660,6 +4906,14 @@ impl Worker {
                 Ok(json!({"type":"idle"}))
             }
             Command::ReclaimInputs { headroom } => self.reclaim_input_space(headroom),
+            Command::CopyHints { prompt_len, tail, tokens } => {
+                ensure!(crate::config::copy_hints(), "copy hints without the startup selection");
+                let digest = crate::history_lookup::fingerprint_ids(&tokens);
+                self.agree(&[tokens.len() as u32, digest as u32, (digest >> 32) as u32, prompt_len as u32])?;
+                let n = tokens.len();
+                self.pending_copy_hints = Some((prompt_len, tail, tokens));
+                Ok(json!({"type":"copy_hints","tokens":n}))
+            }
         }
     }
 }
@@ -6255,6 +6509,9 @@ pub fn run_http(path: &Path) -> Result<()> {
     ready["parking_extra_slots"]=json!(worker.parking_extra_slots);
     ready["physical_execution_banks"]=json!(if worker.peer_bank.is_some(){2}else{1});
     ready["execution_graph_cache_rows"]=json!(crate::config::execution_graph_cache_rows()?);
+    if let Ok(fixture)=std::env::var("CANADA_SCRATCH_VERIFIER_NUMERICS_PROBE") {
+        verifier_numerics_probe::run(&mut worker,p.rank,&fixture)?;
+    }
     events.record(&ready)?;
     if let Some(queue) = &queue {
         if http_interleave {
@@ -6276,7 +6533,7 @@ pub fn run_http(path: &Path) -> Result<()> {
         return interleave_http::run(&mut worker,queue.as_ref(),&mut events);
     }
     let mut active: Option<http_server::Job> = None;
-    let mut next_id = 1u64;
+    let mut next_id = worker.history.next_request_id()?;
     let mut authorized_next = None;
     let outcome = (|| -> Result<()> {
         loop {
@@ -6920,6 +7177,91 @@ mod tests {
         assert_eq!(super::cache_evictions_ladder_reserved(&few,Some(&a),(53_000,1),1_000,true,6,0,4),Some(vec![0]));
         assert!(super::parse_ladder_cap(None).unwrap()==0&&super::parse_ladder_cap(Some("4")).unwrap()==4);
         assert!(super::parse_ladder_cap(Some("1")).is_err()&&super::parse_ladder_cap(Some("17")).is_err());
+    }
+    #[test]
+    fn superseded_first_replays_the_four_conversation_evictions() {
+        use super::{cache_evictions, keep_latest_earlier_flags, prefer_cheaper, EntryFacts};
+        // First run (Nov 22): one conversation's fifth turn saves its prompt-end image (1,012,261 tokens)
+        // with the cache full. List order as traced: an earlier completed image, a second conversation's only restore
+        // point, two more conversations' checkpoints, three completed images of the turn before, the saving
+        // conversation's checkpoint (just restored).
+        let entries = [(1012562, 946906572), (1012424, 942265484), (1010214, 940251652), (1012523, 942311448),
+            (1012251, 946586352), (1012581, 946929432), (1010349, 944892728), (1012146, 941968180)];
+        let planned = cache_evictions(&entries, (1012261, 947126296), 8321499136, true, 16).unwrap();
+        assert_eq!(planned, vec![1], "the length rule protects the stale image and names another conversation's restore point");
+        // Entry 0 was an earlier checkpoint already; entry 4 (the saving conversation's previous completed image)
+        // becomes one when this request restores entry 7: saved at Begin 20, entry 7 restored at Begin 24, 4 extends 7.
+        let facts = [(12, 0), (4, 21), (8, 22), (9, 23), (20, 0), (22, 0), (23, 0), (8, 24)].map(|(serial, restored)|
+            EntryFacts { serial, restored, shared: false });
+        let mut ext = vec![vec![false; 8]; 8];
+        ext[4][7] = true;
+        let earlier = keep_latest_earlier_flags(&facts, &ext);
+        assert_eq!(earlier, vec![false, false, false, false, true, false, false, false]);
+        // Classes: earlier checkpoints 0 (entries 0 and 4), never-restored completed images 1 (5 and 6), the rest 2.
+        let class = [0u8, 2, 2, 2, 0, 1, 1, 2];
+        let mut excluded = vec![false; 8];
+        excluded[7] = true;
+        let none = vec![false; 8];
+        assert_eq!(prefer_cheaper(&entries, &class, &excluded, &none, planned.clone()), vec![0]);
+        // An optional victim stays; a victim that is already an earlier checkpoint stays.
+        let mut keep = none.clone();
+        keep[1] = true;
+        assert_eq!(prefer_cheaper(&entries, &class, &excluded, &keep, planned.clone()), vec![1]);
+        assert_eq!(prefer_cheaper(&entries, &class, &excluded, &none, vec![4]), vec![4]);
+        // Nothing cheaper outside the plan, or only an excluded image: unchanged.
+        assert_eq!(prefer_cheaper(&entries, &[2u8; 8], &excluded, &none, planned.clone()), vec![1]);
+        let lone = [2u8, 2, 2, 2, 2, 2, 2, 0];
+        assert_eq!(prefer_cheaper(&entries, &lone, &excluded, &none, planned.clone()), vec![1]);
+
+        // Third run (Nov 22): the plan needs two victims and names an idle conversation's checkpoint (entry 0)
+        // and another conversation's restore point used 4 s before (entry 1). Retained: the saving conversation's
+        // previous completed image (entry 5, an earlier checkpoint) and two completed images no request has restored
+        // (6 and 7). The restore point is served first and takes entry 5; the idle checkpoint takes entry 6.
+        let entries = [(621059, 592355448), (1012424, 942265484), (1012522, 942311444), (1010214, 940251652),
+            (1010048, 939404652), (1012212, 946586196), (1012493, 946815160), (1012558, 946906556), (1012145, 941968176)];
+        let planned = cache_evictions(&entries, (1012183, 947080416), 8321499136, true, 16).unwrap();
+        assert_eq!(planned, vec![0, 1]);
+        let class = [2u8, 2, 2, 2, 2, 0, 1, 1, 2];
+        let mut excluded = vec![false; 9];
+        excluded[8] = true;
+        let mut chosen = prefer_cheaper(&entries, &class, &excluded, &[false; 9], planned.clone());
+        chosen.sort_unstable();
+        assert_eq!(chosen, vec![5, 6]);
+        // With one cheap image only, the hottest restore point keeps its place and the idle checkpoint goes.
+        let scarce = [2u8, 2, 2, 2, 2, 0, 2, 2, 2];
+        let mut chosen = prefer_cheaper(&entries, &scarce, &excluded, &[false; 9], planned);
+        chosen.sort_unstable();
+        assert_eq!(chosen, vec![0, 5]);
+
+        // Smaller cheap images: as many as free the victim's bytes, or none.
+        let small = [(100, 30), (200, 100), (300, 40), (400, 45), (500, 50)];
+        let cheap = [0u8, 2, 0, 0, 2];
+        assert_eq!(prefer_cheaper(&small, &cheap, &[false; 5], &[false; 5], vec![1]), vec![0, 2, 3]);
+        assert_eq!(prefer_cheaper(&small, &cheap, &[false, false, true, false, false], &[false; 5], vec![1]), vec![1]);
+        // Two victims never take the same replacement; a class-1 victim may move onto a class-0 image.
+        let pair = [(10, 50), (20, 50), (30, 50), (40, 50)];
+        let mut both = prefer_cheaper(&pair, &[0u8, 2, 2, 0], &[false; 4], &[false; 4], vec![1, 2]);
+        both.sort_unstable();
+        assert_eq!(both, vec![0, 3]);
+        assert_eq!(prefer_cheaper(&pair, &[0u8, 1, 2, 2], &[false; 4], &[false; 4], vec![1]), vec![0]);
+    }
+    #[test]
+    fn host_reclaim_takes_optional_then_cheap_then_extended_images() {
+        use super::host_reclaim_order;
+        // The cache when an image input was refused (second run): three conversations' new prompt checkpoints, the
+        // replaced checkpoint of one of them (entry 3; its newer checkpoint, entry 2, not restored yet), and a fourth
+        // conversation's checkpoint. Nothing optional, nothing earlier or unrestored: only entry 3 may go.
+        let none = [false; 5];
+        let extended = [false, false, false, true, false];
+        assert_eq!(host_reclaim_order(&none, &[2u8; 5], &extended, &none), vec![3]);
+        // Groups in order, list order within a group; shared prefixes never; an optional entry counts once.
+        let optional = [false, true, false, false, true, false, false];
+        let class = [0u8, 0, 2, 1, 2, 2, 1];
+        let extended = [true, false, true, false, false, true, false];
+        let shared = [false, false, false, false, false, true, false];
+        assert_eq!(host_reclaim_order(&optional, &class, &extended, &shared), vec![1, 4, 0, 3, 6, 2]);
+        assert!(host_reclaim_order(&[false; 3], &[2u8; 3], &[false; 3], &[false; 3]).is_empty());
+        assert!(host_reclaim_order(&[true; 2], &[0u8; 3], &[false; 2], &[false; 2]).is_empty());
     }
     #[test]
     fn cache_trace_is_off_by_default_and_parses_strictly() {

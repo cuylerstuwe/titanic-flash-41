@@ -217,6 +217,18 @@ available on every rank.
 The historical release used an 8 GiB default. The current pooled-memory profile selects its serving floor explicitly.
 `CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB` overrides the floor and is for tests only.
 
+## November 22 serving profile
+
+The profile adds three settings to the November 21 profile.
+
+`CANADA_SCRATCH_COPY_HINTS=1`: when a rendered prompt contains numbered file listings, the form coding harnesses use to show a file to the model, the coordinator recovers the file text and sends it to the workers as an extra copy source for that request. Nothing is added to the prompt. The speculative decoder may propose a run from it once the output has followed it for the configured match lengths, and the target model checks every proposed token as it checks copies from the conversation, so sampling is unchanged. A request carries at most 196,608 hint tokens, newest listings first. One listing contributes its last 786,432 bytes, and listing tokens are cached between requests up to 2,097,152 tokens. Rank 0 logs one `copy hints attached` or `copy hints dropped` line for each request that had hints.
+
+`CANADA_SCRATCH_HEAD_COMPACT_EXCEPTIONS=1`: the six-row lossless output head reads its escaped weight groups from a compact table on each rank instead of the canonical matrix. It needs `runtime/kernels/target-head-lossless-compact-v1`. At startup the worker checks the bundle hash and compares widths 6, 9 and 12 bit for bit with the stock encoding.
+
+`CANADA_SCRATCH_CACHE_SUPERSEDED_FIRST=1` (needs `CANADA_SCRATCH_CACHE_KEEP_LATEST=1`): when a snapshot save would evict a conversation's latest image, an earlier checkpoint that a request has already gone past is evicted instead, whatever its length. The rule is read when the save is planned, so the restore made by the saving request counts.
+
+`CANADA_SCRATCH_ENGRAM_MEDIA_OVERLAP` is present and off. It starts a request's first Engram reads while its images encode; the measured change in time to first token was under 2 ms. [Qualification](VALIDATION.md#november-22-edit-and-cache-release-s1694)
+
 ## November 21 serving profile
 
 The checked-in deployment profile retains the s1682 compute settings. During startup the worker verifies the BF16 index against the CUDA source embedded in the engine. Six-row sparse verification uses version 2 of the staged-read attention kernel. The launcher supplies 27 prefill widths from 256 through 16,384 rows. The 3,072 MiB operating reserve, bounded snapshot pool and incremental mapping of long conversations apply independently on each rank.

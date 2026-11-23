@@ -1449,6 +1449,46 @@ pub(crate) fn cache_keep_latest() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_CACHE_KEEP_LATEST").as_deref() == Ok("1"))
 }
+/// CANADA_SCRATCH_ENGRAM_MEDIA_OVERLAP (0 default; 1; 2 = odd request ids only, a same-load A/B): a request with
+/// images starts the Engram reads of its first new rows (up to 2,048) on a host thread while the GPU encodes the
+/// images, and stops them the moment encoding returns (the ordinary path behind layer 0 reads whatever is left).
+/// Immutable row bytes into each rank's own cache: a speed hint, nothing a rank agrees on. Nov 22 anatomy
+/// of three screenshot turns: the first chunk's reads take 2-4 ms a rank behind layer 0, hidden, but one 25 ms burst
+/// on rank 0 was exposed and showed in the first token (+20 ms on that turn).
+pub(crate) fn engram_media_overlap(request: u64) -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| validate_engram_media_overlap().unwrap_or(0)) { 1 => true, 2 => request % 2 == 1, _ => false }
+}
+pub(crate) fn validate_engram_media_overlap() -> Result<u8> {
+    match std::env::var("CANADA_SCRATCH_ENGRAM_MEDIA_OVERLAP") {
+        Ok(v) => { ensure!(matches!(v.as_str(), "0" | "1" | "2"), "invalid Engram media overlap policy"); Ok(v.parse()?) }
+        Err(std::env::VarError::NotPresent) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+/// CANADA_SCRATCH_CACHE_SUPERSEDED_FIRST=1 (needs CANADA_SCRATCH_CACHE_KEEP_LATEST=1; default 0): a save's eviction plan
+/// that names a conversation's latest image takes an earlier checkpoint instead while one is cached, read at plan
+/// time (this request's own restore counts) and whatever its length. Nov 22, four ~1M-token screenshot conversations
+/// in one qualification run: the keep-latest order alone left two gaps. The planners protect the two entries longer than
+/// the incoming image, by length only, so a stale completed image a few hundred tokens longer was protected and the
+/// next entry in line, another conversation's only restore point, was evicted (a 127 s re-prefill of 1M tokens). And
+/// the order is set at the start of the command, before the request restores its own checkpoint, so the image that
+/// restore has just made obsolete was not yet first.
+pub(crate) fn cache_superseded_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_CACHE_SUPERSEDED_FIRST").as_deref() == Ok("1"))
+}
+pub(crate) fn validate_cache_superseded_first() -> Result<bool> {
+    match std::env::var("CANADA_SCRATCH_CACHE_SUPERSEDED_FIRST") {
+        Ok(v) => {
+            ensure!(v == "0" || v == "1", "invalid cache superseded-first policy");
+            ensure!(v == "0" || validate_cache_keep_latest()?, "superseded-first needs the keep-latest cache order");
+            Ok(v == "1")
+        }
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
 pub(crate) fn validate_cache_keep_latest() -> Result<bool> {
     match std::env::var("CANADA_SCRATCH_CACHE_KEEP_LATEST") {
         Ok(v) => { ensure!(v == "0" || v == "1", "invalid cache keep-latest policy"); Ok(v == "1") }
@@ -1960,6 +2000,34 @@ pub(crate) fn draft_head_subset_guard(committed: &[u32], pending: u32) -> bool {
 pub(crate) fn moe_route_front() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_MOE_ROUTE_FRONT").as_deref() == Ok("1"))
+}
+/// CANADA_SCRATCH_COPY_HINTS=1 (Nov 22 2026, checklist step 9; default off): file text a harness has shown the model
+/// with line numbers (DSH's read tool, `cat -n` style viewers) becomes an extra exact-copy source for the history
+/// lookup, as the files' own lines without the numbers, which is what a later edit or write call repeats
+/// (protocol::numbered_runs). Never added to the prompt;
+/// every proposed token is verified by the target like any history copy.
+pub(crate) fn copy_hints() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_COPY_HINTS").as_deref() == Ok("1"))
+}
+/// CANADA_SCRATCH_GATE_SEP_SCREEN=1 (Nov 22 2026; plan screen only, checklist step 8): one more plan-screen arm whose
+/// captured graphs launch an empty kernel (kernels/gate_sep_noop.ptx, no PDL) between the router's top-k and the routed
+/// experts in steps of 2-4 live rows (pico's DSGB10_GATE_SEP). Timing only: the same kernels on the same inputs.
+pub(crate) fn head_compact_screen() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_HEAD_COMPACT_SCREEN").as_deref() == Ok("1"))
+}
+/// CANADA_SCRATCH_HEAD_PLANES_SCREEN=1 (Nov 22 2026; plan screen only, checklist step 5; needs
+/// CANADA_SCRATCH_HEAD_COMPACT_EXCEPTIONS=1): the load also builds the six-row head's bit-plane layout (237 MiB a rank
+/// beside the stock encoding, src/lossless_head.rs) and the plan screen gets one more arm on the six-row owner, the
+/// compact head against compact + planes. The same logits bit for bit; nothing in serving selects the planes.
+pub(crate) fn head_planes_screen() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_HEAD_PLANES_SCREEN").as_deref() == Ok("1"))
+}
+pub(crate) fn gate_sep_screen() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_GATE_SEP_SCREEN").as_deref() == Ok("1"))
 }
 pub(crate) fn moe_route_front_screen() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

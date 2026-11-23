@@ -286,6 +286,7 @@ impl ModelIo {
     pub(crate) fn head_gemv_enabled(&self) -> bool {
         self.head.uses_head_gemv() && self.last_head.uses_head_gemv()
     }
+    pub(crate) fn set_head_variant_for_probe(&self,variant:u8)->Result<()> {self.head.set_head_variant_for_probe(variant)}
     pub(crate) fn set_lossless_head_for_probe(&self,active:bool)->Result<()> {
         self.head.set_lossless_for_probe(active)
     }

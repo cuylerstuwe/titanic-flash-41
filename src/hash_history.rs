@@ -63,6 +63,14 @@ impl HashMetadata {
     }
 }
 
+/// The Engram rows of `tokens` appended after the committed prefix `before`: what History::prepare returns at that
+/// position, computed from the tokens alone (cache-read hints; no History is read or advanced).
+pub(crate) fn preview_rows(before: &[u32], tokens: &[u32], metadata: &HashMetadata) -> Result<Vec<[[u64; 24]; 2]>> {
+    let mut history = History::new(1);
+    history.position = before.len() as u64;
+    for (k, token) in before.iter().rev().take(3).enumerate() { history.recent[k] = *token; }
+    Ok(history.prepare(tokens, metadata)?.rows)
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct History {
     pub lineage: u64,
@@ -200,6 +208,20 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preview_rows_match_the_committed_history() {
+        let m = meta();
+        let tokens: Vec<u32> = (0..40u32).map(|i| (i * 7 + 3) % m.token_map.len() as u32).collect();
+        for split in [0usize, 1, 2, 3, 4, 17, 39] {
+            let mut history = History::new(9);
+            if split > 0 {
+                let batch = history.prepare(&tokens[..split], &m).unwrap();
+                history.commit(batch, split).unwrap();
+            }
+            let direct = history.prepare(&tokens[split..], &m).unwrap().rows;
+            assert_eq!(preview_rows(&tokens[..split], &tokens[split..], &m).unwrap(), direct, "split {split}");
+        }
+    }
     fn meta() -> HashMetadata {
         let mut token_map: Vec<_> = (0..129280).map(|i| i % 99092).collect();
         token_map[2] = 2;

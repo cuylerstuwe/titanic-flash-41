@@ -475,8 +475,11 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
     let mut ready:VecDeque<(Option<u64>,Job)>=VecDeque::new();
     // Batched decode: HTTP owners of the conversations decoding in serving regions 1...
     let mut region_jobs:Vec<(u64,Job)>=Vec::new();
-    let mut next_id=1u64;let mut quantum_start=0;let mut prefill_turn_done=false;let mut refused=false;
+    let mut next_id=w.history.next_request_id()?;
+    let mut quantum_start=0;let mut prefill_turn_done=false;let mut refused=false;
     let mut authorized_next=None;
+    // config::copy_hints: a new job's Begin, held for one frame while its CopyHints frame reaches every rank.
+    let mut held_begin:Option<Vec<u8>>=None;
     let mut priority=PrioritySnapshot::default();
     let mut idle_policy=if w.idle_anchor_rolling {
         IdlePolicy::with_mode(idle_anchor_policy::Mode::EveryEligibleGap)
@@ -484,9 +487,19 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
     let result=(||->Result<()>{
         loop {
             let began=Instant::now();
-            let bytes=if authorized_next.is_some(){None}else if let Some(queue)=queue {
-                Some(if batched {batched_admission::choose(w,queue,&mut active,&mut ready,&region_jobs,&mut next_id,&mut prefill_turn_done,quantum_start,refused,&images)?}
-                    else {select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns,&mut idle_policy)?}.encode()?)
+            let bytes=if authorized_next.is_some(){None}else if let Some(held)=held_begin.take(){Some(held)}else if let Some(queue)=queue {
+                let scheduled=if batched {batched_admission::choose(w,queue,&mut active,&mut ready,&region_jobs,&mut next_id,&mut prefill_turn_done,quantum_start,refused,&images)?}
+                    else {select(w,queue,&mut active,&mut ready,&mut next_id,quantum_start,prefill_turn_done,refused,&images,&mut protection,&mut turns,&mut idle_policy)?};
+                // config::copy_hints: the hints go first, in their own frame; the Begin follows in the next one.
+                let hinted=match (&scheduled,active.as_mut()) {
+                    (Scheduled::Native(Command::Begin{tokens,..}),Some(job)) if crate::config::copy_hints()&&job.copy_hints.len()>=16 => {
+                        let tail=tokens[tokens.len().saturating_sub(64)..].to_vec();
+                        Some(Command::CopyHints{prompt_len:tokens.len(),tail,tokens:std::mem::take(&mut job.copy_hints)})
+                    }
+                    _=>None,
+                };
+                Some(if let Some(hints)=hinted {held_begin=Some(scheduled.encode()?);Scheduled::Native(hints).encode()?}
+                    else {scheduled.encode()?})
             }else{None};
             if batched {if let Some(queue)=queue {report_batched_timing(active.as_ref(),&ready,&region_jobs,queue.router_hold());}}
             let wire=if let Some(next)=authorized_next.take(){next}else{w.control.command(bytes.as_deref())?};
@@ -742,6 +755,16 @@ mod tests {
         }
         assert!(Scheduled::decode(&[8,0,0,0,0,0,0,0,0]).is_err());
         assert!(Scheduled::decode(&[18,0,0,0,0,0,0,0,0]).is_err());
+        // config::copy_hints: the hint frame round-trips, rejects truncation and out-of-domain tokens, and is not a
+        // frame the progress fast path may authorize.
+        let hints=Scheduled::Native(Command::CopyHints{prompt_len:900,tail:(800..864).collect(),tokens:(5..2005).collect()});
+        let wire=hints.encode().unwrap();
+        assert_eq!(Scheduled::decode(&wire).unwrap().encode().unwrap(),wire);
+        assert!(Scheduled::decode(&wire[..wire.len()-1]).is_err());
+        let mut invalid=wire.clone();let n=invalid.len();invalid[n-4..].copy_from_slice(&200000u32.to_le_bytes());
+        assert!(Scheduled::decode(&invalid).is_err());
+        assert!(!Scheduled::decode(&wire).unwrap().follows_progress(&[],6));
+        assert!(Command::CopyHints{prompt_len:10,tail:(0..11).collect(),tokens:vec![1;20]}.encode().is_err());
         assert_eq!(Scheduled::decode(&[7]).unwrap().encode().unwrap(),[7]);
         for mask in (0..=u32::MAX).step_by(16_777_259).chain([1,255,256,65_535,65_536,u32::MAX]) {
             let [a,b,c,d]=mask.to_le_bytes();
