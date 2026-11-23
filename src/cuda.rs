@@ -418,7 +418,32 @@ impl Drop for ContextOwner {
 pub(crate) struct ChunkPool {
     chunk: usize,
     count: usize,
+    released: std::cell::Cell<usize>,
     free: RefCell<Vec<u64>>,
+}
+/// Leave hysteresis for simultaneous HTTP conversion and vision work. At most
+/// two allocation cushions (and at most one eighth of the startup pool) become
+/// ordinary host memory for the rest of this worker's lifetime.
+fn idle_pages_to_return(available: usize, required: usize, cushion: usize, chunk: usize,
+    free: usize, keep_bytes: usize, initial: usize, released: usize) -> usize {
+    if cushion == 0 || available >= required.saturating_add(cushion / 2) { return 0; }
+    let cap = (cushion.saturating_mul(2) / chunk).min(initial / 8);
+    required.saturating_add(cushion).saturating_sub(available).div_ceil(chunk)
+        .min(free.saturating_sub(keep_bytes.div_ceil(chunk))).min(cap.saturating_sub(released))
+}
+
+#[cfg(test)]
+#[test]
+fn idle_pool_relief_retains_both_the_next_full_image_and_the_preallocated_pool() {
+    let mib = 1 << 20;
+    let plan = |available, free, keep, released| idle_pages_to_return(available * mib, 3584 * mib,
+        512 * mib, 16 * mib, free, keep * mib, 576, released);
+    assert_eq!(plan(3513, 414, 553, 0), 37);
+    assert_eq!(plan(3513, 37, 553, 0), 2);
+    assert_eq!(plan(3513, 34, 553, 0), 0);
+    assert_eq!(plan(3800, 414, 553, 63), 1);
+    assert_eq!(plan(3500, 414, 553, 64), 0);
+    assert_eq!(plan(3840, 414, 553, 0), 0);
 }
 /// Snapshots smaller than this keep ordinary allocations (small blocks are never scarce; a chunk would waste most of itself).
 pub(crate) const POOLED_IMAGE_MIN: usize = 8 << 20;
@@ -1157,7 +1182,7 @@ impl Cuda {
             }
             handles.push(handle);
         }
-        *self.owner.image_pool.borrow_mut() = Some(Rc::new(ChunkPool {chunk,count,free:RefCell::new(handles)}));
+        *self.owner.image_pool.borrow_mut() = Some(Rc::new(ChunkPool {chunk,count,released:Default::default(),free:RefCell::new(handles)}));
         Ok(serde_json::json!({"chunks":count,"chunk_bytes":chunk,"bytes":count*chunk,"granularity":granularity,
             "seconds":began.elapsed().as_secs_f64(),"memory_before":before,"memory_after":self.admission_memory()?}))
     }
@@ -1178,8 +1203,8 @@ impl Cuda {
     pub(crate) fn release_image_pool(&self) -> Result<usize> {
         let pool = self.owner.image_pool.borrow_mut().take().context("no image pool to release")?;
         let free = pool.free.borrow().len();
-        if free != pool.count || Rc::strong_count(&pool) != 1 {
-            let count = pool.count;
+        let count = pool.count - pool.released.get();
+        if free != count || Rc::strong_count(&pool) != 1 {
             *self.owner.image_pool.borrow_mut() = Some(pool);
             anyhow::bail!("image pool still in use ({free} of {count} chunks free)");
         }
@@ -1188,7 +1213,7 @@ impl Cuda {
         api.check(unsafe{(api.context_sync)()},"drain before releasing the image pool")?;
         let handles: Vec<u64> = pool.free.borrow_mut().drain(..).collect();
         for h in handles { api.check(unsafe{(api.mem_release)(h)},"release image pool chunk")?; }
-        Ok(pool.count)
+        Ok(count)
     }
     pub(crate) fn image_pool_free_bytes(&self) -> Option<usize> {
         self.owner.image_pool.borrow().as_ref().map(|p| p.free.borrow().len() * p.chunk)
@@ -1197,7 +1222,28 @@ impl Cuda {
         self.owner.image_pool.borrow().as_ref().map(|p| p.free.borrow().len())
     }
     pub(crate) fn image_pool_total_bytes(&self) -> Option<usize> {
-        self.owner.image_pool.borrow().as_ref().map(|p| p.count * p.chunk)
+        self.owner.image_pool.borrow().as_ref().map(|p| (p.count - p.released.get()) * p.chunk)
+    }
+    /// Return idle physical pages to the OS at an input or bank handoff. Only the
+    /// tight rank needs to act. Never touch a mapped page or spend the pages
+    /// reserved for the pending snapshot. The lifetime cap prevents repeated
+    /// requests from draining the preallocated pool or churning large allocations.
+    pub(crate) fn return_idle_image_pages(&self, available: usize, required: usize, keep: usize) -> Result<usize> {
+        let Some(pool) = self.owner.image_pool.borrow().clone() else { return Ok(0) };
+        let cushion = self.allocation_reserve_bytes().saturating_sub(crate::memory::floor_bytes());
+        let mut free = pool.free.borrow_mut();
+        let n = idle_pages_to_return(available, required, cushion, pool.chunk, free.len(), keep,
+            pool.count, pool.released.get());
+        if n > 0 {
+            self.owner.current()?;
+            for _ in 0..n {
+                let handle = *free.last().expect("planned free pool page");
+                self.owner.api.check(unsafe { (self.owner.api.mem_release)(handle) }, "return unused image pool page")?;
+                free.pop();
+                pool.released.set(pool.released.get() + 1);
+            }
+        }
+        Ok(n * pool.chunk)
     }
     /// Whether a snapshot of `bytes` would come from the pool right now.
     pub(crate) fn image_pool_fits(&self, bytes: usize) -> bool {

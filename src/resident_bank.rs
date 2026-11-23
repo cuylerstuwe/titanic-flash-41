@@ -173,7 +173,7 @@ impl Worker {
             let local_fits=available>=required;
             CacheSaveAdmission{admitted:self.control.all_admit(eligible&&local_fits)?,available,
                 local_fits,evicted:0,pressure_evicted:0,forecast_refused:false,recycled:None}
-        }else{self.admit_cache_save(eligible,evictions,prefix,&media,required,slots,&[],None)?};
+        }else{self.admit_cache_save(eligible,evictions,prefix,&media,required,slots,&[],None,true)?};
         let at=Instant::now();let mut saved=false;let mut fused_copy=false;let mut recycled_device_bytes=0;
         if admission.admitted {
             let history=self.session.as_ref().unwrap().checkpoint_history_lookup(prefix.len()as u64,&[])?;

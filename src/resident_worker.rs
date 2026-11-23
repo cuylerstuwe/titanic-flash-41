@@ -516,6 +516,14 @@ impl CachedSession {
         let disk=if !self.resident_now(){"parked"}else if self.disk_clean(){"clean"}else{"ram"};
         json!([self.prefix.len(),self.charge,self.kind,self.born.elapsed().as_secs(),self.used.elapsed().as_secs(),disk])
     }
+    fn general_device_bytes(&self) -> usize {
+        self.images().iter().filter(|im| im.owned_pool_chunks() == 0).map(|im| im.device_bytes()).sum()
+    }
+    fn into_clean_parked(mut self) -> Option<Self> {
+        if self.parkable() && self.disk_clean() && self.resident_now() && self.park_device().is_ok() {
+            Some(self)
+        } else { None }
+    }
     /// Disk tier (config::disk_tier): every copied image of the entry.
     fn images(&self)->Vec<&crate::state_image::Image> {
         match &self.image {CachedState::Complete{image,..}=>image.session.images(),CachedState::Encoder{image,..}=>image.images()}
@@ -554,6 +562,63 @@ impl CachedSession {
     fn drop_disk_copies(&mut self) {for image in self.images_mut(){ if image.resident(){let _=image.drop_disk_copy();} }}
     fn opportunistic_logits(&self)->bool {
         self.speculative || (self.prompt_logits.is_some() && self.media.placements().is_empty())
+    }
+}
+
+fn retry_has_short_tail(prompt: &CachedPrefix, media: &crate::prompt_media::Identity,
+    near: &CachedPrefix, near_media: &crate::prompt_media::Identity) -> bool {
+    !near.is_empty() && (1..128).contains(&prompt.len().saturating_sub(near.len()))
+        && media == near_media && prompt.extends(near)
+}
+
+#[cfg(test)]
+#[test]
+fn idle_retry_needs_the_same_screenshots_and_an_exact_nearby_input() {
+    use crate::prompt_media::{Identity, ImageKey, Placement, IMAGE_TOKEN};
+    let ids = vec![1,IMAGE_TOKEN,2];
+    let frame = |digest| Identity::new(vec![Placement{start:1,tokens:1,key:ImageKey{input:digest,encoder:[0;32]}}], &ids).unwrap();
+    let a=frame([0;32]); let b=frame([1;32]);
+    let near=CachedPrefix::from(ids.clone());
+    let mut longer=ids.clone();longer.push(3);
+    let prompt=CachedPrefix::from(longer);
+    assert!(retry_has_short_tail(&prompt,&a,&near,&a));
+    assert!(!retry_has_short_tail(&prompt,&a,&near,&b));
+    assert!(!retry_has_short_tail(&prompt,&a,&CachedPrefix::from(vec![1,IMAGE_TOKEN,4]),&a));
+    let mut far=ids;far.extend(std::iter::repeat_n(3,128));
+    assert!(!retry_has_short_tail(&CachedPrefix::from(far),&a,&near,&a));
+}
+
+/// A shared system prompt is not a substitute for a near-million-token
+/// private continuation. A secondary save may leave at most one short tile.
+fn covers_forward_input(length: usize, covered: usize) -> bool {
+    covered > 0 && length.saturating_sub(covered) < 128
+}
+#[cfg(test)]
+#[test]
+fn a_short_shared_system_prompt_cannot_replace_an_unrelated_forward_anchor() {
+    assert!(!covers_forward_input(1_010_048,8192));
+    assert!(!covers_forward_input(1_010_048,1_009_920));
+    assert!(covers_forward_input(1_010_048,1_010_047));
+    assert!(!covers_forward_input(17,0));
+}
+
+fn idle_park_due(current: u64, saved: u64, restored: u64, wait: u64) -> bool {
+    current.saturating_sub(saved.max(restored)) >= wait
+}
+
+#[cfg(test)]
+#[test]
+fn parking_counts_requests_since_last_use_even_if_one_request_made_many_snapshots() {
+    assert!(!idle_park_due(9,9,0,4));
+    assert!(!idle_park_due(12,7,9,4));
+    assert!(idle_park_due(13,7,9,4));
+}
+
+fn bound_parked_cache(parked: &mut Vec<CachedSession>, cached: &[CachedSession], tier: &crate::config::DiskTierConfig) {
+    let resident: usize = cached.iter().map(CachedSession::disk_bytes).sum();
+    let mut bytes = resident + parked.iter().map(CachedSession::disk_bytes).sum::<usize>();
+    while !parked.is_empty() && (parked.len() > tier.max_parked || bytes as u64 > tier.cap_bytes) {
+        bytes -= parked.remove(0).disk_bytes();
     }
 }
 
@@ -852,6 +917,23 @@ fn cache_evictions(entries:&[(usize,usize)], incoming:(usize,usize), budget:usiz
     cache_evictions_ladder(entries,None,incoming,budget,long_first,slots)
 }
 
+fn reload_evictions(entries: &[(usize,usize)], incoming: (usize,usize), budget: usize,
+    long_first: bool, slots: usize, fallback: Option<usize>) -> Option<Vec<usize>> {
+    let Some(held) = fallback else { return cache_evictions(entries,incoming,budget,long_first,slots) };
+    let held_charge = entries.get(held)?.1;
+    let others: Vec<_> = entries.iter().enumerate().filter_map(|(i,&e)| (i!=held).then_some(e)).collect();
+    let victims = cache_evictions(&others,incoming,budget.checked_sub(held_charge)?,long_first,slots.checked_sub(1)?)?;
+    Some(victims.into_iter().map(|i| if i>=held {i+1} else {i}).collect())
+}
+
+#[cfg(test)]
+#[test]
+fn a_returning_disk_entry_reserves_its_current_ram_fallback_before_selecting_victims() {
+    let entries=[(101_000,50),(90_000,40),(70_000,35)];
+    assert_eq!(reload_evictions(&entries,(190_000,50),160,false,3,Some(0)),Some(vec![1]));
+    assert_eq!(reload_evictions(&entries,(190_000,130),160,false,3,Some(0)),None);
+}
+
 /// Earlier checkpoints of the incoming conversation (`ancestors`, entries whose
 /// prefix the incoming prefix extends) form a reuse ladder: an edit of early
 /// history restores the latest retained checkpoint at or before the edit.
@@ -1129,20 +1211,22 @@ impl Worker {
     }
     /// config::cache_superseded_first: the eviction plan `victims` (indices into the cache list) of an image whose prefix
     /// is `prefix`, moved onto the cheapest retained images (prefer_cheaper). The earlier-checkpoint rule is
-    /// read now, so the restore this request made counts. Never taken as a replacement: `protected` entries, shared
-    /// prefixes, and the incoming image's own ancestors (the planners' ladder and reservations decide about those).
+    /// read now, so the restore this request made counts. Protected entries, shared prefixes without a private
+    /// successor, and the incoming image's own ancestors are excluded from replacement.
     /// `keep`: victims the planner chose because they are optional stay as they are. Every rank holds the same list and
     /// serials, so every rank returns the same plan.
-    fn superseded_first(&self, victims: Vec<usize>, prefix: &[u32], protected: &[usize], keep: Option<&[bool]>) -> Vec<usize> {
+    fn superseded_first(&self, victims: Vec<usize>, prefix: &[u32], media: &crate::prompt_media::Identity, protected: &[usize], keep: Option<&[bool]>) -> Vec<usize> {
         if !crate::config::cache_superseded_first() || victims.is_empty() { return victims; }
-        let class = cache_classes(&self.cached_sessions, &self.keep_latest_earlier());
+        let (facts, ext) = keep_latest_inputs(&self.cached_sessions);
+        let earlier = keep_latest_earlier_flags(&facts, &ext);
+        let class = cache_classes(&self.cached_sessions, &earlier, &ext);
         let none = vec![false; self.cached_sessions.len()];
         let keep = keep.filter(|k| k.len() == none.len()).unwrap_or(&none);
         if victims.iter().all(|&v| v >= class.len() || class[v] == 0 || keep[v]) { return victims; }
         let entries: Vec<(usize, usize)> = self.cached_sessions.iter().map(|c| (c.prefix.len(), c.charge)).collect();
         let excluded: Vec<bool> = self.cached_sessions.iter().enumerate().map(|(i, c)| protected.contains(&i)
-            || c.shared || c.kind == "shared_prefix"
-            || (c.prefix.len() <= prefix.len() && prefix.starts_with(&c.prefix))).collect();
+            || ((c.shared || c.kind == "shared_prefix") && class[i] == 2)
+            || (c.prefix.len() <= prefix.len() && prefix.starts_with(&c.prefix) && media.matches_prefix(&c.media,c.prefix.len()))).collect();
         let planned = victims.clone();
         let chosen = prefer_cheaper(&entries, &class, &excluded, keep, victims);
         if chosen != planned {
@@ -1152,14 +1236,67 @@ impl Worker {
         }
         chosen
     }
+    /// A secondary snapshot must not consume the only independently usable input
+    /// of another conversation. Evaluate all victims together: two entries in
+    /// the same eviction plan cannot serve as each other's surviving fallback.
+    fn loses_unrelated_input(&self, victims: &[usize], prefix: &[u32], media: &crate::prompt_media::Identity) -> bool {
+        !self.uncovered_inputs(victims,prefix,media).is_empty()
+    }
+    fn uncovered_inputs(&self, victims: &[usize], prefix: &[u32], media: &crate::prompt_media::Identity) -> Vec<usize> {
+        if victims.is_empty() || !crate::config::cache_superseded_first() { return Vec::new(); }
+        let alternatives=CheckpointAlternatives::new(&self.cached_sessions);
+        victims.iter().copied().filter(|&i| {
+            let entry=&self.cached_sessions[i];
+            alternatives.independent[i] && !alternatives.cheap[i] && !entry.shared
+                && !(prefix.starts_with(&entry.prefix) && media.matches_prefix(&entry.media,entry.prefix.len()))
+                && !alternatives.coverage[i].iter().enumerate().any(|(j,&covered)| covers_forward_input(entry.prefix.len(),covered) && !victims.contains(&j))
+        }).collect()
+    }
     /// Disk tier (config::disk_tier): evict cache entry `i`, parking it (RAM freed, kept on disk) when it has a disk copy,
     /// else dropping it as before. Every rank holds the same entries and copies, so every rank does the same.
     pub(crate) fn evict_cached(&mut self, i: usize) {
-        let mut entry = self.cached_sessions.remove(i);
-        if self.disk_tier.is_some() && entry.parkable() && entry.disk_clean() && entry.resident_now()
-            && entry.park_device().is_ok() {
+        let entry = self.cached_sessions.remove(i);
+        if self.disk_tier.is_some() && let Some(entry) = entry.into_clean_parked() {
             self.push_parked(entry);
         }
+    }
+
+    /// Called only when a real request already needs this entry's slot or bytes.
+    /// Price a write and subsequent read against the input that would actually
+    /// need replaying. A surviving longer *encoder* checkpoint covers a forward
+    /// continuation; a generated answer may contain reasoning the client omits.
+    fn save_displaced_input(&mut self, i: usize,
+        incoming: Option<(&[u32], &crate::prompt_media::Identity)>) -> Result<()> {
+        let Some(tier) = self.disk_tier.as_ref() else { return Ok(()) };
+        let entry = &self.cached_sessions[i];
+        if entry.speculative || entry.shared || entry.prompt_logits.is_some()
+            || !entry.parkable() || entry.disk_clean() || !entry.resident_now() {
+            return Ok(());
+        }
+        let len = entry.prefix.len();
+        if incoming.is_some_and(|(ids,media)| ids.starts_with(&entry.prefix)
+            && media.matches_prefix(&entry.media,len)) { return Ok(()); }
+        let mut covered = 0;
+        for other in self.cached_sessions.iter().chain(&self.parked_sessions) {
+            if std::ptr::eq(entry,other) || other.owner != entry.owner || other.speculative
+                || other.prompt_logits.is_some() || !other.parkable()
+                || !matches!(other.image,CachedState::Encoder{..}) { continue; }
+            let through = len.min(other.prefix.len());
+            if through <= covered || !entry.media.matches_prefix(&other.media,through) { continue; }
+            let matches = match len.cmp(&other.prefix.len()) {
+                std::cmp::Ordering::Equal => entry.prefix[..] == other.prefix[..],
+                std::cmp::Ordering::Greater => entry.prefix.extends(&other.prefix),
+                std::cmp::Ordering::Less => other.prefix.extends(&entry.prefix),
+            };
+            if matches { covered = through; }
+            if covered == len { return Ok(()); }
+        }
+        let worthwhile = crate::disk_tier::spill_pays(entry.logical_bytes(),len - covered,
+            tier.read_bytes_per_s,tier.read_fixed_s,crate::config::encoder_chunk_costs());
+        // Physical image sizes can differ by rank. All ranks must enter the
+        // write and its collectives together, even near the cost threshold.
+        if self.control.all_admit(worthwhile)? { self.save_before_evict(i,true)?; }
+        Ok(())
     }
     /// Disk tier, save on evict (DiskTierConfig::save_on_evict_tokens; 0 = off): before cache pressure evicts entry `i`,
     /// write its missing disk copies now when it holds at least that many tokens and the tier's budgets allow, so the
@@ -1185,16 +1322,17 @@ impl Worker {
         if self.disk_pending.as_ref().is_some_and(|p| {
             let c = &self.cached_sessions[i]; p.born == c.born && p.tokens == c.prefix.len() }) { self.disk_pending = None; }
         let bytes = self.cached_sessions[i].images().iter().filter(|im| !im.has_disk_copy()).map(|im| im.bytes()).sum::<usize>() as u64;
-        while self.disk_tier_bytes() as u64 + bytes > tier.cap_bytes && !self.parked_sessions.is_empty() {
-            self.parked_sessions.remove(0);
-        }
         let days = (self.disk_tier_started.elapsed().as_secs_f64() / 86400.0).max(1.0);
         let budget = (crate::disk_tier::written_bytes() + bytes) as f64 <= tier.write_bytes_per_day as f64 * days;
         let space = crate::disk_tier::free_bytes(&tier.dir).is_ok_and(|f| f >= tier.free_floor_bytes + bytes);
-        let cap = self.disk_tier_bytes() as u64 + bytes <= tier.cap_bytes;
+        let held = self.cached_sessions.iter().map(CachedSession::disk_bytes).sum::<usize>() as u64;
+        let cap = held.saturating_add(bytes) <= tier.cap_bytes;
         if !self.control.all_admit(budget && space && cap)? {
             return Ok(Some(json!({"event":"save_on_evict_refused","tokens":self.cached_sessions[i].prefix.len(),
                 "budget":budget,"space":space,"cap":cap})));
+        }
+        while self.disk_tier_bytes() as u64 + bytes > tier.cap_bytes && !self.parked_sessions.is_empty() {
+            self.parked_sessions.remove(0);
         }
         self.stream.synchronize()?;
         let mut failed = None;
@@ -1239,6 +1377,7 @@ impl Worker {
 
     /// evict_cached after save_before_evict: what cache pressure (not policy parking) uses.
     pub(crate) fn evict_cached_saving(&mut self, i: usize) -> Result<()> {
+        self.save_displaced_input(i,None)?;
         self.save_before_evict(i, false)?;
         self.evict_cached(i);
         Ok(())
@@ -1336,20 +1475,42 @@ impl Worker {
     /// Add a parked entry (newest last) and keep the parked list within its count and the disk cap.
     fn push_parked(&mut self, entry: CachedSession) {
         self.parked_sessions.push(entry);
-        let Some((max, cap)) = self.disk_tier.as_ref().map(|t| (t.max_parked, t.cap_bytes)) else { return };
-        while !self.parked_sessions.is_empty()
-            && (self.parked_sessions.len() > max || self.disk_tier_bytes() as u64 > cap) {
-            self.parked_sessions.remove(0);
+        if let Some(tier) = self.disk_tier.as_ref() {
+            bound_parked_cache(&mut self.parked_sessions, &self.cached_sessions, tier);
         }
     }
     /// Disk bytes the tier holds: copies of resident entries and parked entries.
     fn disk_tier_bytes(&self) -> usize {
         self.cached_sessions.iter().chain(&self.parked_sessions).map(|c| c.disk_bytes()).sum()
     }
-    /// Reload parked entry `j` on every rank; on success it is the newest cache entry. A rank without room makes every
-    /// rank undo and evict the oldest resident entry (which parks if it has a copy) before the next try; a read or digest
-    /// failure anywhere drops the entry everywhere (the request then prefills).
-    fn reload_parked(&mut self, j: usize) -> Result<bool> {
+
+    /// A parked request can return even when all RAM slots hold private inputs.
+    /// Secure each displaced input on disk before touching its RAM. Price those
+    /// writes against the returning request's actual cold replay. Keep its own
+    /// file inside the capacity calculation while it is checked out of the list.
+    fn secure_reload_victims(&mut self, victims: &[usize], entry: &CachedSession, gain: usize,
+        transfer: &mut (usize,usize)) -> Result<bool> {
+        let save = self.uncovered_inputs(victims,&entry.prefix,&entry.media);
+        if save.is_empty() { return Ok(true); }
+        let tier = self.disk_tier.as_ref().expect("disk restore");
+        let writes:usize = save.iter().map(|&i| self.cached_sessions[i].logical_bytes()).sum();
+        let total = transfer.0.saturating_add(writes.saturating_mul(2));
+        let ops = transfer.1 + 2 * save.len();
+        let fits = self.disk_tier_bytes().saturating_add(entry.disk_bytes()).saturating_add(writes) as u64 <= tier.cap_bytes;
+        let pays = crate::disk_tier::reload_pays(total,gain,false,tier.read_bytes_per_s,
+            ops as f64 * tier.read_fixed_s,crate::config::encoder_chunk_costs());
+        if !self.control.all_admit(fits && pays)? { return Ok(false); }
+        for i in save {
+            self.save_before_evict(i,true)?;
+            if !self.control.all_admit(self.cached_sessions[i].disk_clean())? { return Ok(false); }
+        }
+        *transfer = (total,ops);
+        Ok(true)
+    }
+    /// Try a durable copy while preserving the request's working RAM fallback
+    /// and unrelated private continuations. Only an actual read/integrity error
+    /// invalidates the durable copy; insufficient room leaves it parked.
+    fn reload_parked(&mut self, j: usize, fallback: Option<(Instant,usize)>, gain: usize) -> Result<bool> {
         let began = Instant::now();
         let mut entry = self.parked_sessions.remove(j);
         let (tokens, bytes) = (entry.prefix.len(), entry.logical_bytes());
@@ -1357,17 +1518,25 @@ impl Worker {
         // Room under the cache's own slot and byte limits first, chosen by the planner a new snapshot uses (victims park
         // when they have a copy). Without room the entry stays parked and the request prefills as it would have.
         let (budget, slots) = self.cache_capacity(0, 0);
-        let entries = self.cached_sessions.iter().map(|c| (c.prefix.len(), c.charge)).collect::<Vec<_>>();
-        let victims = cache_evictions(&entries, (tokens, entry.charge), budget, self.session_cache_long_first, slots);
+        let protected = |c: &CachedSession| Some((c.born,c.prefix.len())) == fallback;
+        let held = self.cached_sessions.iter().position(protected);
+        let entries:Vec<_> = self.cached_sessions.iter().map(|c| (c.prefix.len(),c.charge)).collect();
+        let victims = reload_evictions(&entries,(tokens,entry.charge),budget,self.session_cache_long_first,slots,held);
         if !self.control.all_admit(victims.is_some())? {
             self.push_parked(entry);
             eprintln!("disk tier {}", json!({"event":"reload_over_budget","tokens":tokens,"bytes":bytes}));
             return Ok(false);
         }
-        let mut victims = victims.unwrap_or_default();
+        let mut victims = self.superseded_first(victims.unwrap_or_default(),&entry.prefix,&entry.media,held.as_slice(),None);
+        let mut transfer = (bytes,1);
+        if !self.secure_reload_victims(&victims,&entry,gain,&mut transfer)? {
+            self.push_parked(entry);
+            eprintln!("disk tier {}",json!({"event":"reload_preserve_ram","tokens":tokens}));
+            return Ok(false);
+        }
         victims.sort_unstable();
         let planned = began.elapsed().as_secs_f64();
-        for i in victims.into_iter().rev() { self.evict_cached_saving(i)?; evicted += 1; }
+        for i in victims.into_iter().rev() { self.evict_cached(i); evicted += 1; }
         let evicting = began.elapsed().as_secs_f64() - planned;
         let mut phases = [0.0f64; 4];
         loop {
@@ -1383,12 +1552,28 @@ impl Worker {
             if let Some(t) = room { for k in 0..4 { phases[k] += t[k]; } }
             if self.control.all_admit(room.is_some())? { break; }
             if entry.resident_now() { entry.park_device()?; }
-            if self.cached_sessions.is_empty() {
+            let available = self.cuda.admission_memory()?.admitted_available;
+            let reserve = self.cache_reserve()?;
+            let returned = if room.is_none() { self.cuda.return_idle_image_pages(available,reserve,bytes)? } else { 0 };
+            if !self.control.all_admit(returned == 0)? { continue; }
+            let alternatives = CheckpointAlternatives::new(&self.cached_sessions);
+            let mut excluded:Vec<_> = self.cached_sessions.iter().map(protected).collect();
+            let mut next = None;
+            while let Some((i,_)) = alternatives.victim(&excluded,&[]) {
+                excluded[i]=true;
+                let c=&self.cached_sessions[i];
+                let helps=room.is_none() && (c.general_device_bytes()>0 || (available>=reserve
+                    && c.images().iter().any(|image| image.owned_pool_chunks()>0)));
+                if !self.control.all_admit(!helps)? && self.secure_reload_victims(&[i],&entry,gain,&mut transfer)? {
+                    next=Some(i); break;
+                }
+            }
+            let Some(i)=next else {
                 self.push_parked(entry);
                 eprintln!("disk tier {}", json!({"event":"reload_no_room","tokens":tokens,"bytes":bytes}));
                 return Ok(false);
-            }
-            self.evict_cached(0);
+            };
+            self.evict_cached(i);
             evicted += 1;
         }
         entry.used = Instant::now();
@@ -1398,24 +1583,50 @@ impl Worker {
             "plan_s":planned,"evict_s":evicting,"alloc_s":phases[0],"read_s":phases[1],"digest_s":phases[2],"upload_s":phases[3]}));
         Ok(true)
     }
-    /// Write-behind candidate: prompt-end images with logits first, then completed turns of other conversations, then
-    /// the rest except the two newest entries (the next turn usually supersedes them: writing them would only wear the
-    /// SSD); oldest first within a class. Uses only state every rank shares.
+    /// An exact retry with an independent input covering all but the last
+    /// encoder tile can stay in RAM. Its disk copy would only save replaying
+    /// that short text suffix. This decision uses replicated state on every rank.
+    fn idle_retry_covered(&self, entry: &CachedSession) -> bool {
+        if !self.redundant_prompt_image || entry.kind != "prompt_end_logits" { return false; }
+        self.cached_sessions.iter().any(|other| {
+            entry.owner == other.owner && !other.speculative && !other.shared
+                && matches!(other.kind, "prompt_checkpoint" | "near_end")
+                && other.parkable() && other.resident_now()
+                && retry_has_short_tail(&entry.prefix,&entry.media,&other.prefix,&other.media)
+        })
+    }
+
+    fn live_covers(&self, entry: &CachedSession) -> bool {
+        self.history.committed().starts_with(&entry.prefix)
+            && self.history.media().matches_prefix(&entry.media,entry.prefix.len())
+    }
+
+    /// An active forward anchor stays hot. A displaced conversation can be
+    /// backed up before a future eviction. A useful exact retry comes last.
+    /// Age counts actual requests since the last save or restore.
     fn disk_tier_pick(&self) -> Option<(u8, usize)> {
-        let live = self.history.committed();
-        let n = self.cached_sessions.len();
-        self.cached_sessions.iter().enumerate().filter(|(_, c)| c.parkable() && c.resident_now()
-            && !c.disk_clean() && !c.speculative)
-            .map(|(i, c)| (if c.kind == "prompt_end_logits" {0u8}
-                else if matches!(c.image, CachedState::Complete{..}) && !live.starts_with(&c.prefix) {1} else {2}, i))
-            .filter(|&(class, i)| class < 2 || n - 1 - i >= 2).min()
+        self.cached_sessions.iter().enumerate().filter_map(|(i,c)| {
+            if !c.parkable() || !c.resident_now() || c.disk_clean() || c.speculative { return None; }
+            let age = self.cache_serial.saturating_sub(c.serial.max(c.restored_serial));
+            let class = if c.kind == "prompt_end_logits" {
+                if self.idle_retry_covered(c) || age < 2 { return None; }
+                2
+            } else if matches!(c.image,CachedState::Complete{..}) && !self.live_covers(c) {
+                0
+            } else if age >= 2 {
+                1
+            } else {
+                return None;
+            };
+            Some((class,i))
+        }).min()
     }
     /// How long the leader waits for a request before its next idle command, given its usual wait: while copies wait to be
     /// written and the cluster is quiet, idle commands follow each other closely (each writes one slice).
     pub(crate) fn tier_idle_wait(&self, usual: Duration) -> Duration {
         match &self.disk_tier {
             Some(t) if self.disk_tier_busy && self.disk_tier_backoff == 0
-                && self.last_active.elapsed() >= Duration::from_secs(t.idle_secs) => usual.min(Duration::from_millis(20)),
+                && t.idle_secs.is_some_and(|s| self.last_active.elapsed() >= Duration::from_secs(s)) => usual.min(Duration::from_millis(20)),
             _ => usual,
         }
     }
@@ -1425,13 +1636,16 @@ impl Worker {
     /// (entry kinds, the cache's oldest-first order, entry identity by birth and length).
     fn disk_tier_idle_step(&mut self) -> Result<Option<Value>> {
         let Some(tier) = self.disk_tier.clone() else { return Ok(None) };
-        if !self.control.all_admit(self.last_active.elapsed() >= Duration::from_secs(tier.idle_secs))? { return Ok(None); }
+        let Some(delay) = tier.idle_secs else { return Ok(None) };
+        if !self.control.all_admit(self.last_active.elapsed() >= Duration::from_secs(delay))? { return Ok(None); }
         let mut event = None;
         // The copy in progress belongs to an entry that is still cached and resident; otherwise it is abandoned (the
         // partial file goes with it). The cache is the same on every rank, so is this.
         let at = self.disk_pending.as_ref().and_then(|p| self.cached_sessions.iter()
             .position(|c| c.born == p.born && c.prefix.len() == p.tokens && c.resident_now()));
-        if at.is_none() { self.disk_pending = None; }
+        if at.is_none_or(|i| self.idle_retry_covered(&self.cached_sessions[i])) {
+            self.disk_pending = None;
+        }
         if self.disk_pending.is_none() && let Some((class, i)) = self.disk_tier_pick() {
             let bytes = self.cached_sessions[i].logical_bytes() as u64;
             while self.disk_tier_bytes() as u64 + bytes > tier.cap_bytes && !self.parked_sessions.is_empty() {
@@ -1487,15 +1701,17 @@ impl Worker {
                 self.disk_pending = Some(p);
             }
         }
-        // Policy parking: prompt-end images once they have a copy; completed turns of other conversations once
-        // `park_after` newer entries exist.
-        let keep = tier.park_after_requests as usize;
-        let n = self.cached_sessions.len();
-        let live = self.history.committed().to_vec();
-        let park = self.cached_sessions.iter().enumerate().filter(|(i, c)| c.parkable() && c.disk_clean()
-            && c.resident_now() && (c.kind == "prompt_end_logits"
-                || (matches!(c.image, CachedState::Complete{..}) && !live.starts_with(&c.prefix) && n - 1 - i >= keep)))
-            .map(|(i, _)| i).collect::<Vec<_>>();
+        // Count requests, not entries. One turn can save several images. A
+        // clean retry with a nearby independent input may immediately give back
+        // its RAM. An uncovered recent or current forward point stays resident.
+        let park = self.cached_sessions.iter().enumerate().filter(|(_,c)| {
+            if !c.parkable() || !c.disk_clean() || !c.resident_now() { return false; }
+            let retry = c.kind == "prompt_end_logits";
+            (retry && self.idle_retry_covered(c))
+                || ((retry || matches!(c.image,CachedState::Complete{..}))
+                    && idle_park_due(self.cache_serial,c.serial,c.restored_serial,tier.park_after_requests)
+                    && !self.live_covers(c))
+        }).map(|(i,_)|i).collect::<Vec<_>>();
         if !park.is_empty() {
             let freed = park.iter().map(|&i| self.cached_sessions[i].logical_bytes()).sum::<usize>();
             for &i in park.iter().rev() { self.evict_cached(i); }
@@ -1573,14 +1789,14 @@ fn keep_latest_inputs(c: &[CachedSession]) -> (Vec<EntryFacts>, Vec<Vec<bool>>) 
 }
 /// config::cache_superseded_first, host-memory reclaim (reclaim_optional_cache): the order in which cached images may
 /// give way when an input or a restore lacks host memory. Optional images first, then earlier checkpoints (class 0),
-/// then completed-turn images no request has restored (class 1), then images that a later prompt checkpoint of the
+/// then untried completions with a matching input checkpoint (class 1), then images that a later prompt checkpoint of the
 /// same conversation extends (`extended`: the conversation's prompt has grown past them, though no request has
-/// restored the later checkpoint yet); each group in list order. Shared prefixes never. A conversation's newest
+/// restored the later checkpoint yet); each group in list order. A superseded shared prefix may yield. A conversation's newest
 /// prompt checkpoint is in none of the groups.
 fn host_reclaim_order(optional: &[bool], class: &[u8], extended: &[bool], shared: &[bool]) -> Vec<usize> {
     let n = optional.len();
     if class.len() != n || extended.len() != n || shared.len() != n { return Vec::new(); }
-    let pick = |want: &dyn Fn(usize) -> bool| (0..n).filter(|&i| !shared[i] && want(i)).collect::<Vec<_>>();
+    let pick = |want: &dyn Fn(usize) -> bool| (0..n).filter(|&i| (!shared[i] || class[i] == 0) && want(i)).collect::<Vec<_>>();
     let mut order = pick(&|i| optional[i]);
     order.extend(pick(&|i| !optional[i] && class[i] == 0));
     order.extend(pick(&|i| !optional[i] && class[i] == 1));
@@ -1627,9 +1843,30 @@ fn prefer_cheaper(entries: &[(usize, usize)], class: &[u8], excluded: &[bool], k
 }
 /// The class prefer_cheaper and host_reclaim_order read of each cached image (0 earlier checkpoint, 1 completed-turn
 /// image never restored, 2 anything else); `earlier` from keep_latest_earlier_flags over the same list.
-fn cache_classes(cached: &[CachedSession], earlier: &[bool]) -> Vec<u8> {
-    cached.iter().zip(earlier).map(|(c, &e)| if e { 0 } else if c.kind == "completed" && c.restored_serial == 0 { 1 } else { 2 }).collect()
+fn cache_priority(earlier: bool, shared: bool, has_private_successor: bool, untried_completion: bool, has_input: bool) -> u8 {
+    if earlier || (shared && has_private_successor) { 0 } else if untried_completion && has_input { 1 } else { 2 }
 }
+fn cache_classes(cached: &[CachedSession], earlier: &[bool], extends: &[Vec<bool>]) -> Vec<u8> {
+    let input: Vec<_> = cached.iter().map(|c| !c.shared && !c.speculative && matches!(c.kind, "prompt_checkpoint" | "near_end")).collect();
+    cached.iter().enumerate().map(|(i, c)| {
+        // A completion can be the only surviving anchor if a client sends
+        // reasoning back. Lack of a first checkout alone proves nothing.
+        let shared = c.shared || c.kind == "shared_prefix";
+        let untried = c.kind == "completed" && c.restored_serial == 0;
+        cache_priority(earlier[i], shared, shared && (0..cached.len()).any(|j| input[j] && extends[j][i]),
+            untried, untried && (0..cached.len()).any(|j| input[j] && extends[i][j]))
+    }).collect()
+}
+#[cfg(test)]
+#[test]
+fn a_shared_branch_or_untried_completion_yields_only_with_forward_coverage() {
+    assert_eq!(cache_priority(false,true,false,false,false),2);
+    assert_eq!(cache_priority(false,true,true,false,false),0);
+    assert_eq!(cache_priority(false,false,false,true,false),2);
+    assert_eq!(cache_priority(false,false,false,true,true),1);
+    assert_eq!(host_reclaim_order(&[false;3], &[2,0,2], &[false;3], &[true,true,false]), vec![1]);
+}
+
 /// The keep-latest order of a cache list (config::cache_keep_latest): every earlier checkpoint first, then every latest
 /// image; each group keeps its existing order (oldest / least recently used first, restores refresh age). Returns the
 /// new order as indices into the old list.
@@ -1687,7 +1924,8 @@ struct CacheSaveAdmission {
 /// Room for anything else is host memory, which evicting pooled snapshots does not give back: with a pool, nothing is
 /// evicted for it (Nov 17).
 fn reclaim_optional_cache(cuda:&Cuda,control:&mut ControlChannel,
-    cached:&mut Vec<CachedSession>,long_first:bool,headroom:usize,for_image:bool)->Result<Value> {
+    cached:&mut Vec<CachedSession>, parked:&mut Vec<CachedSession>, tier:Option<&crate::config::DiskTierConfig>,
+    long_first:bool,headroom:usize,for_image:bool)->Result<Value> {
     let began=Instant::now();
     cuda.synchronize_all()?;
     let room=|| if for_image {cuda.image_admission_memory()} else {cuda.admission_memory()};
@@ -1702,22 +1940,28 @@ fn reclaim_optional_cache(cuda:&Cuda,control:&mut ControlChannel,
     }
     control.agree(&proof)?;
     let before=room()?;
-    let mut admitted=control.all_admit(before.admitted_available > headroom)?;
+    let returned = if pointless && crate::config::cache_superseded_first() {
+        cuda.return_idle_image_pages(before.admitted_available,headroom.saturating_add(1),0)?
+    } else { 0 };
+    let available = if returned > 0 { room()?.admitted_available } else { before.admitted_available };
+    if returned > 0 { cache_trace(||json!({"path":"return_idle_pool","for":"input","bytes":returned,
+        "before":before.admitted_available,"after":available,"required":headroom})); }
+    let mut admitted=control.all_admit(available > headroom)?;
     let mut evicted=Vec::new();
     while !admitted && !cached.is_empty() && !pointless {
         let index=cached.iter().enumerate().min_by_key(|(i,c)|
             (!c.opportunistic_logits(),if long_first {c.prefix.len()}else{0},*i)).unwrap().0;
         let entry=cached.remove(index);
         evicted.push(json!({"prefix_tokens":entry.prefix.len(),"charge_bytes":entry.charge}));
-        drop(entry);
+        if let Some(entry)=entry.into_clean_parked() { parked.push(entry); }
         admitted=control.all_admit(room()?.admitted_available > headroom)?;
     }
     // config::cache_superseded_first (Nov 22). With a pool, room for host memory was never made from the cache: pooled
     // snapshots give none back. But a snapshot saved while the pool was full came from general memory and holds it
     // for as long as it lives; four ~1M-token conversations left the head 150 MB under its reserve that way and an
     // image input was refused, with a replaced checkpoint of 0.94 GB still resident. Such images give way in
-    // host_reclaim_order, never a conversation's newest prompt-side image. Whether an image sits outside the pool is a
-    // rank's own fact, so each candidate is voted on: it goes everywhere when any rank holds it in general memory.
+    // host_reclaim_order. A candidate must release ordinary memory on a rank that is actually short.
+    // Existing disk copies survive; a sole forward anchor is eligible for the separate lossless parking path.
     if !admitted && pointless && crate::config::cache_superseded_first() && !cached.is_empty() {
         let (facts,ext)=keep_latest_inputs(cached);
         let earlier=keep_latest_earlier_flags(&facts,&ext);
@@ -1728,19 +1972,19 @@ fn reclaim_optional_cache(cuda:&Cuda,control:&mut ControlChannel,
         let extended=(0..n).map(|i|(0..n).any(|j|ext[j][i]&&checkpoint[j])).collect::<Vec<_>>();
         let optional=cached.iter().map(|c|c.opportunistic_logits()).collect::<Vec<_>>();
         let shared=facts.iter().map(|f|f.shared).collect::<Vec<_>>();
-        let class=cache_classes(cached,&earlier);
+        let class=cache_classes(cached,&earlier,&ext);
         let order=host_reclaim_order(&optional,&class,&extended,&shared);
         let mut slots=cached.drain(..).map(Some).collect::<Vec<Option<CachedSession>>>();
         let outcome=(||->Result<bool>{
             let mut admitted=false;
             for i in order {
                 let entry=slots[i].as_ref().expect("each candidate once");
-                let local=entry.images().iter().any(|image|image.resident()&&image.device_bytes()>0&&image.owned_pool_chunks()==0);
+                let local=room()?.admitted_available <= headroom && entry.general_device_bytes() > 0;
                 if control.all_admit(!local)? {continue;}
                 let entry=slots[i].take().unwrap();
                 evicted.push(json!({"prefix_tokens":entry.prefix.len(),"charge_bytes":entry.charge,"kind":entry.kind,
                     "general_memory":true,"group":if optional[i]{"optional"}else if class[i]==0{"earlier"}else if class[i]==1{"unrestored_completed"}else{"extended"}}));
-                drop(entry);
+                if let Some(entry)=entry.into_clean_parked() { parked.push(entry); }
                 admitted=control.all_admit(room()?.admitted_available > headroom)?;
                 if admitted {break;}
             }
@@ -1754,6 +1998,7 @@ fn reclaim_optional_cache(cuda:&Cuda,control:&mut ControlChannel,
                 "entries":cached.iter().map(|c|c.trace()).collect::<Vec<_>>()}));
         }
     }
+    if !evicted.is_empty() && let Some(tier)=tier { bound_parked_cache(parked,cached,tier); }
     Ok(json!({"headroom_bytes":headroom,"admitted":admitted,"evicted":evicted,"for_image":for_image,
         "remaining_cache_entries":cached.len(),"memory_before":before,
         "memory_after":room()?,"seconds":began.elapsed().as_secs_f64()}))
@@ -1924,15 +2169,27 @@ impl Worker {
         ->Result<()> {
         self.install_media(None)?;
         self.media_receipt=Value::Null;
-        if !images.is_empty() {
-            let cuda=&self.cuda;let cached=&mut self.cached_sessions;
-            let long_first=self.session_cache_long_first;
-            let (bindings,receipt)=self.media.as_mut().ok_or_else(||anyhow::anyhow!("vision is not configured"))?
-                .prepare(plan.media.clone(),images,frontier,&mut self.control,&self.comm,&self.stream,
-                    &mut |control,headroom|reclaim_optional_cache(cuda,control,cached,long_first,headroom,false))?;
-            self.install_media(Some(bindings))?;
-            self.media_receipt=receipt;
-        }
+        if images.is_empty() { return Ok(()); }
+        let prepare = |worker: &mut Self| {
+            let cuda=&worker.cuda;
+            let cached=&mut worker.cached_sessions;
+            let parked=&mut worker.parked_sessions;
+            let tier=worker.disk_tier.as_ref();
+            let long_first=worker.session_cache_long_first;
+            worker.media.as_mut().context("vision is not configured")?
+                .prepare(plan.media.clone(),images,frontier,&mut worker.control,&worker.comm,&worker.stream,
+                    &mut |control,headroom|reclaim_optional_cache(cuda,control,cached,parked,tier,long_first,headroom,false))
+        };
+        let (bindings,receipt)=match prepare(self) {
+            Err(error) => {
+                let Some(capacity)=error.downcast_ref::<crate::memory::InputCapacityError>() else { return Err(error); };
+                if !self.park_forward_for_input(capacity.1)? { return Err(error); }
+                prepare(self)?
+            }
+            Ok(value) => value,
+        };
+        self.install_media(Some(bindings))?;
+        self.media_receipt=receipt;
         Ok(())
     }
     /// Called only when input preparation refuses capacity, before any new
@@ -2964,11 +3221,11 @@ impl Worker {
     #[allow(clippy::too_many_arguments)]
     fn admit_cache_save(&mut self,eligible:bool,evictions:Option<Vec<usize>>,prefix:&[u32],
         media:&crate::prompt_media::Identity,required:usize,slots:usize,protected:&[usize],
-        recycle_bytes:Option<usize>)->Result<CacheSaveAdmission> {
+        recycle_bytes:Option<usize>,secondary:bool)->Result<CacheSaveAdmission> {
         let mut removed=if eligible {evictions.expect("eligible cache eviction plan")}else{Vec::new()};
         if crate::config::cache_superseded_first()&&!removed.is_empty() {
             let optional=self.optional_entries(prefix.len());
-            removed=self.superseded_first(removed,prefix,protected,Some(&optional));
+            removed=self.superseded_first(removed,prefix,media,protected,Some(&optional));
         }
         ensure!(protected.iter().all(|&i|i<self.cached_sessions.len()&&!removed.contains(&i)),
             "cache admission would evict a protected parent");
@@ -3008,8 +3265,13 @@ impl Worker {
                 removed.push(next);
             }
             // The pressure victims too (every rank ran the same loop over the same list).
-            if removed.len()>budget_evictions {removed=self.superseded_first(removed,prefix,protected,Some(&optional));}
+            if removed.len()>budget_evictions {removed=self.superseded_first(removed,prefix,media,protected,Some(&optional));}
             if !removed.is_empty(){self.stream.synchronize()?;}
+        }
+        if secondary && self.loses_unrelated_input(&removed,prefix,media) {
+            let available = self.cuda.image_admission_memory()?.admitted_available;
+            return Ok(CacheSaveAdmission{admitted:false,available,local_fits:available>=required,
+                evicted:0,pressure_evicted:0,forecast_refused:true,recycled:None});
         }
         if !removed.is_empty() {
             let held=|i:usize|self.cached_sessions[i].trace();
@@ -3024,14 +3286,15 @@ impl Worker {
         // Eligibility was included in the existing metadata agreement. The
         // shared ordinary policy chooses the victims; reuse adds no exchange,
         // selects no extra victim, and keeps no old history as an uncharged spare.
-        let reuse=removed.iter().copied().find(|&i|reusable.get(i)==Some(&true));
+        let reuse=removed.iter().copied().find(|&i|reusable.get(i)==Some(&true) && !self.cached_sessions[i].disk_clean());
         let mut recycled=None;
         for i in removed.into_iter().rev() {
-            let retired=self.cached_sessions.remove(i);
-            if Some(i)==reuse {
+            if !secondary { self.save_displaced_input(i,Some((prefix,media)))?; }
+            if Some(i)==reuse && !self.cached_sessions[i].disk_clean() {
+                let retired=self.cached_sessions.remove(i);
                 let CachedState::Encoder{image,..}=retired.image else{unreachable!()};
                 recycled=Some(image.into_retired_storage()?);
-            }
+            } else { self.evict_cached(i); }
         }
         // Retain the normal prefill headroom while this old buffer is still
         // resident. Crediting its bytes here could crowd a lazy graph capture
@@ -3083,6 +3346,31 @@ impl Worker {
         Ok(Some(CachedCompleteImage{session,bank_ancestors}))
     }
 
+    /// Last resort for an actual input: recover physical memory without losing
+    /// a continuation. Never write a checkpoint that cannot help the deficient
+    /// rank. The least recently used eligible entry goes first, preferring an
+    /// existing durable copy. Disk budget, space and integrity checks still apply.
+    fn park_forward_for_input(&mut self, headroom: usize) -> Result<bool> {
+        if self.disk_tier.is_none() || !crate::config::cache_superseded_first() { return Ok(false); }
+        let mut order: Vec<_> = (0..self.cached_sessions.len()).collect();
+        order.sort_by_key(|&i| (!self.cached_sessions[i].disk_clean(), i));
+        let mut removed = Vec::new();
+        for original in order {
+            let i = original - removed.iter().filter(|&&r| r < original).count();
+            let c = &self.cached_sessions[i];
+            if !c.parkable() || !c.resident_now() || c.opportunistic_logits() { continue; }
+            let available = self.cuda.admission_memory()?.admitted_available;
+            if self.control.all_admit(available > headroom)? { return Ok(true); }
+            if self.control.all_admit(available > headroom || c.general_device_bytes() == 0)? { continue; }
+            if !c.disk_clean() { self.save_before_evict(i, true)?; }
+            if !self.control.all_admit(self.cached_sessions[i].disk_clean())? { continue; }
+            cache_trace(||json!({"path":"forward_park","headroom":headroom,"entry":self.cached_sessions[i].trace()}));
+            self.evict_cached(i);
+            removed.push(original);
+        }
+        self.control.all_admit(self.cuda.admission_memory()?.admitted_available > headroom)
+    }
+
     /// Reclaim optional cache at a committed boundary. The live target/session
     /// and the scheduler's unfinished request images are never candidates.
     fn reclaim_input_space(&mut self, headroom:usize)->Result<Value> {
@@ -3094,7 +3382,11 @@ impl Worker {
             if let Some(media)=&mut self.media {media.release_warm();}
         }
         let mut event=reclaim_optional_cache(&self.cuda,&mut self.control,&mut self.cached_sessions,
-            self.session_cache_long_first,headroom,false)?;
+            &mut self.parked_sessions,self.disk_tier.as_ref(),self.session_cache_long_first,headroom,false)?;
+        if event["admitted"] == false && self.park_forward_for_input(headroom)? {
+            event["admitted"]=json!(true);
+            event["memory_after"]=json!(self.cuda.admission_memory()?);
+        }
         self.agree(&[])?;
         event["type"]=json!("input_reclaim");event["request_id"]=json!(self.current);
         event["frontier"]=json!(self.history.frontier());event["suspended_image_bytes"]=json!(self.suspended_image_bytes);
@@ -3180,17 +3472,17 @@ impl Worker {
             Some(index) if continued(&self.cached_sessions[index])=>
                 json!({"materialized":false,"candidate":true,"continued":true}),
             Some(index)=>{
-                let (report,removed)=self.materialize_bank_image(index,wanted,&shared)?;
-                for i in shared.iter_mut() {*i-=removed.iter().filter(|&&r|r<*i).count();}
+                let (report,removed)=self.materialize_bank_image(index,wanted,true)?;
+                shared.retain(|i| !removed.contains(i));
+                for i in shared.iter_mut() { *i -= removed.iter().filter(|&&r| r < *i).count(); }
                 report
             },
         };
         if !shared.is_empty() {
             let mut reports=Vec::new();
-            for at in 0..shared.len() {
-                let keep=shared.clone();
-                let (one,removed)=self.materialize_bank_image(shared[at],wanted,&keep)?;
-                for i in shared.iter_mut() {*i-=removed.iter().filter(|&&r|r<*i).count();}
+            for index in shared {
+                let (one,removed)=self.materialize_bank_image(index,wanted,false)?;
+                debug_assert!(removed.is_empty());
                 reports.push(one);
             }
             report["shared"]=Value::Array(reports);
@@ -3199,9 +3491,9 @@ impl Worker {
     }
     /// Replace one sparse (bank-retained) cached image by a standalone copy, under the cache budget and all-rank
     /// memory admission. Indices stay as they are: the entry grows in place.
-    /// `keep`: other entries that must stay (images about to be copied themselves). Returns the report and the
+    /// Only the primary forward handoff may reclaim other entries. A secondary shared-prefix copy uses spare capacity. Returns the report and the
     /// indices (before removal, ascending) of the older entries that gave way for this copy.
-    fn materialize_bank_image(&mut self,index:usize,wanted:Option<&CachedSession>,keep:&[usize])->Result<(Value,Vec<usize>)> {
+    fn materialize_bank_image(&mut self,index:usize,wanted:Option<&CachedSession>,primary:bool)->Result<(Value,Vec<usize>)> {
         let started=Instant::now();
         let mut index=index;
         let CachedState::Encoder{image,..}=&self.cached_sessions[index].image else {unreachable!()};
@@ -3214,8 +3506,17 @@ impl Worker {
         let charged=self.cached_sessions.iter().map(|c|c.charge).sum::<usize>()
             .saturating_add(wanted.map_or(0,|c|c.charge));
         let reserve=self.cache_reserve()?;
-        let available=self.cuda.admission_memory()?.admitted_available;
+        let mut available=self.cuda.admission_memory()?.admitted_available;
         let pooled=self.cuda.image_pool_fits(full);
+        if primary && pooled && crate::config::cache_superseded_first() && full <= 2*1024usize.pow(3) {
+            let returned = self.cuda.return_idle_image_pages(available,reserve,full)?;
+            if returned > 0 {
+                let before = available;
+                available = self.cuda.admission_memory()?.admitted_available;
+                cache_trace(||json!({"path":"return_idle_pool","for":"forward_handoff","bytes":returned,
+                    "before":before,"after":available,"required":reserve,"image_bytes":full}));
+            }
+        }
         let fits=full<=2*1024usize.pow(3)&&charged.saturating_add(delta)<=budget
             &&crate::state_image::image_storage_fits(available,reserve,full,pooled);
         let mut removed:Vec<usize>=Vec::new();
@@ -3224,13 +3525,12 @@ impl Worker {
                 "bytes":full,"pool_free":self.cuda.image_pool_free_bytes(),"pool_fits":pooled,"budget":budget,"charged":charged}));
             let refused=|evicted:usize|json!({"materialized":false,"candidate":true,"refused":true,"bytes":full,
                 "charged":charged,"budget":budget,"gave_way":evicted});
-            if !(self.displaced_reclaim&&self.cache_pressure_reclaim&&full<=2*1024usize.pow(3)) {return Ok((refused(0),removed));}
+            if !primary || !(self.displaced_reclaim&&self.cache_pressure_reclaim&&full<=2*1024usize.pow(3)) {return Ok((refused(0),removed));}
             // A pooled image releases pool pages. Its logical charge does not become free
             // host memory. Only count actual backing for the proposed destination.
             let alternatives = CheckpointAlternatives::new(&self.cached_sessions);
             let tokens = alternatives.lengths[index];
-            let mut protected = keep.to_vec();
-            protected.push(index);
+            let protected = [index];
             let mut gone = vec![false; self.cached_sessions.len()];
             let mut plan = Vec::new();
             let mut projected_charge = charged;
@@ -3313,7 +3613,7 @@ impl Worker {
         // The wanted image remains alive during this check, so temporarily
         // retaining both current and wanted sessions is charged to real UMA.
         let reserve=self.cache_reserve()?;
-        let admission=self.admit_cache_save(eligible,evictions,prefix,&media,reserve+charge,slots,&protected,None)?;
+        let admission=self.admit_cache_save(eligible,evictions,prefix,&media,reserve+charge,slots,&protected,None,true)?;
         let admitted=admission.admitted;
         let mut saved_seconds=0.;
         let mut saved=false;
@@ -3371,7 +3671,8 @@ impl Worker {
         }else{prompt_cache_evictions(&entries,(plan.prompt.len(),charge),budget,
             self.session_cache_long_first,slots,!plan.media.placements().is_empty())};
         let evictions=if plan.media.placements().is_empty() {evictions}
-            else{evictions.map(|victims|self.superseded_first(victims,&plan.prompt,&[],Some(&speculative)))};
+            else{evictions.map(|victims|self.superseded_first(victims,&plan.prompt,&plan.media,&[],Some(&speculative)))};
+        let evictions=evictions.filter(|victims| !self.loses_unrelated_input(victims,&plan.prompt,&plan.media));
         let eligible=evictions.is_some();
         let reserve=self.cache_reserve()?;
         let admitted=self.control.all_admit(eligible
@@ -3414,13 +3715,16 @@ impl Worker {
             "cache lookup requires the current accepted owner");
         // Disk tier: a parked entry that beats every resident one is reloaded (all ranks) and becomes the newest entry.
         if self.disk_tier.is_some() && !self.parked_sessions.is_empty() {
-            let usable=|c:&CachedSession| c.owner==self.bank_id
-                && (allow_encoder||matches!(&c.image,CachedState::Complete{..})) && plan.prompt.starts_with(&c.prefix)
+            let usable=|c:&CachedSession| (allow_encoder||matches!(&c.image,CachedState::Complete{..})) && plan.prompt.starts_with(&c.prefix)
                 && plan.media.matches_prefix(&c.media,c.prefix.len())
                 && (c.prefix.len()<plan.prompt.len() || (self.prompt_cache_logits && allow_exact_logits
                     && c.prefix.len()==plan.prompt.len() && c.prompt_logits.is_some()));
-            let resident_best=self.cached_sessions.iter().filter(|c|usable(c)).map(|c|c.prefix.len()).max();
-            let parked_best=self.parked_sessions.iter().enumerate().filter(|(_,c)|usable(c))
+            let fallback=self.cached_sessions.iter().filter(|c|usable(c)
+                && (c.owner==self.bank_id || (imports && self.can_import_cached_encoder(c))))
+                .max_by_key(|c|c.prefix.len()).map(|c|(c.born,c.prefix.len()));
+            let resident_best=fallback.map(|(_,tokens)|tokens);
+            let parked_best=self.parked_sessions.iter().enumerate().filter(|(_,c)|usable(c)
+                && (c.owner==self.bank_id || (imports && self.can_import_cached_encoder(c))))
                 .max_by_key(|(_,c)|c.prefix.len()).map(|(j,c)|(j,c.prefix.len()));
             if let Some((j,len))=parked_best && resident_best.is_none_or(|r|len>r) {
                 // Only when the read beats prefilling the rows it saves (disk_tier::reload_pays); every rank agrees.
@@ -3428,7 +3732,7 @@ impl Worker {
                 let bytes=self.parked_sessions[j].logical_bytes();
                 let (rate,fixed)=self.disk_tier.as_ref().map_or((1.0,0.0),|t|(t.read_bytes_per_s,t.read_fixed_s));
                 let pays=crate::disk_tier::reload_pays(bytes,gain,len==plan.prompt.len(),rate,fixed,crate::config::encoder_chunk_costs());
-                if self.control.all_admit(pays)? {self.reload_parked(j)?;}
+                if self.control.all_admit(pays)? {self.reload_parked(j,fallback,gain)?;}
                 else {eprintln!("disk tier {}",json!({"event":"reload_skipped","tokens":len,"gain":gain,"bytes":bytes}));}
             }
         }
@@ -4054,7 +4358,7 @@ impl Worker {
                 evicted:0,pressure_evicted:0,forecast_refused:false,recycled:None}
         }else{self.admit_cache_save(eligible,evictions,prefix,&media,admission_required,
             slots.saturating_sub(usize::from(wanted.is_some())),&long_entries,
-            self.encoder_image_recycle.then_some(device_bytes))?};
+            self.encoder_image_recycle.then_some(device_bytes),shared_image)?};
         let admission_seconds=admission_at.elapsed().as_secs_f64();
         let recycled_device_bytes=admission.recycled.as_ref().map_or(0,crate::state_image::Image::bytes);
         let recycled=admission.recycled.take();
@@ -4086,7 +4390,7 @@ impl Worker {
                 let (plan2,long2)=short_checkpoint_plan(&entries,at,charge2,room.map(|r|r.0),room.map(|r|r.1),plan2);
                 let eligible2=!duplicate2&&device2<=2*1024usize.pow(3)&&plan2.is_some();
                 let admission2=self.admit_cache_save(eligible2,plan2,prefix2,&media2,
-                    admission_required+charge2+host_bytes,slots.saturating_sub(held),&long2,None)?;
+                    admission_required+charge2+host_bytes,slots.saturating_sub(held),&long2,None,false)?;
                 retained["extra_near_end"]=json!({"position":at,"already_cached":duplicate2,"eligible":eligible2,
                     "admitted":admission2.admitted,"evicted_sessions":admission2.evicted});
                 admission2.admitted.then_some((at,device2,charge2,media2))
@@ -4890,7 +5194,7 @@ impl Worker {
                 );
                 self.agree(&[])?;
                 // Disk tier: one write-behind / parking step while the cluster is quiet.
-                if self.disk_tier.is_some() {
+                if self.disk_tier.as_ref().is_some_and(|t| t.idle_secs.is_some()) {
                     if self.disk_tier_backoff>0 {self.disk_tier_backoff-=1;}
                     else if let Some(event)=self.disk_tier_idle_step()? {eprintln!("disk tier {event}");}
                 }
@@ -6423,6 +6727,8 @@ pub fn run_http(path: &Path) -> Result<()> {
     }
     // Disk tier (config::disk_tier): files of an earlier process are worthless (their descriptors named its regions).
     worker.disk_tier = crate::config::disk_tier()?;
+    worker.control.agree(&serde_json::to_vec(&("disk-policy",worker.disk_tier.as_ref().map(|t|
+        (t.idle_secs,t.save_on_evict_tokens,t.read_bytes_per_s.to_bits(),t.read_fixed_s.to_bits()))))?)?;
     if let Some(tier) = worker.disk_tier.as_ref() {
         crate::disk_tier::reset_dir(&tier.dir)?;
         worker.disk_tier_started = Instant::now();

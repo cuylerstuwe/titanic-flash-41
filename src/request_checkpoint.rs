@@ -154,7 +154,7 @@ fn checkpoint(w: &mut Worker, other_charge: usize, other_count: usize,
     if within_budget && (exchange || crate::config::single_bank_requested())
         && !w.control.all_admit(w.cuda.image_admission_memory()?.admitted_available >= needed)?
         && !w.cached_sessions.is_empty() {
-        let event=reclaim_optional_cache(&w.cuda,&mut w.control,&mut w.cached_sessions,false,needed,true)?;
+        let event=reclaim_optional_cache(&w.cuda,&mut w.control,&mut w.cached_sessions,&mut w.parked_sessions,w.disk_tier.as_ref(),false,needed,true)?;
         measured_evictions=event["evicted"].as_array().map_or(0,Vec::len);
         evicted+=measured_evictions;
     }

@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1285,12 +1285,10 @@ pub(crate) fn batched_regions() -> Result<usize> {
     }
 }
 /// CANADA_SCRATCH_DISK_TIER=1 (Nov 18 2026; default off): conversation
-/// snapshots get byte-exact copies on local NVMe (crate::disk_tier). In idle time (no request for
-/// CANADA_SCRATCH_DISK_TIER_IDLE_SECS, default 3) the coldest resident snapshots are written one per idle tick:
-/// prompt-end images with exact logits first, then completed turns of conversations not in use, then the rest. A
-/// snapshot with a copy is parked (RAM freed, kept on disk) instead of dropped when the cache evicts it; prompt-end
-/// images park as soon as their copy exists, completed turns of other conversations once
-/// CANADA_SCRATCH_DISK_TIER_PARK_AFTER newer cache entries (default 4) exist. A request whose best prefix is parked
+/// snapshots can be saved to local NVMe on eviction. The default keeps them in RAM until space is needed.
+/// An explicit CANADA_SCRATCH_DISK_TIER_IDLE_SECS opts into bounded write-behind during quiet gaps.
+/// A snapshot with a complete copy can release its RAM when evicted. Optional idle parking counts
+/// CANADA_SCRATCH_DISK_TIER_PARK_AFTER requests since last use (default 4). A request whose best prefix is parked
 /// reloads it (every chunk's digest checked) before restoring, when the read (at CANADA_SCRATCH_DISK_TIER_READ_MBPS,
 /// default 2200, plus CANADA_SCRATCH_DISK_TIER_READ_FIXED_MS, default 30) beats prefilling the rows it saves over the best resident entry (disk_tier::reload_pays), and only
 /// within the cache's slot and byte limits. Budgets: CANADA_SCRATCH_DISK_TIER_GIB (disk, 64),
@@ -1303,7 +1301,7 @@ pub(crate) struct DiskTierConfig {
     pub cap_bytes: u64,
     pub write_bytes_per_day: u64,
     pub free_floor_bytes: u64,
-    pub idle_secs: u64,
+    pub idle_secs: Option<u64>,
     pub park_after_requests: u64,
     pub max_parked: usize,
     /// Read rate and fixed cost the reload decision assumes (CANADA_SCRATCH_DISK_TIER_READ_MBPS, default 2200 MB/s;
@@ -1335,7 +1333,8 @@ pub(crate) fn disk_tier() -> Result<Option<DiskTierConfig>> {
         cap_bytes: number("CANADA_SCRATCH_DISK_TIER_GIB", 64)? * gib,
         write_bytes_per_day: number("CANADA_SCRATCH_DISK_TIER_WRITE_GIB_DAY", 200)? * gib,
         free_floor_bytes: number("CANADA_SCRATCH_DISK_TIER_FREE_FLOOR_GIB", 40)? * gib,
-        idle_secs: number("CANADA_SCRATCH_DISK_TIER_IDLE_SECS", 3)?,
+        idle_secs: std::env::var("CANADA_SCRATCH_DISK_TIER_IDLE_SECS").ok()
+            .map(|v| v.parse::<u64>()).transpose().context("disk tier idle seconds")?,
         park_after_requests: number("CANADA_SCRATCH_DISK_TIER_PARK_AFTER", 4)?,
         max_parked: number("CANADA_SCRATCH_DISK_TIER_MAX_PARKED", 64)? as usize,
         read_bytes_per_s: number("CANADA_SCRATCH_DISK_TIER_READ_MBPS", 2200)? as f64 * 1e6,

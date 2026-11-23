@@ -113,6 +113,30 @@ pub(crate) fn free_bytes(dir: &Path) -> Result<u64> {
 /// Bytes one idle command writes (eight digest chunks; slices start at multiples of it, so chunk digests line up).
 pub(crate) const SLICE: usize = 8 * CHUNK;
 
+// Count acknowledged writes even when a later slice is cancelled or fails.
+// A short write followed by an error still consumed those SSD bytes.
+struct MeteredWrite<'a,W>(&'a mut W, &'a AtomicU64);
+impl<W: Write> Write for MeteredWrite<'_,W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = self.0.write(bytes)?;
+        self.1.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+}
+
+#[cfg(test)]
+#[test]
+fn cancelled_disk_copies_charge_only_the_bytes_actually_written() {
+    let count = AtomicU64::new(0);
+    let mut space = [0u8; 5];
+    let mut output = std::io::Cursor::new(space.as_mut_slice());
+    MeteredWrite(&mut output,&count).write_all(&[1;3]).unwrap();
+    assert_eq!(count.load(Ordering::Relaxed),3);
+    assert!(MeteredWrite(&mut output,&count).write_all(&[2;4]).is_err());
+    assert_eq!(count.load(Ordering::Relaxed),5);
+}
+
 /// A copy written one slice at a time (one slice an idle command), so a request that arrives meanwhile waits for at most
 /// one slice, not a whole snapshot. Dropping it unfinished deletes the partial file.
 pub(crate) struct PendingWrite {
@@ -139,9 +163,8 @@ impl PendingWrite {
         buffer.download_part_into(self.at, &mut data[..n])?;
         data[n..].fill(0);
         self.record.digests.extend(digests(&data[..n]));
-        self.file.write_all(data).with_context(|| format!("disk tier write {}", self.record.path.display()))?;
+        MeteredWrite(&mut self.file,&WRITTEN_BYTES).write_all(data).with_context(|| format!("disk tier write {}", self.record.path.display()))?;
         self.at += n;
-        if self.done() { WRITTEN_BYTES.fetch_add(self.record.disk_bytes() as u64, Ordering::Relaxed); }
         Ok(())
     }
     /// The finished copy's record (the file stays until the record is dropped).
@@ -219,8 +242,21 @@ pub(crate) fn reload_pays(bytes: usize, gain: usize, exact: bool, read_bytes_per
     read < prefill
 }
 
+/// Charge two transfers and their setup costs, with a further factor of two
+/// for a future return that may never happen or a write slower than the read.
+pub(crate) fn spill_pays(bytes: usize, lost: usize, read_bytes_per_s: f64, fixed_s: f64, costs: &[(usize,f64)]) -> bool {
+    lost >= 128 && reload_pays(bytes.saturating_mul(4),lost,false,read_bytes_per_s,4.0*fixed_s,costs)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spill_writes_a_displaced_forward_chat_only_for_substantial_saved_work() {
+        let costs = [(128,0.09),(1024,0.239),(8192,0.97)];
+        assert!(super::spill_pays(930_000_000,1_010_000,2.2e9,0.03,&costs));
+        assert!(!super::spill_pays(930_000_000,1024,2.2e9,0.03,&costs));
+        assert!(!super::spill_pays(200_000,4,2.2e9,0.03,&costs));
+    }
     #[test]
     fn reload_pays_only_when_the_read_beats_the_prefill() {
         let costs = [(128, 0.09), (512, 0.166), (1024, 0.239), (2048, 0.339), (4096, 0.60), (8192, 0.97)];

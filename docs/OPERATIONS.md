@@ -217,6 +217,16 @@ available on every rank.
 The historical release used an 8 GiB default. The current pooled-memory profile selects its serving floor explicitly.
 `CANADA_SCRATCH_CLAUDE_MEMORY_FLOOR_MIB` overrides the floor and is for tests only.
 
+## Forward checkpoints and host memory in s1699
+
+The four workers share physical memory with their host operating systems. The supplied profile reserves 9 GiB per worker in physical pages for model state and enables a 3 GiB physical floor with a 512 MiB allocation cushion. During an input shortage or a forward checkpoint copy, a worker can return idle, unmapped pool pages to the OS. On this profile it can return up to 1 GiB over its lifetime. The worker sets aside enough pool pages for the pending copy and checks the measured reserve again before allocating.
+
+An ordinary continuation has first claim on cache capacity. A saved response may be the only useful continuation for a client that sends reasoning back. A saved input may be the useful continuation for a client that strips reasoning. The cache checks token ancestry and screenshot identity before counting one checkpoint as a substitute. Secondary branch and retry saves yield when they would displace another conversation's only useful private input.
+
+The default keeps private checkpoints in RAM during idle time. When an allocation needs a checkpoint's slot or pages, the worker can save a displaced conversation if its surviving history, write and read costs justify the transfer. Restoring a parked conversation protects its existing RAM fallback and other conversations' private inputs. Incomplete writes count toward the SSD budget.
+
+An operator can opt into idle writes by setting `CANADA_SCRATCH_DISK_TIER_IDLE_SECS` explicitly. That mode counts requests since last use and skips an exact-retry backup when a standalone checkpoint covers the same screenshots with fewer than 128 text tokens to replay. [Qualification](VALIDATION.md#november-23-forward-cache-reliability-s1699)
+
 ## November 22 serving profile
 
 The profile adds three settings to the November 21 profile.

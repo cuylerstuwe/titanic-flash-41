@@ -1,8 +1,40 @@
 # Validation status
 
+## November 23 forward cache reliability (s1699)
+
+Four independent chats each carried 70 screenshots and grew beyond 1.01 million tokens. The matched runs held 768 MiB of extra anonymous memory on the coordinator and included two 12-second pauses between tool turns. The foreground sampler and 2350 MHz clock profile were the same. The client sent full histories through an SSH tunnel to the head. First-token timings include upload and transport. SSD figures below are per coordinator, in decimal GB.
+
+| Matched workload | s1694 | s1699 |
+|---|---:|---:|
+| Successful requests, including image identity and solo checks | 46/46 | 46/46 |
+| Forward turns reusing the previous prompt to within 256 tokens | 32/32 | 32/32 |
+| Checkpoint writes acknowledged by the head | 12.67 GB | 2.44 GB |
+| Completed idle exact-retry copies | 1.87 GB | 0 |
+| Cold 621,049-token screenshot prompt, server prefill | 67.55 s | 67.92 s |
+| Its first warm extension, time to first token | 0.80 s | 0.78 s |
+| Median time to first token on the 32 follow-ups | 2.50 s | 2.36 s |
+| 95th percentile time to first token | 3.51 s | 2.89 s |
+| Minimum head memory available, sampled every 250 ms | 3.33 GiB | 3.48 GiB |
+
+The s1699 head returned 1 GiB of idle, unmapped pool pages during this run. The other three workers kept their full pools. Neither run recorded a kernel OOM or worker swap. The pool, host memory readings and SSD writes measure different resources. These are finite runs on repeatedly loaded hardware.
+
+A second s1699 run rotated the arrival order so all four long requests began cold, without added memory pressure. All four answered their own screenshot and receipt questions. All 32 subsequent turns hit within 191 tokens of their previous prompts. Median and 95th-percentile first-token times were 2.46 and 3.05 seconds. The head wrote one 0.93 GB checkpoint on eviction.
+
+In a separate eviction test, the same seeded 19,385-token ledger question was asked again after 20 other conversations. Its per-worker checkpoint was about 45 MB. The server restored 19,384 tokens and answered the question correctly. The conversation displaced to make room then restored 20,190 of 20,191 tokens. The OS reported zero worker writes on all four devices during an eight-second idle interval.
+
+The cold ledger run generated 289 tokens and the near-end restore generated 524. Both gave the correct final receipt and amount. To isolate the storage medium, a second test drew from the same 19,384-token position and seed, first from RAM and then from checksummed SSD copies on all four devices. Both responses matched exactly across all 524 generated tokens.
+
+A head-local single-stream panel used temperature 1 and top-p 1 at high and max reasoning effort. The releases returned identical sampled responses for all 65 requests. On 16 ordinary timed requests, pooled decode was 90.10 tok/s on s1694 and 90.04 on s1699. On 16 timed continuations of authored reasoning or answer fragments, it was 84.12 and 84.39 tok/s. The initial prompts in this panel were 47–74 tokens. Median server prompt time differed by at most 1.3 ms in the two groups.
+
+A separate head-local panel used 129,553–129,618 input tokens. It ran in both release orders with three high-effort and three max-effort generations of 384 tokens per run. Across both orders, pooled decode was 85.87 tok/s on s1694 and 89.41 on s1699. Mean server prefill on the four cold requests per release was 13.63 and 13.66 seconds. Both releases passed the additional ledger question in both runs. Reloading either release produced different sampled continuations at these lengths even with fixed seeds. Draft acceptance also varied, which limits how much of the measured rate difference can be attributed to the release.
+
+To check the target distribution directly, both releases scored the same fixed tokens at 16 history lengths between 131,329 and 132,289 tokens, evaluating six positions per history. The six-row and sixteen-row verifiers each returned bit-identical full-vocabulary logits across releases. That covers 24,821,760 FP32 scores. Repeated evaluations and rollback checks also passed.
+
+The installed native release passed a clean boot with one model load per device. A head-local ledger question returned the exact requested answer and server prefill timing. Through the router, DeepSeek Harness completed a 34-screenshot test with an additional screenshot tool call. Its follow-up reused 10,703 tokens and submitted 27 new input tokens to the model. Pi answered its routed image question correctly. All 316 portable profile settings matched the running workers on all four devices. Portable package checks covered the CPU build, launcher tests and pinned GPU artifacts. The four-GPU runs used the native deployment.
+
 ## November 22 edit and cache release (s1694)
 
-Four GB10s ran the serving binary at 2350 MHz with the canonical target, temperature 1 and top-p 1. Every comparison below uses a head-local client, the same seeds and the s1690 settings on the same hardware as its control.
+Four GB10s ran the serving binary at 2350 MHz with the canonical target, temperature 1 and top-p 1. The edit and decode comparisons used head-local clients, matched seeds and the s1690 settings on the same hardware. A separate client sent the four-conversation screenshot workload through an SSH tunnel to the head. Its first-token times include transport.
 
 | Check | s1690 settings | s1694 |
 |---|---:|---:|
@@ -11,8 +43,8 @@ Four GB10s ran the serving binary at 2350 MHz with the canonical target, tempera
 | Its 16 edit requests, wall time | 163.5 s | 142.8 s |
 | Its 8 whole-file rewrites, wall time | 161.9 s | 74.3 s |
 | Server prompt processing on that panel, median | 642 ms | 648 ms |
-| Ordinary and long-context decode panel, 65 requests, loaded back to back | 89.9 tok/s | 89.7 tok/s |
-| The same at an interior position of a long context | 84.1 tok/s | 83.8 tok/s |
+| Ordinary short prompts in the 65-request panel, pooled decode | 89.9 tok/s | 89.7 tok/s |
+| Reasoning and answer continuations from authored 47–63-token prompts | 84.1 tok/s | 83.8 tok/s |
 
 All 46 tool calls of the edit panel applied to their files, and the eight rewritten files were byte-identical with and without copy hints. The panel was built to exercise file edits; the share of such turns in ordinary use was not measured. Edits of a few lines moved by less than 2 %. The decode panel generated identical tokens in identical steps in both arms. A third load of the candidate placed before the control read 90.0 tok/s, so the two settings are equal within the drift between consecutive loads.
 
@@ -31,7 +63,7 @@ The four-conversation screenshot panel of the s1690 release ran twice, 46 reques
 | Pages swapped out on the coordinator during the panel | 0 | 46 |
 | Coordinator's lowest available memory | 3.53 GiB | 3.60 GiB |
 
-The engine's own swap use was zero in both runs and no input was refused. The second run was a late load on a 6.5-hour boot. In both, available memory on the coordinator came within 0.1 GiB of the 3.5 GiB reserve for a moment while four 55 MB requests arrived together, closer than the 4.05 GiB of the s1690 qualification. A third run in the standard order on that aged boot, with about 0.5 GiB less free host memory, declined one conversation's checkpoint 74 MB below the reserve and prefilled it again; the fresh-boot run above replaced it.
+The engine's own swap use was zero in both runs and no input was refused. The second run was a late load on a 6.5-hour boot. In both, available memory on the coordinator came within 0.1 GiB of the 3.5 GiB reserve for a moment while four 55 MB requests arrived together. The full host trace for the s1690 qualification also reached 3.56 GiB. Use 3.56 GiB for comparisons of the whole-panel minimum. A third run in the standard order on that aged boot, with about 0.5 GiB less free host memory, declined one conversation's checkpoint 74 MB below the reserve and prefilled it again; the fresh-boot run above replaced it.
 
 A separate load checked serving behaviour. A stream cancelled mid-answer left the server ready, and the same prompt then ran to its limit. A follow-up turn reused 12,642 of 12,664 prompt tokens. Three maximum-effort tasks finished naturally with the graded answers. A foreground request completed in 2.2 s beside a running background request. Two overlapping requests each repeated about 75 lines of a numbered listing with copy hints attached, returned every line exactly and decoded together at about 105 tokens per second each. The same load compared the six-row and 16-row verifiers after a 131,000-token prefix, where no reference logits exist: their mutual KL was 0.0017 on 96 rows with identical top tokens, below their difference at short context (0.0034) and well below the reference's own noise.
 
