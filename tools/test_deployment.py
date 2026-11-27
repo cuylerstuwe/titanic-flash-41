@@ -221,5 +221,12 @@ class DeploymentChecks(unittest.TestCase):
             finally:
                 for s, handler in handlers.items(): signal.signal(s, handler)
 
+    def test_preflight_memory_symmetry_rejects_large_single_rank_deficit(self):
+        gib = 2**30
+        mib = 2**20
+        fleet.check_memory_symmetry([118*gib, 118*gib - 300*mib, 118*gib - 1024*mib, 118*gib])
+        with self.assertRaisesRegex(AssertionError, r'rank 1 .*deficit 1536 MiB > 1024 MiB'):
+            fleet.check_memory_symmetry([118*gib, 118*gib - 1536*mib, 118*gib, 118*gib])
+
 if __name__ == '__main__':
     unittest.main()

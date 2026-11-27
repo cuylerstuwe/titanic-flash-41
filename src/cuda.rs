@@ -432,6 +432,28 @@ fn idle_pages_to_return(available: usize, required: usize, cushion: usize, chunk
         .min(free.saturating_sub(keep_bytes.div_ceil(chunk))).min(cap.saturating_sub(released))
 }
 
+/// Emergency idle-pool return used only during input-capacity reclamation when
+/// the soft-capped pass and general-memory eviction still cannot keep the UMA
+/// reserve. Ignores the lifetime cap while still leaving mapped chunks and
+/// `keep_bytes` untouched.
+fn idle_pages_to_return_emergency(available: usize, required: usize, cushion: usize, chunk: usize,
+    free: usize, keep_bytes: usize) -> usize {
+    if chunk == 0 || available >= required { return 0; }
+    let target = required.saturating_add(cushion.min(128 << 20));
+    target.saturating_sub(available).div_ceil(chunk)
+        .min(free.saturating_sub(keep_bytes.div_ceil(chunk)))
+}
+
+/// Incremental idle pool re-hydration: buy back previously released physical
+/// chunks once host memory has comfortably recovered above reserve + cushion + 512 MiB.
+fn pool_chunks_to_rehydrate(available: usize, reserve: usize, cushion: usize, chunk: usize,
+    released: usize, max_chunks: usize) -> usize {
+    if chunk == 0 || released == 0 || max_chunks == 0 { return 0; }
+    let floor = reserve.saturating_add(cushion).saturating_add(512 << 20);
+    if available <= floor { return 0; }
+    ((available - floor) / chunk).min(released).min(max_chunks)
+}
+
 #[cfg(test)]
 #[test]
 fn idle_pool_relief_retains_both_the_next_full_image_and_the_preallocated_pool() {
@@ -444,6 +466,23 @@ fn idle_pool_relief_retains_both_the_next_full_image_and_the_preallocated_pool()
     assert_eq!(plan(3800, 414, 553, 63), 1);
     assert_eq!(plan(3500, 414, 553, 64), 0);
     assert_eq!(plan(3840, 414, 553, 0), 0);
+}
+
+#[cfg(test)]
+#[test]
+fn emergency_pool_relief_bypasses_soft_cap_and_rehydrates_with_hysteresis() {
+    let mib = 1 << 20;
+    // Past the 64-chunk soft cap, emergency return still frees idle chunks to meet required + 128 MiB.
+    assert_eq!(idle_pages_to_return_emergency(3500 * mib, 3600 * mib, 512 * mib, 16 * mib, 200, 0), 15);
+    assert_eq!(idle_pages_to_return_emergency(3500 * mib, 3600 * mib, 512 * mib, 16 * mib, 10, 0), 10);
+    assert_eq!(idle_pages_to_return_emergency(3500 * mib, 3600 * mib, 512 * mib, 16 * mib, 40, 553 * mib), 5);
+    assert_eq!(idle_pages_to_return_emergency(3600 * mib, 3600 * mib, 512 * mib, 16 * mib, 200, 0), 0);
+    // Re-hydration stays inactive until available exceeds reserve + cushion + 512 MiB (4608 MiB).
+    assert_eq!(pool_chunks_to_rehydrate(4608 * mib, 3584 * mib, 512 * mib, 16 * mib, 64, 8), 0);
+    assert_eq!(pool_chunks_to_rehydrate(4640 * mib, 3584 * mib, 512 * mib, 16 * mib, 64, 8), 2);
+    assert_eq!(pool_chunks_to_rehydrate(6000 * mib, 3584 * mib, 512 * mib, 16 * mib, 64, 8), 8);
+    assert_eq!(pool_chunks_to_rehydrate(6000 * mib, 3584 * mib, 512 * mib, 16 * mib, 3, 8), 3);
+    assert_eq!(pool_chunks_to_rehydrate(6000 * mib, 3584 * mib, 512 * mib, 16 * mib, 0, 8), 0);
 }
 /// Snapshots smaller than this keep ordinary allocations (small blocks are never scarce; a chunk would waste most of itself).
 pub(crate) const POOLED_IMAGE_MIN: usize = 8 << 20;
@@ -1221,6 +1260,9 @@ impl Cuda {
     pub(crate) fn image_pool_free_chunks(&self) -> Option<usize> {
         self.owner.image_pool.borrow().as_ref().map(|p| p.free.borrow().len())
     }
+    pub(crate) fn image_pool_released_chunks(&self) -> Option<usize> {
+        self.owner.image_pool.borrow().as_ref().map(|p| p.released.get())
+    }
     pub(crate) fn image_pool_total_bytes(&self) -> Option<usize> {
         self.owner.image_pool.borrow().as_ref().map(|p| (p.count - p.released.get()) * p.chunk)
     }
@@ -1244,6 +1286,52 @@ impl Cuda {
             }
         }
         Ok(n * pool.chunk)
+    }
+    /// Emergency fallback inside input-capacity reclamation: bypasses the soft
+    /// 64-chunk lifetime cap when a rank would otherwise refuse a request while
+    /// holding free chunks in its pool. Never touches mapped chunks.
+    pub(crate) fn return_idle_image_pages_emergency(&self, available: usize, required: usize, keep: usize) -> Result<usize> {
+        let Some(pool) = self.owner.image_pool.borrow().clone() else { return Ok(0) };
+        let cushion = self.allocation_reserve_bytes().saturating_sub(crate::memory::floor_bytes());
+        let mut free = pool.free.borrow_mut();
+        let n = idle_pages_to_return_emergency(available, required, cushion, pool.chunk, free.len(), keep);
+        if n > 0 {
+            self.owner.current()?;
+            for _ in 0..n {
+                let handle = *free.last().expect("planned free pool page");
+                self.owner.api.check(unsafe { (self.owner.api.mem_release)(handle) }, "return unused image pool page (emergency)")?;
+                free.pop();
+                pool.released.set(pool.released.get() + 1);
+            }
+        }
+        Ok(n * pool.chunk)
+    }
+    /// Re-hydrate previously released image pool chunks while idle and host memory
+    /// has comfortably recovered above the reserve + hysteresis floor. Best-effort:
+    /// stops cleanly on driver refusal without failing the worker.
+    pub(crate) fn rehydrate_image_pool(&self, max_chunks: usize) -> Result<usize> {
+        let Some(pool) = self.owner.image_pool.borrow().clone() else { return Ok(0) };
+        let released = pool.released.get();
+        if released == 0 || max_chunks == 0 { return Ok(0); }
+        let reserve = self.allocation_reserve_bytes();
+        let cushion = reserve.saturating_sub(crate::memory::floor_bytes());
+        let available = self.admission_memory()?.admitted_available;
+        let n = pool_chunks_to_rehydrate(available, reserve, cushion, pool.chunk, released, max_chunks);
+        if n == 0 { return Ok(0); }
+        self.owner.current()?;
+        let api = &self.owner.api;
+        let prop = MemAllocationProp { kind: 1, location: MemLocation { kind: 1, id: self.owner.device }, ..MemAllocationProp::default() };
+        let mut added = 0usize;
+        for _ in 0..n {
+            let mut handle = 0u64;
+            if api.check(unsafe { (api.mem_create)(&mut handle, pool.chunk, &prop, 0) }, "rehydrate image pool chunk").is_err() {
+                break;
+            }
+            pool.free.borrow_mut().push(handle);
+            pool.released.set(pool.released.get() - 1);
+            added += 1;
+        }
+        Ok(added * pool.chunk)
     }
     /// Whether a snapshot of `bytes` would come from the pool right now.
     pub(crate) fn image_pool_fits(&self, bytes: usize) -> bool {

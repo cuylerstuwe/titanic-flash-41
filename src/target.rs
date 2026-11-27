@@ -858,8 +858,25 @@ struct TinyAppendGraphs {
     adaptive_sparse_active: bool,
     decoder: Option<Step>,
 }
+/// Default slot-LRU budget when CANADA_SCRATCH_GRAPH_CACHE_ROWS=0 so long-running
+/// serving cannot accumulate unbounded tail or batched/region CUDA graphs.
+/// Core 6-row solo decode graphs remain unbounded; canonical full widths stay pinned.
+fn default_slot_retention(rows: usize, row_limit: usize) -> crate::graph_retention::SlotPolicy {
+    if row_limit > 0 {
+        return crate::graph_retention::SlotPolicy::new(0, 0);
+    }
+    let limit = match rows {
+        16 => 28,
+        32 => 16,
+        128 => 16,
+        _ => 0,
+    };
+    crate::graph_retention::SlotPolicy::new(if limit > 0 { graph_slots(rows) } else { 0 }, limit)
+}
+
 pub struct Target {
     graph_retention: crate::graph_retention::Policy,
+    slot_retention: crate::graph_retention::SlotPolicy,
     graph_evictions: usize,
     rows: usize,
     source_phase: Phase,
@@ -1371,6 +1388,7 @@ impl Target {
             tiny_prefix_gather: source_phase==Phase::Verify && [6,16].contains(&rows)
                 && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1"),
             graph_retention: crate::graph_retention::Policy::new(rows,crate::config::execution_graph_cache_rows()?),
+            slot_retention: default_slot_retention(rows,crate::config::execution_graph_cache_rows()?),
             graph_evictions: 0,
             graphs: (0..graph_slots(rows)).map(|_| None).collect(),
             engram_graphs: (0..graph_slots(rows)).map(|_| None).collect(),
@@ -2054,6 +2072,7 @@ impl Target {
             tiny_prefix_gather: phase==Phase::Verify && [6,16].contains(&rows)
                 && std::env::var("CANADA_SCRATCH_LIVE_ROW_TRANSPORT").as_deref()==Ok("1"),
             graph_retention: crate::graph_retention::Policy::new(rows,crate::config::execution_graph_cache_rows()?),
+            slot_retention: default_slot_retention(rows,crate::config::execution_graph_cache_rows()?),
             graph_evictions: 0,
             graphs: (0..graph_slots(rows)).map(|_| None).collect(),
             engram_graphs: (0..graph_slots(rows)).map(|_| None).collect(),
@@ -5208,9 +5227,114 @@ impl Target {
         }
         Ok(())
     }
+    /// Default LRU bound for wide/batched graph slots (rows 16/32/128) when
+    /// CANADA_SCRATCH_GRAPH_CACHE_ROWS=0. Runs identically across all ranks
+    /// because every execute_rows invocation carries the exact same slot.
+    fn bound_slot_graphs(&mut self, slot: usize, stream: &Stream) -> Result<()> {
+        if self.slot_retention.limit() == 0 { return Ok(()); }
+        self.slot_retention.touch(slot);
+        if self.graphs[slot].is_some() || self.engram_graphs[slot].is_some() { return Ok(()); }
+        let mut present: Vec<usize> = (0..self.graphs.len())
+            .filter(|&i| self.graphs[i].is_some() || self.engram_graphs[i].is_some())
+            .collect();
+        let pinned = |i: usize| i == self.rows;
+        if self.slot_retention.victim(&present, slot, pinned).is_none() { return Ok(()); }
+        stream.synchronize()?;
+        while let Some(victim) = self.slot_retention.victim(&present, slot, pinned) {
+            let dropped = usize::from(self.graphs[victim].take().is_some())
+                + self.engram_graphs[victim].take().map_or(0, |v| v.len());
+            present.retain(|&i| i != victim);
+            self.graph_evictions += dropped.max(1);
+        }
+        Ok(())
+    }
+    /// Count currently resident captured CUDA graph executables on this target.
+    pub(crate) fn resident_graph_count(&self) -> usize {
+        let count_bank = |g: &[Option<Graph>], eg: &[Option<Vec<Graph>>]| -> usize {
+            g.iter().filter(|x| x.is_some()).count()
+                + eg.iter().filter_map(|x| x.as_ref()).map(Vec::len).sum::<usize>()
+        };
+        let mut total = count_bank(&self.graphs, &self.engram_graphs)
+            + count_bank(&self.alternate_index_graphs, &self.alternate_index_engram_graphs)
+            + usize::from(self.encoder_graph.is_some())
+            + usize::from(self.decoder_graph.is_some())
+            + self.local_target_gather.iter().filter(|x| x.is_some()).count();
+        if let Some(b) = &self.tiny_append_graphs {
+            total += count_bank(&b.graphs, &b.engram_graphs)
+                + count_bank(&b.alternate_index_graphs, &b.alternate_index_engram_graphs)
+                + usize::from(b.decoder_graph.is_some());
+        }
+        total
+    }
+    /// Pressure-triggered eviction of disposable CUDA graph executables.
+    /// Synchronizes the stream before destroying any graph; preserves all
+    /// model weights, causal state, buffers, and decoder metadata.
+    pub(crate) fn evict_cold_graphs(&mut self, aggressive: bool, keep_batched: bool, stream: &Stream) -> Result<usize> {
+        ensure!(self.pending.is_none(), "cannot evict graphs during pending verification");
+        stream.synchronize()?;
+        let mut dropped = 0usize;
+        let clear_opt = |slot: &mut Option<Graph>, n: &mut usize| {
+            if slot.take().is_some() { *n += 1; }
+        };
+        let clear_vec = |slot: &mut Option<Vec<Graph>>, n: &mut usize| {
+            if let Some(v) = slot.take() { *n += v.len(); }
+        };
+        for g in &mut self.alternate_index_graphs { clear_opt(g, &mut dropped); }
+        for g in &mut self.alternate_index_engram_graphs { clear_vec(g, &mut dropped); }
+        if let Some(b) = &mut self.tiny_append_graphs {
+            for g in b.graphs.iter_mut().chain(&mut b.alternate_index_graphs) { clear_opt(g, &mut dropped); }
+            for g in b.engram_graphs.iter_mut().chain(&mut b.alternate_index_engram_graphs) { clear_vec(g, &mut dropped); }
+            clear_opt(&mut b.decoder_graph, &mut dropped);
+        }
+        match self.rows {
+            6 => {
+                // Keep core solo decode graphs (1..=6) hot; drop short-index variants.
+                for executed in 1..=self.rows {
+                    let s = short_index_slot(self.rows, executed);
+                    clear_opt(&mut self.graphs[s], &mut dropped);
+                    clear_vec(&mut self.engram_graphs[s], &mut dropped);
+                }
+            }
+            16 => {
+                for i in 0..self.graphs.len() {
+                    if !aggressive && (i == self.rows || (keep_batched && i > self.rows)) { continue; }
+                    clear_opt(&mut self.graphs[i], &mut dropped);
+                    clear_vec(&mut self.engram_graphs[i], &mut dropped);
+                }
+            }
+            32 => {
+                for i in 0..self.graphs.len() {
+                    if !aggressive && i == self.rows { continue; }
+                    clear_opt(&mut self.graphs[i], &mut dropped);
+                    clear_vec(&mut self.engram_graphs[i], &mut dropped);
+                }
+            }
+            128 => {
+                for i in 0..self.graphs.len() {
+                    if !aggressive && i == self.rows { continue; }
+                    clear_opt(&mut self.graphs[i], &mut dropped);
+                    clear_vec(&mut self.engram_graphs[i], &mut dropped);
+                }
+                if aggressive {
+                    clear_opt(&mut self.encoder_graph, &mut dropped);
+                    self.encoder_graph_live = None;
+                    clear_opt(&mut self.decoder_graph, &mut dropped);
+                }
+            }
+            _ => {
+                if aggressive {
+                    clear_opt(&mut self.encoder_graph, &mut dropped);
+                    self.encoder_graph_live = None;
+                }
+            }
+        }
+        self.graph_evictions += dropped;
+        Ok(dropped)
+    }
     pub(crate) fn graph_retention_report(&self)->serde_json::Value {
         let count=|a:&Vec<Option<Graph>>,b:&Vec<Option<Vec<Graph>>>|a.iter().zip(b).filter(|(a,b)|a.is_some()||b.is_some()).count();
-        serde_json::json!({"row_limit":self.graph_retention.limit(),"evictions":self.graph_evictions,
+        serde_json::json!({"row_limit":self.graph_retention.limit(),"slot_limit":self.slot_retention.limit(),"evictions":self.graph_evictions,
+            "resident_graphs":self.resident_graph_count(),
             "current":count(&self.graphs,&self.engram_graphs),"alternate":count(&self.alternate_index_graphs,&self.alternate_index_engram_graphs),
             "other_phase":self.tiny_append_graphs.as_ref().map(|b|[count(&b.graphs,&b.engram_graphs),count(&b.alternate_index_graphs,&b.alternate_index_engram_graphs)])})
     }
@@ -5228,6 +5352,7 @@ impl Target {
             for g in b.engram_graphs.iter_mut().chain(&mut b.alternate_index_engram_graphs){*g=None;}
         }
         self.graph_retention=crate::graph_retention::Policy::new(self.rows,limit);
+        self.slot_retention=default_slot_retention(self.rows,limit);
         Ok(())
     }
     pub(crate) fn append_last_gather_enabled(&self)->bool {self.append_last_gather}
@@ -5786,6 +5911,7 @@ impl Target {
             && sessions == 1 && !region && self.source_phase == Phase::Verify && !self.adaptive_sparse_active
             && p.pair_lengths.iter().chain(&p.single_lengths).all(|&l| (0..=512).contains(&l));
         let slot = if short_index { short_index_slot(self.rows, ids.len()) } else { slot };
+        if graph_replay { self.bound_slot_graphs(slot, stream)?; }
         let _short_index_rows = if short_index {
             if self.short_index_flags.is_empty() {
                 self.short_index_flags = self.index_queries().into_iter().flatten().map(|q| q.short_rows_flag()).collect();

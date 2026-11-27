@@ -24,6 +24,19 @@ from host_state import atomic, atomic_bytes
 
 PROJECT = 'titanic-flash-41'
 SOURCE = Path(__file__).resolve().parents[1]
+MAX_IDLE_MEMORY_DEFICIT = 1024 * 2**20
+
+def check_memory_symmetry(available_bytes, max_deficit=MAX_IDLE_MEMORY_DEFICIT):
+    """Reject a launch when one idle rank lags the peer peak by more than max_deficit."""
+    if not available_bytes:
+        return
+    peak = max(available_bytes)
+    for rank, avail in enumerate(available_bytes):
+        deficit = peak - avail
+        assert deficit <= max_deficit, (
+            f'rank {rank} has {avail // 2**20} MiB MemAvailable vs peer peak {peak // 2**20} MiB '
+            f'(deficit {deficit // 2**20} MiB > {max_deficit // 2**20} MiB); reboot or clear host memory before launch'
+        )
 
 def vision_encoder_rank(profile):
     value = profile['CANADA_SCRATCH_VISION_ENCODER_RANK']
@@ -301,6 +314,7 @@ class Fleet:
         atomic(self.state_file, state)
 
     def preflight(self):
+        available_by_rank = []
         for rank, node in enumerate(self.cfg['nodes']):
             assert self.run(['hostname'], rank).stdout.strip() == node['hostname'], 'SSH reached a different host'
             assert self.run(['uname', '-m'], rank).stdout.strip() == 'aarch64'
@@ -308,6 +322,7 @@ class Fleet:
             mem = self.run(['cat', '/proc/meminfo'], rank).stdout
             available = int(next(x.split()[1] for x in mem.splitlines() if x.startswith('MemAvailable:')))*1024
             assert available >= 110*2**30, 'less than 110 GiB available before model load'
+            available_by_rank.append(available)
             assert int(self.run(['df', '-B1', '--output=avail', self.root], rank).stdout.split()[-1]) >= 35*2**30
             image = json.loads(self.run(['docker', 'image', 'inspect', self.cfg['image']], rank).stdout)[0]
             if rank == 0:
@@ -329,6 +344,7 @@ class Fleet:
                 if rank == 0:
                     derived = digests
                 assert digests == derived, 'derived prefill matrices differ between ranks; rerun sync_fleet.py'
+        check_memory_symmetry(available_by_rank)
         provenance = json.loads((self.root/'data/runtime/provenance.json').read_text())
         assert provenance['serving'] and not provenance['storage_fault_injection']
         return image_id

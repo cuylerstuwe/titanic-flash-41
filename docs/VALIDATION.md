@@ -1,5 +1,37 @@
 # Validation status
 
+## November 27 UMA resilience release (s1701)
+
+Release s1701 keeps every setting in `deploy/profile.json` and every compiled GPU kernel unchanged from s1699 (`core.cubin` is code-identical after private-symbol normalization; `vision.cubin` and the fixed verifier panel are byte-identical). The changes are Rust host/scheduler memory-resilience improvements plus a cross-rank idle `MemAvailable` symmetry gate in `deploy/fleet.py` (rejecting any rank more than 1,024 MiB below the peer peak before launch).
+
+Four independent chats each carried 70 screenshots and grew past 1.01 million tokens at 2350 MHz with the canonical target, temperature 1 and top-p 1. Alongside the matched 768 MiB head-pressure workload from s1699 and the rotated all-four-cold order, s1701 was also tested under **1,408 MiB** of extra anonymous memory held on the coordinator (1.83× the s1699 pressure, designed to exceed the 64-chunk / 1 GiB soft idle-pool return cap). SSD figures below are per coordinator, in decimal GB.
+
+| Four-conversation 1M-token screenshot panel | s1699 (768 MiB) | s1701 (768 MiB) | s1701 (1,408 MiB extreme) | s1701 (all four cold, 0 MiB) |
+|---|---:|---:|---:|---:|
+| Successful requests (including image identity and solo checks) | 46/46 | 46/46 | 46/46 | 46/46 |
+| Forward turns reusing previous prompt within 256 tokens | 32/32 | 32/32 | 32/32 | 32/32 |
+| Largest gap from preceding prompt length (tokens) | 201 | 201 | 201 | 141 |
+| Checkpoint writes acknowledged by the head | 2.44 GB | 2.45 GB | 2.09 GB | 0.93 GB |
+| Completed idle exact-retry copies | 0 | 0 | 0 | 0 |
+| Cold 621,049-token screenshot prompt, server prefill | 67.92 s | 67.32 s | 67.71 s | 67.57 s |
+| Its first warm extension, time to first token | 0.78 s | 0.79 s | 0.80 s | 0.82 s |
+| Median time to first token on the 32 follow-ups | 2.36 s | 2.43 s | 2.43 s | 2.46 s |
+| 95th percentile time to first token | 2.89 s | 3.10 s | 3.46 s | 3.02 s |
+| Minimum head available memory | 3.48 GiB | 3.53 GiB | 3.24 GiB | 3.46 GiB |
+| Soft-cap idle pool returned on head | 1.00 GiB | 592 MiB | 1.00 GiB | 944 MiB |
+| Emergency idle pool returned past soft cap | — | 0 | 176 MiB | 0 |
+| Worker swap / kernel OOM | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+
+During the 1,408 MiB extreme-pressure run, worker telemetry confirmed every layer of the escalation path operating live: rank 0 evicted 57 cold non-canonical CUDA graphs (`3,534 -> 3,597 MiB` available without evicting KV cache), returned 176 MiB (11 chunks, `64 -> 75`) via the emergency idle-pool fallback past the 64-chunk soft cap (`3,551 -> 3,730 MiB`), yielded active prefills at chunk boundaries so concurrent 55 MB screenshot uploads completed without timing out, and incrementally re-hydrated 512 MiB (32 chunks, `75 -> 43` released) once idle host memory recovered. The other three workers retained their full pools throughout all three runs.
+
+In the 65-request head-local single-stream panel (`temperature 1`, `top_p 1`, high and max reasoning effort), s1699 and s1701 returned identical sampled responses for all 65 requests. On the 16 ordinary timed requests, pooled decode was 91.17 tok/s on s1699 and 89.65 tok/s on s1701 (run warm immediately after the 1,408 MiB stress panel); on the 16 timed continuations of authored fragments, it was 85.28 and 83.79 tok/s. In the 129,553–129,618-token head-local panel (three high-effort and three max-effort 384-token generations plus the graded ledger question), cold server prefill was 13.75 s on s1699 and 13.63 s on s1701, pooled decode was 86.59 tok/s on s1699 and 89.43 tok/s on s1701 (high: 87.33 vs 88.63; max: 85.86 vs 90.25), and both releases passed the graded ledger check.
+
+To verify the target distribution directly, both releases scored the same fixed tokens at 16 history lengths between 131,329 and 132,289 tokens (six positions per history). Both the six-row narrow and 16-row wide verifiers returned bit-identical full-vocabulary logits across all 96 rows (**24,821,760 FP32 scores**, KL 0.0, TV 0.0, top-1 96/96).
+
+In the local NVMe disk-tier eviction test, the seeded 19,385-token ledger question restored 19,384 tokens from checksummed SSD copies (44,646,404 bytes read per rank) with zero worker OS writes on all four devices during the idle interval. In the matched RAM-vs-SSD comparison at the same 19,384-token frontier and seed, both responses produced identical generated choices and completion token count.
+
+The installed native release passed a fresh four-node reboot with one model load per device and zero kernel OOM or Xid errors. The cross-rank idle `MemAvailable` symmetry gate passed with a 234 MiB spread across all four devices (having previously caught a 1,912 MiB single-rank deficit on an aged boot before reboot), and post-load available memory stayed symmetric at 6.39–6.68 GiB across ranks with zero swap. A head-local ledger check returned the exact answer in 124.8 ms server prefill. Through the external router, the 34-screenshot harness test completed with a live screenshot tool call (10,703 cached and 27 new prompt tokens on follow-up), and the routed image check answered accurately. All 316 settings in `deploy/profile.json` match the running native workers across all four devices (excluding per-cluster network interface variables).
+
 ## November 23 forward cache reliability (s1699)
 
 Four independent chats each carried 70 screenshots and grew beyond 1.01 million tokens. The matched runs held 768 MiB of extra anonymous memory on the coordinator and included two 12-second pauses between tool turns. The foreground sampler and 2350 MHz clock profile were the same. The client sent full histories through an SSH tunnel to the head. First-token timings include upload and transport. SSD figures below are per coordinator, in decimal GB.

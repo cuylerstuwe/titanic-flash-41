@@ -625,7 +625,7 @@ pub(super) fn run(w:&mut Worker,queue:Option<&Queue>,events:&mut crate::event_lo
                     event["queue_and_prefill_seconds"]=json!(job.enqueued.elapsed().as_secs_f64());
                 }
                 if input_refused {
-                    job.emit(BackendEvent::Failed(event["message"].as_str()
+                    job.emit(BackendEvent::CapacityFailed(event["message"].as_str()
                         .ok_or_else(||anyhow::anyhow!("input refusal message missing"))?.into()));
                 }else if event["type"]=="tokens" {
                     if event["early_first_token"]!=true {

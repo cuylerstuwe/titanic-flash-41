@@ -2096,6 +2096,8 @@ struct Worker {
     /// token already went out.
     #[cfg(feature = "serving")]
     early_emit: Option<crate::http_server::EarlyEmitter>,
+    #[cfg(feature = "serving")]
+    http_warm_image_reclaimer: Option<crate::http_server::WarmImageReclaimer>,
     /// config::copy_hints: hints received for the next Begin (prompt length, prompt tail, hint tokens), and the
     /// built hint sources of the requests that began with hints and have not finished (request id, lookup; at
     /// most four, one per serving region, oldest dropped; at most 10.5 MiB each). A request parked and resumed, or stepping after another began, finds its own.
@@ -3044,6 +3046,8 @@ impl Worker {
             progress_next: false,
             #[cfg(feature = "serving")]
             early_emit: None,
+            #[cfg(feature = "serving")]
+            http_warm_image_reclaimer: None,
             pending_copy_hints: None,
             copy_hints: Vec::new(),
             early_first_emitted: false,
@@ -3346,10 +3350,54 @@ impl Worker {
         Ok(Some(CachedCompleteImage{session,bank_ancestors}))
     }
 
+    fn resident_graph_counts(&self) -> Value {
+        let wide: usize = self.wides.iter().map(|t| t.resident_graph_count()).sum();
+        json!({
+            "verify": self.verify.resident_graph_count(),
+            "long_verify": self.long_verify.as_ref().map_or(0, |t| t.resident_graph_count()),
+            "copy32_verify": self.copy32_verify.as_ref().map_or(0, |t| t.resident_graph_count()),
+            "large": self.large.resident_graph_count(),
+            "wides": wide,
+        })
+    }
+
+    fn evict_cold_graphs(&mut self, aggressive: bool) -> Result<usize> {
+        let keep_batched = !self.peers.is_empty();
+        let mut dropped = 0usize;
+        dropped += self.verify.evict_cold_graphs(aggressive, keep_batched, &self.stream)?;
+        if let Some(t) = &mut self.long_verify {
+            dropped += t.evict_cold_graphs(aggressive, keep_batched, &self.stream)?;
+        }
+        if let Some(t) = &mut self.copy32_verify {
+            dropped += t.evict_cold_graphs(aggressive, keep_batched, &self.stream)?;
+        }
+        dropped += self.large.evict_cold_graphs(aggressive, keep_batched, &self.stream)?;
+        for t in &mut self.wides {
+            dropped += t.evict_cold_graphs(aggressive, keep_batched, &self.stream)?;
+        }
+        if dropped > 0 {
+            crate::memory::trim_free_host_pages();
+        }
+        Ok(dropped)
+    }
+
+    fn release_http_warm_images(&self) -> bool {
+        #[cfg(feature = "serving")]
+        {
+            self.http_warm_image_reclaimer.as_ref().is_some_and(|r| r.release())
+        }
+        #[cfg(not(feature = "serving"))]
+        {
+            false
+        }
+    }
+
     /// Last resort for an actual input: recover physical memory without losing
-    /// a continuation. Never write a checkpoint that cannot help the deficient
-    /// rank. The least recently used eligible entry goes first, preferring an
-    /// existing durable copy. Disk budget, space and integrity checks still apply.
+    /// a continuation. Pass 1 parks general-memory snapshots; Pass 2 (if a rank
+    /// is still short and owns an image pool) parks pooled snapshots to NVMe
+    /// disk-tier and immediately returns their freed pool chunks to the OS.
+    /// The least recently used eligible entry goes first, preferring an existing
+    /// durable copy. Disk budget, space and integrity checks still apply.
     fn park_forward_for_input(&mut self, headroom: usize) -> Result<bool> {
         if self.disk_tier.is_none() || !crate::config::cache_superseded_first() { return Ok(false); }
         let mut order: Vec<_> = (0..self.cached_sessions.len()).collect();
@@ -3368,6 +3416,41 @@ impl Worker {
             self.evict_cached(i);
             removed.push(original);
         }
+        if self.control.all_admit(self.cuda.admission_memory()?.admitted_available > headroom)? {
+            return Ok(true);
+        }
+        // Pass 2: if an image pool exists, park LRU pooled snapshots to disk-tier,
+        // freeing their VMM chunks back into pool.free, then return those idle chunks
+        // to the OS on any tight rank via emergency pool return.
+        if self.cuda.image_pool_total_bytes().is_some() {
+            let mut pooled_order: Vec<_> = (0..self.cached_sessions.len()).collect();
+            pooled_order.sort_by_key(|&i| (!self.cached_sessions[i].disk_clean(), i));
+            let mut pooled_removed = Vec::new();
+            for original in pooled_order {
+                let i = original - pooled_removed.iter().filter(|&&r| r < original).count();
+                let c = &self.cached_sessions[i];
+                if !c.parkable() || !c.resident_now() || c.opportunistic_logits() || c.general_device_bytes() > 0 { continue; }
+                let available = self.cuda.admission_memory()?.admitted_available;
+                if self.control.all_admit(available > headroom)? { return Ok(true); }
+                if !c.disk_clean() { self.save_before_evict(i, true)?; }
+                if !self.control.all_admit(self.cached_sessions[i].disk_clean())? { continue; }
+                let entry_trace = self.cached_sessions[i].trace();
+                let tokens = self.cached_sessions[i].prefix.len();
+                self.evict_cached(i);
+                pooled_removed.push(original);
+                let after_evict = self.cuda.admission_memory()?.admitted_available;
+                let returned = self.cuda.return_idle_image_pages_emergency(after_evict, headroom.saturating_add(1), 0)?;
+                if returned > 0 {
+                    eprintln!("forward_park_pooled {}", json!({
+                        "rank": self.comm.rank(), "tokens": tokens, "returned_bytes": returned,
+                        "available_after": self.cuda.admission_memory()?.admitted_available,
+                        "headroom": headroom, "free_chunks": self.cuda.image_pool_free_chunks(),
+                        "released_chunks": self.cuda.image_pool_released_chunks(),
+                    }));
+                }
+                cache_trace(||json!({"path":"forward_park_pooled","headroom":headroom,"returned_bytes":returned,"entry":entry_trace}));
+            }
+        }
         self.control.all_admit(self.cuda.admission_memory()?.admitted_available > headroom)
     }
 
@@ -3378,18 +3461,85 @@ impl Worker {
         self.cuda.synchronize_all()?;
         self.agree(&[])?;
         let before=self.cuda.admission_memory()?;
+        let mut http_warm_released = false;
+        let mut cold_graphs_evicted = 0usize;
+        let mut emergency_pool_returned = 0usize;
+        let mut aggressive_graphs_evicted = 0usize;
+        let mut parked_forward = false;
         if !self.control.all_admit(before.admitted_available > headroom)? {
+            // Tier 0: drop Rank-0 warm decoded HTTP image patches (256 MiB, preserving
+            // stored encoded sources) and GPU warm vision spans before touching graphs or KV.
+            http_warm_released = self.release_http_warm_images();
             if let Some(media)=&mut self.media {media.release_warm();}
+            crate::memory::trim_free_host_pages();
         }
+        // Tier 1: evict cold disposable CUDA graphs (tail widths, inactive banks,
+        // non-active batched/copy32 graphs) while keeping core solo decode hot.
+        if !self.control.all_admit(self.cuda.admission_memory()?.admitted_available > headroom)? {
+            cold_graphs_evicted = self.evict_cold_graphs(false)?;
+        }
+        // Tier 2: soft-capped idle pool return + general-memory KV cache eviction.
         let mut event=reclaim_optional_cache(&self.cuda,&mut self.control,&mut self.cached_sessions,
             &mut self.parked_sessions,self.disk_tier.as_ref(),self.session_cache_long_first,headroom,false)?;
+        // Tier 3: emergency idle-pool return bypassing the 64-chunk soft cap before
+        // sacrificing aggressive graphs or parking KV snapshots to disk.
+        if event["admitted"] == false && self.cuda.image_pool_total_bytes().is_some() {
+            let cur = self.cuda.admission_memory()?.admitted_available;
+            emergency_pool_returned = self.cuda.return_idle_image_pages_emergency(cur, headroom.saturating_add(1), 0)?;
+            let after = self.cuda.admission_memory()?;
+            if emergency_pool_returned > 0 {
+                cache_trace(||json!({"path":"return_idle_pool_emergency","for":"input","bytes":emergency_pool_returned,
+                    "before":cur,"after":after.admitted_available,"required":headroom}));
+            }
+            if self.control.all_admit(after.admitted_available > headroom)? {
+                event["admitted"] = json!(true);
+                event["memory_after"] = json!(after);
+            }
+        }
+        // Tier 4: aggressive cold graph eviction across auxiliary profiles.
+        if event["admitted"] == false {
+            aggressive_graphs_evicted = self.evict_cold_graphs(true)?;
+            let after = self.cuda.admission_memory()?;
+            if self.control.all_admit(after.admitted_available > headroom)? {
+                event["admitted"] = json!(true);
+                event["memory_after"] = json!(after);
+            }
+        }
+        // Tier 5: lossless NVMe disk-tier parking (general-memory then pooled + emergency return).
         if event["admitted"] == false && self.park_forward_for_input(headroom)? {
+            parked_forward = true;
             event["admitted"]=json!(true);
             event["memory_after"]=json!(self.cuda.admission_memory()?);
+        }
+        if http_warm_released || cold_graphs_evicted > 0 || emergency_pool_returned > 0
+            || aggressive_graphs_evicted > 0 || parked_forward {
+            let after = self.cuda.admission_memory()?;
+            if self.comm.rank() == 0 || emergency_pool_returned > 0 || after.admitted_available <= headroom {
+                eprintln!("input_reclaim_pressure {}", json!({
+                    "rank": self.comm.rank(),
+                    "admitted": event["admitted"],
+                    "before_mib": before.admitted_available >> 20,
+                    "after_mib": after.admitted_available >> 20,
+                    "headroom_mib": headroom >> 20,
+                    "http_warm_released": http_warm_released,
+                    "cold_graphs_evicted": cold_graphs_evicted,
+                    "emergency_pool_returned_mib": emergency_pool_returned >> 20,
+                    "aggressive_graphs_evicted": aggressive_graphs_evicted,
+                    "parked_forward": parked_forward,
+                    "pool_free_chunks": self.cuda.image_pool_free_chunks(),
+                    "pool_released_chunks": self.cuda.image_pool_released_chunks(),
+                    "resident_graphs": self.resident_graph_counts(),
+                }));
+            }
         }
         self.agree(&[])?;
         event["type"]=json!("input_reclaim");event["request_id"]=json!(self.current);
         event["frontier"]=json!(self.history.frontier());event["suspended_image_bytes"]=json!(self.suspended_image_bytes);
+        event["http_warm_images_released"]=json!(http_warm_released);
+        event["cold_graphs_evicted"]=json!(cold_graphs_evicted);
+        event["emergency_pool_returned_bytes"]=json!(emergency_pool_returned);
+        event["aggressive_graphs_evicted"]=json!(aggressive_graphs_evicted);
+        event["parked_forward"]=json!(parked_forward);
         event["memory_before"]=json!(before);event["seconds"]=json!(began.elapsed().as_secs_f64());
         Ok(event)
     }
@@ -3435,10 +3585,25 @@ impl Worker {
         // Return allocator-free host pages before sacrificing reusable model
         // images. This is pressure-only work, never a decode-loop operation.
         let reclaimed=self.recover_request_headroom(required)?;
-        let fits=self.cuda.admission_memory()?.admitted_available>required;
+        let after = self.cuda.admission_memory()?;
+        let fits=after.admitted_available>required;
         #[cfg(feature = "storage-fault-injection")]
         let fits=self.cache_save_fault.apply(cache_admission_fault::Point::PrefillAfterReclaim,self.comm.rank(),fits);
-        ensure!(self.control.all_admit(fits)?,crate::memory::InputCapacityError(
+        let admitted = self.control.all_admit(fits)?;
+        if !admitted && (!fits || self.comm.rank() == 0) {
+            eprintln!("input_refused_diag {}", json!({
+                "rank": self.comm.rank(),
+                "local_fits": fits,
+                "admitted_available_mib": after.admitted_available >> 20,
+                "required_mib": required >> 20,
+                "pool_free_chunks": self.cuda.image_pool_free_chunks(),
+                "pool_released_chunks": self.cuda.image_pool_released_chunks(),
+                "cached_entries": self.cached_sessions.len(),
+                "parked_entries": self.parked_sessions.len(),
+                "resident_graphs": self.resident_graph_counts(),
+            }));
+        }
+        ensure!(admitted,crate::memory::InputCapacityError(
             "prefill cannot retain the UMA reserve after optional cache reclamation",required));
         Ok(Some(reclaimed))
     }
@@ -5198,6 +5363,19 @@ impl Worker {
                     if self.disk_tier_backoff>0 {self.disk_tier_backoff-=1;}
                     else if let Some(event)=self.disk_tier_idle_step()? {eprintln!("disk tier {event}");}
                 }
+                // Gradually re-hydrate previously returned image-pool chunks while idle
+                // once host memory has comfortably recovered above the hysteresis floor.
+                if self.peers.is_empty() && self.cuda.image_pool_released_chunks().unwrap_or(0) > 0 {
+                    let rehydrated = self.cuda.rehydrate_image_pool(8)?;
+                    if rehydrated > 0 {
+                        eprintln!("image_pool_rehydrated {}", json!({
+                            "rank": self.comm.rank(),
+                            "bytes": rehydrated,
+                            "free_chunks": self.cuda.image_pool_free_chunks(),
+                            "released_chunks_remaining": self.cuda.image_pool_released_chunks(),
+                        }));
+                    }
+                }
                 // config::idle_heartbeat: a short spin on this rank's GPU while the last request is recent.
                 if let (Some((_, spin, window, blocks)), Some(module)) = (self.heartbeat, self.heartbeat_module.as_ref()) {
                     if spin > 0 && self.last_active.elapsed() < Duration::from_secs(window) {
@@ -5248,8 +5426,8 @@ impl Worker {
             // numerical execution are unchanged when cancellation is absent.
             let head=queue.map(|q|->Result<[u8;1]>{
                 Ok([if q.stopping()||job.is_some_and(|j|j.cancelled()){1}
-                    else if peers&&q.prefill_peer_should_yield(job.is_some_and(|j|j.background),remaining,q.prefill_slice_due(began.elapsed(),slice),
-                        |peer|estimated_peer_remaining(peer,cached,held))? {2}else{0}])
+                    else if peers&&(q.input_reclaim_target()>0||q.prefill_peer_should_yield(job.is_some_and(|j|j.background),remaining,q.prefill_slice_due(began.elapsed(),slice),
+                        |peer|estimated_peer_remaining(peer,cached,held))?) {2}else{0}])
             }).transpose()?;
             let wire=control.command(head.as_ref().map(|v|v.as_slice()))?;
             ensure!(wire.len()==1&&wire[0]<=2&& (wire[0]!=2||peers),"foreground prefill interruption command");
@@ -6832,6 +7010,7 @@ pub fn run_http(path: &Path) -> Result<()> {
             queue.enable_decode_priority();
             if worker.background_prefill_enabled { queue.enable_background_prefill(); }
         }
+        worker.http_warm_image_reclaimer = Some(queue.warm_image_reclaimer());
         worker.control.observe_progress(queue.progress_counter());
         queue.ready(&worker.identity);
     }
@@ -6911,7 +7090,7 @@ pub fn run_http(path: &Path) -> Result<()> {
                         json!(job.enqueued.elapsed().as_secs_f64());
                 }
                 if input_refused {
-                    job.emit(BackendEvent::Failed(event["message"].as_str()
+                    job.emit(BackendEvent::CapacityFailed(event["message"].as_str()
                         .ok_or_else(||anyhow::anyhow!("input refusal message missing"))?.into()));
                 } else if event["type"] == "tokens" {
                     if !early_sent { job.emit(BackendEvent::Tokens(serde_json::from_value(

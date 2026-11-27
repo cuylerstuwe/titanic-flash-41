@@ -299,6 +299,20 @@ pub(crate) struct Job {
 /// A second handle on one job's ordered output (CANADA_SCRATCH_EARLY_FIRST_TOKEN=1): the worker sends Ready and
 /// the first token as soon as every rank agrees on it, before the drafter attaches. Same channel and fail-closed
 /// rule as Job::emit.
+#[derive(Clone)]
+pub(crate) struct WarmImageReclaimer(Arc<Shared>);
+impl WarmImageReclaimer {
+    /// Drop Rank-0 warm decoded image patches (256 MiB) without touching stored
+    /// encoded sources so incremental context image references stay valid.
+    pub(crate) fn release(&self) -> bool {
+        let released = self.0.frontend.release_optional_images(false);
+        if released {
+            crate::memory::trim_free_host_pages();
+        }
+        released
+    }
+}
+
 pub(crate) struct EarlyEmitter {
     output: tokio::sync::mpsc::Sender<BackendEvent>,
     cancelled: Arc<AtomicBool>,
@@ -600,6 +614,11 @@ impl Queue {
             |pending| (pending <= target).then_some(0));
         self.shared.input_reclaim_ack.publish(&self.shared.input_reclaim_generation);
     }
+    /// Handle for the Rank-0 worker to drop HTTP warm decoded image patches
+    /// (256 MiB) under UMA pressure while keeping stored encoded sources intact.
+    pub(crate) fn warm_image_reclaimer(&self) -> WarmImageReclaimer {
+        WarmImageReclaimer(self.shared.clone())
+    }
     pub fn router_hold(&self) -> bool {
         self.shared.priority.as_ref().is_some_and(|p| p.hold())
     }
@@ -876,7 +895,7 @@ async fn reserve_input_workspace(shared: &Shared, bytes: usize)
         &shared.input_reclaim_target, &shared.input_reclaim_generation, &shared.input_reclaim_ack,
         || shared.health.load(Ordering::Acquire) == READY && !shared.shutdown.load(Ordering::Acquire),
         || shared.wake_worker(),
-        Duration::from_secs(5),
+        Duration::from_secs(12),
     ).await
 }
 
@@ -1078,7 +1097,7 @@ async fn finish_chat(shared: Arc<Shared>, body: context::Input, permit: OwnedSem
                     preprocessing_shared.input_reclaim_ack.wait_sync(
                         &preprocessing_shared.input_reclaim_generation,generation,
                         ||!cancelled()&&preprocessing_shared.health.load(Ordering::Acquire)==READY,
-                        Duration::from_secs(5));
+                        Duration::from_secs(12));
                     if !cancelled() && preprocessing_shared.health.load(Ordering::Acquire) == READY
                         && preprocessing_shared.input_reclaim_generation.load(Ordering::Acquire) != generation {
                         prepared = convert();
@@ -1200,8 +1219,17 @@ async fn finish_chat(shared: Arc<Shared>, body: context::Input, permit: OwnedSem
                         // An SSE error is explicit and never followed by a
                         // successful finish or [DONE]. Dropping the body also
                         // cancels any remaining native execution.
-                        yield Ok(Event::default().event("error").json_data(
-                            json!({"error":{"type":"inference_error","message":reason.to_string()}})).unwrap());
+                        let payload = if let Some(cap) = reason.downcast_ref::<crate::protocol::StreamCapacityError>() {
+                            json!({"error":{
+                                "type":"input_capacity",
+                                "code":"input_capacity",
+                                "retryable":true,
+                                "message":format!("503 input_capacity: {}", cap.0),
+                            }})
+                        } else {
+                            json!({"error":{"type":"inference_error","message":reason.to_string()}})
+                        };
+                        yield Ok(Event::default().event("error").json_data(payload).unwrap());
                         return;
                     }
                 }
@@ -1231,6 +1259,13 @@ async fn finish_chat(shared: Arc<Shared>, body: context::Input, permit: OwnedSem
             match chunk {
                 Ok(chunk) => complete.accumulate(chunk),
                 Err(reason) => {
+                    if let Some(cap) = reason.downcast_ref::<crate::protocol::StreamCapacityError>() {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "input_capacity",
+                            &cap.0,
+                        );
+                    }
                     return error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "inference_error",
@@ -1737,6 +1772,58 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("event: error"));
         assert!(!body.contains("[DONE]"));
+
+        // Capacity refusal on a streaming request emits a distinct retryable
+        // input_capacity SSE error carrying 503 for client retry classification.
+        let cap_response = rt.block_on(chat(State(shared.clone()), request()));
+        let cap_job = queue.next(Duration::from_millis(10)).unwrap().unwrap();
+        cap_job.emit(BackendEvent::CapacityFailed(
+            "prefill cannot retain the UMA reserve after optional cache reclamation".into(),
+        ));
+        drop(cap_job);
+        let cap_body = String::from_utf8(
+            rt.block_on(to_bytes(cap_response.into_body(), 1024 * 1024)).unwrap().to_vec(),
+        ).unwrap();
+        assert!(cap_body.contains("event: error"), "{cap_body}");
+        assert!(cap_body.contains("\"type\":\"input_capacity\""), "{cap_body}");
+        assert!(cap_body.contains("\"code\":\"input_capacity\""), "{cap_body}");
+        assert!(cap_body.contains("\"retryable\":true"), "{cap_body}");
+        assert!(cap_body.contains("503 input_capacity: prefill cannot retain the UMA reserve"), "{cap_body}");
+        assert!(!cap_body.contains("[DONE]"), "{cap_body}");
+
+        // Capacity refusal on a non-streaming request returns HTTP 503 input_capacity.
+        let non_stream_req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer test-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": MODEL_NAME,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 4,
+                    "stream": false
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let non_stream_shared = shared.clone();
+        let non_stream_handle = std::thread::spawn(move || {
+            let job = queue.next(Duration::from_secs(2)).unwrap().unwrap();
+            job.emit(BackendEvent::CapacityFailed(
+                "prefill cannot retain the UMA reserve after optional cache reclamation".into(),
+            ));
+            queue
+        });
+        let non_stream_resp = rt.block_on(chat(State(non_stream_shared), non_stream_req));
+        let queue = non_stream_handle.join().unwrap();
+        assert_eq!(non_stream_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let non_stream_body = String::from_utf8(
+            rt.block_on(to_bytes(non_stream_resp.into_body(), 1024 * 1024)).unwrap().to_vec(),
+        ).unwrap();
+        assert!(non_stream_body.contains("\"code\":\"input_capacity\""), "{non_stream_body}");
+        // WarmImageReclaimer is callable without blocking even when empty.
+        assert!(!queue.warm_image_reclaimer().release());
         assert!(!body.contains("\"finish_reason\":\"stop\""));
 
         let background_request = || {

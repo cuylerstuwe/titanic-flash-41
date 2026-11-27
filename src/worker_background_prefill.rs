@@ -86,8 +86,8 @@ impl Worker {
         let result=self.continue_prefill(&mut |control,remaining,cached| {
             let stop=queue.map(|q|->Result<bool>{
                 let priority=background&&(q.foreground_can_join()?||q.router_hold());
-                let peer=peers&&q.prefill_peer_should_yield(background,remaining,q.prefill_slice_due(began.elapsed(),slice),
-                    |peer|estimated_peer_remaining(peer,cached,None))?;
+                let peer=peers&&(q.input_reclaim_target()>0||q.prefill_peer_should_yield(background,remaining,q.prefill_slice_due(began.elapsed(),slice),
+                    |peer|estimated_peer_remaining(peer,cached,None))?);
                 Ok(priority||peer||q.stopping()||job.is_some_and(|j|j.cancelled()))
             }).transpose()?;
             let head=stop.map(|v|[u8::from(v)]);

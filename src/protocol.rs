@@ -145,6 +145,18 @@ pub struct PreparedChat {
 }
 
 #[cfg(feature = "serving")]
+#[derive(Debug, Clone)]
+pub(crate) struct StreamCapacityError(pub String);
+#[cfg(feature = "serving")]
+impl std::fmt::Display for StreamCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[cfg(feature = "serving")]
+impl std::error::Error for StreamCapacityError {}
+
+#[cfg(feature = "serving")]
 pub(crate) enum BackendEvent {
     Ready {
         fingerprint: String,
@@ -153,6 +165,7 @@ pub(crate) enum BackendEvent {
     Tokens(Vec<u32>),
     Finish(InferenceFinishReason),
     Failed(String),
+    CapacityFailed(String),
 }
 
 #[cfg(feature = "serving")]
@@ -170,7 +183,7 @@ impl Frontend {
     > + Send
     + 'static {
         use std::sync::{Arc, Mutex};
-        let terminal: Arc<Mutex<Option<std::result::Result<(), String>>>> =
+        let terminal: Arc<Mutex<Option<std::result::Result<(), (bool, String)>>>> =
             Arc::new(Mutex::new(None));
         let observed = terminal.clone();
         let generator =
@@ -209,30 +222,40 @@ impl Frontend {
                         return;
                     }
                     BackendEvent::Failed(message) => {
-                        *terminal.lock().unwrap()=Some(Err(message));
+                        *terminal.lock().unwrap()=Some(Err((false, message)));
+                        return;
+                    }
+                    BackendEvent::CapacityFailed(message) => {
+                        *terminal.lock().unwrap()=Some(Err((true, message)));
                         return;
                     }
                     _ => {
-                        *terminal.lock().unwrap()=Some(Err("worker output violated the request frontier".into()));
+                        *terminal.lock().unwrap()=Some(Err((false, "worker output violated the request frontier".into())));
                         return;
                     }
                 }
             }
-            *terminal.lock().unwrap()=Some(Err("worker stream ended without committed completion".into()));
+            *terminal.lock().unwrap()=Some(Err((false, "worker stream ended without committed completion".into())));
         };
         async_stream::stream! {
             let stream=processor.into_protocol_stream(inference);
             let mut stream=std::pin::pin!(stream);
+            let into_err = |(capacity, message): (bool, String)| -> anyhow::Error {
+                if capacity { StreamCapacityError(message).into() } else { anyhow::anyhow!(message) }
+            };
             while let Some(chunk)=stream.next().await {
                 let failure=observed.lock().unwrap().as_ref().and_then(|result|result.as_ref().err().cloned());
-                if let Some(message)=failure { yield Err(anyhow::anyhow!(message));return; }
+                if let Some(failure)=failure { yield Err(into_err(failure));return; }
                 match chunk {
                     Ok(chunk)=>yield Ok(chunk),
                     Err(error)=>{yield Err(error.into());return;}
                 }
             }
-            if !matches!(*observed.lock().unwrap(),Some(Ok(()))) {
-                yield Err(anyhow::anyhow!("protocol ended before a committed backend finish"));
+            let terminal=observed.lock().unwrap().clone();
+            match terminal {
+                Some(Ok(())) => {}
+                Some(Err(failure)) => { yield Err(into_err(failure)); }
+                None => { yield Err(anyhow::anyhow!("protocol ended before a committed backend finish")); }
             }
         }
     }
