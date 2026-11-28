@@ -740,6 +740,51 @@ impl Cuda {
             "bounded pinned host allocation required"
         );
         self.owner.current()?;
+        // CANADA_SCRATCH_ROCE_HOST_NUMA=1: allocate via cuMemCreate(HOST_NUMA) mapped to both
+        // DEVICE and HOST_NUMA at one virtual address so GPU staging/reduce reads run at full GB10
+        // DRAM bandwidth (~25% faster than cuMemHostAlloc) while remaining ibv_reg_mr-compatible.
+        if std::env::var("CANADA_SCRATCH_ROCE_HOST_NUMA").as_deref() == Ok("1") {
+            let api = &self.owner.api;
+            let prop = MemAllocationProp {
+                kind: 1, // CU_MEM_ALLOCATION_TYPE_PINNED
+                location: MemLocation { kind: 3, id: 0 }, // CU_MEM_LOCATION_TYPE_HOST_NUMA
+                ..MemAllocationProp::default()
+            };
+            let mut gran = 0usize;
+            api.check(unsafe { (api.mem_granularity)(&mut gran, &prop, 0) }, "query host NUMA granularity")?;
+            ensure!(gran > 0 && gran.is_power_of_two(), "invalid host NUMA VMM granularity");
+            let vmm_size = bytes.div_ceil(gran) * gran;
+            let mut handle = 0u64;
+            api.check(unsafe { (api.mem_create)(&mut handle, vmm_size, &prop, 0) }, "create host NUMA pinned allocation")?;
+            let mut va = 0u64;
+            if let Err(e) = api.check(unsafe { (api.address_reserve)(&mut va, vmm_size, gran, 0, 0) }, "reserve host NUMA VA") {
+                unsafe { (api.mem_release)(handle); }
+                return Err(e);
+            }
+            if let Err(e) = api.check(unsafe { (api.mem_map)(va, vmm_size, 0, handle, 0) }, "map host NUMA VA") {
+                unsafe { (api.address_free)(va, vmm_size); (api.mem_release)(handle); }
+                return Err(e);
+            }
+            let acc = [
+                MemAccessDesc { location: MemLocation { kind: 1, id: self.owner.device }, flags: 3 },
+                MemAccessDesc { location: MemLocation { kind: 3, id: 0 }, flags: 3 },
+            ];
+            if let Err(e) = api.check(unsafe { (api.mem_access)(va, vmm_size, acc.as_ptr(), acc.len()) }, "set host NUMA access") {
+                unsafe { (api.mem_unmap)(va, vmm_size); (api.address_free)(va, vmm_size); (api.mem_release)(handle); }
+                return Err(e);
+            }
+            let host = va as *mut c_void;
+            unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0, bytes); }
+            eprintln!("mapped_host: allocated {} bytes via cuMemCreate(HOST_NUMA) at 0x{:x} (vmm_size={})", bytes, va, vmm_size);
+            return Ok(MappedHost {
+                owner: self.owner.clone(),
+                host,
+                device: va,
+                bytes,
+                vmm_handle: handle,
+                vmm_size,
+            });
+        }
         let mut host = ptr::null_mut();
         let result = self.owner.api.check(
             unsafe { (self.owner.api.host_alloc)(&mut host, bytes, 3) },
@@ -752,6 +797,8 @@ impl Cuda {
             host,
             device: 0,
             bytes,
+            vmm_handle: 0,
+            vmm_size: 0,
         };
         self.owner.api.check(
             unsafe { (self.owner.api.host_device)(&mut region.device, host, 0) },
@@ -1621,6 +1668,8 @@ pub struct MappedHost {
     host: *mut c_void,
     device: u64,
     bytes: usize,
+    vmm_handle: u64,
+    vmm_size: usize,
 }
 impl MappedHost {
     pub fn host_ptr(&self) -> *mut c_void {
@@ -1648,7 +1697,13 @@ impl Drop for MappedHost {
     fn drop(&mut self) {
         let _ = self.owner.current();
         unsafe {
-            (self.owner.api.host_free)(self.host);
+            if self.vmm_handle != 0 {
+                let _ = (self.owner.api.mem_unmap)(self.device, self.vmm_size);
+                let _ = (self.owner.api.address_free)(self.device, self.vmm_size);
+                let _ = (self.owner.api.mem_release)(self.vmm_handle);
+            } else {
+                (self.owner.api.host_free)(self.host);
+            }
         }
     }
 }

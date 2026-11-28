@@ -67,9 +67,10 @@ fn compact_message(raw:&str, aliases:&HashMap<[u8;32],[u8;32]>) -> Option<crate:
     Some(crate::context_transport::StoredMessage {json:if images.is_empty(){raw.to_owned()}else{message.to_string()},images})
 }
 
-/// Optional transport storage is discarded before asking for GPU-cache work.
-/// Never block the GPU owner behind an HTTP parser holding this mutex.
-pub(super) fn reclaim(shared: &Shared) -> bool {
+/// Optional transport storage is trimmed oldest-first before asking for GPU-cache work;
+/// full clear runs only if partial trim was insufficient. Never block the GPU owner behind
+/// an HTTP parser holding this mutex.
+fn reclaim_inner(shared: &Shared, full: bool) -> bool {
     let Some(cache) = &shared.context_cache else {
         return false;
     };
@@ -77,13 +78,22 @@ pub(super) fn reclaim(shared: &Shared) -> bool {
         return false;
     };
     let before = cache.stats().retained_bytes;
-    cache.clear();
-    let released = before.saturating_sub(cache.stats().retained_bytes);
+    let released = if full {
+        cache.clear();
+        before.saturating_sub(cache.stats().retained_bytes)
+    } else {
+        let target = (before / 2).max(16 << 20);
+        cache.trim_oldest(target, false)
+    };
     drop(cache);
     if released > 0 {
         crate::memory::trim_free_host_pages();
     }
     released > 0
+}
+
+pub(super) fn reclaim(shared: &Shared) -> bool {
+    reclaim_inner(shared, false) || reclaim_inner(shared, true)
 }
 
 pub(super) fn reserve_after_reclaim<T>(
@@ -101,7 +111,8 @@ pub(super) fn reserve_after_reclaim<T>(
             result = reserve();
         }
     }
-    if result.as_ref().is_err_and(capacity) && reclaim(shared) { result = reserve(); }
+    if result.as_ref().is_err_and(&capacity) && reclaim_inner(shared, false) { result = reserve(); }
+    if result.as_ref().is_err_and(capacity) && reclaim_inner(shared, true) { result = reserve(); }
     result
 }
 

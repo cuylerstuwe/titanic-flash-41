@@ -138,6 +138,103 @@ extern "C" __global__ void ca_l2_paced_wide(const uint64_t* segments, uint32_t c
     else __nanosleep(64);
   }
 }
+extern "C" __global__ void ca_l2_paced_stop(const uint64_t* segments, uint32_t count, uint32_t first,
+                                            uint32_t budget, uint32_t ns_piece, const uint32_t* stop_ptr) {
+  constexpr uint32_t piece = 8192;
+  const uint32_t lane = threadIdx.x;
+  uint32_t ends[16];
+  uint32_t total = 0;
+  for (uint32_t s = 0; s < 16; ++s) {
+    if (s < count) total += uint32_t((segments[s * 2 + 1] + piece - 1) / piece);
+    ends[s] = total;
+  }
+  const uint32_t last = total < first + budget ? total : first + budget;
+  uint32_t e0 = 0;
+  if (lane == 0 && stop_ptr) {
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(e0) : "l"(stop_ptr) : "memory");
+  }
+  e0 = __shfl_sync(0xffffffffu, e0, 0);
+  unsigned long long t0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  t0 = __shfl_sync(0xffffffffu, t0, 0);
+  uint32_t done = first < last ? first : last;
+  while (done < last) {
+    int quit = 0;
+    if (lane == 0 && stop_ptr) {
+      uint32_t e;
+      asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(e) : "l"(stop_ptr) : "memory");
+      quit = (e != e0);
+    }
+    if (__shfl_sync(0xffffffffu, quit, 0)) break;
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    t = __shfl_sync(0xffffffffu, t, 0);
+    const unsigned long long by_now = first + (t - t0) / ns_piece + 1;
+    const uint32_t cap = last < done + 32 ? last : done + 32;
+    const uint32_t due = by_now < cap ? uint32_t(by_now) : cap;
+    const uint32_t c = done + lane;
+    if (c < due) {
+      uint32_t i = 0;
+      while (c >= ends[i]) ++i;
+      const uint64_t off = uint64_t(c - (i ? ends[i - 1] : 0)) * piece, left = segments[i * 2 + 1] - off;
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                   :: "l"(segments[i * 2] + off), "r"(uint32_t(left < piece ? left : piece)) : "memory");
+    }
+    if (due > done) done = due;
+    else __nanosleep(64);
+  }
+}
+extern "C" __global__ void ca_l2_paced_wide_stop(const uint64_t* segments, uint32_t count, uint32_t first,
+                                                 uint32_t budget, uint32_t ns_piece, uint32_t warps, uint32_t wave,
+                                                 const uint32_t* stop_ptr) {
+  constexpr uint32_t piece = 8192;
+  const uint32_t lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  uint32_t ends[16];
+  uint32_t total = 0;
+  for (uint32_t s = 0; s < 16; ++s) {
+    if (s < count) total += uint32_t((segments[s * 2 + 1] + piece - 1) / piece);
+    ends[s] = total;
+  }
+  const uint32_t last = total < first + budget ? total : first + budget;
+  const uint32_t span = first < last ? last - first : 0;
+  const uint32_t mine = span > warp ? (span - warp + warps - 1) / warps : 0;
+  const unsigned long long ns = (unsigned long long)ns_piece * warps;
+  uint32_t e0 = 0;
+  if (lane == 0 && stop_ptr) {
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(e0) : "l"(stop_ptr) : "memory");
+  }
+  e0 = __shfl_sync(0xffffffffu, e0, 0);
+  unsigned long long t0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  t0 = __shfl_sync(0xffffffffu, t0, 0);
+  uint32_t done = 0;
+  while (done < mine) {
+    int quit = 0;
+    if (lane == 0 && stop_ptr) {
+      uint32_t e;
+      asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(e) : "l"(stop_ptr) : "memory");
+      quit = (e != e0);
+    }
+    if (__shfl_sync(0xffffffffu, quit, 0)) break;
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    t = __shfl_sync(0xffffffffu, t, 0);
+    const unsigned long long by_now = (t - t0) / ns + 1;
+    const uint32_t cap = mine < done + wave ? mine : done + wave;
+    const uint32_t due = by_now < cap ? uint32_t(by_now) : cap;
+    const uint32_t k = done + lane;
+    if (k < due) {
+      const uint32_t c = first + warp + k * warps;
+      uint32_t i = 0;
+      while (c >= ends[i]) ++i;
+      const uint64_t off = uint64_t(c - (i ? ends[i - 1] : 0)) * piece, left = segments[i * 2 + 1] - off;
+      asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;"
+                   :: "l"(segments[i * 2] + off), "r"(uint32_t(left < piece ? left : piece)) : "memory");
+    }
+    if (due > done) done = due;
+    else __nanosleep(64);
+  }
+}
 // Sensitivity screen (crate::inject; CANADA_SCRATCH_INJECT_SCREEN): a spin of `ns` nanoseconds with no memory traffic
 // (one thread on the global timer), and a cold read of `packs` 16-byte packs with streaming loads (they allocate no
 // L2 lines, so hinted data stays). Timing instruments: nothing the model reads is written.

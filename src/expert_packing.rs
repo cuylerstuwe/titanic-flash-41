@@ -173,7 +173,7 @@ fn prepare_named(
     }
     stream.synchronize()?;
     weights.finish_expert_layer(layer)?;
-    if layer < 40 && crate::config::moe_scale_code1()? {
+    if layer < 40 && (crate::config::moe_scale_code1()? || crate::config::moe_scale_code1_screen()) {
         code_layer_scales(cuda, module, weights, layer, experts, n, k, so, ds, &stream)?;
     }
     if layer<40 && std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE_SCREEN").as_deref()==Ok("1") {

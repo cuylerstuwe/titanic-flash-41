@@ -1404,7 +1404,38 @@ impl Worker {
         self.control.agree(&proof)?;
         let free_before = self.cuda.image_pool_free_chunks().unwrap_or(0);
         let mut gave_way = Vec::new();
-        let plan = self.wide16_eviction_plan(policy, total, need + reserve)?;
+        let mut plan = self.wide16_eviction_plan(policy, total, need + reserve)?;
+        let mut spilled_for_borrow = Vec::new();
+        let spill_min = crate::config::wide16_spill_min_uncached();
+        if plan.is_none() && spill_min > 0 && uncached >= spill_min && self.disk_tier.is_some() {
+            // Spill oldest parkable resident checkpoints to NVMe so large (>=128K) cold prefills
+            // can still borrow 16K chunks instead of falling back to 8K chunks.
+            let mut potential = self.cuda.image_pool_free_chunks().unwrap_or(0);
+            for c in &self.cached_sessions {
+                if c.resident_now() && c.parkable() && c.disk_clean() {
+                    potential += c.images().iter().map(|im| im.owned_pool_chunks()).sum::<usize>();
+                }
+            }
+            for i in 0..self.cached_sessions.len() {
+                if self.control.all_admit(potential >= need + reserve)? { break; }
+                let eligible = {
+                    let c = &self.cached_sessions[i];
+                    c.resident_now() && c.parkable() && !c.disk_clean()
+                        && !c.speculative && !c.opportunistic_logits()
+                };
+                if !eligible { continue; }
+                let chunks: usize = self.cached_sessions[i].images().iter().map(|im| im.owned_pool_chunks()).sum();
+                if let Some(ev) = self.save_before_evict(i, true)? {
+                    spilled_for_borrow.push(ev);
+                }
+                if self.control.all_admit(self.cached_sessions[i].disk_clean())? {
+                    potential += chunks;
+                }
+            }
+            if !spilled_for_borrow.is_empty() {
+                plan = self.wide16_eviction_plan(policy.max(2), total, need + reserve)?;
+            }
+        }
         let lent = plan.is_some();
         if let Some(indices) = plan {
             for i in indices {
@@ -1420,6 +1451,7 @@ impl Worker {
         self.wide16_held = agreed;
         let report = json!({"lent":agreed,"policy":policy,"uncached":uncached,"need_chunks":need,"reserve_chunks":reserve,
             "free_chunks_before":free_before,"free_chunks_after":self.cuda.image_pool_free_chunks().unwrap_or(0),
+            "spilled_for_borrow":spilled_for_borrow,
             "gave_way":gave_way,"seconds":began.elapsed().as_secs_f64()});
         eprintln!("wide16 borrow {report}");
         Ok(report)
@@ -2019,6 +2051,12 @@ struct Worker {
     /// evicting images; it takes turns until a region frees up or another conversation is current.
     elastic_declined: Option<u64>,
     batched_timing: batched_serving::Timing,
+    /// Steps executed in the active turn (used for Step-0 copy-verify guard).
+    turn_steps: usize,
+    /// Remaining decode steps before 16/32-row copy escalation may retry after a <=3-token miss.
+    long_history_cooldown: u8,
+    /// Consecutive 1-conversation batched steps run by a lone peer while region 0 and ready queue are empty.
+    lone_peer_steps: usize,
     cached_sessions: Vec<CachedSession>,
     /// Disk tier (config::disk_tier): snapshots parked on disk (RAM freed), oldest first. Every rank holds the same list.
     parked_sessions: Vec<CachedSession>,
@@ -2719,6 +2757,32 @@ impl Worker {
             }
         }
         let session_prepare_seconds = prepare_started.elapsed().as_secs_f64();
+        if crate::config::release_canonical_head() {
+            let head4_requested = crate::config::head4_rescore()?.is_some() || crate::config::head4_rescore_screen();
+            let canonical_screen = [
+                "CANADA_SCRATCH_HEAD_COMPACT_SCREEN",
+                "CANADA_SCRATCH_HEAD_PLANES_SCREEN",
+                "CANADA_SCRATCH_LOSSLESS_HEAD_SCREEN",
+                "CANADA_SCRATCH_PRIVATE_HEAD_GEMV_SCREEN",
+                "CANADA_SCRATCH_PRIVATE_HEAD_INT8_SCREEN",
+                "CANADA_SCRATCH_PRIVATE_HEAD_LOSSLESS_SCREEN",
+                "CANADA_SCRATCH_PRIVATE_HEAD_NVFP4_SCREEN",
+                "CANADA_SCRATCH_PAIRED_GENERATION_SCREEN",
+            ]
+            .iter()
+            .any(|k| std::env::var(k).as_deref() == Ok("1"));
+            let safe = !head4_requested
+                && !canonical_screen
+                && crate::config::prefill_encoded_head_requested()?
+                && crate::config::append_encoded_head_requested()?
+                && std::env::var("CANADA_SCRATCH_HEAD_COMPACT_EXCEPTIONS").as_deref() == Ok("1")
+                && std::env::var("CANADA_SCRATCH_PAIRED_TARGET_HEAD").as_deref() == Ok("1")
+                && crate::draft_head::DraftHead::nvfp4_only_mode();
+            ensure!(safe, "CANADA_SCRATCH_RELEASE_CANONICAL_HEAD requires compact M6/M9/M12, encoded prefill/append heads, NVFP4-only draft head, and no canonical-head screen");
+            stream.synchronize()?;
+            let freed = verify.release_canonical_head()?;
+            eprintln!("rank{} released canonical BF16 head.weight: reclaimed {} bytes UMA", p.rank, freed);
+        }
         eprintln!("rank{} allocation boundary before vision: {}",p.rank,json!(cuda.admission_memory()?));
         let mut media=p.vision.as_ref().map(|config|crate::worker_media::Media::load(&cuda,p.rank,&cfg,config)).transpose()?;
         if let Some(media)=&mut media {
@@ -2979,6 +3043,9 @@ impl Worker {
             spare_sessions: Vec::new(),
             elastic_declined: None,
             batched_timing: Default::default(),
+            turn_steps: 0,
+            long_history_cooldown: 0,
+            lone_peer_steps: 0,
             cached_sessions:Vec::new(),
             parked_sessions:Vec::new(),
             disk_tier:None,
@@ -4260,6 +4327,7 @@ impl Worker {
             "resident prompt state/history admission");
         let output=self.history.prefilled(self.verify.position()as usize,anchor)?;
         self.current=Some(plan.id);self.emitted=1;self.limit=plan.limit;
+        self.turn_steps=0;self.long_history_cooldown=0;
         self.install_media(None)?;
         if !self.progress_next {self.agree(&output)?;}
         let mut event=json!({"type":"tokens","request_id":plan.id,"output_ids":output,
@@ -4301,10 +4369,16 @@ impl Worker {
 
     fn begin_small_append(&mut self,plan:RequestPlan,greedy:bool,started:Instant,
         retained_session_cache:Value)->Result<Value> {
-        let medium=plan.delta().len()>6;
-        let extended=plan.delta().len()>16;
-        ensure!(plan.reuse && (1..=if self.retained_append32{32}else{16}).contains(&plan.delta().len()) && self.session.is_some()
-            && (!extended || (self.retained_append32&&self.copy32_verify.is_some()&&self.copy32_buffers.is_some()))
+        let max_small = if self.retained_append32 {
+            if crate::config::resident_append64() { 64 } else { 32 }
+        } else { 16 };
+        let two_chunk = plan.delta().len() > 32;
+        let tail_start = if two_chunk { 32 } else { 0 };
+        let tail_delta = &plan.delta()[tail_start..];
+        let medium = tail_delta.len() > 6;
+        let extended = tail_delta.len() > 16;
+        ensure!(plan.reuse && (1..=max_small).contains(&plan.delta().len()) && self.session.is_some()
+            && ((!two_chunk && !extended) || (self.retained_append32&&self.copy32_verify.is_some()&&self.copy32_buffers.is_some()))
             && (!medium || (std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1")
                 && self.long_verify.is_some() && self.long_history_buffers.is_some()))
             && self.verify.profile_is_current() && self.verify.position()==plan.previous as u64
@@ -4312,6 +4386,20 @@ impl Worker {
             && std::env::var("CANADA_SCRATCH_TINY_APPEND_RETAIN_GRAPHS").as_deref()==Ok("1"),
             "resident small append requires a complete short suffix and BF16 graph bank");
         let prepared_at=Instant::now();
+        if two_chunk {
+            let first_chunk = &plan.delta()[..32];
+            let longer = self.copy32_verify.as_mut().unwrap();
+            longer.handoff_from(&self.verify)?;
+            longer.set_tiny_extend_for_probe(true, &self.stream)?;
+            longer.begin_verification(first_chunk, &self.comm, &self.stream)?;
+            longer.finish_verification(32, &self.comm, &self.stream)?;
+            let session = self.session.as_mut().unwrap();
+            session.resume_after_medium_extend(longer, self.copy32_buffers.as_mut().unwrap(),
+                plan.previous as u64, first_chunk, &self.comm, &self.stream)?;
+            longer.set_tiny_extend_for_probe(false, &self.stream)?;
+            self.verify.handoff_from(self.copy32_verify.as_ref().unwrap())?;
+        }
+        let tail_previous = (plan.previous + tail_start) as u64;
         // One whole request suffix: the decoder floor must not reset between
         // chunks of a larger prompt. Encoder history stays absolute.
         let target=if extended {
@@ -4324,8 +4412,8 @@ impl Worker {
             longer
         } else {&mut self.verify};
         target.set_tiny_extend_for_probe(true,&self.stream)?;
-        target.begin_verification(plan.delta(),&self.comm,&self.stream)?;
-        target.finish_verification(plan.delta().len(),&self.comm,&self.stream)?;
+        target.begin_verification(tail_delta,&self.comm,&self.stream)?;
+        target.finish_verification(tail_delta.len(),&self.comm,&self.stream)?;
         let prefilled_at=Instant::now();
         let anchor=if greedy {target.greedy_token(&self.stream)?}
             else {target.sample_token(plan.seed,&self.stream)?};
@@ -4333,19 +4421,19 @@ impl Worker {
         let session=self.session.as_mut().unwrap();
         if extended {
             session.resume_after_medium_extend(target,self.copy32_buffers.as_mut().unwrap(),
-                plan.previous as u64,plan.delta(),&self.comm,&self.stream)?;
+                tail_previous,tail_delta,&self.comm,&self.stream)?;
         } else if medium {
             session.resume_after_medium_extend(target,self.long_history_buffers.as_mut().unwrap(),
-                plan.previous as u64,plan.delta(),&self.comm,&self.stream)?;
+                tail_previous,tail_delta,&self.comm,&self.stream)?;
         } else {
-            session.resume_after_small_extend(target,plan.previous as u64,plan.delta(),
+            session.resume_after_small_extend(target,tail_previous,tail_delta,
                 &self.comm,&self.stream)?;
         }
         if greedy {session.configure_greedy(Some(self.cfg.eos_token_id))?;}
         else {session.configure_sampling(plan.seed,Some(self.cfg.eos_token_id))?;}
         // Ordinary decode and all saved images must see the normal verifier
         // mode, while both attention workspaces remain alive for graph replay.
-        let final_row_gather=target.append_last_gather_enabled()&&plan.delta().len()>1;
+        let final_row_gather=target.append_last_gather_enabled()&&tail_delta.len()>1;
         let encoded_head=target.append_encoded_head_enabled();
         target.set_tiny_extend_for_probe(false,&self.stream)?;
         if extended {self.verify.handoff_from(self.copy32_verify.as_ref().unwrap())?;}
@@ -4354,6 +4442,7 @@ impl Worker {
         self.publish_begin(plan,anchor,greedy,started,json!({
             "retained_session_cache":retained_session_cache,
             "small_append":true,
+            "small_append_two_chunk":two_chunk,
             "small_append_physical_rows":if extended {32}else if medium {16}else{6},
             "small_append_final_row_gather":final_row_gather,
             "small_append_encoded_head":encoded_head,
@@ -4842,6 +4931,7 @@ impl Worker {
         self.verify.handoff_from(&self.large)?;
         self.history.partial_prefilled(frontier,anchor)?;
         self.current=Some(plan.id);self.emitted=0;self.limit=plan.limit;self.prefill_cancelled=!resume;
+        self.turn_steps=0;self.long_history_cooldown=0;
         // A yielded request may still contain image rows after this frontier.
         // Its bindings travel with the existing lossless request checkpoint.
         if !resume{self.install_media(None)?;}
@@ -4984,7 +5074,7 @@ impl Worker {
                 }
                 ensure!(deferred_encoder.is_none(),"deferred encoder cache requires the compound path");
                 if std::env::var("CANADA_SCRATCH_RESIDENT_SMALL_APPEND").as_deref()==Ok("1")
-                    && plan.reuse && (1..=if self.retained_append32{32}else if std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1")
+                    && plan.reuse && (1..=if self.retained_append32{if crate::config::resident_append64(){64}else{32}}else if std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND").as_deref()==Ok("1")
                         && std::env::var("CANADA_SCRATCH_RESIDENT_MEDIUM_APPEND_CONTROL").as_deref()!=Ok("1") {16}else{6})
                         .contains(&plan.delta().len()) && self.session.is_some() {
                     return self.begin_small_append(plan,greedy,started,retained_session_cache);
@@ -5144,16 +5234,21 @@ impl Worker {
                     else if self.long_verify.is_some() {self.history.step_limit_for_rows(16)?}
                     else {self.history.step_limit()?};
                 ensure!(limit > 0, "decode after terminal output");
-                let mut long=if let (Some(target),Some(buffers))=(&mut self.copy32_verify,&mut self.copy32_buffers) {
-                    self.session.as_mut().unwrap().try_long_history_step(&mut self.verify,target,buffers,
-                        self.history.pending().unwrap(),limit,&self.comm,&self.stream)?
+                let allow_long = !crate::config::copy_step0_guard()
+                    || (self.turn_steps > 0 && self.long_history_cooldown == 0);
+                let mut long=if allow_long {
+                    if let (Some(target),Some(buffers))=(&mut self.copy32_verify,&mut self.copy32_buffers) {
+                        self.session.as_mut().unwrap().try_long_history_step(&mut self.verify,target,buffers,
+                            self.history.pending().unwrap(),limit,&self.comm,&self.stream)?
+                    }else{None}
                 }else{None};
-                if long.is_none() {
+                if allow_long && long.is_none() {
                     if let (Some(target),Some(buffers))=(&mut self.long_verify,&mut self.long_history_buffers) {
                         long=self.session.as_mut().unwrap().try_long_history_step(&mut self.verify,target,buffers,
                             self.history.pending().unwrap(),limit,&self.comm,&self.stream)?;
                     }
                 }
+                let used_long_history = long.is_some();
                 // Within-load screens: a variant alternates request by request, so one load measures both arms under
                 // the same memory layout and temperature (a bench pass with an odd number of requests swaps the arms
                 // on its next pass). A request is counted at its first step (its id differs from the last one's).
@@ -5197,6 +5292,12 @@ impl Worker {
                     self.verify.position() as usize,
                 )?;
                 self.emitted += output.len();
+                self.turn_steps = self.turn_steps.saturating_add(1);
+                if used_long_history && output.len() <= 3 {
+                    self.long_history_cooldown = 3;
+                } else if self.long_history_cooldown > 0 {
+                    self.long_history_cooldown -= 1;
+                }
                 if decode_summary_enabled() {
                     let ms = step_started.elapsed().as_secs_f64() * 1000.;
                     crate::dspark_generation::log_step_confidence("single", &step, output.len());
@@ -5338,6 +5439,8 @@ impl Worker {
                 self.install_media(None)?;
                 self.agree(&[])?;
                 let id = self.current.take().unwrap();
+                self.turn_steps = 0;
+                self.long_history_cooldown = 0;
                 Ok(
                     json!({"type":"finish","request_id":id,"reason":match reason {Finish::Stop=>"stop",Finish::Length=>"length",Finish::Cancelled=>"cancelled"},
                     "completion_tokens":self.emitted,"frontier":self.history.frontier(),"pending":self.history.pending()}),

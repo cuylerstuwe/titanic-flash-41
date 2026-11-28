@@ -300,8 +300,40 @@ impl Layer {
     /// Plan screen: every installed direct-read projection (wq_b, QKV-A) on or off; `None` puts each back on its
     /// configured setting.
     pub(crate) fn set_wqb_direct_for_probe(&self, on: Option<bool>) -> Result<()> {
-        if self.qb.direct_installed() { self.qb.set_direct_for_probe(on.unwrap_or_else(crate::config::wqb_direct))?; }
-        if self.qa.direct_installed() { self.qa.set_direct_for_probe(on.unwrap_or_else(crate::config::qkva_direct))?; }
+        if self.qb.direct_installed() {
+            let v = if crate::config::wqb_direct_screen() {
+                on.unwrap_or_else(crate::config::wqb_direct)
+            } else {
+                crate::config::wqb_direct()
+            };
+            self.qb.set_direct_for_probe(v)?;
+        }
+        if self.qa.direct_installed() {
+            let v = if crate::config::qkva_direct_screen() {
+                on.unwrap_or_else(crate::config::qkva_direct)
+            } else {
+                crate::config::qkva_direct()
+            };
+            self.qa.set_direct_for_probe(v)?;
+        }
+        if self.ob.direct_installed() {
+            let v = if crate::config::wob_direct_screen() {
+                on.unwrap_or_else(crate::config::wob_direct)
+            } else {
+                crate::config::wob_direct()
+            };
+            self.ob.set_direct_for_probe(v)?;
+        }
+        if let WoA::Small(v) = &self.woa {
+            if v.fused_direct_installed() {
+                let flag = if crate::config::woa_fused_direct_screen() {
+                    on.unwrap_or_else(crate::config::woa_fused_direct)
+                } else {
+                    crate::config::woa_fused_direct()
+                };
+                v.set_fused_direct_for_probe(flag)?;
+            }
+        }
         Ok(())
     }
     /// Plan screen: the QKV-A and wq_b outputs of this layer (bytes), for a kernel-against-kernel comparison on a
@@ -519,7 +551,7 @@ impl Layer {
                 },
             )?)
         };
-        let ob = projection(
+        let mut ob = projection(
             "wo_b",
             &if draft {
                 "fp8-dspark-wo_b-r0-m5-v1".into()
@@ -527,6 +559,9 @@ impl Layer {
                 format!("fp8-canonical-wo_b-r0-m{rows}-v0")
             },
         )?;
+        if !draft && rows == 6 && (crate::config::wob_direct() || crate::config::wob_direct_screen()) {
+            ob.install_direct(crate::config::wob_direct())?;
+        }
         let norm_weight = |name: &str, width: usize| -> Result<Buffer<bf16>> {
             let key = format!("{attn}.{name}.weight");
             let v = weights.view(&key)?;
@@ -704,6 +739,9 @@ impl Layer {
         };
         if crate::config::woa_native() || crate::config::woa_native_screen() {
             if let WoA::Small(v) = &mut woa { v.install_native(module, crate::config::woa_native())?; }
+        }
+        if !draft && rows == 6 && (crate::config::woa_fused_direct() || crate::config::woa_fused_direct_screen()) {
+            if let WoA::Small(v) = &mut woa { v.install_fused_direct(crate::config::woa_fused_direct())?; }
         }
         if crate::woa_medium::cached_policy()? {
             if let WoA::Medium(v) = &mut woa { v.prepare_cached(stream)?; }
@@ -1160,7 +1198,10 @@ impl Layer {
                         cache.page_bytes(), cache.pages(), self.rows, 128)?;
                 }
                 let lead = q.w2_lead.as_ref().filter(|_| self.index_lead.get());
-                if let Some(w) = lead.or(q.w2.as_ref()) { w.begin(stream)?; }
+                if let Some(w) = lead.or(q.w2.as_ref()) {
+                    let stop = crate::l2_prefetch::early_stop_active().then(|| comm.map(Roce::epoch_ptr)).flatten();
+                    w.begin_stopping(stream, stop)?;
+                }
             } else if let Some(hint) = &self.qb_prefetch {
                 hint.begin(stream)?;
             }

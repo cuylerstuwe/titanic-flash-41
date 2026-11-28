@@ -441,7 +441,7 @@ impl QueryNetwork {
             head_passes: [0; 2],
             pair_body_graph:None,
             shared_bodies: Rc::new(std::cell::OnceCell::new()),
-            pair_head:if crate::config::paired_draft_head_requested(){
+            pair_head:if crate::config::paired_draft_head_requested() && !crate::draft_head::DraftHead::nvfp4_only_mode(){
                 // Batched decode (serving or its screens) pools pairs of its conversations' heads
                 // (CANADA_SCRATCH_BATCHED_POOLED_HEAD=1); its drafters are independent forks.
                 ensure!(crate::config::paired_serving_requested()

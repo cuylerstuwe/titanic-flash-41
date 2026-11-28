@@ -140,7 +140,7 @@ pub struct Linear {
 /// four such buffers in rank order produces the existing full-row operands.
 /// The direct-read GEMV's module (kernels/direct_gemv_fp8.cu built for compute_121a; provenance beside the
 /// artifact) and whether this projection uses it (config::wqb_direct; the plan screen toggles it).
-static DIRECT_GEMV_CUBIN: &[u8] = include_bytes!("../kernels/prebuilt/direct_gemv_fp8.cubin");
+pub(crate) static DIRECT_GEMV_CUBIN: &[u8] = include_bytes!("../kernels/prebuilt/direct_gemv_fp8.cubin");
 struct Direct { module: crate::cuda::Module, on: Cell<bool>, output: Cell<u64> }
 pub(crate) struct RowShard {
     rows: usize,
@@ -531,11 +531,12 @@ impl Linear {
     /// Install the direct-read GEMV as this projection's dense consumer, switched `on` or off (six rows, wq_b's
     /// shape, the checkpoint's own layout).
     pub(crate) fn install_direct(&mut self, on: bool) -> Result<()> {
-        // wq_b (8192 x 1280) or this rank's QKV-A slice (448 x 5120); every caller of launch_dense passes activation
-        // scales in the MMA byte layout (the projection's own quantizer and the boundary's alike).
+        // wq_b (8192 x 1280), wo_b (5120 x 2048), or this rank's QKV-A slice (448 x 5120); every caller of
+        // launch_dense passes activation scales in the MMA byte layout.
         let shape = (self.matrix.n, self.matrix.k, self.matrix.padded_k);
         ensure!(self.geometry.rows == 6 && self.matrix.unpadded()
             && ((shape == (8192, 1280, 1280) && matches!(self.backend, Backend::FlashInfer { .. }) && self.prepared_dense.is_none())
+                || shape == (5120, 2048, 2048)
                 || shape == (448, 5120, 5120)),
             "direct-read GEMV geometry");
         if self.direct.is_none() {
@@ -843,18 +844,30 @@ impl Linear {
     unsafe fn launch_dense(&self, values: u64, scales: u64, stream: &Stream) -> Result<()> {
         self.guard_stream(stream)?;
         if let Some(direct) = self.direct.as_ref().filter(|d| d.on.get()) {
-            // One tile of 8 weight rows a block, 16 warps over K; activations as the quantizer left them (scales in
-            // the MMA byte layout), weights and their 32x32 scales in the checkpoint's layout.
+            // MT=2 for large N (wq_b 8192x1280 wk=5 exact 4 steps/warp; wo_b 5120x2048 wk=8 exact 4 steps/warp);
+            // MT=1 wk=16 for narrow QKV-A (448x5120, 56 CTAs fills 48 SMs).
             let (mut xq, mut xs, mut w, mut s, mut y) = (values, scales, self.matrix.values(), self.matrix.canonical_scales(),
                 if direct.output.get() != 0 { direct.output.get() } else { self.output.ptr() });
+            let use_mt2 = self.matrix.n >= 1024 && self.matrix.n % 16 == 0;
+            let (func_name, grid_x, wk_val, smem_bytes) = if use_mt2 {
+                let wk_val: i32 = match self.matrix.k {
+                    1280 => 5, // P=20 -> 4 steps/warp
+                    2048 => 8, // P=32 -> 4 steps/warp
+                    _ => 8,
+                };
+                let smem = ((wk_val as usize) * 8 * 16).max(264) * 4;
+                ("ca_direct_gemv_fp8_mt2", (self.matrix.n / 16) as u32, wk_val, smem as u32)
+            } else {
+                ("ca_direct_gemv_fp8", (self.matrix.n / 8) as u32, 16i32, 4096u32)
+            };
             let (mut m, mut n, mut k, mut ldq, mut wk, mut mma) = (self.geometry.rows as i32, self.matrix.n as i32,
-                self.matrix.k as i32, self.matrix.padded_k as i32, 16i32, 1i32);
+                self.matrix.k as i32, self.matrix.padded_k as i32, wk_val, 1i32);
             let mut args: [*mut std::ffi::c_void; 11] = [(&mut xq as *mut u64).cast(), (&mut xs as *mut u64).cast(),
                 (&mut w as *mut u64).cast(), (&mut s as *mut u64).cast(), (&mut y as *mut u64).cast(),
                 (&mut m as *mut i32).cast(), (&mut n as *mut i32).cast(), (&mut k as *mut i32).cast(),
                 (&mut ldq as *mut i32).cast(), (&mut wk as *mut i32).cast(), (&mut mma as *mut i32).cast()];
-            return unsafe { direct.module.function("ca_direct_gemv_fp8")?
-                .launch_pdl([(self.matrix.n / 8) as u32, 1, 1], [512, 1, 1], 4096, stream, &mut args) };
+            return unsafe { direct.module.function(func_name)?
+                .launch_pdl([grid_x, 1, 1], [(wk_val * 32) as u32, 1, 1], smem_bytes, stream, &mut args) };
         }
         if let Some(dense)=self.prepared_dense.as_ref().filter(|d|d.enabled()) {
             return unsafe{dense.launch(values,self.matrix.values(),scales,self.matrix.scales(),

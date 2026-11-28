@@ -101,6 +101,7 @@ pub(crate) struct Timing {
     capture_steps: [usize; 5], capture_ms: [f64; 5], steady: [Vec<f64>; 5], positions: [f64; 5],
 }
 impl Timing {
+    pub(crate) fn reset_last_end(&mut self) { self.last_end = None; }
     fn report(&mut self, captures: usize) {
         if self.since_report == 0 { return; }
         let mut parts = Vec::new();
@@ -200,6 +201,17 @@ impl Worker {
     }
     /// Region conversations still generating (not finished).
     pub(crate) fn generating_peers(&self) -> usize { self.peers.iter().filter(|p| p.finished.is_none()).count() }
+    /// The sole generating peer left in a serving region (with enough remaining output budget to justify relocating
+    /// back into region 0 so it recovers full 6-row owner + copy-verify speed).
+    pub(crate) fn lone_generating_peer(&self) -> Option<u64> {
+        if self.peers.len() == 1 {
+            let p = &self.peers[0];
+            if p.finished.is_none() && p.limit.saturating_sub(p.emitted) >= 16 {
+                return Some(p.id);
+            }
+        }
+        None
+    }
     /// Region 0 shares the owner's compressed address space with the serving regions: region k's rows start at
     /// k times a region's capacity, and region 0's at zero, without an upper bound of their own. A region-0
     /// conversation that reaches past one region's capacity therefore covers the regions' rows, and so does its
@@ -290,6 +302,9 @@ impl Worker {
         self.current = None;
         self.emitted = 0;
         self.limit = 0;
+        self.turn_steps = 0;
+        self.long_history_cooldown = 0;
+        self.lone_peer_steps = 0;
         // Region 0 starts clean: a new lineage (with serving regions the reset clears region 0 only).
         self.target_lineage = self.target_lineage.checked_add(1).context("target lineage exhausted")?;
         self.verify.reset(self.target_lineage, &self.comm, &self.stream)?;
@@ -609,6 +624,9 @@ impl Worker {
         if let Some(spare) = spare { self.spare_sessions.push(spare); }
         self.emitted = 0;
         self.limit = 0;
+        self.turn_steps = 0;
+        self.long_history_cooldown = 0;
+        self.lone_peer_steps = 0;
         self.control.agree(&serde_json::to_vec(&json!({"batched_save_v1":[id, peer.region as u64, position as u64]}))?)?;
         Ok(json!({"type":"peer_saved","request_id":id,"region":peer.region,"position":position,
             "relocation":moved,"displaced_resident":displaced,"seconds":began.elapsed().as_secs_f64()}))
@@ -621,7 +639,8 @@ impl Worker {
     pub(crate) fn attach_peer(&mut self, id: u64) -> Result<Value> {
         let began = Instant::now();
         ensure!(enabled()? && self.current.is_none() && self.pending_prefill.is_none() && !self.prefill_cancelled
-            && self.peer_at_boundary(id)?, "attach needs a free region 0 and a region conversation at its region's end");
+            && (self.peer_at_boundary(id)? || self.lone_generating_peer() == Some(id)),
+            "attach needs a free region 0 and a boundary or lone generating region conversation");
         let mut displaced = Value::Null;
         if self.session.is_some() && !self.history.committed().is_empty() && self.session_cache_budget > 0 {
             let prefix = self.history.committed().to_vec();
@@ -651,6 +670,9 @@ impl Worker {
         self.current = Some(id);
         self.emitted = peer.emitted;
         self.limit = peer.limit;
+        self.turn_steps = peer.emitted.min(1);
+        self.long_history_cooldown = 0;
+        self.lone_peer_steps = 0;
         self.control.agree(&serde_json::to_vec(&json!({"batched_attach_v1":[id, peer.region as u64, position as u64]}))?)?;
         Ok(json!({"type":"attach","request_id":id,"region":peer.region,"position":position,"emitted":self.emitted,
             "limit":self.limit,"relocation":moved,"displaced_resident":displaced,"seconds":began.elapsed().as_secs_f64()}))
@@ -791,6 +813,11 @@ impl Worker {
         }
         let mut out = json!({"type":"batched_tokens","conversations":conversations,"owner_rows":rows,
             "rows_per_conversation":per,"region0":include_active,"seconds":began.elapsed().as_secs_f64()});
+        if !include_active && parts_n == 1 && self.lone_generating_peer().is_some() {
+            self.lone_peer_steps = self.lone_peer_steps.saturating_add(1);
+        } else {
+            self.lone_peer_steps = 0;
+        }
         if !grown.is_null() { out["region_caches_grown"] = grown; }
         Ok(out)
     }

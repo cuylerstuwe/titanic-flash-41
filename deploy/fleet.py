@@ -369,7 +369,7 @@ class Fleet:
                                 cache_bytes=268435456),
                     http=dict(bind=self.cfg['http_bind'], allow_remote=self.cfg['allow_remote'],
                               tokenizer='/data/model/tokenizer.json', bearer_file='/state/http.key',
-                              priority_file='/state/priority.key', output_stall_seconds=60, context_cache_mib=64) if rank == 0 else None)
+                              priority_file='/state/priority.key', output_stall_seconds=60, context_cache_mib=256) if rank == 0 else None)
 
     def launch(self):
         self.stop(self.state())

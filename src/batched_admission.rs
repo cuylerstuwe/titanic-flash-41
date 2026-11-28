@@ -227,6 +227,14 @@ pub(super) fn choose(w: &mut Worker, queue: &Queue, active: &mut Option<Job>,
             *active = Some(job);
             return Ok(Scheduled::Native(command));
         }
+        let attach_after = crate::config::lone_peer_attach_steps();
+        if attach_after > 0 && w.lone_peer_steps >= attach_after {
+            if let Some(id) = w.lone_generating_peer() {
+                if w.peer_region(id).is_some_and(|r| skip & (1u8 << r) == 0) {
+                    return Ok(Scheduled::AttachPeer(id));
+                }
+            }
+        }
         if stepping { return Ok(Scheduled::Batched(false, skip)); }
         if peers {
             // Every region conversation's reader is behind: wait for them.

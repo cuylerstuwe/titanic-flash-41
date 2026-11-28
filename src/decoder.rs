@@ -1502,7 +1502,9 @@ impl SwaLayer {
         // A tail registration the FFN did not take (no concurrent shared branch) is dropped; the window begins here.
         drop(crate::layer_attention::tail_w1_take(stream, crate::layer_attention::TailKind::Any));
         if let Some(q) = queue.as_ref() {
-            if let Some(w) = q.as_ref().and_then(|q| q.w1.as_ref()) && !w.is_open() { w.begin(stream)?; }
+            if let Some(w) = q.as_ref().and_then(|q| q.w1.as_ref()) && !w.is_open() {
+                w.begin_stopping(stream, crate::l2_prefetch::early_stop_active().then(|| comm.epoch_ptr()))?;
+            }
         } else if let Some(hint) = &self.next_input_prefetch {
             hint.begin(stream)?;
         }

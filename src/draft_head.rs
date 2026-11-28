@@ -21,7 +21,7 @@ pub(crate) use pair::Pair;
 pub(crate) struct DraftHead {
     cuda: Cuda,
     canonical: Rc<Weights>,
-    projection: Operator,
+    projection: Option<Operator>,
     gemv: Option<Operator>,
     gemv_active: Cell<bool>,
     integer: Option<IntegerHead>,
@@ -32,9 +32,10 @@ pub(crate) struct DraftHead {
     nvfp4_active: Cell<bool>,
     // Immutable after construction. Request owners may share these bytes,
     // while precision switches, operators and every activation stay private.
-    weights: Rc<Buffer<u8>>,
-    scales: Rc<Buffer<u8>>,
-    quantizer_sha256: String,
+    // Omitted (None) in NVFP4-only serving mode to reclaim ~170.7 MiB/rank UMA.
+    weights: Option<Rc<Buffer<u8>>>,
+    scales: Option<Rc<Buffer<u8>>>,
+    quantizer_sha256: Option<String>,
     stream: usize,
 }
 struct IntegerHead { projection:Operator, weights:Buffer<u8>, scales:Buffer<f32> }
@@ -97,15 +98,17 @@ pub fn qualify(path: &Path) -> Result<serde_json::Value> {
     let mut quantized_digest = Sha256::new();
     // Diagnostic hashing respects the same bounded host staging contract as
     // atlas loading. This private shard is larger than one permitted transfer.
-    for offset in (0..head.weights.bytes()).step_by(16 * 1024 * 1024) {
-        let bytes = (head.weights.bytes() - offset).min(16 * 1024 * 1024);
+    let fp8_weights = head.weights.as_ref().ok_or_else(|| anyhow::anyhow!("FP8 weights absent in qualify"))?;
+    let fp8_scales = head.scales.as_ref().ok_or_else(|| anyhow::anyhow!("FP8 scales absent in qualify"))?;
+    for offset in (0..fp8_weights.bytes()).step_by(16 * 1024 * 1024) {
+        let bytes = (fp8_weights.bytes() - offset).min(16 * 1024 * 1024);
         // Construction synchronized the quantizer and this is a live owned
         // byte buffer; offset+bytes never exceeds its allocation.
         quantized_digest
-            .update(unsafe { cuda.read_device(head.weights.ptr() + offset as u64, bytes) }?);
+            .update(unsafe { cuda.read_device(fp8_weights.ptr() + offset as u64, bytes) }?);
     }
     let quantized_sha256 = format!("{:x}", quantized_digest.finalize());
-    let scales_sha256 = format!("{:x}", Sha256::digest(head.scales.download()?));
+    let scales_sha256 = format!("{:x}", Sha256::digest(fp8_scales.download()?));
     let mut all_exact =
         quantized_sha256 == expected.quantized_sha256 && scales_sha256 == expected.scales_sha256;
     let mut input = cuda.allocate::<bf16>(M * K)?;
@@ -167,15 +170,45 @@ pub fn qualify(path: &Path) -> Result<serde_json::Value> {
     )
 }
 impl DraftHead {
+    pub(crate) fn nvfp4_only_mode() -> bool {
+        crate::config::draft_head_nvfp4()
+            && std::env::var("CANADA_SCRATCH_DRAFT_HEAD_FP8_KEEP").as_deref() != Ok("1")
+            && std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_GEMV").as_deref() != Ok("1")
+            && std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_GEMV_SCREEN").as_deref() != Ok("1")
+            && std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_INT8_SCREEN").as_deref() != Ok("1")
+            && std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_LOSSLESS_SCREEN").as_deref() != Ok("1")
+            && std::env::var("CANADA_SCRATCH_PRIVATE_HEAD_NVFP4_SCREEN").as_deref() != Ok("1")
+            && std::env::var("CANADA_SCRATCH_PAIRED_GENERATION_SCREEN").as_deref() != Ok("1")
+    }
     pub(crate) fn share_encoding_from(&mut self,source:&Self,stream:&Stream)->Result<usize> {
         ensure!(std::env::var("CANADA_SCRATCH_SHARED_DRAFT_HEAD").as_deref()==Ok("1")
             &&Rc::ptr_eq(&self.canonical,&source.canonical)&&self.cuda.owns_stream(stream)
-            &&self.stream==stream.raw()as usize&&self.stream==source.stream
-            &&self.projection.entry.artifact_sha256==source.projection.entry.artifact_sha256
-            &&self.quantizer_sha256==source.quantizer_sha256
-            &&self.weights.len()==source.weights.len()&&self.scales.len()==source.scales.len()
-            &&self.cuda.owns_buffer(&source.weights)&&self.cuda.owns_buffer(&source.scales),
+            &&self.stream==stream.raw()as usize&&self.stream==source.stream,
             "immutable draft-head sharing requires the same canonical source/encoding/stream");
+        if self.weights.is_none() && source.weights.is_none() {
+            ensure!(crate::config::draft_head_nvfp4() && source.nvfp4_active.get() && source.nvfp4.is_some(),
+                "NVFP4-only draft-head sharing requires an active NVFP4 source");
+            stream.synchronize()?;
+            if self.nvfp4.is_none() {
+                self.nvfp4 = source.nvfp4.clone();
+                self.nvfp4_active.set(true);
+            }
+            return Ok(0);
+        }
+        let (self_w, self_s) = (
+            self.weights.as_ref().ok_or_else(|| anyhow::anyhow!("destination FP8 draft head absent"))?,
+            self.scales.as_ref().ok_or_else(|| anyhow::anyhow!("destination FP8 draft scales absent"))?,
+        );
+        let (src_w, src_s) = (
+            source.weights.as_ref().ok_or_else(|| anyhow::anyhow!("source FP8 draft head absent"))?,
+            source.scales.as_ref().ok_or_else(|| anyhow::anyhow!("source FP8 draft scales absent"))?,
+        );
+        ensure!(self.projection.as_ref().map(|p| &p.entry.artifact_sha256)
+                == source.projection.as_ref().map(|p| &p.entry.artifact_sha256)
+            &&self.quantizer_sha256==source.quantizer_sha256
+            &&self_w.len()==src_w.len()&&self_s.len()==src_s.len()
+            &&self.cuda.owns_buffer(src_w)&&self.cuda.owns_buffer(src_s),
+            "immutable draft-head sharing requires matching FP8 encoding");
         // Only a fresh QueryNetwork may invoke this: no captured peer head
         // can still reference the old buffers when they are released.
         stream.synchronize()?;
@@ -183,17 +216,17 @@ impl DraftHead {
             use sha2::{Digest,Sha256};
             // Finite proof only: hash GPU-produced bytes before dropping the
             // redundant copy. Serving pays no download or hashing cost.
-            let digest=|head:&Self|->Result<String>{
+            let digest=|w:&Buffer<u8>, s:&Buffer<u8>|->Result<String>{
                 let mut hash=Sha256::new();
-                hash.update(head.weights.download()?);hash.update(head.scales.download()?);
+                hash.update(w.download()?);hash.update(s.download()?);
                 Ok(format!("{:x}",hash.finalize()))
             };
-            let own=digest(self)?;let shared=digest(source)?;
+            let own=digest(self_w, self_s)?;let shared=digest(src_w, src_s)?;
             ensure!(own==shared,"independently encoded draft-head bytes differ");
             eprintln!("draft_head_shared_encoding_proof {}",serde_json::json!({
-                "exact":true,"sha256":shared,"bytes":self.weights.bytes()+self.scales.bytes()}));
+                "exact":true,"sha256":shared,"bytes":self_w.bytes()+self_s.bytes()}));
         }
-        let reclaimed=if Rc::ptr_eq(&self.weights,&source.weights){0}else{self.weights.bytes()+self.scales.bytes()};
+        let reclaimed=if Rc::ptr_eq(self_w,src_w){0}else{self_w.bytes()+self_s.bytes()};
         self.weights=source.weights.clone();self.scales=source.scales.clone();
         // The serving NVFP4 copy is one a rank: drafters on the same ordered stream share the source's head whole
         // (its scratch is used by one pass at a time there).
@@ -299,6 +332,26 @@ impl DraftHead {
             "private draft-head canonical source"
         );
         let bytes = N * K + (N / 32) * (K / 32);
+        if Self::nvfp4_only_mode() {
+            eprintln!("DSpark private draft head: skipped unused FP8 allocation ({bytes} bytes) in NVFP4-only mode");
+            return Ok(Self {
+                cuda: cuda.clone(),
+                canonical,
+                projection: None,
+                gemv: None,
+                gemv_active: Cell::new(false),
+                integer: None,
+                integer_active: Cell::new(false),
+                lossless: None,
+                lossless_active: Cell::new(false),
+                nvfp4: None,
+                nvfp4_active: Cell::new(false),
+                weights: None,
+                scales: None,
+                quantizer_sha256: None,
+                stream: stream.raw() as usize,
+            });
+        }
         ensure!(
             cuda.admission_memory()?.admitted_available > bytes + crate::memory::floor_bytes(),
             "private draft-head copy would consume reserved host/device headroom"
@@ -343,7 +396,7 @@ impl DraftHead {
         Ok(Self {
             cuda: cuda.clone(),
             canonical,
-            projection,
+            projection: Some(projection),
             gemv:None,
             gemv_active:Cell::new(false),
             integer:None,
@@ -352,9 +405,9 @@ impl DraftHead {
             lossless_active:Cell::new(false),
             nvfp4:None,
             nvfp4_active:Cell::new(false),
-            weights,
-            scales,
-            quantizer_sha256: quantizer.entry.artifact_sha256.clone(),
+            weights: Some(weights),
+            scales: Some(scales),
+            quantizer_sha256: Some(quantizer.entry.artifact_sha256.clone()),
             stream: stream.raw() as usize,
         })
     }
@@ -384,13 +437,16 @@ impl DraftHead {
                 return head.projection.launch(N as u32,
                     &[input.ptr(),head.weights.ptr(),head.scales.ptr(),output.ptr()],stream);
             }
-            let projection=if self.gemv_active.get(){self.gemv.as_ref().expect("active private GEMV loaded")}else{&self.projection};
+            let weights = self.weights.as_ref().ok_or_else(|| anyhow::anyhow!("FP8 draft head omitted in NVFP4-only mode"))?;
+            let scales = self.scales.as_ref().ok_or_else(|| anyhow::anyhow!("FP8 draft scales omitted in NVFP4-only mode"))?;
+            let projection=if self.gemv_active.get(){self.gemv.as_ref().expect("active private GEMV loaded")}
+                else{self.projection.as_ref().ok_or_else(|| anyhow::anyhow!("FP8 draft projection omitted in NVFP4-only mode"))?};
             projection.launch(
                 N as u32,
                 &[
                     input.ptr(),
-                    self.weights.ptr(),
-                    self.scales.ptr(),
+                    weights.ptr(),
+                    scales.ptr(),
                     output.ptr(),
                 ],
                 stream,

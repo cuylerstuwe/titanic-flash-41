@@ -1,0 +1,16 @@
+{
+ "source_manifest_sha256": "f70610b580a96a550b9120a8780867502b2c830c3147528a3fe9a52a9e3b6b97",
+ "ptxas": "Build cuda_13.0.r13.0/compiler.36424714_0",
+ "patched_load": "@%p2 ld.global.v4.b32 { %r20, %r21, %r22, %r23 }, [ %rd13 + 0 ];",
+ "kernels": {
+  "lossless_head_m9": {
+   "source_ptx_sha256": "78f7e6f8348a48acfbfa93cd09cc4f581199026c67d4ad528ca935bee8753f56",
+   "cubin_sha256": "cc7d120613548330631a657fac33e874ca0d2f37d87068bdbcdc4f2309ea4db5"
+  },
+  "lossless_head_m12": {
+   "source_ptx_sha256": "5eb6cac0c224402f1980407345075dcbfe11aa48a8cb16bf0999903577c883e0",
+   "cubin_sha256": "259db1349614b1e80c8855ca4a88fd31197c0112ccf9a67b3f0664513e0eb10b"
+  }
+ },
+ "manifest_sha256": "7f7fbc3280b388d09465f26286fee67e8eacba7b4859a954364467f05e678671"
+}

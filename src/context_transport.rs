@@ -265,6 +265,24 @@ impl Cache {
         self.snapshots.clear();
         self.blobs.clear();
     }
+    /// Evict oldest snapshots until at least `target_bytes` are freed (or only one newest snapshot remains,
+    /// unless `allow_last` is true). Preserves active conversations' transport receipts under mild pressure.
+    pub fn trim_oldest(&mut self, target_bytes: usize, allow_last: bool) -> usize {
+        let before = self.stats().retained_bytes;
+        if before == 0 || target_bytes == 0 {
+            return 0;
+        }
+        let min_keep = usize::from(!allow_last);
+        while self.snapshots.len() > min_keep
+            && before.saturating_sub(self.stats().retained_bytes) < target_bytes
+        {
+            if !self.evict_oldest() {
+                break;
+            }
+            self.blobs.retain(|_, value| value.strong_count() > 0);
+        }
+        before.saturating_sub(self.stats().retained_bytes)
+    }
     pub fn stats(&self) -> Stats {
         Stats {
             retained_bytes: self.live.load(Ordering::Relaxed),
@@ -796,5 +814,27 @@ mod tests {
             .code,
             "context_invalid"
         );
+    }
+    #[test]
+    fn trim_oldest_preserves_newest_snapshot_unless_allow_last() {
+        let mut c = Cache::new(1 << 20, 8, 10_000);
+        let m1 = json!({"role":"user","content":"a".repeat(2000)});
+        let m2 = json!({"role":"user","content":"b".repeat(2000)});
+        let m3 = json!({"role":"user","content":"c".repeat(2000)});
+        let r1 = resolve(&mut c, &wire(&[m1.clone()], None, &[m1], NS), 10);
+        let r2 = resolve(&mut c, &wire(&[m2.clone()], None, &[m2], NS), 20);
+        let r3 = resolve(&mut c, &wire(&[m3.clone()], None, &[m3], NS), 30);
+        assert_eq!(c.stats().snapshots, 3);
+        let before = c.stats().retained_bytes;
+        let freed = c.trim_oldest(before / 2, false);
+        assert!(freed > 0);
+        assert!(c.stats().snapshots >= 1);
+        // Newest snapshot r3 survives partial trim; oldest r1 was evicted.
+        assert!(c.resolve("authenticated-user", &wire(&[json!({"role":"user","content":"c".repeat(2000)})], Some((&r3.key, 1)), &[], NS), 31, 1 << 20).is_ok());
+        assert_eq!(c.resolve("authenticated-user", &wire(&[json!({"role":"user","content":"a".repeat(2000)})], Some((&r1.key, 1)), &[], NS), 31, 1 << 20).unwrap_err().code, "context_miss");
+        let _ = r2;
+        c.trim_oldest(usize::MAX, true);
+        assert_eq!(c.stats().snapshots, 0);
+        assert_eq!(c.stats().retained_bytes, 0);
     }
 }

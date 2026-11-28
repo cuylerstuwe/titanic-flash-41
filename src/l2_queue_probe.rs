@@ -325,6 +325,10 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
     // The six-row head's bit-plane layout on that table against the compact head (CANADA_SCRATCH_HEAD_PLANES_SCREEN=1
     // with CANADA_SCRATCH_HEAD_COMPACT_EXCEPTIONS=1; checklist step 5): six-row owner, after that one.
     let head_planes = owner == 6 && crate::config::head_planes_screen();
+    // One-bit MoE scale code screen (CANADA_SCRATCH_MOE_SCALE_CODE1_SCREEN=1): six-row owner, with 12 warm-up iters.
+    let scale_code1 = owner == 6 && crate::config::moe_scale_code1_screen();
+    // Arrival-triggered early-stop L2 hint screen (CANADA_SCRATCH_L2_EARLY_STOP_SCREEN=1): same-allocation A/B.
+    let l2_early_stop = crate::config::l2_early_stop_screen();
     let live_variants: &[(&str, usize, usize, bool)] = if owner == 6
         && std::env::var("CANADA_SCRATCH_MOE_LIVE_VARIANTS_SCREEN").as_deref() == Ok("1") {
         &[("cache-ca plan from two live rows", 2, 6, false), ("fused FFN sum from two live rows", 6, 2, false),
@@ -341,9 +345,12 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
         let mut expected = None;
         // The direct-read wq_b (CANADA_SCRATCH_WQB_DIRECT_SCREEN=1, six-row owner): after every other variant, on
         // plan 0 or (…_SCREEN_ALL=1) on every plan; other arithmetic, so a difference is recorded, not fatal.
-        let direct_plans = if !(owner == 6 && (crate::config::wqb_direct_screen() || crate::config::qkva_direct_screen())) { 0 }
+        let direct_plans = if !(owner == 6 && (crate::config::wqb_direct_screen()
+                || crate::config::qkva_direct_screen()
+                || crate::config::wob_direct_screen()
+                || crate::config::woa_fused_direct_screen())) { 0 }
             else if crate::config::wqb_direct_screen_all() { plans.len().max(1) } else { 1 };
-        let direct_base = plans.len() + woa_plans + grids.len() + lates.len() + usize::from(early) + phases.len() + usize::from(bounded) + live_variants.len() + usize::from(keys_fork) + usize::from(index_lead) + usize::from(engram_lead) + usize::from(native_front) + usize::from(union_share) + usize::from(index_fork) + usize::from(qkv_narrow) + usize::from(route_front) + usize::from(scale_codes) + usize::from(gate_sep) + usize::from(head_compact) + usize::from(head_planes);
+        let direct_base = plans.len() + woa_plans + grids.len() + lates.len() + usize::from(early) + phases.len() + usize::from(bounded) + live_variants.len() + usize::from(keys_fork) + usize::from(index_lead) + usize::from(engram_lead) + usize::from(native_front) + usize::from(union_share) + usize::from(index_fork) + usize::from(qkv_narrow) + usize::from(route_front) + usize::from(scale_codes) + usize::from(gate_sep) + usize::from(head_compact) + usize::from(head_planes) + usize::from(scale_code1) + usize::from(l2_early_stop);
         // The attention boundaries' statistics by rank quarter (CANADA_SCRATCH_MHC_QUARTER_STATS_SCREEN=1; six-row
         // owner): one more variant after those, on plan 0 in both arms. Bit-identical by construction: the
         // screen's logit and sample comparison is its check.
@@ -402,6 +409,8 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
             let planes_variant = head_planes && index == first_live_variant + live_variants.len() + usize::from(keys_fork)
                 + usize::from(index_lead) + usize::from(engram_lead) + usize::from(native_front) + usize::from(union_share) + usize::from(index_fork)
                 + usize::from(qkv_narrow) + usize::from(route_front) + usize::from(scale_codes) + usize::from(gate_sep) + usize::from(head_compact);
+            let scale_code1_variant = scale_code1 && index == direct_base - usize::from(l2_early_stop) - 1;
+            let l2_early_stop_variant = l2_early_stop && index == direct_base - 1;
             let direct_plan = (index >= direct_base && index < direct_base + direct_plans).then(|| index - direct_base);
             let quarter_variant = quarter && index == direct_base + direct_plans;
             let head4_variant = head4 && index == direct_base + direct_plans + usize::from(quarter);
@@ -433,6 +442,12 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
                 } else if scale_variant {
                     target.set_l2_queue_for_probe((!plans.is_empty()).then_some(0), stream)?;
                     target.set_moe_scale_codes_for_probe(on, stream)?;
+                } else if scale_code1_variant {
+                    target.set_l2_queue_for_probe((!plans.is_empty()).then_some(0), stream)?;
+                    target.set_moe_scale_code1_for_probe(on, stream)?;
+                } else if l2_early_stop_variant {
+                    crate::l2_prefetch::set_early_stop_for_probe(Some(on));
+                    target.set_l2_queue_for_probe((!plans.is_empty()).then_some(0), stream)?;
                 } else if route_variant {
                     target.set_l2_queue_for_probe((!plans.is_empty()).then_some(0), stream)?;
                     target.set_moe_route_front_for_probe(on, stream)?;
@@ -491,7 +506,8 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
                     target.set_l2_queue_for_probe((!plans.is_empty()).then_some(0), stream)?;
                     target.set_injection_for_probe(on.then_some(*arm), stream)?;
                 } else if let Some((_, mask)) = &knock {
-                    target.set_l2_queue_for_probe((!plans.is_empty()).then_some(knock_plan), stream)?;
+                    let hints_off = crate::config::knockout_hints_off();
+                    target.set_l2_queue_for_probe((!hints_off && !plans.is_empty()).then_some(knock_plan), stream)?;
                     target.set_knockout_for_probe(0, stream)?;
                     if on {
                         // The previous arm ended on the changed input: run this step once in full so every buffer
@@ -503,7 +519,8 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
                 } else {
                     target.set_l2_queue_for_probe(arm, stream)?;
                 }
-                for _ in 0..4 {
+                let warmups = crate::config::l2_queue_warmups().unwrap_or(if scale_code1_variant { 12 } else { 4 });
+                for _ in 0..warmups {
                     target.begin_verification(proposed, comm, stream)?;
                     target.finish_verification(0, comm, stream)?;
                 }
@@ -563,7 +580,7 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
                 ensure!(checks[0]["logits_sha256"] != checks[1]["logits_sha256"],
                     "changed L2 queue inputs did not change logits");
                 if let Some(reference) = &expected {
-                    if direct_plan.is_some() || native || grid.is_some() || late.is_some() || index_early || phase.is_some() || bounded_mask || live_variant.is_some() || fork_variant || lead_variant || engram_variant || front_variant || union_variant || ifork_variant || qkv_variant || route_variant || scale_variant || sep_variant || compact_variant || planes_variant || head4_variant { exact &= reference == &checks; }
+                    if direct_plan.is_some() || native || grid.is_some() || late.is_some() || index_early || phase.is_some() || bounded_mask || live_variant.is_some() || fork_variant || lead_variant || engram_variant || front_variant || union_variant || ifork_variant || qkv_variant || route_variant || scale_variant || scale_code1_variant || l2_early_stop_variant || sep_variant || compact_variant || planes_variant || head4_variant { exact &= reference == &checks; }
                     else { ensure!(reference == &checks, "an L2 queue plan changed full logits or target T1 samples"); }
                 } else { expected = Some(checks.clone()); }
                 let mean = samples.iter().sum::<f64>() / samples.len() as f64;
@@ -577,6 +594,38 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
                 means[usize::from(arm.is_some())] += mean / 2.;
                 records.push(json!({"owner_rows":owner,"live":live,"plan":index,"queue":arm.is_some(),"trial":trial,
                     "mean_ms":mean,"samples_ms":samples,"roce_counter_deltas":moved,"clock":clocks}));
+            }
+            if l2_early_stop_variant {
+                crate::l2_prefetch::set_early_stop_for_probe(None);
+                let arm = |queue: bool| { let mut all = records.iter().rev().take(4).filter(|r| r["queue"] == queue)
+                    .flat_map(|r| r["samples_ms"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap())).collect::<Vec<_>>();
+                    all.sort_by(f64::total_cmp); (all[0], all[all.len() / 2]) };
+                let ((floor0, median0), (floor1, median1)) = (arm(false), arm(true));
+                ensure!(exact, "arrival-triggered L2 early-stop changed logits or samples in the plan screen");
+                eprintln!("rank{rank} L2 early-stop M{owner} live{live}: control {:.3} ms, early_stop {:.3} ms ({:+.2}%), medians {median0:.3} / {median1:.3} ({:+.2}%), floors {floor0:.3} / {floor1:.3}, logits and samples exact {exact}",
+                    means[0], means[1], 100.*(means[1]/means[0]-1.), 100.*(median1/median0-1.));
+                summary.push(json!({"owner_rows":owner,"live":live,"plan":index,"variant":"arrival-triggered L2 early-stop (ca_l2_paced_stop watching RoCE epoch) on W1/W2",
+                    "exact":exact,"control_ms":means[0],"queue_ms":means[1],
+                    "delta_ms":means[1]-means[0],"delta_percent":100.*(means[1]/means[0]-1.),
+                    "control_median_ms":median0,"queue_median_ms":median1,"delta_median_ms":median1-median0,
+                    "control_floor_ms":floor0,"queue_floor_ms":floor1,"delta_floor_ms":floor1-floor0}));
+                continue;
+            }
+            if scale_code1_variant {
+                target.set_moe_scale_code1_for_probe(crate::config::moe_scale_code1()?, stream)?;
+                let arm = |queue: bool| { let mut all = records.iter().rev().take(4).filter(|r| r["queue"] == queue)
+                    .flat_map(|r| r["samples_ms"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap())).collect::<Vec<_>>();
+                    all.sort_by(f64::total_cmp); (all[0], all[all.len() / 2]) };
+                let ((floor0, median0), (floor1, median1)) = (arm(false), arm(true));
+                ensure!(exact, "one-bit MoE scale code changed logits or samples in the plan screen");
+                eprintln!("rank{rank} one-bit MoE scale code M{owner} live{live}: control {:.3} ms, coded {:.3} ms ({:+.2}%), medians {median0:.3} / {median1:.3} ({:+.2}%), floors {floor0:.3} / {floor1:.3}, logits and samples exact {exact}",
+                    means[0], means[1], 100.*(means[1]/means[0]-1.), 100.*(median1/median0-1.));
+                summary.push(json!({"owner_rows":owner,"live":live,"plan":index,"variant":"one-bit MoE scale code (moe-runtime-m6-scale1-v1) against cache-ca",
+                    "exact":exact,"control_ms":means[0],"queue_ms":means[1],
+                    "delta_ms":means[1]-means[0],"delta_percent":100.*(means[1]/means[0]-1.),
+                    "control_median_ms":median0,"queue_median_ms":median1,"delta_median_ms":median1-median0,
+                    "control_floor_ms":floor0,"queue_floor_ms":floor1,"delta_floor_ms":floor1-floor0}));
+                continue;
             }
             if scale_variant {
                 target.set_moe_scale_codes_for_probe(false, stream)?;
@@ -817,10 +866,11 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
             }
             if let Some((name, _)) = &knock {
                 target.set_knockout_for_probe(0, stream)?;
-                eprintln!("rank{rank} knockout {name} on plan {knock_plan} M{owner} live{live}: control {:.3} ms, without {:.3} ms ({:+.2}%)",
+                let mode = if crate::config::knockout_hints_off() { "hints off".to_string() } else { format!("plan {knock_plan}") };
+                eprintln!("rank{rank} knockout {name} on {mode} M{owner} live{live}: control {:.3} ms, without {:.3} ms ({:+.2}%)",
                     means[0], means[1], 100.*(means[1]/means[0]-1.));
                 summary.push(json!({"owner_rows":owner,"live":live,"plan":index,
-                    "variant":format!("knockout {name} on plan {knock_plan} (timing only: the group's outputs are reused)"),
+                    "variant":format!("knockout {name} on {mode} (timing only: the group's outputs are reused)"),
                     "exact":exact,"control_ms":means[0],"queue_ms":means[1],"delta_ms":means[1]-means[0],
                     "delta_percent":100.*(means[1]/means[0]-1.)}));
                 continue;
@@ -909,17 +959,26 @@ fn screen_owner(target: &mut Target, comm: &Roce, stream: &Stream, cuda: &Cuda, 
                         same_top += usize::from(top(x) == top(y)); rows_seen += 1;
                     }
                 }
+                let med = |queue: bool| {
+                    let mut v: Vec<f64> = records.iter().rev().take(4).filter(|r| r["queue"] == queue)
+                        .flat_map(|r| r["samples_ms"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()))
+                        .collect();
+                    v.sort_by(f64::total_cmp);
+                    v[v.len() / 2]
+                };
+                let (med0, med1) = (med(false), med(true));
                 let floor = |queue: bool| records.iter().rev().take(4).filter(|r| r["queue"] == queue)
                     .flat_map(|r| r["samples_ms"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()))
                     .fold(f64::INFINITY, f64::min);
                 let (floor0, floor1) = (floor(false), floor(true));
-                eprintln!("rank{rank} direct wq_b on plan {plan} M{owner} live{live}: exported {:.3} ms, direct {:.3} ms ({:+.2}%), floors {floor0:.3} / {floor1:.3}, largest logit difference {largest:.4}, same top-1 {same_top}/{rows_seen}, bit-identical {exact}",
+                eprintln!("rank{rank} direct dense on plan {plan} M{owner} live{live}: exported {:.3} ms, direct {:.3} ms ({:+.2}%), medians {med0:.3} / {med1:.3}, floors {floor0:.3} / {floor1:.3}, largest logit difference {largest:.4}, same top-1 {same_top}/{rows_seen}, bit-identical {exact}",
                     means[0], means[1], 100.*(means[1]/means[0]-1.));
                 summary.push(json!({"owner_rows":owner,"live":live,"plan":index,
                     "variant":format!("direct-read projections on plan {plan}"),"first_layer_outputs":kernel_check,
                     "exact":exact,"largest_logit_difference":largest,"same_top1_rows":same_top,"rows":rows_seen,
                     "control_ms":means[0],"queue_ms":means[1],"delta_ms":means[1]-means[0],
                     "delta_percent":100.*(means[1]/means[0]-1.),
+                    "control_median_ms":med0,"queue_median_ms":med1,"delta_median_ms":med1-med0,
                     "control_floor_ms":floor0,"queue_floor_ms":floor1,"delta_floor_ms":floor1-floor0}));
                 continue;
             }

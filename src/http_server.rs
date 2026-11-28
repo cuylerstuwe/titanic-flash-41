@@ -117,7 +117,7 @@ impl ServerConfig {
         ensure!(ip.is_loopback() || (self.allow_remote && fleet && self.priority_file.is_some()),
             "remote native HTTP requires explicit fleet binding and scheduler authentication");
         ensure!((1..=300).contains(&self.output_stall_seconds), "output stall timeout must be 1..300 seconds");
-        ensure!(self.context_cache_mib <= 128, "context transport cache is bounded at128MiB");
+        ensure!(self.context_cache_mib <= 512, "context transport cache is bounded at 512 MiB");
         Ok(())
     }
 }
@@ -1330,7 +1330,7 @@ pub(crate) fn start(config: &ServerConfig, capacity: usize, images: bool) -> Res
         waiting_image_budget: AtomicUsize::new(0),
         waiting_raw_pool: Mutex::new(None),
         context_cache: (config.context_cache_mib > 0).then(|| Mutex::new(crate::context_transport::Cache::new(
-            config.context_cache_mib << 20, 16, 30 * 60 * 1000))),
+            config.context_cache_mib << 20, 64, 4 * 60 * 60 * 1000))),
         health: AtomicU8::new(LOADING),
         progress: Arc::new(AtomicU64::new(0)),
         progress_gap_ms: AtomicU64::new(0),

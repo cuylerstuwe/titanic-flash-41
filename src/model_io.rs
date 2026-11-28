@@ -45,6 +45,8 @@ pub struct ModelIo {
     // Optional final-only head scratch; immutable encoding is shared with
     // the existing M6 verifier. No second encoded/canonical weight copy.
     append_encoded: Option<(Rc<crate::lossless_head::Head>,Buffer<bf16>)>,
+    // Optional shared compact lossless head for 16/32/64-row verification profiles.
+    compact_multirow: Option<Rc<crate::lossless_head::Head>>,
     prefill_encoded_active: bool,
     prefill_row_pruned: bool,
     // Private per-CTA row history for the final-only M128 publication kernel.
@@ -224,6 +226,15 @@ impl ModelIo {
                 head.with_shared_lossless_head(&root,stream,&lossless_atlas)?
             }else{head.with_lossless_head(&root,stream)?};
         }
+        let compact_multirow = if !input_only && head_rows >= 16 && crate::config::compact_multirow_head() {
+            lossless_atlas
+                .borrow()
+                .as_ref()
+                .filter(|h| h.is_compact_multirow_ready())
+                .cloned()
+        } else {
+            None
+        };
         Ok(Self {
             cuda: cuda.clone(),
             module: cuda.module(core)?,
@@ -245,6 +256,7 @@ impl ModelIo {
             last_input: cuda.allocate(5120)?,
             last_gathered: cuda.allocate(129280)?,
             append_encoded:None,
+            compact_multirow,
             prefill_encoded_active:false,
             prefill_row_pruned:false,
             last_published_rows:None,
@@ -296,7 +308,7 @@ impl ModelIo {
         if self.append_encoded.is_some(){return Ok(());}
         let head=self.lossless_atlas.borrow().as_ref().cloned()
             .ok_or_else(||anyhow::anyhow!("final head needs the existing shared M6 encoding"))?;
-        ensure!(head.matches_canonical(&self.cuda,self.weights.ptr("head.weight")?,stream)
+        ensure!(head.matches_canonical(&self.cuda,self.weights.canonical_head_tag()?,stream)
             &&self.cuda.admission_memory()?.admitted_available>=crate::memory::floor_bytes()+6*5120*2,
             "final head shared encoding/reserve");
         let mut input=self.cuda.allocate::<bf16>(6*5120)?;input.zero()?;
@@ -489,6 +501,28 @@ impl ModelIo {
     ) -> Result<()> {
         self.prepare_head(residual, pre, stream)?;
         self.head.run(&self.normalized, stream)
+    }
+    pub(crate) fn run_head_live(
+        &mut self,
+        residual: &Buffer<bf16>,
+        pre: &Buffer<f32>,
+        live: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if let Some(head) = self.compact_multirow.clone().filter(|h| h.is_compact_multirow_ready()) {
+            self.prepare_head(residual, pre, stream)?;
+            return head.run_compact_rows(
+                self.normalized.ptr(),
+                self.head.output().ptr(),
+                live,
+                self.rows,
+                stream,
+            );
+        }
+        self.run_head(residual, pre, stream)
+    }
+    pub(crate) fn release_canonical_head(&self) -> Result<usize> {
+        self.weights.release_canonical_head()
     }
     /// DSpark supplies its own final-stage normalization while reusing the
     /// canonical target vocabulary atlas. No duplicate head/embedding weights.

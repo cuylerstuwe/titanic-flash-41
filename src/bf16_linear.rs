@@ -56,7 +56,11 @@ impl<T: Output> Projection<T> {
         );
         let n = w.shape[0] as usize;
         let k = w.shape[1] as usize;
-        let pointer = weights.ptr(&name)?;
+        let pointer = if name == "head.weight" && weights.canonical_head_released() {
+            0
+        } else {
+            weights.ptr(&name)?
+        };
         Self::view(cuda, weights, blas, pointer, rows, n, k)
     }
     pub fn compressor_pair(
@@ -183,7 +187,7 @@ impl<T: Output> Projection<T> {
             "shared lossless head requires canonical M6 BF16/FP32 GEMV");
         let previous=atlas.borrow().clone();
         if let Some(head)=previous {
-            ensure!(head.matches_canonical(&self.cuda,self.pointer,stream),"shared head atlas has a different canonical operand/context");
+            ensure!(head.matches_canonical(&self.cuda,self._weights.canonical_head_tag()?,stream),"shared head atlas has a different canonical operand/context");
             self.lossless_head=Some(head);self.lossless_active.set(true);
         }else{
             self=self.with_lossless_head(root,stream)?;
@@ -238,6 +242,7 @@ impl<T: Output> Projection<T> {
         if self.lossless_active.get() {
             return self.lossless_head.as_ref().unwrap().run(input.ptr(),self.output.ptr(),stream);
         }
+        ensure!(self.pointer != 0, "canonical BF16 head weight was released; use compact lossless head");
         if let Some(op) = self.head_gemv.as_ref().filter(|_| self.head_gemv_active.get()) {
             let args=[input.ptr(),self.pointer,self.output.ptr(),self.output.ptr()];
             // This kernel's grid enumerates vocabulary rows. The batch size

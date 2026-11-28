@@ -2694,7 +2694,9 @@ impl Target {
     /// Plan screen (CANADA_SCRATCH_WQB_DIRECT_SCREEN): every layer's wq_b on the direct-read GEMV or back on the
     /// exported kernel; graphs are recaptured.
     pub(crate) fn set_wqb_direct_for_probe(&mut self, on: Option<bool>, stream: &Stream) -> Result<()> {
-        ensure!((crate::config::wqb_direct_screen() || crate::config::qkva_direct_screen()) && self.rows == 6 && self.source_phase == Phase::Verify
+        ensure!((crate::config::wqb_direct_screen() || crate::config::qkva_direct_screen()
+                || crate::config::wob_direct_screen() || crate::config::woa_fused_direct_screen())
+            && self.rows == 6 && self.source_phase == Phase::Verify
             && self.pending.is_none() && self.lease.is_current() && self.graph_replay && self.cuda.owns_stream(stream)
             && stream.raw() as usize == self.stream && self.tiny_append_graphs.is_none(), "idle direct wq_b screen");
         stream.synchronize()?;
@@ -3668,6 +3670,9 @@ impl Target {
     pub(crate) fn shares_lossless_target_head(&self,other:&Self)->bool {
         self.io.shares_lossless_head(&other.io)
     }
+    pub(crate) fn release_canonical_head(&self)->Result<usize> {
+        self.io.release_canonical_head()
+    }
     pub fn shared_state_report(&self, other: &Self) -> serde_json::Value {
         // The wide encoder profile owns layers0..20 only; compare that prefix.
         let layers = |t: &Self| if t.wide.is_some() { 21 } else { 40 };
@@ -4266,6 +4271,19 @@ impl Target {
         for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
         self.decoder_graph=None;
         for layer in self.layer_owners(){layer.narrow_workspace().set_scale_codes_for_probe(enabled,stream)?;}
+        Ok(())
+    }
+    pub(crate) fn set_moe_scale_code1_for_probe(&mut self,enabled:bool,stream:&Stream)->Result<()> {
+        ensure!(crate::config::moe_scale_code1_screen()
+            &&self.rows==6&&self.source_phase==Phase::Verify&&self.pending.is_none()
+            &&self.lease.is_current()&&self.graph_replay&&self.cuda.owns_stream(stream)
+            &&stream.raw()as usize==self.stream&&self.tiny_append_graphs.is_none(),
+            "idle one-bit scale-code screen ownership");
+        stream.synchronize()?;
+        for graph in self.graphs.iter_mut().chain(&mut self.alternate_index_graphs){*graph=None;}
+        for graph in self.engram_graphs.iter_mut().chain(&mut self.alternate_index_engram_graphs){*graph=None;}
+        self.decoder_graph=None;
+        for layer in self.layer_owners(){layer.narrow_workspace().set_scale_code1_for_probe(enabled,stream)?;}
         Ok(())
     }
     pub(crate) fn prepare_wo_b_alternates_for_probe(&self,kernels:&Path)->Result<Vec<crate::fp8_linear::Linear>> {
@@ -8611,7 +8629,7 @@ impl Target {
                 // crate::head4_rescore (an option, off by default; it approximates the model's own output head, see its
                 // module documentation): the 4-bit copy of the head, exact rescoring of the largest rows.
                 self.io.run_head4(self.late.output(), self.late.pre(), self.tokens.active_rows(), stream)?;
-            } else {self.io.run_head(self.late.output(), self.late.pre(), stream)?;}
+            } else {self.io.run_head_live(self.late.output(), self.late.pre(), self.tokens.active_rows(), stream)?;}
             if self.append_last_gather&&self.cached_decoder.is_some()&&self.tokens.active_rows()>1 {
                 self.io.gather_existing_last_logits(comm,&self.tokens,stream)?;
             } else if !self.compact_sampling_active() {self.io.gather_logits(comm, stream)?;}

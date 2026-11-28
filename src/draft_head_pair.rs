@@ -19,8 +19,11 @@ pub(crate) struct Pair {
 impl DraftHead {
     pub(crate) fn can_pool_with(&self,other:&Self)->bool {
         Rc::ptr_eq(&self.canonical,&other.canonical)&&self.stream==other.stream
-            &&self.quantizer_sha256==other.quantizer_sha256
-            &&self.projection.entry.artifact_sha256==other.projection.entry.artifact_sha256
+            &&self.weights.is_some()&&other.weights.is_some()
+            &&self.scales.is_some()&&other.scales.is_some()
+            &&self.quantizer_sha256.is_some()&&self.quantizer_sha256==other.quantizer_sha256
+            &&self.projection.as_ref().zip(other.projection.as_ref())
+                .is_some_and(|(a,b)|a.entry.artifact_sha256==b.entry.artifact_sha256)
             && !self.gemv_active.get()&&!other.gemv_active.get()
             && !self.integer_active.get()&&!other.integer_active.get()
             && !self.lossless_active.get()&&!other.lossless_active.get()
@@ -50,7 +53,8 @@ impl Pair {
             &&inputs[0].ptr()!=inputs[1].ptr()&&outputs[0].ptr()!=outputs[1].ptr(),
             "paired head source/context/private output contract");
         let bindings=[inputs[0].ptr(),inputs[1].ptr(),outputs[0].ptr(),outputs[1].ptr(),
-            heads[0].weights.ptr(),heads[0].scales.ptr()];
+            heads[0].weights.as_ref().expect("FP8 paired weights").ptr(),
+            heads[0].scales.as_ref().expect("FP8 paired scales").ptr()];
         let index=match self.graphs.iter().position(|(b,_)|*b==bindings) {
             Some(index)=>index,
             None=>{

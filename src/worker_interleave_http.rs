@@ -153,6 +153,7 @@ fn execute(w:&mut Worker,images:&mut Vec<ParkedRequest>,command:Scheduled,
     if let Scheduled::Native(c)|Scheduled::BeginBackground(c)=&command {w.select_resident_bank(c)?;}
     w.loaded_request_is_suspended=matches!(command,Scheduled::Native(Command::Begin{..})|Scheduled::BeginBackground(_))
         && images.iter().any(|p|p.matches_history(&w.history));
+    if !matches!(command, Scheduled::Batched(..)) { w.batched_timing.reset_last_end(); }
     let result=match command {
         Scheduled::Priority(snapshot)=>{
             ensure!(snapshot.revision>=priority.revision,"priority revision went backwards");

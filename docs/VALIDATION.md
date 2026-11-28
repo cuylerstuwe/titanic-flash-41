@@ -1,5 +1,42 @@
 # Validation status
 
+## November 27 memory, cache, and decode optimization release (s1706)
+
+Release s1706 builds on s1701's UMA resilience base with five verified improvements across memory reclamation, multi-turn cache retention, batched scheduling, short-suffix appends, and bit-exact decode latency:
+
+1. **Unified-memory weight reclamation (+496.6 MB/rank = +1.99 GB cluster):**
+   - NVFP4-only draft head (`CANADA_SCRATCH_DRAFT_HEAD_NVFP4=1`) skips the unused 165.64 MB/rank FP8 draft-head allocation.
+   - Compact M6/M9/M12 lossless heads (`runtime/kernels/target-head-lossless-paired-compact-v1`, 430 KB escape table, 872,640/872,640 logits verified bit-exact on GPU at load) allow releasing the canonical 330.96 MB/rank BF16 `head.weight` backing (`CANADA_SCRATCH_RELEASE_CANONICAL_HEAD=1`) while also routing 16/32-row verification heads through compact M6/M9/M12 tiles.
+2. **Multi-turn & multi-image cache retention:**
+   - Default `context_cache_mib` increased from 64 to 256 MiB (`deploy/fleet.py`) and `CANADA_SCRATCH_IMAGE_SOURCE_STORE_MIB` raised from 384 to 1,024 MiB (`deploy/profile.json`), preventing `context_miss` cascades and multi-image re-encoding stalls on long tool-calling histories.
+   - `wide16` prefill chunk borrowing can spill parkable resident checkpoints directly to NVMe when needed so large cold prefills (>=128K tokens) retain 16K prefill chunks instead of falling back to 8K chunks.
+3. **Batched decode & copy-speculation hygiene:**
+   - Lone region peers automatically relocate back to the primary 6-row owner via `AttachPeer` after 2 steps (`lone_peer_attach_steps`), eliminating single-stream stranding on the 16-row batched owner while preserving s1701's bounded M16 graph budget (`16 => 28`).
+   - A step-0 copy guard with a 3-step cooldown suppresses cold-continuation 16/32-row copy misses.
+4. **33–64-token two-chunk small append:**
+   - Live cached continuations of 33–64 uncached tokens execute as two small-append chunks (`M32` + `M6`/`M16`/`M32`, zero extra UMA) instead of falling through to the 128-row prefill path.
+5. **Bit-exact decode optimizations enabled in serving (`deploy/profile.json`):**
+   - `CANADA_SCRATCH_MHC_QUARTER_STATS=1` (`-0.08 to -0.16 ms/step` median/floor across `live=2/3/6`, bit-exact).
+   - `CANADA_SCRATCH_INDEX_FORK=1` (`-0.17 to -0.38 ms/step` median at 131K context, bit-exact).
+   - `CANADA_SCRATCH_MOE_ROUTE_FRONT=1` (`-0.08 to -0.10 ms/step` at 131K context, bit-exact).
+   - *(Screened and intentionally left off in serving: `MOE_SCALE_CODE1` was speed-neutral while saving 737 MiB/rank when off; `L2_EARLY_STOP` regressed +0.31–0.38 ms; `ROCE_HOST_NUMA` regressed collectives +0.12–0.67 us; `L2_QUEUE_ENGRAM_LEAD` regressed floors +0.15–0.22 ms; opt-in direct-read `ca_direct_gemv_fp8_mt2` and fused `ca_woa_fused_quant_m6` compiled cleanly with zero spills and matched FlashInfer within 0.09–0.23 ms, leaving L2-prefetched FlashInfer + `woa_w8_partial_m6` both faster and 100% bit-exact.)*
+
+### Qualification results (s1706 vs s1701, four GB10 nodes, 2350 MHz)
+
+| Gate / metric | s1701 | s1706 | Notes |
+|---|---:|---:|---|
+| CPU/library unit tests (`full` scope) | 318+ passed | **322 passed, 0 failed** | Clean provenance build across all 4 ranks |
+| Fixed 16-frontier narrow verifier (131K–132K, 96×129,280 logits) | reference | **100% bit-identical** | Exact SHA-256 `3a7e7349...` across 12,410,880 FP32 logits |
+| Fixed 16-frontier narrow vs wide (compact M6/M9/M12) | 96/96 top-1, KL `1.697e-3` | **96/96 top-1, KL `1.697e-3`** | `narrow_repeat`, `wide_repeat`, `wide16_prefix` all 16/16 bitwise |
+| Phase 3B two-chunk append64 vs s1701 M128 across 16 frontiers | — | **95/96 top-1, KL `2.78e-3`** | 4× below DeepSeek's `0.0110` split-K yardstick; 37-tok live append `115.2 ms` |
+| 65-request single-stream panel exact output identity | 65/65 | **65/65 identical** | `timed`: `89.65 -> 90.24 tok/s` (`+0.66%`); `prefix-timed`: `83.79 -> 84.41 tok/s` (`+0.75%`) |
+| 131K cold prefill (`long_solo_client.py`) | 13.63 s | **13.58 s** | `wide16` borrow in `0.058 s`; `warmup` `95.5 tok/s`; `ledger` `103.7 tok/s` |
+| 2/3/4-stream batched decode (`batched-append64`) | — | **134.5 tok/s (2c), 0 recaptures** | Lone peer relocated via `AttachPeer` after 2 steps; 3c & 4c clean |
+| 4-stream × 24-screenshot UMA pressure (`smoke_image_sessions.py`, +973 MiB head pressure) | — | **12/12 HTTP 200, 12/12 exact colors** | Round-3 cache hit `43,543/43,577` (99.92%); `MemAvailable` `3,788 -> 3,767 MiB`, 0 OOM/swap |
+| Clean 4-node fresh-boot idle `MemAvailable` spread | 234 MiB | **288 MiB** | `[120160, 120448, 120368, 120419]` MiB across ranks 0–3 |
+| Clean 4-node fresh-boot post-load `MemAvailable` | 6.39–6.68 GiB | **6.77–6.94 GiB** (`6,931–7,108 MiB`) | `~+390–450 MiB/rank` higher live UMA headroom, 0 swap, 0 OOM/Xid |
+| Head-local sanity check prefill | 124.8 ms | **120.1 ms** | Exact answer returned, `context_capacity = 1,048,576`, 1 model start/rank |
+
 ## November 27 UMA resilience release (s1701)
 
 Release s1701 keeps every setting in `deploy/profile.json` and every compiled GPU kernel unchanged from s1699 (`core.cubin` is code-identical after private-symbol normalization; `vision.cubin` and the fixed verifier panel are byte-identical). The changes are Rust host/scheduler memory-resilience improvements plus a cross-rank idle `MemAvailable` symmetry gate in `deploy/fleet.py` (rejecting any rank more than 1,024 MiB below the peer peak before launch).

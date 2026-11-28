@@ -34,7 +34,7 @@ const REUSE_OVERLAP: usize = 256;
 /// How far back from the first differing byte a cut is searched.
 const REUSE_SCAN: usize = 1 << 20;
 /// Cached regions compared with a missed one (most recently used first).
-const REUSE_CANDIDATES: usize = 4;
+const REUSE_CANDIDATES: usize = 8;
 
 /// True where a pre-token of the pinned tokenizer starts in any text containing these two bytes at `p - 1`, `p`:
 /// after a line break followed by a visible ASCII character (the alternation's whitespace and punctuation

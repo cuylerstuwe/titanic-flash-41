@@ -210,6 +210,12 @@ pub struct View {
 }
 pub struct Weights {
     atlas: Buffer<u8>,
+    /// Optional separately allocated canonical `head.weight` backing (offset, bytes, buffer)
+    /// so it can be dropped after compact lossless + NVFP4 heads initialize (+315.6 MiB/rank UMA).
+    split_head: Option<(usize, usize, std::cell::RefCell<Option<Buffer<u8>>>)>,
+    /// Immutable device address of `head.weight` recorded at load time, preserved across release
+    /// so `lossless_head::Head::matches_canonical` can verify atlas identity for later forks.
+    split_head_tag: u64,
     pub views: BTreeMap<String, View>,
     pub source_sha256: String,
     expert_states: BTreeMap<usize, bool>,
@@ -424,9 +430,42 @@ impl Weights {
             bytes <= 16 * 1024 * 1024,
             "diagnostic transfer exceeds staging bound"
         );
-        self.atlas.download_part(offset, bytes)
+        let mut out = vec![0u8; bytes];
+        self.download_logical_into(offset, &mut out)?;
+        Ok(out)
+    }
+    fn download_logical_into(&self, offset: usize, out: &mut [u8]) -> Result<()> {
+        let Some((head_off, head_len, ref cell)) = self.split_head else {
+            return self.atlas.download_part_into(offset, out);
+        };
+        let head_end = head_off + head_len;
+        let mut pos = offset;
+        let mut dst = 0usize;
+        while dst < out.len() {
+            let rem = out.len() - dst;
+            if pos < head_off {
+                let n = rem.min(head_off - pos);
+                self.atlas.download_part_into(pos, &mut out[dst..dst + n])?;
+                pos += n;
+                dst += n;
+            } else if pos < head_end {
+                let n = rem.min(head_end - pos);
+                let guard = cell.borrow();
+                let buf = guard.as_ref().context("canonical head.weight was already released")?;
+                buf.download_part_into(pos - head_off, &mut out[dst..dst + n])?;
+                pos += n;
+                dst += n;
+            } else {
+                let n = rem;
+                self.atlas.download_part_into(pos - head_len, &mut out[dst..dst + n])?;
+                pos += n;
+                dst += n;
+            }
+        }
+        Ok(())
     }
     pub(crate) fn pointer_at(&self, offset: usize, bytes: usize) -> Result<u64> {
+        ensure!(self.split_head.is_none(), "pointer_at not supported on split model-IO atlas");
         ensure!(
             bytes > 0
                 && offset
@@ -476,13 +515,45 @@ impl Weights {
     }
     pub fn ptr(&self, name: &str) -> Result<u64> {
         let v = self.views.get(name).context("missing loaded weight")?;
+        if let Some((head_off, head_len, ref cell)) = self.split_head {
+            if name == "head.weight" {
+                let guard = cell.borrow();
+                let buf = guard.as_ref().context("canonical head.weight was already released")?;
+                return Ok(buf.ptr());
+            }
+            let phys = if v.offset >= head_off + head_len {
+                v.offset - head_len
+            } else {
+                v.offset
+            };
+            return Ok(self.atlas.ptr() + phys as u64);
+        }
         Ok(self.atlas.ptr() + v.offset as u64)
+    }
+    pub(crate) fn canonical_head_tag(&self) -> Result<u64> {
+        if self.split_head.is_some() {
+            Ok(self.split_head_tag)
+        } else {
+            self.ptr("head.weight")
+        }
+    }
+    pub(crate) fn canonical_head_released(&self) -> bool {
+        self.split_head.as_ref().is_some_and(|(_, _, cell)| cell.borrow().is_none())
+    }
+    pub(crate) fn release_canonical_head(&self) -> Result<usize> {
+        let Some((_, _, ref cell)) = self.split_head else {
+            return Ok(0);
+        };
+        let freed = cell.borrow_mut().take().map_or(0, |buf| buf.bytes());
+        Ok(freed)
     }
     pub fn view(&self, name: &str) -> Result<&View> {
         self.views.get(name).context("missing loaded weight")
     }
     pub fn bytes(&self) -> usize {
-        self.atlas.len()
+        self.atlas.len() + self.split_head.as_ref().map_or(0, |(_, _, cell)| {
+            cell.borrow().as_ref().map_or(0, |b| b.bytes())
+        })
     }
     /// prefix bounds a vertical-slice qualification. Empty selects every device
     /// weight; exact Engram backing is separately owned by its row cache.
@@ -615,6 +686,8 @@ impl Weights {
         timing.report("checkpoint",plan.rank,prefixes,total);
         Ok(Self {
             atlas,
+            split_head: None,
+            split_head_tag: 0,
             views,
             source_sha256: format!("{:x}", digest.finalize()),
             expert_states: BTreeMap::new(),
@@ -644,10 +717,9 @@ impl Weights {
             digest.update(name.as_bytes());
             digest.update((v.bytes as u64).to_le_bytes());
             for offset in (0..v.bytes).step_by(CHUNK) {
-                digest.update(
-                    self.atlas
-                        .download_part(v.offset + offset, CHUNK.min(v.bytes - offset))?,
-                );
+                let mut part = vec![0u8; CHUNK.min(v.bytes - offset)];
+                self.download_logical_into(v.offset + offset, &mut part)?;
+                digest.update(&part);
             }
         }
         let device_sha = format!("{:x}", digest.finalize());
@@ -665,7 +737,7 @@ impl Weights {
             prefix.extend_from_slice(&(v.bytes as u64).to_le_bytes());
             Part{prefix,offset:v.offset,bytes:v.bytes}
         }).collect();
-        crate::ordered_digest::digest(&parts,CHUNK,|offset,out|self.atlas.download_part_into(offset,out))
+        crate::ordered_digest::digest(&parts,CHUNK,|offset,out|self.download_logical_into(offset,out))
     }
     /// Lossless per-rank source-byte cache for cluster nodes that do not own
     /// the canonical NVMe checkpoint. Export only unprepared original units.
@@ -815,10 +887,24 @@ impl Weights {
             .filter(|(n, _)| n.contains(".ffn.experts.") && n.ends_with(".scale"))
             .map(|(_, v)| (v.offset, v.offset + v.bytes))
             .collect();
-        let mut atlas = match reserved {
-            Some(reserved)=>reserved.take(cuda,plan,directory,total)?,
-            None if compressed=>cuda.allocate_compressible::<u8>(total)?,
-            None=>cuda.allocate::<u8>(total)?,
+        let split_head_range = if reserved.is_none()
+            && !compressed
+            && prefixes == ["embed.", "head.", "norm."]
+            && crate::config::release_canonical_head()
+        {
+            views.get("head.weight").map(|v| (v.offset, v.bytes))
+        } else {
+            None
+        };
+        let (mut atlas, mut head_buf) = if let Some((_, head_len)) = split_head_range {
+            (cuda.allocate::<u8>(total - head_len)?, Some(cuda.allocate::<u8>(head_len)?))
+        } else {
+            let atlas = match reserved {
+                Some(reserved)=>reserved.take(cuda,plan,directory,total)?,
+                None if compressed=>cuda.allocate_compressible::<u8>(total)?,
+                None=>cuda.allocate::<u8>(total)?,
+            };
+            (atlas, None)
         };
         let mut hash = Sha256::new();
         let mut consume=|offset:usize,staging:&[u8]| {
@@ -839,7 +925,32 @@ impl Weights {
             timing.add(1,began);let began=timing.tick();
             if !hash_pipeline{hash.update(staging);}
             timing.add(2,began);let began=timing.tick();
-            atlas.upload_part(offset, staging)?;
+            if let (Some((head_off, head_len)), Some(hb)) = (split_head_range, head_buf.as_mut()) {
+                let head_end = head_off + head_len;
+                let mut pos = offset;
+                let mut src = 0usize;
+                while src < n {
+                    let rem = n - src;
+                    if pos < head_off {
+                        let k = rem.min(head_off - pos);
+                        atlas.upload_part(pos, &staging[src..src + k])?;
+                        pos += k;
+                        src += k;
+                    } else if pos < head_end {
+                        let k = rem.min(head_end - pos);
+                        hb.upload_part(pos - head_off, &staging[src..src + k])?;
+                        pos += k;
+                        src += k;
+                    } else {
+                        let k = rem;
+                        atlas.upload_part(pos - head_len, &staging[src..src + k])?;
+                        pos += k;
+                        src += k;
+                    }
+                }
+            } else {
+                atlas.upload_part(offset, staging)?;
+            }
             timing.add(3,began);
             Ok(())
           })().map_err(std::io::Error::other)
@@ -879,8 +990,17 @@ impl Weights {
             // Advisory: every byte is verified and on the device; a refusal changes nothing.
             let _=unsafe{libc::posix_fadvise(input.as_raw_fd(),0,0,libc::POSIX_FADV_DONTNEED)};
         }
+        let (split_head, split_head_tag) = match (split_head_range, head_buf) {
+            (Some((off, len)), Some(buf)) => {
+                let tag = buf.ptr();
+                (Some((off, len, std::cell::RefCell::new(Some(buf)))), tag)
+            }
+            _ => (None, 0),
+        };
         let result = Self {
             atlas,
+            split_head,
+            split_head_tag,
             views,
             source_sha256: m.source_sha256,
             expert_states: BTreeMap::new(),

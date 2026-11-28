@@ -160,6 +160,11 @@ impl Roce {
     pub fn rank(&self) -> usize {
         self.rank
     }
+    /// Device address of the monotonically advancing collective epoch counter (u32),
+    /// watched by arrival-triggered early-stop L2 hint kernels.
+    pub(crate) fn epoch_ptr(&self) -> u64 {
+        self.counters.ptr()
+    }
     pub(crate) fn transport_memory(&self) -> serde_json::Value {
         serde_json::json!({"slot_bytes":self.layout.slot_bytes,
             "mapped_region_bytes":self.layout.total_bytes,

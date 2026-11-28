@@ -432,9 +432,18 @@ impl Frontend {
         // An invalid source-store setting is refused here (the cache itself falls back to off).
         #[cfg(feature = "vision-protocol")]
         crate::image_input_cache::source_store_budget()?;
+        let region_cache_mib = match std::env::var("CANADA_SCRATCH_PROMPT_REGION_CACHE_MIB") {
+            Ok(value) => {
+                let mib: usize = value.parse().map_err(|_| anyhow::anyhow!("invalid prompt-region cache MiB"))?;
+                ensure!((1..=1024).contains(&mib), "prompt-region cache MiB must be 1..=1024");
+                mib
+            }
+            Err(std::env::VarError::NotPresent) => 256,
+            Err(error) => return Err(error.into()),
+        };
         Ok(Self {
             prompt_tokenizer: PromptTokenizer::new(&tokenizer),
-            region_cache: crate::prompt_regions::RegionCache::with_prefix_reuse(32 * 1024 * 1024, crate::config::prompt_prefix_reuse()),
+            region_cache: crate::prompt_regions::RegionCache::with_prefix_reuse(region_cache_mib * 1024 * 1024, crate::config::prompt_prefix_reuse()),
             use_region_cache: match std::env::var("CANADA_SCRATCH_PROMPT_REGION_CACHE") {
                 Ok(value) => { ensure!(value == "0" || value == "1", "invalid prompt-region cache policy"); value == "1" },
                 Err(std::env::VarError::NotPresent) => true,

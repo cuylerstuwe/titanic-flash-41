@@ -247,6 +247,7 @@ pub(super) fn try_exchange(w:&mut Worker,saved:&mut RequestCheckpoint)->Result<O
     std::mem::swap(&mut w.pending_prefill,&mut saved.pending_prefill);
     std::mem::swap(&mut w.emitted,&mut saved.emitted);std::mem::swap(&mut w.limit,&mut saved.limit);
     w.current=Some(incoming);saved.id=outgoing;saved.charge=charge;
+    w.turn_steps=w.emitted.min(1);w.long_history_cooldown=0;
     w.stream.synchronize()?;
     ensure!(Some(anchor)==w.history.pending()&&w.verify.position()==w.history.frontier()as u64
         &&w.verify.logits().is_err()&&!w.large.profile_is_current()&&saved.image.device_bytes()==device,
@@ -277,6 +278,7 @@ pub(super) fn suspend(w: &mut Worker) -> Result<Value> {
     let id=w.current.unwrap();
     w.history.suspend()?;
     w.current=None;w.emitted=0;w.limit=0;w.pending_prefill=None;
+    w.turn_steps=0;w.long_history_cooldown=0;
     w.install_media(None)?;
     // Keep loaded token history so the next Begin sees the correct GPU owner.
     w.agree(&[])?;
@@ -333,6 +335,7 @@ pub(super) fn restore(w: &mut Worker, saved: &RequestCheckpoint) -> Result<Value
     w.history.resume(&saved.history)?;
     w.install_media(saved.media.clone())?;
     w.current=Some(saved.id);w.emitted=saved.emitted;w.limit=saved.limit;w.pending_prefill=saved.pending_prefill.clone();
+    w.turn_steps=saved.emitted.min(1);w.long_history_cooldown=0;
     w.stream.synchronize()?;
     ensure!(Some(anchor)==w.history.pending() && w.verify.position()==w.history.frontier() as u64
         && w.verify.logits().is_err() && !w.large.profile_is_current(),

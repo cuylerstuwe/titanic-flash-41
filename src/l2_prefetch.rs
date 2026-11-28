@@ -10,6 +10,20 @@ use anyhow::{Context, Result, ensure};
 use std::{cell::Cell, ffi::c_void, rc::Rc};
 
 const BUDGET: usize = 6 * 1024 * 1024;
+thread_local! {
+    static EARLY_STOP_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+/// Arrival-triggered early-stop for L2 paced hint windows (CANADA_SCRATCH_L2_EARLY_STOP=1).
+/// When active, W1/W2 windows watch the RoCE collective epoch counter and stop prefetching the
+/// moment the collective completes instead of competing with downstream GEMVs for DRAM bandwidth.
+pub(crate) fn early_stop_active() -> bool {
+    EARLY_STOP_OVERRIDE.with(|o| o.get()).unwrap_or_else(|| {
+        std::env::var("CANADA_SCRATCH_L2_EARLY_STOP").as_deref() == Ok("1")
+    })
+}
+pub(crate) fn set_early_stop_for_probe(override_on: Option<bool>) {
+    EARLY_STOP_OVERRIDE.with(|o| o.set(override_on));
+}
 pub(crate) fn enabled() -> bool {
     std::env::var("CANADA_SCRATCH_L2_PREFETCH").as_deref() == Ok("1")
 }
@@ -413,16 +427,21 @@ impl Window {
         self.module.function("ca_l2_hint_sized")?;
         self.chunk=chunk;Ok(())
     }
-    pub(crate) fn begin(&self, parent: &Stream) -> Result<()> { self.begin_on(parent, parent) }
+    pub(crate) fn begin(&self, parent: &Stream) -> Result<()> { self.begin_on(parent, parent, None) }
+    /// `begin` with an optional device u32 epoch pointer: paced windows exit their loop immediately
+    /// when `*stop_ptr` changes from its entry value (e.g., when the concurrent RoCE collective completes).
+    pub(crate) fn begin_stopping(&self, parent: &Stream, stop_ptr: Option<u64>) -> Result<()> {
+        self.begin_on(parent, parent, stop_ptr)
+    }
     /// `begin` with the release recorded on `source`, another stream of the same context: the window starts when
     /// the work already issued on `source` has finished, not when `parent` reaches this call. Joined on `parent`
     /// like any other window.
     pub(crate) fn begin_from(&self, parent: &Stream, source: &Stream) -> Result<()> {
         ensure!(self.cuda.owns_stream(source) && self.tiled.is_none() && self.routed.is_none()
             && self.side.raw() != source.raw(), "an L2 queue window begins from another side stream of its context");
-        self.begin_on(parent, source)
+        self.begin_on(parent, source, None)
     }
-    fn begin_on(&self, parent: &Stream, source: &Stream) -> Result<()> {
+    fn begin_on(&self, parent: &Stream, source: &Stream, stop_ptr: Option<u64>) -> Result<()> {
         ensure!(
             self.cuda.owns_stream(parent)
                 && parent.raw() as usize == self.parent
@@ -459,6 +478,24 @@ impl Window {
         if let Some((ns_piece, budget, warps, wave)) = self.paced {
             let (mut segments, mut count, mut first, mut budget, mut ns, mut warps, mut wave) =
                 (self.segments.ptr(), self.count, 0u32, budget, ns_piece, warps, wave);
+            if let Some(mut stop) = stop_ptr {
+                if warps > 1 || wave != 32 {
+                    let mut args: [*mut c_void; 8] = [(&mut segments as *mut u64).cast(), (&mut count as *mut u32).cast(),
+                        (&mut first as *mut u32).cast(), (&mut budget as *mut u32).cast(), (&mut ns as *mut u32).cast(),
+                        (&mut warps as *mut u32).cast(), (&mut wave as *mut u32).cast(), (&mut stop as *mut u64).cast()];
+                    unsafe { self.module.function("ca_l2_paced_wide_stop")?.launch([1, 1, 1], [32 * warps, 1, 1], 0, &self.side, &mut args) }?;
+                    self.done.record(&self.side)?;
+                    self.open.set(true);
+                    return Ok(());
+                }
+                let mut args: [*mut c_void; 6] = [(&mut segments as *mut u64).cast(), (&mut count as *mut u32).cast(),
+                    (&mut first as *mut u32).cast(), (&mut budget as *mut u32).cast(), (&mut ns as *mut u32).cast(),
+                    (&mut stop as *mut u64).cast()];
+                unsafe { self.module.function("ca_l2_paced_stop")?.launch([1, 1, 1], [32, 1, 1], 0, &self.side, &mut args) }?;
+                self.done.record(&self.side)?;
+                self.open.set(true);
+                return Ok(());
+            }
             if warps > 1 || wave != 32 {
                 let mut args: [*mut c_void; 7] = [(&mut segments as *mut u64).cast(), (&mut count as *mut u32).cast(),
                     (&mut first as *mut u32).cast(), (&mut budget as *mut u32).cast(), (&mut ns as *mut u32).cast(),

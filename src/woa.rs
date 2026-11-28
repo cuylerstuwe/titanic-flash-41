@@ -25,6 +25,9 @@ pub struct Grouped {
     /// ca_woa_partial_w8 in place of the exported partial kernel (config::woa_native), and whether it is on.
     native: Option<crate::cuda::Module>,
     native_on: Cell<bool>,
+    /// Single-kernel fused WO-A + split-K + MXFP8 quant (ca_woa_fused_quant_m6; config::woa_fused_direct).
+    fused_direct: Option<crate::cuda::Module>,
+    fused_direct_on: Cell<bool>,
 }
 impl Grouped {
     /// The immutable canonical WO-A bytes (weights, scales) and their owner, for L2 hints.
@@ -118,7 +121,25 @@ impl Grouped {
             stream: Cell::new(0),
             native: None,
             native_on: Cell::new(false),
+            fused_direct: None,
+            fused_direct_on: Cell::new(false),
         })
+    }
+    /// Install single-kernel fused WO-A + MXFP8 quant (ca_woa_fused_quant_m6 from DIRECT_GEMV_CUBIN).
+    pub(crate) fn install_fused_direct(&mut self, on: bool) -> Result<()> {
+        ensure!(self.fused_direct.is_none() && self.stream.get() == 0 && self.rows <= 8 && self.weight % 16 == 0 && self.scales != 0,
+            "fused direct WO-A requires idle small owner over aligned canonical bytes");
+        let module = self.cuda.module(crate::fp8_linear::DIRECT_GEMV_CUBIN)?;
+        module.function("ca_woa_fused_quant_m6")?;
+        self.fused_direct = Some(module);
+        self.fused_direct_on.set(on);
+        Ok(())
+    }
+    pub(crate) fn fused_direct_installed(&self) -> bool { self.fused_direct.is_some() }
+    pub(crate) fn set_fused_direct_for_probe(&self, on: bool) -> Result<()> {
+        ensure!(self.fused_direct.is_some(), "fused direct WO-A not installed");
+        self.fused_direct_on.set(on);
+        Ok(())
     }
     /// Install ca_woa_partial_w8 (same arithmetic as the exported partial kernel; see kernels/core.cu), on for
     /// serving (CANADA_SCRATCH_WOA_NATIVE=1) or off until the plan screen switches it.
@@ -157,6 +178,19 @@ impl Grouped {
             "WO-A workspace needs one ordered stream"
         );
         self.stream.set(raw);
+        if let Some(module) = self.fused_direct.as_ref().filter(|_| self.fused_direct_on.get()) {
+            let (mut x, mut w, mut s, mut vals, mut sc_mma, mut m) = (
+                input.ptr(), self.weight, self.scales, self.values.ptr(), self.output_scales.ptr(), self.rows as i32
+            );
+            let mut args: [*mut std::ffi::c_void; 6] = [
+                (&mut x as *mut u64).cast(), (&mut w as *mut u64).cast(), (&mut s as *mut u64).cast(),
+                (&mut vals as *mut u64).cast(), (&mut sc_mma as *mut u64).cast(), (&mut m as *mut i32).cast(),
+            ];
+            return unsafe {
+                module.function("ca_woa_fused_quant_m6")?
+                    .launch_pdl([64, 1, 1], [256, 1, 1], 0, stream, &mut args)
+            };
+        }
         if let Some(module) = self.native.as_ref().filter(|_| self.native_on.get()) {
             let (mut x, mut w, mut s, mut p, mut m) =
                 (input.ptr(), self.weight, self.scales, self.partial.ptr(), self.rows as i32);

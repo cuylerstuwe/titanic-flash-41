@@ -32,6 +32,7 @@ pub(crate) struct Head {
     bases:Buffer<u8>,
     head:Operator,
     paired:Option<[Operator;2]>,
+    paired_compact:Option<[Operator;2]>,
 }
 impl Head {
     pub(crate) fn matches_canonical(&self,cuda:&Cuda,canonical:u64,stream:&Stream)->bool {
@@ -68,6 +69,23 @@ impl Head {
                 operators.push(op);
             }
             head.paired=Some(operators.try_into().ok().unwrap());
+            if crate::config::compact_paired_head() {
+                let extra_compact=root.with_file_name("target-head-lossless-paired-compact-v1");
+                let raw_c=std::fs::read(extra_compact.join("manifest.json"))?;
+                ensure!(format!("{:x}",Sha256::digest(&raw_c))=="7f7fbc3280b388d09465f26286fee67e8eacba7b4859a954364467f05e678671",
+                    "compact paired lossless head manifest changed");
+                let mut ops_c=Vec::new();
+                for rows in [9,12] {
+                    let op=Operator::load(cuda,&extra_compact,&format!("lossless_head_m{rows}"))?;
+                    ensure!(op.entry.arguments.iter().map(|a|(a.name.as_str(),a.kind.as_str())).collect::<Vec<_>>()
+                        ==vec![("X","*bf16"),("W","*bf16"),("SM","*u8"),("Codes","*u32"),("Base","*u8"),("Y","*fp32")]
+                        &&op.entry.grid.rows_div==1&&op.entry.grid.x_mul==1&&op.entry.grid.x_add==0
+                        &&op.entry.grid.y==1&&op.entry.grid.z==1&&op.entry.metadata.num_warps==4,
+                        "compact paired lossless head AOT ABI");
+                    ops_c.push(op);
+                }
+                head.paired_compact=Some(ops_c.try_into().ok().unwrap());
+            }
         }
         let compact=match std::env::var("CANADA_SCRATCH_HEAD_COMPACT_EXCEPTIONS") {
             Err(std::env::VarError::NotPresent)=>false,
@@ -135,7 +153,7 @@ impl Head {
         ensure!(errors.download()?.iter().all(|&count|count==0),"lossless head changed canonical weight bits");
         eprintln!("lossless M{rows} head: {BYTES} encoded bytes, every canonical BF16 bit verified on GPU, preparation {:.3}ms",began.elapsed().as_secs_f64()*1000.);
         Ok(Self{cuda:cuda.clone(),canonical,compact:None,planes:None,variant:std::cell::Cell::new(CANONICAL),
-            sign_mantissa,codes,bases,head,paired:None})
+            sign_mantissa,codes,bases,head,paired:None,paired_compact:None})
     }
     pub(crate) fn run(&self,input:u64,output:u64,stream:&Stream)->Result<()> {
         ensure!(self.cuda.owns_stream(stream),"lossless head stream context");
@@ -317,12 +335,62 @@ impl Head {
             "back_to_back_ms":{"compact":compact,"planes":planes},"ms":began.elapsed().as_secs_f64()*1000.}));
         Ok(())
     }
+    pub(crate) fn is_compact_multirow_ready(&self) -> bool {
+        self.variant.get() == COMPACT && self.compact.is_some() && self.paired_compact.is_some()
+    }
     pub(crate) fn run_pooled(&self,input:u64,output:u64,rows:usize,stream:&Stream)->Result<()> {
         ensure!(self.cuda.owns_stream(stream)&&matches!(rows,6|9|12),"pooled lossless head rows/context");
         if rows==6{return self.run(input,output,stream);}
+        if self.variant.get()==COMPACT {
+            if let (Some((_,table)),Some(ops))=(&self.compact,&self.paired_compact) {
+                let op=&ops[usize::from(rows==12)];
+                return unsafe{op.launch(32320,&[input,table.ptr(),self.sign_mantissa.ptr(),self.codes.ptr(),self.bases.ptr(),output],stream)};
+            }
+        }
         let ops=self.paired.as_ref().ok_or_else(||anyhow::anyhow!("paired lossless operators absent"))?;
         let op=&ops[usize::from(rows==12)];
         unsafe{op.launch(32320,&[input,self.canonical,self.sign_mantissa.ptr(),self.codes.ptr(),self.bases.ptr(),output],stream)}
+    }
+    pub(crate) fn compact_row_tiles(live: usize, capacity: usize) -> Result<Vec<(usize, usize)>> {
+        ensure!(live >= 1 && live <= capacity && capacity >= 6, "compact multirow lossless head contract");
+        if live <= 6 {
+            return Ok(vec![(0, 6)]);
+        }
+        if live <= 9 && capacity >= 9 {
+            return Ok(vec![(0, 9)]);
+        }
+        if live <= 12 && capacity >= 12 {
+            return Ok(vec![(0, 12)]);
+        }
+        let mut tiles = Vec::new();
+        let mut done = 0usize;
+        while done + 12 <= live {
+            tiles.push((done, 12));
+            done += 12;
+        }
+        let rem = live - done;
+        if rem > 0 {
+            let width = if rem <= 6 { 6 } else if rem <= 9 { 9 } else { 12 };
+            let start = live - width;
+            ensure!(start + width <= capacity, "compact head tile exceeds buffer capacity");
+            tiles.push((start, width));
+        }
+        Ok(tiles)
+    }
+    /// Exact compact lossless target head for any `1 <= live <= capacity` rows (`capacity >= 6`)
+    /// using compact M6/M9/M12 passes. Uses a single pass for `live <= 12` (cutting 16-row
+    /// batched head reads by 25% vs BF16 M16) and overlapping tail tiles for `live > 12`
+    /// without extra buffers or canonical `head.weight` access.
+    pub(crate) fn run_compact_rows(&self,input:u64,output:u64,live:usize,capacity:usize,stream:&Stream)->Result<()> {
+        ensure!(self.cuda.owns_stream(stream)&&self.is_compact_multirow_ready(),"compact multirow lossless head contract");
+        const IN_ROW_BYTES: u64 = 5120 * 2;
+        const OUT_ROW_BYTES: u64 = 32320 * 4;
+        for (start, width) in Self::compact_row_tiles(live, capacity)? {
+            let inp = input + (start as u64) * IN_ROW_BYTES;
+            let out = output + (start as u64) * OUT_ROW_BYTES;
+            self.run_pooled(inp, out, width, stream)?;
+        }
+        Ok(())
     }
 }
 /// The bit-plane arrangement of whole 32-weight groups (tools/build_plane_head.py; the reference pack_planes).
@@ -433,5 +501,25 @@ mod tests {
         assert!(pack_planes(&bytes(&[100u16<<7;32]),&[101]).is_err());
         assert!(pack_planes(&bytes(&[100u16<<7;32]),&[100,100]).is_err());
         assert!(pack_planes(&bytes(&words),&[255]).is_ok());
+    }
+    #[test]
+    fn compact_row_tiles_cover_every_live_extent_within_capacity() {
+        for capacity in [6usize, 16, 32, 64] {
+            for live in 1..=capacity {
+                let tiles = super::Head::compact_row_tiles(live, capacity).unwrap();
+                if live <= 12 && capacity >= 12 {
+                    assert_eq!(tiles.len(), 1, "expected single pass for live={live}, cap={capacity}");
+                }
+                let mut covered = vec![false; capacity];
+                for (start, width) in tiles {
+                    assert!(matches!(width, 6 | 9 | 12));
+                    assert!(start + width <= capacity);
+                    for i in start..start + width {
+                        covered[i] = true;
+                    }
+                }
+                assert!(covered[..live].iter().all(|&c| c), "uncovered row for live={live}, cap={capacity}");
+            }
+        }
     }
 }

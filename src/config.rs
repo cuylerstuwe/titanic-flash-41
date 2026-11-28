@@ -1448,6 +1448,48 @@ pub(crate) fn cache_keep_latest() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CANADA_SCRATCH_CACHE_KEEP_LATEST").as_deref() == Ok("1"))
 }
+/// CANADA_SCRATCH_COPY_STEP0_GUARD (default on; 0 disables): skip 16/32-row copy-verify escalation on
+/// Step 0 of a newly started turn and apply a 3-step cooldown after any <=3-token 16/32-row miss.
+pub(crate) fn copy_step0_guard() -> bool {
+    std::env::var("CANADA_SCRATCH_COPY_STEP0_GUARD").as_deref() != Ok("0")
+}
+/// CANADA_SCRATCH_MOE_SCALE_CODE1_SCREEN=1: screen the one-bit MoE scale code against cache-ca on the
+/// six-row owner inside l2_queue_probe with extended warm-up.
+pub(crate) fn moe_scale_code1_screen() -> bool {
+    std::env::var("CANADA_SCRATCH_MOE_SCALE_CODE1_SCREEN").as_deref() == Ok("1")
+}
+/// CANADA_SCRATCH_L2_EARLY_STOP_SCREEN=1: A/B screen arrival-triggered early-stop on L2 paced hint windows
+/// inside l2_queue_probe.
+pub(crate) fn l2_early_stop_screen() -> bool {
+    std::env::var("CANADA_SCRATCH_L2_EARLY_STOP_SCREEN").as_deref() == Ok("1")
+}
+/// CANADA_SCRATCH_KNOCKOUT_HINTS_OFF=1: run l2_queue_probe knockout arms with L2 hint queues disabled
+/// so each stage's true cost is measured without concurrent L2 hint contention.
+pub(crate) fn knockout_hints_off() -> bool {
+    std::env::var("CANADA_SCRATCH_KNOCKOUT_HINTS_OFF").as_deref() == Ok("1")
+}
+/// CANADA_SCRATCH_L2_QUEUE_WARMUPS: override the timed warm-up count per arm in l2_queue_probe (1..=64).
+pub(crate) fn l2_queue_warmups() -> Option<usize> {
+    std::env::var("CANADA_SCRATCH_L2_QUEUE_WARMUPS").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+}
+/// CANADA_SCRATCH_WIDE16_SPILL_MIN_UNCACHED (default 128_000; 0 disables): when borrow_wide16 cannot fit
+/// from free/parkable chunks on a large cold prefill, spill oldest parkable resident checkpoints to NVMe
+/// first so 16K prefill chunks succeed instead of falling back to 8K.
+pub(crate) fn wide16_spill_min_uncached() -> usize {
+    std::env::var("CANADA_SCRATCH_WIDE16_SPILL_MIN_UNCACHED").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(128_000)
+}
+/// CANADA_SCRATCH_LONE_PEER_ATTACH_STEPS (default 4; 0 disables): consecutive 1-conversation batched
+/// steps in a peer region while region 0 and ready queue are empty before moving the peer back to region 0
+/// so it recovers full 6-row owner + copy-verify speed.
+pub(crate) fn lone_peer_attach_steps() -> usize {
+    std::env::var("CANADA_SCRATCH_LONE_PEER_ATTACH_STEPS").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+}
 /// CANADA_SCRATCH_ENGRAM_MEDIA_OVERLAP (0 default; 1; 2 = odd request ids only, a same-load A/B): a request with
 /// images starts the Engram reads of its first new rows (up to 2,048) on a host thread while the GPU encodes the
 /// images, and stops them the moment encoding returns (the ordinary path behind layer 0 reads whatever is left).
@@ -2198,6 +2240,26 @@ pub(crate) fn wqb_direct_screen_all() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_WQB_DIRECT_SCREEN_ALL").as_deref() == Ok("1"))
 }
+/// CANADA_SCRATCH_WOB_DIRECT=1: run the six-row owner's wo_b projection ([5120, 2048]) through
+/// ca_direct_gemv_fp8_mt2 (MT=2, wk=8, PDL load_w before pdl_wait).
+pub(crate) fn wob_direct() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_WOB_DIRECT").as_deref() == Ok("1"))
+}
+pub(crate) fn wob_direct_screen() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_WOB_DIRECT_SCREEN").as_deref() == Ok("1"))
+}
+/// CANADA_SCRATCH_WOA_FUSED_DIRECT=1: run the six-row owner's grouped wo_a ([2048, 4096]) +
+/// split-K reduction + exact MXFP8 quantization in one single PDL kernel (ca_woa_fused_quant_m6).
+pub(crate) fn woa_fused_direct() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_WOA_FUSED_DIRECT").as_deref() == Ok("1"))
+}
+pub(crate) fn woa_fused_direct_screen() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_WOA_FUSED_DIRECT_SCREEN").as_deref() == Ok("1"))
+}
 /// CANADA_SCRATCH_BATCHED_DRAFT_BODY=1 (default off): in batched steps, two or three conversations that draft
 /// share one drafter body pass (dspark_batch_query): each stage's residual boundaries, experts and sums run
 /// once over all their five-row blocks, the attention per conversation. Needs moe-runtime-dspark-m16-v1.
@@ -2317,4 +2379,37 @@ pub(crate) fn batched_block_cap() -> usize {
         Ok(v) => v.parse::<usize>().ok().filter(|c| (4..=8).contains(c)).unwrap_or(6),
         Err(_) => 6,
     })
+}
+/// CANADA_SCRATCH_RELEASE_CANONICAL_HEAD=1 (default off): split `head.weight` out of the
+/// model-IO atlas at load time, route paired M9/M12 and multi-row (16/32/64) target heads
+/// through the compact lossless encoding + compact escape table, and free the 315.6 MiB/rank
+/// canonical BF16 `head.weight` backing once the lossless M6/M9/M12 and NVFP4 draft heads
+/// finish initializing (+1.26 GiB cluster UMA headroom).
+pub(crate) fn release_canonical_head() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_RELEASE_CANONICAL_HEAD").as_deref() == Ok("1"))
+}
+/// Use the compact-escape paired M9/M12 lossless head bundle (target-head-lossless-paired-compact-v1).
+pub(crate) fn compact_paired_head() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        release_canonical_head()
+            || std::env::var("CANADA_SCRATCH_COMPACT_PAIRED_HEAD").as_deref() == Ok("1")
+    })
+}
+/// Route 16/32/64-row verification heads through compact lossless M6/M9/M12 tiles.
+pub(crate) fn compact_multirow_head() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        release_canonical_head()
+            || std::env::var("CANADA_SCRATCH_COMPACT_MULTIROW_HEAD").as_deref() == Ok("1")
+    })
+}
+/// CANADA_SCRATCH_RESIDENT_APPEND64 (default true when retained_append32 is active):
+/// route 33..=64-token cached continuations through two small-append chunks (32 tokens on
+/// copy32_verify followed by the 1..=32-token tail on verify/long_verify/copy32_verify)
+/// instead of falling back to the 128-row prefill owner. Bit-exact and zero extra UMA.
+pub(crate) fn resident_append64() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CANADA_SCRATCH_RESIDENT_APPEND64").as_deref() != Ok("0"))
 }
